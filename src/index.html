@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#111315" />
+  <title>模組包翻譯工具｜ZeitFrei</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <a class="workspace-brand" href="#top" aria-label="回到模組包翻譯工具首頁">
+        <img class="brand-icon" src="assets/zeitfrei-modpack-icon-gpt-image-2.png" alt="" />
+        <span class="brand-copy"><strong>zeitfrei / modpack-i18n</strong><small>DESKTOP TOOL</small></span>
+      </a>
+      <div class="topbar-actions">
+        <kbd class="version-key">0.5.1</kbd>
+        <button type="button" id="btn-theme" class="text-button theme-button" aria-pressed="true" title="切換到淺色模式"><span id="theme-glyph" aria-hidden="true">◐</span><span id="theme-label">深色</span></button>
+        <button type="button" id="btn-check-update" class="text-button update-button"><span>檢查更新</span><span id="update-status" class="update-status" aria-live="polite"></span></button>
+        <button type="button" id="btn-guide" class="text-button">使用說明</button>
+      </div>
+    </header>
+
+    <main id="top" class="document">
+      <header class="document-head">
+        <p class="breadcrumb"><span>zeitfrei</span><span>/</span><span>tools</span><span>/</span><strong>modpack translation</strong></p>
+        <div class="markdown-title"><span class="hash-mark">#</span><h1>模組包翻譯工具</h1></div>
+        <p class="document-lead">把 Minecraft 模組整合包裡的英文或簡體中文，整理成台灣玩家看得懂的繁體中文。</p>
+      </header>
+
+      <nav class="service-tabs" aria-label="工具服務" role="tablist">
+        <button type="button" id="tab-translate" class="service-tab active" data-page="translate" aria-selected="true" role="tab">
+          <span class="tab-title"><span class="tab-symbol">01</span>翻譯整合包</span>
+          <span class="tab-note">掃描、翻譯、輸出</span>
+        </button>
+        <button type="button" id="tab-font" class="service-tab" data-page="font" aria-selected="false" role="tab">
+          <span class="tab-title"><span class="tab-symbol">02</span>字體資源包</span>
+          <span class="tab-note">一鍵套用喜歡的字體</span>
+        </button>
+      </nav>
+
+      <div class="workspace-grid">
+        <div class="content-column">
+          <div id="page-translate" class="page-panel active" data-page="translate">
+            <section class="document-section" aria-labelledby="translation-title">
+              <div class="service-intro">
+                <div class="section-heading">
+                  <span class="md-symbol">##</span>
+                  <div><h2 id="translation-title">翻譯整合包</h2><p>選好遊戲實例與輸出位置，剩下的交給工具處理。</p></div>
+                </div>
+                <img class="service-art" src="assets/art/translation-service-illustration.png" alt="" />
+              </div>
+
+              <div class="quote-note"><span>&gt;</span><p>工具只讀取語言檔，不會改動 <code>mods/*.jar</code>。</p></div>
+
+              <div class="field-list">
+                <div class="field-block">
+                  <label for="instance">整合包資料夾</label>
+                  <p class="field-help">你在 CurseForge、Modrinth、Prism Launcher 等啟動器實際遊玩的資料夾。</p>
+                  <div class="input-row"><input id="instance" type="text" placeholder="選取 Minecraft 實例資料夾" autocomplete="off" /><button type="button" id="btn-inst" class="small-button">選取</button></div>
+                </div>
+                <div class="field-block">
+                  <label for="output">翻譯輸出位置</label>
+                  <p class="field-help">工具會在這裡建立 <code>翻譯結果/</code>。</p>
+                  <div class="input-row"><input id="output" type="text" placeholder="選取結果要放在哪裡" autocomplete="off" /><button type="button" id="btn-out" class="small-button">選取</button></div>
+                  <button type="button" id="btn-suggest-rp" class="inline-link">↳ 使用啟動器建議的位置</button>
+                </div>
+                <div class="field-block compact-field">
+                  <label for="pack-name">資源包名稱</label>
+                  <input id="pack-name" type="text" value="台灣繁體中文翻譯" autocomplete="off" />
+                </div>
+                <div class="field-block compact-field version-field">
+                  <label for="target-version">Minecraft 版本</label>
+                  <p class="field-help">會先自動偵測，也可以手動指定。</p>
+                  <select id="target-version" aria-describedby="version-status">
+                    <option value="">自動偵測</option>
+                    <option value="1.13">1.13</option>
+                    <option value="1.14.4">1.14.4</option>
+                    <option value="1.15.2">1.15.2</option>
+                    <option value="1.16.5">1.16.5</option>
+                    <option value="1.17.1">1.17.1</option>
+                    <option value="1.18.2">1.18.2</option>
+                    <option value="1.19.2">1.19.2</option>
+                    <option value="1.19.4">1.19.4</option>
+                    <option value="1.20.1">1.20.1</option>
+                    <option value="1.20.4">1.20.4</option>
+                    <option value="1.20.6">1.20.6</option>
+                    <option value="1.21">1.21</option>
+                    <option value="1.21.1">1.21.1</option>
+                    <option value="1.21.4">1.21.4</option>
+                    <option value="1.21.5">1.21.5</option>
+                    <option value="1.21.8">1.21.8</option>
+                    <option value="1.21.9">1.21.9</option>
+                    <option value="26.1">26.1</option>
+                    <option value="26.2">26.2</option>
+                    <option value="26.3">26.3</option>
+                  </select>
+                  <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲實例</small>
+                </div>
+              </div>
+
+              <div class="subsection-heading"><span class="md-symbol">###</span><h3>翻譯方式</h3></div>
+              <div class="option-list">
+                <label class="option-row" for="use-ai">
+                  <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
+                  <span><strong>補上原本沒有繁中的文字</strong><small>可使用開發者代管 AI；也能在進階設定填入自己的金鑰。</small></span>
+                </label>
+                <label class="option-row" for="minimize-on-close">
+                  <input type="checkbox" id="minimize-on-close" checked /><span class="check-box" aria-hidden="true"></span>
+                  <span><strong>關閉視窗時縮到背景</strong><small>翻譯繼續進行，不會因為關閉視窗而中斷。</small></span>
+                </label>
+              </div>
+
+              <div id="ai-panel" class="ai-panel">
+                <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
+                <p id="ai-source-note" class="ai-source-note">AI 為選用功能；已有中文的內容仍會先做台灣用語轉換。</p>
+                <details id="adv-details" class="advanced-details"><summary>進階 AI 設定（可選）</summary><div class="advanced-body">
+                  <div class="field-block"><label for="api-key">自備 API 金鑰</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="只會儲存在本機" /></div>
+                  <div class="field-block"><label for="base-url">API 位置</label><input id="base-url" type="text" autocomplete="off" placeholder="留白使用預設服務" /></div>
+                  <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
+                </div></details>
+              </div>
+
+              <div class="action-area">
+                <button type="button" id="btn-run" class="primary-button">開始翻譯 <span>↗</span></button>
+                <button type="button" id="btn-stop" class="danger-button" hidden>停止翻譯</button>
+                <div class="action-row">
+                  <button type="button" id="btn-supplement" class="secondary-button">補翻工作階段</button>
+                  <button type="button" id="btn-apply" class="secondary-button">套用到遊戲</button>
+                  <button type="button" id="btn-repair" class="text-button">修復工作階段</button>
+                  <button type="button" id="btn-glossary" class="text-button">術語表</button>
+                </div>
+              </div>
+              <p class="footnote"><span>ⓘ</span>套用前會先備份會被覆蓋的目標。請在 Minecraft 關閉時套用。</p>
+            </section>
+          </div>
+
+          <div id="page-font" class="page-panel" data-page="font" hidden>
+            <section class="document-section font-service" aria-labelledby="font-title">
+              <div class="service-intro">
+                <div class="section-heading">
+                  <span class="md-symbol">#</span>
+                  <div><h2 id="font-title">字體資源包</h2><p>這是獨立服務：把你喜歡的字體一鍵放進 Minecraft。</p></div>
+                </div>
+                <img class="service-art" src="assets/art/font-service-illustration.png" alt="" />
+              </div>
+              <div class="quote-note"><span>&gt;</span><p>選一個你有權使用的 <code>.ttf</code>、<code>.otf</code> 或 <code>.ttc</code>，工具會建立可放進 <code>resourcepacks</code> 的資源包。</p></div>
+
+              <div class="field-grid">
+                <div class="field-block"><label for="font-file">字體檔案</label><p class="field-help">支援 TTF、OTF、TTC。</p><div class="input-row"><input id="font-file" type="text" placeholder="尚未選取字體檔" autocomplete="off" /><button type="button" id="btn-font-pick" class="small-button">選取</button></div></div>
+                <div class="field-block"><label for="font-output">字體包輸出位置</label><p class="field-help">會建立在這個位置的 <code>翻譯結果/resourcepacks</code>。</p><div class="input-row"><input id="font-output" type="text" placeholder="選取字體包要放在哪裡" autocomplete="off" /><button type="button" id="btn-font-out" class="small-button">選取</button></div></div>
+                <div class="field-block full-field"><label for="font-pack-name">字體資源包名稱</label><input id="font-pack-name" type="text" value="繁體中文遊戲字體" placeholder="輸入資源包名稱" autocomplete="off" /></div>
+              </div>
+
+              <div class="subsection-heading"><span class="md-symbol">##</span><h3>字體設定</h3><span class="setting-note">輸出前可隨時重建</span></div>
+              <div class="settings-grid">
+                <label class="range-field" for="font-size"><span><strong>字體大小</strong><small>基準顯示尺寸</small></span><span class="range-value"><output id="font-size-value">11</output> px</span><input id="font-size" type="range" min="8" max="24" step="0.5" value="11" /></label>
+                <label class="range-field" for="font-weight"><span><strong>字重感</strong><small>renderer 層近似調整</small></span><span class="range-value"><output id="font-weight-value">400</output></span><input id="font-weight" type="range" min="100" max="900" step="50" value="400" /></label>
+                <label class="range-field" for="font-shift-x"><span><strong>水平位移</strong><small>左右對齊</small></span><span class="range-value"><output id="font-shift-x-value">0</output></span><input id="font-shift-x" type="range" min="-3" max="3" step="0.1" value="0" /></label>
+                <label class="range-field" for="font-shift-y"><span><strong>垂直位移</strong><small>上下對齊</small></span><span class="range-value"><output id="font-shift-y-value">0.5</output></span><input id="font-shift-y" type="range" min="-3" max="3" step="0.1" value="0.5" /></label>
+                <label class="range-field full-range" for="font-oversample"><span><strong>清晰度</strong><small>oversample 越高，邊緣越平滑，但資源需求也越高</small></span><span class="range-value"><output id="font-oversample-value">4</output>x</span><input id="font-oversample" type="range" min="1" max="8" step="0.5" value="4" /></label>
+              </div>
+
+              <details class="advanced-details font-details"><summary>進階說明</summary><div class="advanced-copy"><p>字重感是 Minecraft 字體 renderer 的近似調整，不會改寫 TTF/OTF 的原始筆畫。如果要真正變粗或變細，請選用對應字重的字體檔，例如 Regular、Medium 或 Bold。</p><p>建立後會同時寫入 <code>default.json</code> 與 <code>uniform.json</code>，讓一般文字和 Unicode 文字都能使用。</p></div></details>
+              <button type="button" id="btn-font-build" class="primary-button">建立字體資源包 <span>↗</span></button>
+              <p class="footnote"><span>ⓘ</span>字體檔只會被複製進資源包，不會修改原始字體檔。</p>
+            </section>
+          </div>
+        </div>
+
+        <aside class="status-column">
+          <section class="status-section progress-card" aria-labelledby="progress-title">
+            <div class="status-header"><div><p class="eyebrow">STATUS</p><h2 id="progress-title">執行狀態</h2></div><button type="button" id="btn-open" class="text-button">開啟輸出</button></div>
+            <div class="status-message"><span class="status-dot"></span><span id="prog-msg" aria-live="polite">尚未開始</span><strong id="prog-pct">0%</strong></div>
+            <ol class="linear-steps" id="linear-steps" aria-label="翻譯流程">
+              <li class="lin-step" data-step="prep"><span class="step-line"></span><span>準備</span></li>
+              <li class="lin-step" data-step="scan"><span class="step-line"></span><span>掃描</span></li>
+              <li class="lin-step" data-step="polish"><span class="step-line"></span><span>轉換</span></li>
+              <li class="lin-step" data-step="ai"><span class="step-line"></span><span>補翻</span></li>
+              <li class="lin-step" data-step="pack"><span class="step-line"></span><span>打包</span></li>
+              <li class="lin-step" data-step="done"><span class="step-line"></span><span>完成</span></li>
+            </ol>
+            <div class="prog-bar"><div id="prog-fill" class="prog-fill"></div></div>
+            <img class="status-art" src="assets/art/translation-status-illustration.png" alt="" />
+            <div class="log-label"><span>活動紀錄</span><span class="muted-code">session.log</span></div>
+            <pre id="log" class="log log-empty" aria-live="polite">選好遊戲實例後，按下「開始翻譯」。
+
+翻譯過程會顯示在這裡；完成後可以開啟輸出，確認無誤再套用。</pre>
+          </section>
+          <section class="side-note output-note"><img class="output-art" src="assets/art/resource-pack-output-illustration.png" alt="" /><div><p class="eyebrow">OUTPUT</p><h3>輸出會放什麼？</h3><p>工具會建立獨立的翻譯結果資料夾，不會把內容偷偷塞進原本的整合包。</p><code>翻譯結果/<br />├─ resourcepacks/<br />├─ config/<br />└─ 覆蓋範圍說明.txt</code></div></section>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="footer"><span>zeitfrei / modpack-i18n</span><span>本機工具 · 不處理圖片文字</span><div class="footer-actions"><button type="button" class="promo-card" data-url="https://discord.gg/zeitfrei"><strong>Discord</strong><span>回報問題</span></button><button type="button" class="promo-card" data-url="https://zeitfrei.bobaboba.me"><strong>支持開發</strong><span>請作者喝飲料</span></button><button type="button" id="btn-quit" class="text-button">離開工具</button></div></footer>
+  </div>
+
+  <div id="guide-overlay" class="guide-overlay" hidden aria-hidden="true">
+    <div class="guide-shell" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+      <header class="guide-top"><div class="guide-top-title"><span class="guide-symbol">?</span><span id="guide-title">使用說明與免責</span></div><button type="button" id="btn-guide-close" class="text-button">關閉</button></header>
+      <div class="guide-body">
+        <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-disclaimer">免責說明</a></aside>
+        <main class="guide-content">
+          <p class="eyebrow">PLAYER GUIDE / v0.5.1</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p>
+          <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔，將簡體中文轉成台灣用語，並找出沒有繁中的英文文字。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>選取翻譯輸出位置；工具會建立獨立的 <code>翻譯結果/</code>。</p></li><li><span>3</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在進階設定填入自己的金鑰。</p></li><li><span>4</span><p>完成後按「開啟輸出」，確認結果後再按「套用到遊戲」。</p></li></ol></section>
+          <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在翻譯頁手動指定。這會用來產生對應的資源包格式，補翻與修復工作階段也會沿用同一版本。</p></section>
+          <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>套用到遊戲</th><td>複製翻譯結果到整合包，會先備份可能被覆蓋的檔案。</td></tr><tr><th>修復工作階段</th><td>找回輸出位置或工作階段資訊後再繼續。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>
+          <section><h2 id="g-font">字體資源包</h2><p>字體資源包是獨立服務，不會翻譯文字。它會把你選的字體檔與 Minecraft 字體設定打包成資源包，協助模組介面與遊戲文字使用你喜歡的字體。</p><ul><li><strong>字體大小：</strong>調整 Minecraft renderer 使用的基準尺寸。</li><li><strong>字重感：</strong>做小幅的 renderer 層近似；不會改寫字體檔的真正筆畫。</li><li><strong>水平／垂直位移：</strong>修正字體在遊戲裡偏左、偏右、偏上或偏下。</li><li><strong>清晰度：</strong>調整 oversample。越高通常越平滑，也可能增加資源需求。</li></ul><div class="guide-callout"><strong>想要真正的粗體？</strong><span>請選用 Regular、Medium、SemiBold 或 Bold 等對應字重的字體檔。工具不會修改或重新繪製字體。</span></div></section>
+          <section><h2 id="g-apply">輸出與套用</h2><p>翻譯和字體服務都會輸出到資源包資料夾。請把產生的資源包放到啟動器實例的 <code>resourcepacks</code>，再從 Minecraft 的「設定 → 資源包」啟用。</p><div class="guide-callout guide-callout-warn"><strong>套用前請關閉 Minecraft。</strong><span>工具會備份會被覆蓋的目標，但仍建議保留原始整合包與輸出資料夾。</span></div></section>
+          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。關閉 AI 仍可以處理既有中文、簡繁轉換與資源包輸出。沒有填入自己的金鑰時，工具會使用開發者代管的免費翻譯，額度有限；也可以在進階設定改用自己的金鑰與 API 位置。</p><p>API 金鑰只儲存在本機設定檔，不會寫進翻譯結果或程式預設值。送往 AI 的內容只包含待翻譯字串與必要的通用語境。請自行確認服務條款，不要送出個人資料或私密伺服器資訊。</p></section>
+          <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲出現紅字或閃退怎麼辦？</strong>先停用資源包，確認原本整合包可正常啟動。語言檔工具不會修復缺少模組、版本不相容或世界存檔問題。</p><p><strong>中文字變成方框怎麼辦？</strong>使用字體資源包，選擇支援繁中的字體檔，再到遊戲資源包選單啟用。</p><p><strong>圖片裡的字會翻譯嗎？</strong>不會。本工具目前只處理遊戲文字與相關語言檔。</p><p><strong>翻譯一定完美嗎？</strong>不一定。模組上下文可能不足，請在遊戲裡檢查結果，並用術語表固定重要名稱。</p></section>
+          <section><h2 id="g-disclaimer">免責說明</h2><div class="disclaimer"><p>本工具由 ZeitFrei 以方便玩家整理模組包文字為目的提供。翻譯結果可能因模組版本、原文上下文、第三方 AI 服務或字體檔品質而有錯誤、不完整或不符合個人偏好的情況。</p><p>使用者應自行確認模組整合包、字體檔、翻譯內容及第三方服務的授權與使用條款。請不要使用你沒有權利散布的字體或內容。</p><p>本工具不保證遊戲一定能啟動、不保證翻譯完整、不負責模組本身的錯誤、存檔損壞、版本衝突、第三方 API 費用或任何因使用輸出結果造成的直接或間接損失。套用前請備份整合包與存檔。</p></div></section>
+          <p class="guide-footer">zeitfrei / modpack-i18n · 請在使用前閱讀以上說明</p>
+        </main>
+      </div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
