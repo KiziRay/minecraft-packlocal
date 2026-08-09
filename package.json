@@ -1,0 +1,19 @@
+{
+  "name": "modpack-i18n-tool",
+  "private": true,
+  "version": "0.5.1",
+  "description": "Minecraft 模組包→台灣繁體中文（Tauri 2；不改 jar）",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/plugin-dialog": "^2"
+  }
+}

@@ -1,0 +1,36 @@
+name = "modpack-i18n"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
+# 客戶端打 /api/desktop/latest 比對版本。
+[vars]
+LATEST_VERSION = "0.5.1"
+# 安裝檔直連（NSIS）。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-0.5.1-setup.exe"
+# 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
+UPSTREAM_BASE = "https://api.deepseek.com"
+UPSTREAM_MODEL = "deepseek-chat"
+
+# 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
+# 超過就回 429，客戶端顯示贊助提示。
+DAILY_TOKEN_BUDGET = "20000000"
+
+# 更新安裝檔的 sha256（上傳後填；客戶端會驗證，不符不啟動）。留空＝不驗證。
+INSTALLER_SHA256 = "f857ce48db0ee47881e17ef3b18e93d70392b5f37c1955446b8cf89d9e44ca63"
+
+# 安裝檔存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
+[[r2_buckets]]
+binding = "DOWNLOADS"
+bucket_name = "modpack-i18n"
+
+# 每日用量計數（KV）— 選用。沒有它時 Worker 仍可運作，只是不在 Worker 層做每日
+# 上限（DeepSeek 帳號餘額仍是最終上限，用完回 402 → 客戶端顯示贊助提示）。
+# 要啟用每日上限：先建 namespace，取消下面兩行註解並填 id，再 deploy：
+#   npx wrangler kv namespace create USAGE
+# [[kv_namespaces]]
+# binding = "USAGE"
+# id = "<FILL_KV_ID>"
+
+# DEEPSEEK_KEY 用 secret 設定，不進版控：
+#   npx wrangler secret put DEEPSEEK_KEY

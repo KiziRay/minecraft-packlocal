@@ -1,0 +1,56 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Codex／Claude 本機工作檔，不上傳到公開 repository
+.claudecode/
+AGENTS.md
+CLAUDE.md
+
+# 本機舊版執行檔；正式版本請用 GitHub Release 管理
+*.exe
+
+# 舊版未使用 Icon；公開 repository 只保留目前採用的原始美術資產
+src/assets/zeitfrei-modpack-icon.png
+src-tauri/icons/zeitfrei-modpack-icon.png
+src-tauri/icons/zeitfrei-generated/
+src-tauri/icons/_backup_old/
+src-tauri/icons/128x128.png
+src-tauri/icons/128x128@2x.png
+src-tauri/icons/32x32.png
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/icon.icns
+src-tauri/icons/icon.ico
+src-tauri/icons/icon.png
+
+# 機密與建置
+secrets.json
+*.key
+src-tauri/target
+
+# Cloudflare Worker 本地狀態（不進版控）
+worker/.wrangler
+.dev.vars
+
