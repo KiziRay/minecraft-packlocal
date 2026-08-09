@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::cancel;
+use super::discord_auth::managed_ai_session_cookie;
 use super::glossary::{self, Glossary};
 use super::jar_scan::LangMap;
 use super::placeholder::{self, GuardStats};
@@ -221,7 +222,9 @@ where
     }
 
     // 剩下未命中的才進去重＋術語表＋本機記憶＋AI
-    let remaining: Vec<usize> = (0..jobs.len()).filter(|i| !shared_done.contains(i)).collect();
+    let remaining: Vec<usize> = (0..jobs.len())
+        .filter(|i| !shared_done.contains(i))
+        .collect();
     let mut unique: Vec<String> = Vec::new();
     let mut ctx: Vec<Option<&'static str>> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -428,7 +431,15 @@ fn resolve_unique(
         })
         .collect();
 
-    let raw = run_batches(&engine, &masked_need_ai, &gloss, ctx, base_pct, span_pct, on_progress)?;
+    let raw = run_batches(
+        &engine,
+        &masked_need_ai,
+        &gloss,
+        ctx,
+        base_pct,
+        span_pct,
+        on_progress,
+    )?;
 
     // ── 還原遮罩 + 佔位符把關 + 寫入翻譯記憶 ──
     for (uid, src) in &need_ai {
@@ -475,16 +486,33 @@ struct Engine {
     /// 代管模式為空——不送 Authorization，金鑰由 Worker 注入。
     api_key: Arc<String>,
     model: Arc<String>,
+    /// 只在代管模式使用；送往自家 Worker，由 Worker 驗證登入與伺服器會員身分。
+    managed_session: Arc<String>,
     managed: bool,
 }
 
 impl Engine {
     fn connect() -> Result<Self, String> {
-        // resolve 一定會給一個可用設定：使用者自填金鑰，否則走代管 Worker。
-        let cfg = resolve_ai_config();
+        // AI 來源由使用者明確選擇；自訂模式缺金鑰時直接回報，代管模式再驗 Discord。
+        let cfg = resolve_ai_config()?;
+        let managed_session = if cfg.managed {
+            managed_ai_session_cookie()?
+        } else {
+            String::new()
+        };
 
-        if let Err(probe) = probe_ai_ready(&cfg.base_url, &cfg.api_key, &cfg.model, cfg.managed) {
-            return Err(ai_quota_support_message(&probe));
+        if let Err(probe) = probe_ai_ready(
+            &cfg.base_url,
+            &cfg.api_key,
+            &cfg.model,
+            cfg.managed,
+            &managed_session,
+        ) {
+            return Err(if cfg.managed {
+                probe
+            } else {
+                ai_quota_support_message(&probe)
+            });
         }
 
         let client = reqwest::blocking::Client::builder()
@@ -500,6 +528,7 @@ impl Engine {
             )),
             api_key: Arc::new(cfg.api_key),
             model: Arc::new(cfg.model),
+            managed_session: Arc::new(managed_session),
             managed: cfg.managed,
         })
     }
@@ -522,8 +551,7 @@ fn run_batches(
     span_pct: u8,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<HashMap<usize, String>, String> {
-    let chunks: Vec<Vec<(usize, String)>> =
-        items.chunks(BATCH).map(|c| c.to_vec()).collect();
+    let chunks: Vec<Vec<(usize, String)>> = items.chunks(BATCH).map(|c| c.to_vec()).collect();
     let total_batches = chunks.len().max(1);
     let total_unique = items.len();
 
@@ -538,7 +566,11 @@ fn run_batches(
     };
 
     // 代管（共用金鑰）降並行，避免多人同時把 DeepSeek 打到限流。
-    let parallel = if engine.managed { PARALLEL_MANAGED } else { PARALLEL };
+    let parallel = if engine.managed {
+        PARALLEL_MANAGED
+    } else {
+        PARALLEL
+    };
 
     let mut group_start = 0usize;
     while group_start < chunks.len() {
@@ -556,6 +588,7 @@ fn run_batches(
             let url = Arc::clone(&engine.url);
             let api_key = Arc::clone(&engine.api_key);
             let model = Arc::clone(&engine.model);
+            let managed_session = Arc::clone(&engine.managed_session);
             let managed = engine.managed;
             let translations = Arc::clone(&translations);
             let items: Vec<(usize, String)> = chunk.clone();
@@ -573,7 +606,17 @@ fn run_batches(
                     if cancel::is_cancelled() {
                         return Ok(0);
                     }
-                    let map = translate_chunk(&client, &url, &api_key, &model, managed, slice, slice_ctx, &hints)?;
+                    let map = translate_chunk(
+                        &client,
+                        &url,
+                        &api_key,
+                        &model,
+                        managed,
+                        &managed_session,
+                        slice,
+                        slice_ctx,
+                        &hints,
+                    )?;
                     let mut n = 0usize;
                     if let Ok(mut tr) = translations.lock() {
                         for (local_i, t) in map {
@@ -756,7 +799,9 @@ fn build_user_prompt(
 
     let mut p = String::with_capacity(512);
     p.push_str("把下列 Minecraft 模組文字翻成台灣繁體中文（台灣用語）。\n");
-    p.push_str("只輸出一個 JSON 陣列 [{\"i\":編號,\"t\":\"譯文\"}]，i 與輸入相同，不要任何說明文字。\n");
+    p.push_str(
+        "只輸出一個 JSON 陣列 [{\"i\":編號,\"t\":\"譯文\"}]，i 與輸入相同，不要任何說明文字。\n",
+    );
     p.push_str("規則：\n");
     p.push_str("1. 文中的 {0} {1} {2}… 是佔位符，必須原封不動保留（數量一致，可依語序移動位置），不要翻譯、不要改成全形、不要新增或刪除。\n");
     p.push_str("2. 保留原文開頭與結尾的空白。\n");
@@ -780,6 +825,7 @@ fn translate_chunk(
     api_key: &str,
     model: &str,
     managed: bool,
+    managed_session: &str,
     chunk: &[(usize, String)],
     contexts: &[Option<&'static str>],
     hints: &[(String, String)],
@@ -798,12 +844,17 @@ fn translate_chunk(
         if cancel::is_cancelled() {
             return Ok(HashMap::new());
         }
-        // 代管模式不送 Authorization——金鑰由 Worker 端注入，客戶端不持有。
+        // 代管模式不送上游 Authorization；只送 ZeitFrei session 給自家 Worker 驗證。
         let mut req = client
             .post(url)
             .header("Content-Type", "application/json")
             .json(&body);
-        if !managed && !api_key.is_empty() {
+        if managed {
+            req = req
+                .header("X-Zeitfrei-AI-Protocol", "2")
+                .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
+                .header("X-Zeitfrei-Session", managed_session);
+        } else if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
         let resp = match req.send() {
@@ -841,6 +892,15 @@ fn translate_chunk(
             last_err = "請求太頻繁，稍後再試".into();
             thread::sleep(Duration::from_millis(800 + attempt as u64 * 1200));
             continue;
+        }
+        if code == 426 && managed {
+            return Err("這個版本已不能使用開發者代管 AI，請更新工具後再試。".into());
+        }
+        if code == 401 && managed {
+            return Err("使用開發者代管 AI 前，請先登入 Discord。".into());
+        }
+        if code == 403 && managed {
+            return Err("使用開發者代管 AI 前，請先加入 ZeitFrei 官方 Discord 伺服器。".into());
         }
         if code == 401 || code == 403 {
             let t = resp.text().unwrap_or_default();
@@ -958,7 +1018,13 @@ fn strip_code_fence(s: &str) -> &str {
 }
 
 /// 輕量探測：餘額 API 或迷你 chat；網路抖動不阻擋，明確額度／金鑰問題直接回錯。
-fn probe_ai_ready(base: &str, api_key: &str, model: &str, managed: bool) -> Result<(), String> {
+fn probe_ai_ready(
+    base: &str,
+    api_key: &str,
+    model: &str,
+    managed: bool,
+    managed_session: &str,
+) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(25))
         .build()
@@ -992,7 +1058,17 @@ fn probe_ai_ready(base: &str, api_key: &str, model: &str, managed: bool) -> Resu
 
     let url = format!("{base}/v1/chat/completions");
     let probe = vec![(0usize, "OK".to_string())];
-    match translate_chunk(&client, &url, api_key, model, managed, &probe, &[None], &[]) {
+    match translate_chunk(
+        &client,
+        &url,
+        api_key,
+        model,
+        managed,
+        managed_session,
+        &probe,
+        &[None],
+        &[],
+    ) {
         Ok(m) if !m.is_empty() => Ok(()),
         Ok(_) if cancel::is_cancelled() => Ok(()),
         Ok(_) => Err("探測成功連線但沒有內容回應".into()),
@@ -1056,8 +1132,9 @@ fn is_resource_location(t: &str) -> bool {
     if !t.contains(':') || t.contains(char::is_whitespace) {
         return false;
     }
-    t.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '_' | '/' | '.' | '-'))
+    t.chars().all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '_' | '/' | '.' | '-')
+    })
 }
 
 #[cfg(test)]

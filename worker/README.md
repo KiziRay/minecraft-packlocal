@@ -8,7 +8,7 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 |------|------|------|
 | GET | `/api/desktop/latest` | 回 `{version, url, notes, sha256}`，桌面版檢查更新用 |
 | GET | `/download/<檔名>` | 從 R2 bucket `modpack-i18n` 串流安裝檔（更新下載用） |
-| POST | `/v1/chat/completions` | AI 代理：注入伺服器端 DeepSeek 金鑰後轉發上游 |
+| POST | `/v1/chat/completions` | AI 代理：驗證 Discord 資格，注入伺服器端 DeepSeek 金鑰後轉發上游 |
 | POST | `/tm/lookup` | 社群共享翻譯記憶查詢（`{items:[{ns,kh}]}` → `{hits:{kh:zh}}`） |
 | POST | `/tm/contribute` | 貢獻翻譯（`{items:[{ns,kh,zh}]}`）；存 R2 `tm/v1/<ns>.json` |
 | GET | `/health` | 健康檢查（`hasKey` 表代管金鑰是否設好） |
@@ -23,9 +23,19 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 - **只有真的有新條目才寫分片**（`changed` 才 put），沒新增就不動 R2。
 - 讀改寫為 last-write-wins（偶發遺漏下次翻譯自動補回）。有 KV 權限可再升級成 KV。
 
-目前線上：`0.5.0`，安裝檔
-`https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-0.5.0-setup.exe`
-（sha256 `dc8d6a8f13ee55f257f2a069c2ce9b5ed65e85587b3fa5cbf0d1bbc0a10f391d`）。
+`wrangler.toml` 目前指向 `1.0.0` 安裝檔；實際線上版本以 `/api/desktop/latest` 回應為準。
+
+## 代管 AI 授權
+
+開發者代管 API 只提供給已登入 Discord、且仍在 ZeitFrei 官方伺服器的玩家。桌面端送出以下標頭：
+
+- `X-Zeitfrei-AI-Protocol: 2`
+- `X-Zeitfrei-Client-Version: <桌面版版本>`
+- `X-Zeitfrei-Session: <桌面登入 session>`
+
+Worker 會先向 `cloud.zeitfrei.uk/api/check-upload` 驗證 session，再以該 session 對應的 Discord user id 查詢 `member-tier`。缺少新版協定、登入過期或不在官方伺服器都會拒絕，因此只修改舊版 UI 無法繞過限制。
+
+桌面登入沿用既有的 `/api/desktop-auth` 與 `127.0.0.1:19420..19430/callback`，不需要新增 Discord Developer Portal callback，也不需要修改現有機器人。完成程式更新後仍需手動重新部署本 Worker，線上限制才會生效。
 
 ## ⚠️ 上線前唯一必做：設定金鑰
 
@@ -77,10 +87,12 @@ npx wrangler kv namespace create USAGE
 # 把回傳 id 填進 wrangler.toml 的 [[kv_namespaces]]（取消註解），再 deploy
 ```
 
-沒有 KV 也能運作——此時以 DeepSeek 帳號餘額為最終上限（用完回 402 → 客戶端顯示贊助提示）。
+`DAILY_TOKEN_BUDGET` 控制所有人的每日總量，`PER_USER_DAILY_TOKEN_BUDGET` 控制單一 Discord 帳號的每日用量。沒有 KV 也能運作，但不會在 Worker 層記帳；此時以 DeepSeek 帳號餘額為最終上限。
 
 ## 安全性
 
 - 真正的 DeepSeek 金鑰只存在 Worker secret，客戶端不持有、不傳送。
+- Worker 逐次驗證登入 session 與官方 Discord 會員資格，驗證服務異常時採拒絕存取。
+- 舊版未帶 `MANAGED_AI_PROTOCOL` 指定版本時回 `426 client_upgrade_required`。
 - Worker 鎖定模型（`UPSTREAM_MODEL`），避免被拿去打別的昂貴模型。
 - 只轉發 `messages`／`temperature`，不透傳任意欄位。

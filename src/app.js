@@ -10,6 +10,53 @@ const listen =
 const $ = (id) => document.getElementById(id);
 
 const THEME_STORAGE_KEY = "modpack-i18n-theme";
+const UI_SCALE_STORAGE_KEY = "modpack-i18n-ui-scale";
+const UI_SCALE_MIN = 1;
+const UI_SCALE_MAX = 1.5;
+const UI_SCALE_STEP = 0.05;
+let uiScale = 1;
+let latestAiStatus = null;
+let discordLoginUrl = "";
+let aiModeChangePromise = Promise.resolve();
+
+function clampUiScale(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, Math.round(parsed * 100) / 100));
+}
+
+function applyUiScale(value, save = true) {
+  uiScale = clampUiScale(value);
+  document.documentElement.style.setProperty("--ui-scale", String(uiScale));
+  const label = $("scale-label");
+  const button = $("btn-scale");
+  const percent = Math.round(uiScale * 100);
+  if (label) label.textContent = `介面 ${percent}%`;
+  if (button) {
+    button.title = `Ctrl＋↑／↓或 Ctrl＋滾輪調整介面大小；點擊重設為 100%（目前 ${percent}%）`;
+  }
+  if (save) {
+    try {
+      localStorage.setItem(UI_SCALE_STORAGE_KEY, String(uiScale));
+    } catch (_) {
+      /* 瀏覽器儲存不可用時仍保留本次縮放 */
+    }
+  }
+}
+
+function initUiScale() {
+  let saved = 1;
+  try {
+    saved = clampUiScale(localStorage.getItem(UI_SCALE_STORAGE_KEY) || 1);
+  } catch (_) {
+    /* 使用預設比例 */
+  }
+  applyUiScale(saved, false);
+}
+
+function adjustUiScale(delta) {
+  applyUiScale(uiScale + delta);
+}
 
 function applyTheme(theme) {
   const normalized = theme === "light" ? "light" : "dark";
@@ -363,6 +410,15 @@ function setBusy(busy) {
     "btn-out",
     "btn-save-adv",
     "use-ai",
+    "ai-source-managed",
+    "ai-source-custom",
+    "btn-discord-login",
+    "btn-discord-join",
+    "btn-discord-refresh",
+    "btn-discord-logout",
+    "btn-open-login-url",
+    "btn-copy-login-url",
+    "btn-cancel-login",
     "btn-font-pick",
     "btn-font-out",
     "btn-font-build",
@@ -424,13 +480,26 @@ async function pickDir(title) {
   return typeof selected === "string" ? selected : null;
 }
 
-function syncAiPanel() {
+function syncAiPanel(refreshStatus = true) {
   const panel = $("ai-panel");
   const enabled = !!$("use-ai")?.checked;
   if (panel) {
     panel.style.display = enabled ? "block" : "none";
     panel.setAttribute("aria-hidden", enabled ? "false" : "true");
   }
+  if (enabled && refreshStatus) refreshAiStatus();
+}
+
+function aiModeFromUi() {
+  return $("ai-source-custom")?.checked ? "custom" : "managed";
+}
+
+function syncAiModeUi(mode) {
+  const normalized = mode === "custom" ? "custom" : "managed";
+  if ($("ai-source-managed")) $("ai-source-managed").checked = normalized === "managed";
+  if ($("ai-source-custom")) $("ai-source-custom").checked = normalized === "custom";
+  if ($("managed-auth-panel")) $("managed-auth-panel").hidden = normalized !== "managed";
+  if ($("adv-details")) $("adv-details").hidden = normalized !== "custom";
 }
 
 async function refreshAiStatus() {
@@ -438,40 +507,138 @@ async function refreshAiStatus() {
   const noteEl = $("ai-source-note");
   const statusRow = statusEl?.closest(".ai-status");
   if (!statusEl) return;
+  if (statusRow) statusRow.dataset.state = "checking";
+  statusEl.textContent = "AI：正在確認";
   try {
     const s = await invoke("ai_status");
+    latestAiStatus = s || null;
     const ready = s && s.ready !== false;
+    const mode = String((s && (s.aiMode || s.ai_mode)) || aiModeFromUi());
     const usingOwnKey = !!(s && (s.usingOwnKey || s.using_own_key));
-    const managedFree = !!(s && (s.managedFree || s.managed_free));
     const message = String(s && s.message ? s.message : "").trim();
+    syncAiModeUi(mode);
     statusEl.textContent = ready
       ? usingOwnKey
-        ? "AI：使用自己的金鑰"
-        : managedFree
-          ? "AI：開發者代管翻譯可用"
-          : "AI：目前可用"
-      : "AI：目前無法使用";
+        ? "AI：自訂 API 可用"
+        : "AI：開發者 API 可用"
+      : mode === "custom"
+        ? "AI：請先設定自訂 API"
+        : "AI：尚未完成 Discord 驗證";
     if (statusRow) statusRow.dataset.state = ready ? (usingOwnKey ? "own" : "managed") : "error";
-    if (noteEl) {
-      noteEl.textContent = message || (ready
-        ? "可直接使用 AI；自備金鑰可在進階設定中填寫。"
-        : "請稍後再試，或在進階設定確認自己的 API 設定。");
+
+    if (mode === "managed") {
+      const loggedIn = !!(s && (s.loggedIn || s.logged_in));
+      const inGuild = !!(s && (s.inGuild || s.in_guild));
+      const serviceAvailable = s && (s.serviceAvailable ?? s.service_available) !== false;
+      const displayName = String((s && (s.displayName || s.display_name)) || "").trim();
+      const title = $("discord-auth-title");
+      const authNote = $("discord-auth-note");
+      if (title) {
+        title.textContent = ready
+          ? `Discord 已驗證${displayName ? `：${displayName}` : ""}`
+          : !loggedIn
+            ? "Discord 尚未登入"
+            : !serviceAvailable
+              ? "Discord 驗證服務暫時無法使用"
+              : !inGuild
+                ? "尚未加入官方伺服器"
+                : "Discord 尚未驗證";
+      }
+      if (authNote) authNote.textContent = message || "登入 Discord 並加入官方伺服器後即可使用。";
+      if ($("btn-discord-login")) $("btn-discord-login").hidden = loggedIn;
+      if ($("btn-discord-logout")) $("btn-discord-logout").hidden = !loggedIn;
+      if ($("btn-discord-join")) $("btn-discord-join").hidden = inGuild;
+      if (noteEl) {
+        noteEl.textContent = ready
+          ? "登入資格會在每次翻譯時由伺服器再次確認。"
+          : message || "請先登入 Discord 並加入 ZeitFrei 官方伺服器。";
+      }
+    } else if (noteEl) {
+      noteEl.textContent = message || "使用自己的金鑰與額度，不需要 Discord 驗證。";
     }
+    return s;
   } catch (e) {
+    latestAiStatus = null;
     statusEl.textContent = "AI：狀態暫時無法確認";
     if (statusRow) statusRow.dataset.state = "error";
-    if (noteEl) noteEl.textContent = "不影響簡繁轉換；需要補翻英文時請稍後再確認。";
+    if (noteEl) noteEl.textContent = "不影響本機簡繁轉換；需要 AI 補翻時請稍後再確認。";
+    return null;
   }
 }
 
 async function refreshApiSettings() {
   try {
     const s = await invoke("get_api_settings");
+    syncAiModeUi(String(s.aiMode || s.ai_mode || "managed"));
     // 不在介面顯示具體服務商網址
     const bu = (s.baseUrl || s.base_url || "").trim();
     $("base-url").value = /deepseek/i.test(bu) ? "" : bu;
   } catch (e) {
     /* AI 狀態由 refreshAiStatus 顯示；設定讀取失敗不阻擋本機翻譯。 */
+  }
+}
+
+async function changeAiMode(mode) {
+  syncAiModeUi(mode);
+  try {
+    await invoke("set_ai_mode_cmd", { aiMode: mode });
+  } catch (e) {
+    appendError("無法切換 AI 來源：" + formatInvokeError(e));
+  }
+  return refreshAiStatus();
+}
+
+async function ensureAiReadyForAction() {
+  await aiModeChangePromise;
+  const status = await refreshAiStatus();
+  if (status && status.ready !== false) return true;
+  const mode = String((status && (status.aiMode || status.ai_mode)) || aiModeFromUi());
+  const message = String((status && status.message) || "目前無法確認 AI 狀態。");
+  appendLog(message, "warn");
+  if (mode === "custom") {
+    if ($("adv-details")) $("adv-details").open = true;
+    $("api-key")?.focus();
+  } else {
+    $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+  return false;
+}
+
+async function openExternalUrl(url) {
+  if (!url) return;
+  try {
+    await invoke("open_url", { url });
+  } catch (_) {
+    window.open(url, "_blank");
+  }
+}
+
+async function beginDiscordLogin() {
+  const loginButton = $("btn-discord-login");
+  const fallback = $("discord-login-fallback");
+  if (loginButton) loginButton.disabled = true;
+  if (fallback) fallback.hidden = false;
+  if ($("discord-auth-title")) $("discord-auth-title").textContent = "等待 Discord 登入";
+  if ($("discord-auth-note")) $("discord-auth-note").textContent = "請在瀏覽器完成授權，再回到工具。";
+  try {
+    const result = await invoke("discord_login");
+    if (result && result.ok) {
+      if (fallback) fallback.hidden = true;
+      appendLog("Discord 登入完成，正在確認官方伺服器資格。");
+    } else {
+      const reason = String((result && result.error) || "登入未完成");
+      const message = reason === "cancelled"
+        ? "已取消 Discord 登入。"
+        : reason === "timeout"
+          ? "Discord 登入逾時，請重新登入。"
+          : "Discord 登入未完成：" + reason;
+      appendLog(message, "warn");
+    }
+  } catch (e) {
+    appendError("Discord 登入失敗：" + formatInvokeError(e));
+  } finally {
+    if (loginButton) loginButton.disabled = false;
+    await refreshAiStatus();
   }
 }
 
@@ -524,6 +691,7 @@ async function onRun() {
   if (!outputDir) return log("請先選擇「翻譯結果放哪」。");
 
   const useAi = !!$("use-ai").checked;
+  if (useAi && !(await ensureAiReadyForAction())) return;
   let targetVersion = ($("target-version")?.value || "").trim();
   if (!targetVersion) {
     targetVersion = (await detectVersionForInstance(instancePath, true)) || "";
@@ -578,16 +746,7 @@ async function onRepair() {
   }
 
   const useAi = !!$("use-ai").checked;
-  if (useAi) {
-    try {
-      const ai = await invoke("ai_status");
-      if (ai && ai.ready === false) {
-        appendLog("AI 目前無法使用：仍可修復既有檔案，但不會補翻新的文字。", "warn");
-      }
-    } catch (_) {
-      /* 修復本身仍可交給後端處理 */
-    }
-  }
+  if (useAi && !(await ensureAiReadyForAction())) return;
 
   setBusy(true);
   lastProgressLogKey = "";
@@ -615,14 +774,11 @@ async function onSupplement() {
   if (!outputDir) {
     return log("請選與上次相同的「翻譯結果」位置。");
   }
-  try {
-    const ai = await invoke("ai_status");
-    if (ai && ai.ready === false) {
-      return log("目前沒有可用的 AI 翻譯，請稍後再試或檢查進階設定。");
-    }
-  } catch (_) {
-    return log("目前無法確認 AI 狀態，請稍後再試。");
+  if (!$("use-ai").checked) {
+    $("use-ai").checked = true;
+    syncAiPanel();
   }
+  if (!(await ensureAiReadyForAction())) return;
   try {
     const st = await invoke("session_status", { outputDir });
     if (!(st.ok || st.OK)) {
@@ -648,10 +804,6 @@ async function onSupplement() {
   setProgress(3, "準備中…");
 
   try {
-    if (!$("use-ai").checked) {
-      $("use-ai").checked = true;
-      syncAiPanel();
-    }
     const result = await invoke("supplement_translate", { outputDir });
     setProgress(100, "補譯完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
@@ -710,8 +862,9 @@ async function loadUiPrefs() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   initTheme();
-  syncAiPanel();
-  refreshApiSettings();
+  initUiScale();
+  syncAiPanel(false);
+  await refreshApiSettings();
   refreshAiStatus();
   loadUiPrefs();
   setProgress(0, "尚未開始");
@@ -737,6 +890,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
       applyTheme(current === "dark" ? "light" : "dark");
     };
+  }
+  if ($("btn-scale")) {
+    $("btn-scale").onclick = () => applyUiScale(1);
   }
 
   // 即時進度（白話 + 百分比）
@@ -769,7 +925,65 @@ window.addEventListener("DOMContentLoaded", async () => {
     /* 略 */
   }
 
-  $("use-ai").onchange = syncAiPanel;
+  try {
+    await listen("discord-login-url", (ev) => {
+      const payload = (ev && ev.payload) || {};
+      discordLoginUrl = String(payload.url || "").trim();
+      if ($("discord-login-url")) $("discord-login-url").value = discordLoginUrl || "登入網址尚未就緒";
+      if ($("discord-login-fallback")) $("discord-login-fallback").hidden = false;
+    });
+  } catch (e) {
+    /* 瀏覽器仍可能由後端直接開啟，不阻擋登入。 */
+  }
+
+  $("use-ai").onchange = () => syncAiPanel();
+  document.querySelectorAll('input[name="ai-source"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      if (radio.checked) aiModeChangePromise = changeAiMode(radio.value);
+    });
+  });
+  if ($("btn-discord-login")) $("btn-discord-login").onclick = beginDiscordLogin;
+  if ($("btn-discord-refresh")) $("btn-discord-refresh").onclick = refreshAiStatus;
+  if ($("btn-discord-join")) {
+    $("btn-discord-join").onclick = () => {
+      const invite = (latestAiStatus && (latestAiStatus.inviteUrl || latestAiStatus.invite_url)) || "https://discord.gg/zeitfrei";
+      return openExternalUrl(invite);
+    };
+  }
+  if ($("btn-discord-logout")) {
+    $("btn-discord-logout").onclick = async () => {
+      try {
+        await invoke("discord_logout");
+        appendLog("已登出 Discord。");
+      } catch (e) {
+        appendError("Discord 登出失敗：" + formatInvokeError(e));
+      }
+      await refreshAiStatus();
+    };
+  }
+  if ($("btn-open-login-url")) {
+    $("btn-open-login-url").onclick = () => openExternalUrl(discordLoginUrl || $("discord-login-url")?.value || "");
+  }
+  if ($("btn-copy-login-url")) {
+    $("btn-copy-login-url").onclick = async () => {
+      const value = discordLoginUrl || $("discord-login-url")?.value || "";
+      if (!value || !/^https:\/\//i.test(value)) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        appendLog("已複製 Discord 登入網址。");
+      } catch (_) {
+        const input = $("discord-login-url");
+        input?.select();
+        document.execCommand("copy");
+      }
+    };
+  }
+  if ($("btn-cancel-login")) {
+    $("btn-cancel-login").onclick = async () => {
+      await invoke("cancel_discord_login_cmd");
+      if ($("discord-login-fallback")) $("discord-login-fallback").hidden = true;
+    };
+  }
   if ($("target-version")) {
     $("target-version").onchange = () => {
       const value = $("target-version").value;
@@ -844,9 +1058,37 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     });
   });
-  // Esc 關閉說明
+  // Ctrl＋方向鍵／Ctrl＋滾輪調整介面比例；阻止 WebView 直接縮放整個頁面
   window.addEventListener("keydown", (ev) => {
+    if (ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown" || ev.key === "0")) {
+      ev.preventDefault();
+      if (ev.key === "ArrowUp") adjustUiScale(UI_SCALE_STEP);
+      else if (ev.key === "ArrowDown") adjustUiScale(-UI_SCALE_STEP);
+      else applyUiScale(1);
+      return;
+    }
     if (ev.key === "Escape") closeGuideOverlay();
+  });
+  window.addEventListener(
+    "wheel",
+    (ev) => {
+      if (!ev.ctrlKey) return;
+      ev.preventDefault();
+      adjustUiScale(ev.deltaY < 0 ? UI_SCALE_STEP : -UI_SCALE_STEP);
+    },
+    { passive: false }
+  );
+  // 推廣連結：Discord／支持開發
+  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const url = el.getAttribute("data-url");
+      if (!url) return;
+      try {
+        await openExternalUrl(url);
+      } catch (e) {
+        appendLog("無法開啟連結：" + String(e), "warn");
+      }
+    });
   });
   if ($("btn-font-pick")) {
     $("btn-font-pick").onclick = async () => {
@@ -973,23 +1215,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   };
 
-  // 推廣連結：雲端／工具箱／Discord
-  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
-    el.addEventListener("click", async () => {
-      const url = el.getAttribute("data-url");
-      if (!url) return;
-      try {
-        await invoke("open_url", { url });
-      } catch (e) {
-        // 備援：系統預設瀏覽器
-        try {
-          window.open(url, "_blank");
-        } catch (e2) {
-          log("無法開啟連結：" + String(e));
-        }
-      }
-    });
-  });
 });
 
 // ───────────────────────── 檢查更新（自足模組）─────────────────────────

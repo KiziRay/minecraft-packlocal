@@ -4,22 +4,22 @@
 mod engine;
 
 use engine::{
-    apply_to_instance, restore_last_apply, diagnose_launch, LaunchDiagnosis, RestoreResult,
-    build_font_pack_str_with_options, build_resource_pack, check_cancelled,
-    convert_langmap_s2tw, converter_name, count_map, detect_minecraft_version, detect_pack_format,
-    pack_format_for_version,
-    discover_default_reference, ensure_result_layout, ensure_space, ensure_user_glossary_template,
-    MIN_FREE_BYTES,
-    fill_missing_with_ai, find_pack_near, find_session_file, fix_minemenu_unicode_escapes,
-    get_api_settings_public, get_minimize_on_close, has_session_file, load_deepseek_key, managed_ai_available,
-    load_pack_zh, load_phrase_dict, load_reference_zh_tw, load_session, merge_fill_missing,
-    normalize_user_path, remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir,
-    save_api_settings, save_session, scan_instance, sanitize_folder_name, set_minimize_on_close,
-    subtract_covered, suggest_output_base, translate_ftbquests, translate_origins,
-    translate_quests_books, translate_text_overlays,
-    user_glossary_path, validate_open_url, write_coverage_report, ApiSettingsPublic,
-    ApplyResult, BuildOptions, CoverageStats, FontPackOptions, FontPackResult, LangMap, ScanReport,
-    TranslateSession, UpdateCheck, CANCEL_MESSAGE, RESULT_DIR_NAME, SESSION_FILE,
+    apply_to_instance, build_font_pack_str_with_options, build_resource_pack, cancel_discord_login,
+    check_cancelled, check_discord_auth_status, convert_langmap_s2tw, converter_name, count_map,
+    detect_minecraft_version, detect_pack_format, diagnose_launch, discover_default_reference,
+    ensure_result_layout, ensure_space, ensure_user_glossary_template, fill_missing_with_ai,
+    find_pack_near, find_session_file, fix_minemenu_unicode_escapes, get_ai_mode,
+    get_api_settings_public, get_minimize_on_close, has_session_file, load_pack_zh,
+    load_phrase_dict, load_reference_zh_tw, load_session, login_discord_blocking, logout_discord,
+    managed_ai_available, merge_fill_missing, normalize_user_path, pack_format_for_version,
+    remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir, restore_last_apply,
+    sanitize_folder_name, save_api_settings, save_session, scan_instance, set_ai_mode,
+    set_minimize_on_close, subtract_covered, suggest_output_base, translate_ftbquests,
+    translate_origins, translate_quests_books, translate_text_overlays, user_glossary_path,
+    validate_open_url, write_coverage_report, ApiSettingsPublic, ApplyResult, BuildOptions,
+    CoverageStats, DiscordAuthStatus, FontPackOptions, FontPackResult, LangMap, LaunchDiagnosis,
+    RestoreResult, ScanReport, TranslateSession, UpdateCheck, CANCEL_MESSAGE, DISCORD_INVITE_URL,
+    MIN_FREE_BYTES, RESULT_DIR_NAME, SESSION_FILE,
 };
 use engine::{check_update_engine, download_and_launch};
 use serde::Serialize;
@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 // append_error_file uses fs
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 /// 關閉視窗時是否縮小（與 secrets 同步）
 static MINIMIZE_ON_CLOSE: AtomicBool = AtomicBool::new(true);
@@ -82,10 +83,7 @@ fn append_error_file(work: &Path, lines: &[String]) {
         return;
     }
     let p = work.join("翻譯錯誤日誌.txt");
-    let header = format!(
-        "\n======== {} ========\n",
-        chrono_like_now()
-    );
+    let header = format!("\n======== {} ========\n", chrono_like_now());
     let body = lines.join("\n") + "\n";
     let mut content = String::new();
     if p.is_file() {
@@ -203,7 +201,15 @@ async fn one_click_translate(
     reset_cancel();
     let app2 = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_one_click(&app2, instance, out, pack_name, use_ai, reference_pack, target_version)
+        run_one_click(
+            &app2,
+            instance,
+            out,
+            pack_name,
+            use_ai,
+            reference_pack,
+            target_version,
+        )
     })
     .await
     .map_err(|e| format!("工作中斷：{e}"))?;
@@ -300,11 +306,7 @@ fn run_one_click(
     // 使用者只選根目錄；工具建立 翻譯結果/ 與子目錄
     let layout = ensure_result_layout(&out)?;
     let work = layout.work_root.clone();
-    emit_progress(
-        app,
-        3,
-        &format!("結果目錄：{}", work.display()),
-    );
+    emit_progress(app, 3, &format!("結果目錄：{}", work.display()));
 
     let pack_name = if pack_name.is_empty() {
         "繁體中文翻譯".to_string()
@@ -316,15 +318,10 @@ fn run_one_click(
 
     // ═══ 階段 A：本機掃模組／資源包語言（不 AI）═══
     let app_scan = app.clone();
-    let (mut zh, mut en_only, mut report) = scan_instance(
-        &instance,
-        &dict,
-        true,
-        true,
-        move |pct, msg| {
+    let (mut zh, mut en_only, mut report) =
+        scan_instance(&instance, &dict, true, true, move |pct, msg| {
             emit_progress(&app_scan, pct, msg);
-        },
-    )?;
+        })?;
 
     emit_progress(app, 40, "本地整理：詞典與快捷選單…");
     postprocess_lang_values(&mut zh, &dict);
@@ -364,8 +361,7 @@ fn run_one_click(
             }
         }
     } else {
-        ref_note =
-            "未找到參考包。建議選 CTE2 TW 全翻 zip，本機合併可大幅減少 AI 用量。".into();
+        ref_note = "未找到參考包。建議選 CTE2 TW 全翻 zip，本機合併可大幅減少 AI 用量。".into();
         emit_progress(app, 42, &ref_note);
     }
 
@@ -437,7 +433,10 @@ fn run_one_click(
     if !report.errors.is_empty() {
         emit_warn(
             app,
-            &format!("掃描時有 {} 筆問題（詳見下方與錯誤日誌檔）", report.errors.len()),
+            &format!(
+                "掃描時有 {} 筆問題（詳見下方與錯誤日誌檔）",
+                report.errors.len()
+            ),
         );
         for (i, e) in report.errors.iter().enumerate() {
             let line = format!("掃描問題 [{}/{}]：{}", i + 1, report.errors.len(), e);
@@ -581,11 +580,7 @@ fn run_one_click(
             Ok(o) => {
                 overlay_note = o.note;
                 if o.files_written > 0 {
-                    emit_progress(
-                        app,
-                        98,
-                        &format!("覆寫文字已寫出 {} 個檔", o.files_written),
-                    );
+                    emit_progress(app, 98, &format!("覆寫文字已寫出 {} 個檔", o.files_written));
                 } else {
                     emit_progress(app, 98, &overlay_note);
                 }
@@ -609,7 +604,11 @@ fn run_one_click(
             Ok(o) => {
                 origins_note = o.note;
                 if o.files_written > 0 {
-                    emit_progress(app, 99, &format!("Origins 能力已寫出 {} 個檔", o.files_written));
+                    emit_progress(
+                        app,
+                        99,
+                        &format!("Origins 能力已寫出 {} 個檔", o.files_written),
+                    );
                 }
             }
             Err(e) => {
@@ -630,7 +629,11 @@ fn run_one_click(
             Ok(o) => {
                 qb_note = o.note;
                 if o.files_written > 0 {
-                    emit_progress(app, 99, &format!("任務／書本已寫出 {} 個檔", o.files_written));
+                    emit_progress(
+                        app,
+                        99,
+                        &format!("任務／書本已寫出 {} 個檔", o.files_written),
+                    );
                 }
             }
             Err(e) => {
@@ -792,8 +795,11 @@ fn save_pending_manifest(out: &Path, pending: &LangMap, count: usize) -> Result<
         "pendingCount": count,
         "namespaces": pending.len(),
     });
-    std::fs::write(p, serde_json::to_string_pretty(&obj).unwrap_or_default() + "\n")
-        .map_err(|e| e.to_string())
+    std::fs::write(
+        p,
+        serde_json::to_string_pretty(&obj).unwrap_or_default() + "\n",
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// 只補缺漏：讀上次工作階段 + 現有資源包，不重掃 mods。必須有 AI 金鑰。
@@ -822,8 +828,7 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
     ensure_space(&out, MIN_FREE_BYTES)?;
     let layout = ensure_result_layout(&out)?;
     let work = layout.work_root.clone();
-    let (mut session, session_file) = load_session(&out)
-        .or_else(|_| load_session(&work))?;
+    let (mut session, session_file) = load_session(&out).or_else(|_| load_session(&work))?;
     emit_progress(
         app,
         10,
@@ -866,17 +871,11 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
                 ));
             }
             let app_scan = app.clone();
-            let (zh_scan, _en, _rep) = scan_instance(
-                &inst,
-                &dict,
-                true,
-                true,
-                move |pct, msg| {
-                    // 映射到 16–24
-                    let mapped = 16 + (pct as u16 * 8 / 100) as u8;
-                    emit_progress(&app_scan, mapped.min(24), msg);
-                },
-            )?;
+            let (zh_scan, _en, _rep) = scan_instance(&inst, &dict, true, true, move |pct, msg| {
+                // 映射到 16–24
+                let mapped = 16 + (pct as u16 * 8 / 100) as u8;
+                emit_progress(&app_scan, mapped.min(24), msg);
+            })?;
             zh_scan
         }
     };
@@ -894,7 +893,7 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
                 pack_description: "台灣用語繁體中文翻譯資源包".into(),
                 output_dir: work.display().to_string(),
                 pack_format: session_pack_format(&session),
-            target_version: session.target_version.clone(),
+                target_version: session.target_version.clone(),
             },
         )?;
         session.pack_path = built.pack_path.clone();
@@ -903,7 +902,12 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
         session.pending_count = 0;
         let _ = save_session(&work, &session);
         return Ok(OneClickResult {
-            report: empty_report(&session.instance_path, built.keys_total, built.namespaces, 0),
+            report: empty_report(
+                &session.instance_path,
+                built.keys_total,
+                built.namespaces,
+                0,
+            ),
             pack_path: built.pack_path.clone(),
             work_root: work.display().to_string(),
             namespaces: built.namespaces,
@@ -1118,8 +1122,7 @@ fn run_repair(app: &AppHandle, out: PathBuf, use_ai: bool) -> Result<OneClickRes
     ensure_space(&out, MIN_FREE_BYTES)?;
     let layout = ensure_result_layout(&out)?;
     let work = layout.work_root.clone();
-    let (mut session, session_file) = load_session(&out)
-        .or_else(|_| load_session(&work))?;
+    let (mut session, session_file) = load_session(&out).or_else(|_| load_session(&work))?;
     let session_home = session_file
         .parent()
         .map(|p| p.to_path_buf())
@@ -1283,16 +1286,10 @@ fn rebuild_zh_from_instance(
     }
     actions.push(format!("從遊戲重建：{}", inst.display()));
     let app_scan = app.clone();
-    let (zh_scan, _en, rep) = scan_instance(
-        &inst,
-        dict,
-        true,
-        true,
-        move |pct, msg| {
-            let mapped = 15 + (pct as u16 * 20 / 100) as u8;
-            emit_progress(&app_scan, mapped.min(38), msg);
-        },
-    )?;
+    let (zh_scan, _en, rep) = scan_instance(&inst, dict, true, true, move |pct, msg| {
+        let mapped = 15 + (pct as u16 * 20 / 100) as u8;
+        emit_progress(&app_scan, mapped.min(38), msg);
+    })?;
     actions.push(format!(
         "本地整理完成：模組 {}、中文 {} 條",
         rep.jars_scanned, rep.keys_zh
@@ -1491,29 +1488,94 @@ fn save_api_settings_cmd(api_key: String, base_url: String) -> Result<String, St
     Ok("已儲存進階設定".into())
 }
 
-/// AI 是否可用。永遠 true：有使用者金鑰走自己的，沒有就走開發者代管 Worker。
-/// 前端據此不再擋「勾了 AI 但沒金鑰」。
 #[tauri::command]
-fn has_api_key() -> bool {
+fn set_ai_mode_cmd(ai_mode: String) -> Result<String, String> {
+    let mode = set_ai_mode(&ai_mode)?;
+    Ok(if mode == "custom" {
+        "已切換為自訂 API".into()
+    } else {
+        "已切換為開發者代管 AI".into()
+    })
+}
+
+#[tauri::command]
+async fn discord_login(app: AppHandle) -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(move || login_discord_blocking(app))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "error": "登入流程發生問題" }))
+}
+
+#[tauri::command]
+fn cancel_discord_login_cmd() -> bool {
+    cancel_discord_login();
     true
 }
 
-/// 給 UI 顯示 AI 來源狀態。
-/// - `ready`：AI 是否能用（一律 true）
-/// - `usingOwnKey`：使用者是否填了自己的金鑰
-/// - `managedFree`：是否使用開發者免費代管
 #[tauri::command]
-fn ai_status() -> serde_json::Value {
-    let own = load_deepseek_key().is_some();
+async fn discord_auth_status() -> Result<DiscordAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(check_discord_auth_status)
+        .await
+        .map_err(|e| format!("登入狀態檢查中斷：{e}"))
+}
+
+#[tauri::command]
+fn discord_logout() -> Result<String, String> {
+    logout_discord()?;
+    Ok("已登出 Discord".into())
+}
+
+/// 是否已儲存自訂 API 金鑰；代管模式的可用性由 `ai_status` 判斷。
+#[tauri::command]
+fn has_api_key() -> bool {
+    get_api_settings_public().has_key
+}
+
+/// 給 UI 顯示 AI 來源狀態。
+/// 自訂 API 只檢查本機是否有金鑰；代管 AI 會即時驗證 Discord 登入與官方伺服器會員。
+#[tauri::command]
+async fn ai_status() -> serde_json::Value {
+    let settings = get_api_settings_public();
+    let mode = get_ai_mode();
+    if mode == "custom" {
+        return serde_json::json!({
+            "ready": settings.has_key,
+            "aiMode": "custom",
+            "usingOwnKey": settings.has_key,
+            "managedFree": false,
+            "loggedIn": false,
+            "inGuild": false,
+            "message": if settings.has_key {
+                "自訂 API 已設定，翻譯時會直接連線到你的服務。"
+            } else {
+                "尚未儲存自訂 API 金鑰。"
+            }
+        });
+    }
+
+    let status = tauri::async_runtime::spawn_blocking(check_discord_auth_status)
+        .await
+        .ok();
+    let logged_in = status.as_ref().map(|s| s.logged_in).unwrap_or(false);
+    let in_guild = status.as_ref().map(|s| s.in_guild).unwrap_or(false);
+    let service_available = status
+        .as_ref()
+        .map(|s| s.service_available)
+        .unwrap_or(false);
+    let message = status
+        .as_ref()
+        .map(|s| s.message.clone())
+        .unwrap_or_else(|| "目前無法確認 Discord 登入狀態。".into());
     serde_json::json!({
-        "ready": true,
-        "usingOwnKey": own,
-        "managedFree": !own && managed_ai_available(),
-        "message": if own {
-            "AI：使用你自己的金鑰"
-        } else {
-            "AI：使用開發者免費提供的翻譯（額度有限，用完可自備金鑰或贊助支持）"
-        }
+        "ready": managed_ai_available() && logged_in && in_guild && service_available,
+        "aiMode": "managed",
+        "usingOwnKey": false,
+        "managedFree": true,
+        "loggedIn": logged_in,
+        "inGuild": in_guild,
+        "serviceAvailable": service_available,
+        "inviteUrl": DISCORD_INVITE_URL,
+        "displayName": status.as_ref().map(|s| s.nickname.clone()).unwrap_or_default(),
+        "message": message
     })
 }
 
@@ -1631,11 +1693,7 @@ async fn apply_translation_to_game(
             "【警告】請先完全關閉 Minecraft，再套用（避免檔案被鎖）",
         );
         emit_progress(&app2, 40, "套用：備份後複製資源包／任務…");
-        let r = apply_to_instance(
-            &instance,
-            &out,
-            pack_name.as_deref(),
-        );
+        let r = apply_to_instance(&instance, &out, pack_name.as_deref());
         match &r {
             Ok(ok) => {
                 for w in &ok.warnings {
@@ -1669,6 +1727,12 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if MINIMIZE_ON_CLOSE.load(Ordering::Relaxed) {
                     api.prevent_close();
+                    let _ = window
+                        .dialog()
+                        .message("工具已縮到背景，翻譯工作會繼續執行。要完全結束工具，請取消勾選「關閉視窗時縮到背景」後再關閉。")
+                        .title("模組包翻譯工具")
+                        .kind(MessageDialogKind::Info)
+                        .blocking_show();
                     let _ = window.minimize();
                 }
             }
@@ -1687,8 +1751,13 @@ pub fn run() {
             create_font_pack,
             save_api_key,
             save_api_settings_cmd,
+            set_ai_mode_cmd,
             has_api_key,
             ai_status,
+            discord_login,
+            cancel_discord_login_cmd,
+            discord_auth_status,
+            discord_logout,
             get_api_settings,
             get_default_reference_pack,
             get_ui_prefs,

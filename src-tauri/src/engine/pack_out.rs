@@ -681,4 +681,3 @@ fn load_pack_zh_zip(zip_path: &Path) -> Result<LangMap, String> {
     }
     Ok(zh)
 }
-

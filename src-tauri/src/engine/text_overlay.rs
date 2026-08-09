@@ -10,7 +10,6 @@ use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings;
-use super::secrets::load_deepseek_key;
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_AI_UNIQUE: usize = 8000;
@@ -36,17 +35,24 @@ where
     F: FnMut(u8, &str),
 {
     if !minecraft_dir.is_dir() {
-        return Err(format!("找不到 minecraft 目錄：{}", minecraft_dir.display()));
+        return Err(format!(
+            "找不到 minecraft 目錄：{}",
+            minecraft_dir.display()
+        ));
     }
 
-    on_progress(3, "覆寫文字：掃描 patchouli／openloader／kubejs／datapacks／fancymenu…");
+    on_progress(
+        3,
+        "覆寫文字：掃描 patchouli／openloader／kubejs／datapacks／fancymenu…",
+    );
     let files = collect_overlay_files(minecraft_dir);
     if files.is_empty() {
         return Ok(OverlayTranslateResult {
             files_written: 0,
             strings_translated: 0,
-            note: "未找到可處理的文字覆寫檔（patchouli／openloader／kubejs／datapacks／fancymenu）。"
-                .into(),
+            note:
+                "未找到可處理的文字覆寫檔（patchouli／openloader／kubejs／datapacks／fancymenu）。"
+                    .into(),
         });
     }
 
@@ -65,8 +71,7 @@ where
         match load_payload(path) {
             Ok(payload) => {
                 for s in payload.collect_strings() {
-                    if should_translate_overlay_string(&s) && seen.insert(s.clone(), ()).is_none()
-                    {
+                    if should_translate_overlay_string(&s) && seen.insert(s.clone(), ()).is_none() {
                         unique.push(s);
                     }
                 }
@@ -134,9 +139,6 @@ where
 
     // 2) AI：剩餘非中文（或未進 map 的拉丁文）
     if use_ai {
-        if load_deepseek_key().is_none() {
-            return Err("翻譯覆寫文字需要 AI 金鑰。請先在進階設定儲存。".into());
-        }
         let mut need_ai: Vec<String> = Vec::new();
         let mut skipped_over_cap = 0usize;
         for s in &unique {
@@ -161,7 +163,11 @@ where
             );
             on_progress(
                 38,
-                &format!("覆寫文字：超過上限，本輪先處理 {} 條，剩 {} 條下次再補", need_ai.len(), skipped_over_cap),
+                &format!(
+                    "覆寫文字：超過上限，本輪先處理 {} 條，剩 {} 條下次再補",
+                    need_ai.len(),
+                    skipped_over_cap
+                ),
             );
         }
 
@@ -605,9 +611,9 @@ fn should_translate_overlay_string(s: &str) -> bool {
     // 純 item id namespace:path
     if t.contains(':') && !t.contains(' ') && t.is_ascii() && !t.contains('\n') {
         // 允許 "Hello: world" 類；純 id 略過
-        if t.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '/' || c == '.' || c == '-')
-        {
+        if t.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '/' || c == '.' || c == '-'
+        }) {
             return false;
         }
     }
@@ -627,10 +633,7 @@ fn should_translate_overlay_string(s: &str) -> bool {
 
 fn is_color_or_format_only(s: &str) -> bool {
     // 僅 §x / &x / #RRGGBB / 空白
-    let stripped: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     if stripped.is_empty() {
         return true;
     }

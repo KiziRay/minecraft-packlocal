@@ -2,6 +2,13 @@
 
 格式：版本 — 日期（台北）— 摘要。
 
+## 1.0.1 — 2026-08-10（台北）
+
+- **桌面 UI 修復**：改善深色／淺色模式對比、背景模糊與主視窗滾動；全面放大主介面、狀態欄、日誌與使用說明文字，並針對高解析度螢幕再提高一級。新增 Ctrl＋↑／↓與 Ctrl＋滾輪調整 100%～150% 介面比例；開啟「關閉視窗時縮到背景」時，Alt+F4／關閉視窗會先提示再縮到背景；恢復 Discord 與支持開發連結。
+- **AI 來源與 Discord 驗證**：AI 可明確選擇「開發者提供的 API」或「自訂 API」。開發者 API 沿用 ZeitFrei 桌面 Discord 登入，必須加入官方伺服器；Worker 同時驗證新版協定、session 與會員資格，舊版不能繞過。自訂 API 不受 Discord 限制。
+- **執行檔更名**：產品名改為「Minecraft 模組整合包翻譯工具」；發佈檔改為 `minecraftpacklocal-1.0.1-setup.exe`／`-portable.exe`（GitHub 資產用 ASCII 名，頁面以中文標示安裝版／免安裝版）。
+- **Worker 協定 v2**：代管 AI 需 `X-Zeitfrei-AI-Protocol: 2` ＋ Discord session ＋ 官方伺服器會員；舊版用戶端收到 426 需更新。安裝檔更新到 1.0.1（R2 + `/api/desktop/latest` 已同步、雜湊驗過）。
+
 ## 1.0.0 — 2026-08-10（台北）— 公開發佈
 
 - **任務／書本系統翻譯（新增，`engine/quests_books.rs`）**：Better Questing、HQM、Heracles、Modonomicon

@@ -1,4 +1,4 @@
-# Tauri Commands 契約（0.5.0）
+# Tauri Commands 契約（1.0.0）
 
 前端：`window.__TAURI__.core.invoke("command_name", { … })`  
 Rust：`snake_case`；JS 參數 **camelCase**。
@@ -98,9 +98,14 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `create_font_pack` | fontPath, outputDir, packName, packDesc | FontPackResult |
 | `save_api_key` | key | string |
 | `save_api_settings_cmd` | apiKey, baseUrl | string（金鑰空＝保留） |
-| `has_api_key` | — | bool；**一律 true**（AI 一定可用：自備金鑰或代管） |
-| `ai_status` | — | `{ ready, usingOwnKey, managedFree, message }` |
-| `get_api_settings` | — | `{ baseUrl, hasKey, keyMasked }` |
+| `set_ai_mode_cmd` | aiMode：`managed`／`custom` | string |
+| `has_api_key` | — | bool；只代表是否已儲存自訂 API 金鑰 |
+| `ai_status` | — | 見下方；代管模式會即時驗證 Discord |
+| `get_api_settings` | — | `{ baseUrl, hasKey, keyMasked, aiMode }` |
+| `discord_login` | — | `{ ok, user? , error? }`；開啟既有桌面 OAuth 流程 |
+| `cancel_discord_login_cmd` | — | bool |
+| `discord_auth_status` | — | `DiscordAuthStatus` |
+| `discord_logout` | — | string |
 | `get_default_reference_pack` | — | string \| null |
 | `get_ui_prefs` | — | `{ minimizeOnClose }` |
 | `set_ui_prefs` | minimizeOnClose | string |
@@ -114,19 +119,21 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `suggest_resourcepacks_dir` | instancePath | string（相容舊） |
 | `suggest_output_dir` | instancePath | string（建議繁中翻譯輸出） |
 
-### AI 來源（代管 vs 自備金鑰）
+### AI 來源（開發者代管 vs 自訂 API）
 
-`ai_status` 給前端顯示 AI 是誰在付錢：
+使用者必須明確選擇來源。代管模式的狀態範例：
 
 ```json
-{ "ready": true, "usingOwnKey": false, "managedFree": true,
-  "message": "AI：使用開發者免費提供的翻譯（額度有限，用完可自備金鑰或贊助支持）" }
+{ "ready": true, "aiMode": "managed", "usingOwnKey": false,
+  "managedFree": true, "loggedIn": true, "inGuild": true,
+  "serviceAvailable": true, "displayName": "玩家名稱",
+  "inviteUrl": "https://discord.gg/zeitfrei", "message": "Discord 登入與官方伺服器會員驗證完成。" }
 ```
 
-- 有自填金鑰 → 直連使用者自己的上游（`usingOwnKey:true`）。
-- 沒填 → 走開發者代管 Worker（`managedFree:true`），exe 內只有非機密的 Worker URL。
-- `has_api_key` 回 true 只是讓「勾了 AI 卻沒金鑰」的舊守門不再誤擋，不代表有自填金鑰；
-  要判斷自填請用 `ai_status.usingOwnKey` 或 `get_api_settings.hasKey`。
+- `managed`：需要 Discord 登入且仍在 ZeitFrei 官方伺服器。桌面端、Rust 連線層與 Worker 都會檢查；Worker 缺少新版協定、session 或會員資格時直接拒絕。
+- `custom`：使用者自己的金鑰與 API 位置，直接連上游，不需要 Discord 驗證。
+- Discord 登入沿用 `https://cloud.zeitfrei.uk/api/desktop-auth` 與本機 `127.0.0.1:19420..19430/callback`，不需要新增 Discord Developer Portal callback。
+- `discord-login-url` event payload 為 `{ "url": "https://…" }`，供前端顯示瀏覽器未自動開啟時的備用網址。
 
 ### 檢查更新（`UpdateCheck`）
 

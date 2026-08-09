@@ -5,20 +5,26 @@ compatibility_date = "2026-08-01"
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "1.0.0"
+LATEST_VERSION = "1.0.1"
 # 安裝檔直連（NSIS）。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-1.0.0-setup.exe"
-RELEASE_NOTES = "1.0.0：新增 Better Questing／HQM／Heracles／Modonomicon 任務書本翻譯；補全支援範圍與免責文件；公開發佈。"
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-setup.exe"
+RELEASE_NOTES = "1.0.1：介面全面優化（深淺色、字級、100%～150% 縮放）；AI 可選開發者提供或自訂 API；開發者免費翻譯改用 Discord 登入驗證。"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-chat"
 
+# 開發者代管 AI 的桌面授權。舊版沒有協定標頭，會由 Worker 回 426 拒絕。
+AUTH_BASE_URL = "https://cloud.zeitfrei.uk"
+MANAGED_AI_PROTOCOL = "2"
+
 # 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
 # 超過就回 429，客戶端顯示贊助提示。
 DAILY_TOKEN_BUDGET = "20000000"
+# 單一 Discord 帳號每日上限；啟用 USAGE KV 後生效。
+PER_USER_DAILY_TOKEN_BUDGET = "1000000"
 
 # 更新安裝檔的 sha256（上傳後填；客戶端會驗證，不符不啟動）。留空＝不驗證。
-INSTALLER_SHA256 = "cd5d6dcb20690f689f7543fea66e54cca1c5759816e561de0b6836f757205d4f"
+INSTALLER_SHA256 = "3eac851753ad5918331c99d5193bfd0f1351b8782c29d39a22cf8308b6416a74"
 
 # 安裝檔存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
 [[r2_buckets]]

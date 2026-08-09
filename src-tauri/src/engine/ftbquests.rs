@@ -9,7 +9,6 @@ use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings;
-use super::secrets::load_deepseek_key;
 
 /// 逐項統計。目前彙整成 `note` 給玩家看，其餘欄位保留供排查回報用。
 #[allow(dead_code)]
@@ -120,9 +119,6 @@ where
     // 翻譯表
     let mut map: HashMap<String, String> = HashMap::new();
     if use_ai {
-        if load_deepseek_key().is_none() {
-            return Err("翻譯任務需要 AI 金鑰。請先在進階設定儲存。".into());
-        }
         on_progress(30, "任務：呼叫 AI 翻譯任務／劇情文字…");
         let app_prog = &mut on_progress;
         let translated = translate_plain_strings(&all_strings, |pct, msg| {
@@ -172,9 +168,7 @@ where
     let mut applied = 0usize;
 
     for (src_path, text) in &file_texts {
-        let rel = src_path
-            .strip_prefix(&src)
-            .unwrap_or(src_path.as_path());
+        let rel = src_path.strip_prefix(&src).unwrap_or(src_path.as_path());
         let mut new_text = text.clone();
         // 由長到短替換，減少部分重疊
         let mut pairs: Vec<_> = map.iter().collect();
@@ -313,4 +307,3 @@ fn escape_snbt(s: &str) -> String {
     }
     out
 }
-

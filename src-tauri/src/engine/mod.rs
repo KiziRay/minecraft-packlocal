@@ -3,6 +3,7 @@ mod cancel;
 mod convert;
 mod deepseek;
 mod diagnose;
+mod discord_auth;
 mod disk;
 mod font_pack;
 mod ftbquests;
@@ -30,33 +31,36 @@ pub use cancel::{
     check as check_cancelled, request as request_cancel, reset as reset_cancel, CANCEL_MESSAGE,
 };
 pub use convert::{convert_langmap_s2tw, converter_name};
-pub use diagnose::{diagnose as diagnose_launch, LaunchDiagnosis};
-pub use disk::{ensure_space, MIN_FREE_BYTES};
 pub use deepseek::fill_missing_with_ai;
+pub use deepseek::managed_ai_available;
+pub use diagnose::{diagnose as diagnose_launch, LaunchDiagnosis};
+pub use discord_auth::{
+    cancel_discord_login, check_discord_auth_status, login_discord_blocking, logout_discord,
+    DiscordAuthStatus, DISCORD_INVITE_URL,
+};
+pub use disk::{ensure_space, MIN_FREE_BYTES};
 pub use font_pack::{build_font_pack_str_with_options, FontPackOptions, FontPackResult};
 pub use ftbquests::translate_ftbquests;
-pub use glossary::{
-    ensure_user_glossary_template, load_phrase_dict, user_glossary_path,
-};
+pub use glossary::{ensure_user_glossary_template, load_phrase_dict, user_glossary_path};
 pub use jar_scan::{resolve_minecraft_dir, scan_instance, LangMap, ScanReport};
 pub use merge_ref::{
     discover_default_reference, load_reference_zh_tw, merge_fill_missing, subtract_covered,
 };
 pub use minemenu::fix_minemenu_unicode_escapes;
 pub use origins::translate_origins;
-pub use quests_books::translate_quests_books;
 pub use out_layout::{
-    ensure_result_layout, suggest_output_base, write_coverage_report, CoverageStats, RESULT_DIR_NAME,
+    ensure_result_layout, suggest_output_base, write_coverage_report, CoverageStats,
+    RESULT_DIR_NAME,
 };
 pub use pack_out::{
     build_resource_pack, detect_minecraft_version, detect_pack_format, pack_format_for_version,
     BuildOptions,
 };
+pub use quests_books::translate_quests_books;
 pub use secrets::{
-    get_api_settings_public, get_minimize_on_close, load_deepseek_key, save_api_settings,
+    get_ai_mode, get_api_settings_public, get_minimize_on_close, save_api_settings, set_ai_mode,
     set_minimize_on_close, ApiSettingsPublic,
 };
-pub use deepseek::managed_ai_available;
 pub use security::{normalize_user_path, sanitize_folder_name, validate_open_url};
 pub use session::{
     count_map, find_pack_near, find_session_file, has_session_file, load_pack_zh, load_session,

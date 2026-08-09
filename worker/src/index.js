@@ -218,6 +218,9 @@ async function download(url, env, headOnly) {
 // ───────────────────────── AI 代理 ─────────────────────────
 
 async function proxyChat(request, env) {
+  const access = await authorizeManagedAi(request, env);
+  if (!access.ok) return access.response;
+
   // trim：擋掉空字串／只有換行的 secret（貼進遮罩提示常見的坑），也避免結尾換行害上游 401。
   const key = env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim();
   if (!key) {
@@ -230,6 +233,7 @@ async function proxyChat(request, env) {
 
   // 每日總量保護：超過就回 429，客戶端顯示贊助提示。
   const budget = parseInt(env.DAILY_TOKEN_BUDGET || "0", 10);
+  const userBudget = parseInt(env.PER_USER_DAILY_TOKEN_BUDGET || "0", 10);
   if (budget > 0 && env.USAGE) {
     const dayKey = "usage:" + utcDay();
     const spent = parseInt((await env.USAGE.get(dayKey)) || "0", 10);
@@ -245,12 +249,34 @@ async function proxyChat(request, env) {
       );
     }
   }
+  if (userBudget > 0 && env.USAGE) {
+    const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
+    const spent = parseInt((await env.USAGE.get(userDayKey)) || "0", 10);
+    if (spent >= userBudget) {
+      return json(
+        { error: { message: "personal daily translation budget reached", type: "insufficient_quota" } },
+        429
+      );
+    }
+  }
 
   let body;
   try {
-    body = await request.json();
+    const declaredSize = parseInt(request.headers.get("content-length") || "0", 10);
+    if (declaredSize > 250000) {
+      return json({ error: { message: "request too large", type: "invalid_request" } }, 413);
+    }
+    const raw = await request.text();
+    if (raw.length > 250000) {
+      return json({ error: { message: "request too large", type: "invalid_request" } }, 413);
+    }
+    body = JSON.parse(raw);
   } catch (_) {
     return json({ error: { message: "invalid json body" } }, 400);
+  }
+
+  if (!validTranslationMessages(body.messages)) {
+    return json({ error: { message: "invalid translation messages", type: "invalid_request" } }, 400);
   }
 
   // 只允許聊天補全所需欄位轉發，並鎖定模型（避免被拿去打別的昂貴模型）。
@@ -278,13 +304,20 @@ async function proxyChat(request, env) {
   const text = await resp.text();
 
   // 記帳（成功才計；用量以 usage.total_tokens 為準，取不到就估）。
-  if (resp.ok && budget > 0 && env.USAGE) {
+  if (resp.ok && env.USAGE && (budget > 0 || userBudget > 0)) {
     try {
       const used = estimateTokens(text, forward);
-      const dayKey = "usage:" + utcDay();
-      const spent = parseInt((await env.USAGE.get(dayKey)) || "0", 10);
-      // 隔日自動歸零：TTL 略長於一天。
-      await env.USAGE.put(dayKey, String(spent + used), { expirationTtl: 172800 });
+      if (budget > 0) {
+        const dayKey = "usage:" + utcDay();
+        const spent = parseInt((await env.USAGE.get(dayKey)) || "0", 10);
+        // 隔日自動歸零：TTL 略長於一天。
+        await env.USAGE.put(dayKey, String(spent + used), { expirationTtl: 172800 });
+      }
+      if (userBudget > 0) {
+        const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
+        const userSpent = parseInt((await env.USAGE.get(userDayKey)) || "0", 10);
+        await env.USAGE.put(userDayKey, String(userSpent + used), { expirationTtl: 172800 });
+      }
     } catch (_) {
       /* 記帳失敗不影響翻譯 */
     }
@@ -295,6 +328,91 @@ async function proxyChat(request, env) {
     status: resp.status,
     headers: { ...JSON_HEADERS, ...corsHeaders() },
   });
+}
+
+async function authorizeManagedAi(request, env) {
+  const expectedProtocol = String(env.MANAGED_AI_PROTOCOL || "2");
+  if (request.headers.get("x-zeitfrei-ai-protocol") !== expectedProtocol) {
+    return {
+      ok: false,
+      response: json(
+        { error: { message: "client upgrade required", type: "client_upgrade_required" } },
+        426
+      ),
+    };
+  }
+
+  const session = String(request.headers.get("x-zeitfrei-session") || "").trim();
+  if (!session || session.length < 40 || session.length > 8192 || !/^[A-Za-z0-9+/=_-]+$/.test(session)) {
+    return {
+      ok: false,
+      response: json({ error: { message: "discord login required", type: "login_required" } }, 401),
+    };
+  }
+
+  const authBase = String(env.AUTH_BASE_URL || "https://cloud.zeitfrei.uk").replace(/\/+$/, "");
+  let account;
+  try {
+    const response = await fetch(`${authBase}/api/check-upload`, {
+      headers: { Cookie: `cf_storage_v3_session=${session}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (response.status === 401) {
+      return {
+        ok: false,
+        response: json({ error: { message: "discord login expired", type: "login_required" } }, 401),
+      };
+    }
+    if (!response.ok) throw new Error("account check failed");
+    account = await response.json();
+  } catch (_) {
+    return {
+      ok: false,
+      response: json({ error: { message: "login verification unavailable", type: "auth_unavailable" } }, 503),
+    };
+  }
+
+  const userId = String((account && account.user_id) || "");
+  if (!/^\d{5,25}$/.test(userId)) {
+    return {
+      ok: false,
+      response: json({ error: { message: "invalid discord session", type: "login_required" } }, 401),
+    };
+  }
+
+  try {
+    const response = await fetch(`${authBase}/api/member-tier/${encodeURIComponent(userId)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) throw new Error("membership check failed");
+    const membership = await response.json();
+    if (!membership || membership.inGuild !== true) {
+      return {
+        ok: false,
+        response: json({ error: { message: "official discord membership required", type: "guild_required" } }, 403),
+      };
+    }
+  } catch (_) {
+    return {
+      ok: false,
+      response: json({ error: { message: "membership verification unavailable", type: "auth_unavailable" } }, 503),
+    };
+  }
+
+  return { ok: true, userId };
+}
+
+function validTranslationMessages(messages) {
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 4) return false;
+  let total = 0;
+  for (const message of messages) {
+    if (!message || !["system", "user"].includes(message.role) || typeof message.content !== "string") {
+      return false;
+    }
+    total += message.content.length;
+    if (total > 180000) return false;
+  }
+  return messages.some((message) => message.role === "user");
 }
 
 function estimateTokens(text, forward) {
@@ -321,7 +439,7 @@ function corsHeaders() {
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization",
+    "access-control-allow-headers": "content-type, authorization, x-zeitfrei-ai-protocol, x-zeitfrei-client-version, x-zeitfrei-session",
   };
 }
 
