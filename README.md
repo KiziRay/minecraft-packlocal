@@ -8,7 +8,9 @@
 - 不宣稱 100% 漢化
 - **免安裝任何額外東西**（簡繁轉換內建於執行檔）
 
-目前版本：**1.0.0**（以 `src-tauri/Cargo.toml` 為準）
+目前版本：**1.0.2**（以 `src-tauri/Cargo.toml` 為準）
+
+開發者代管 AI 會先檢查 Discord 官方伺服器資格，再透過 Cloudflare Turnstile 完成安全驗證；自訂 API 不需要這些驗證。
 
 ## 支援範圍（一句話）
 
@@ -19,7 +21,7 @@
 ## 下載
 
 - **Release**：見本專案 [Releases](https://github.com/KiziRay/minecraft-packlocal/releases) 的最新版（安裝檔 + 免安裝版 + `SHA256SUMS.txt`）。
-- 工具內建「檢查更新」會自動抓最新安裝檔並**核對 SHA-256** 後再開啟。
+- 工具內建「檢查更新」會從官方 Worker 下載安裝檔，強制核對 SHA-256 與檔案格式，再自動安裝並重開；自動流程失敗時可改用瀏覽器下載。
 - 下載後請用 `SHA256SUMS.txt` 自行核對雜湊，確認檔案未被竄改（公開原始碼不等於自動保證檔案安全）。
 
 ## 這個工具跟「丟給 AI 翻」差在哪
@@ -38,7 +40,7 @@
 
 1. 執行免安裝程式（建置後在 `src-tauri/target/release/`）。
 2. 選**遊戲實例**資料夾、**結果根目錄**。
-3. （建議）選社群繁中參考 zip；勾 AI 並存金鑰。
+3. （建議）選社群繁中參考 zip；勾選 AI 後使用開發者代管服務，或填入自己的 API。
 4. **開始一鍵翻譯** → 完成後**關遊戲** → **一鍵套用到遊戲**。
 5. 遊戲內：語言「繁體中文（台灣）」→ 啟用資源包。
 
@@ -50,7 +52,6 @@
 
 | 文件 | 給誰 | 內容 |
 |------|------|------|
-| [AGENTS.md](./AGENTS.md) | AI／維修者 | 硬規則、導航、DoD、陷阱 |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 開發 | 架構、模組、資料流 |
 | [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | 開發 | 環境、建置、除錯、設定路徑 |
 | [docs/API-COMMANDS.md](./docs/API-COMMANDS.md) | 前後端 | Tauri command 契約 |
@@ -58,7 +59,7 @@
 | [docs/USER-GUIDE.md](./docs/USER-GUIDE.md) | 玩家／文案 | 使用說明全文結構 |
 | [docs/COMMUNITY.md](./docs/COMMUNITY.md) | 產品 | 社群期望與紅線 |
 | [docs/CHANGELOG.md](./docs/CHANGELOG.md) | 所有人 | 版本紀錄 |
-| [docs/GUIDE-PLAN.md](./docs/GUIDE-PLAN.md) | 文案 | 說明頁資訊架構 |
+| [docs/詳細使用說明.md](./docs/詳細使用說明.md) | 玩家 | 實例、資料夾、安裝與分享 |
 
 ---
 

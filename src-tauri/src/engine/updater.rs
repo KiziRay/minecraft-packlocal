@@ -1,15 +1,16 @@
-//! 檢查更新（通知＋下載安裝檔）。
+//! 檢查更新（通知＋驗證＋安裝）。
 //!
-//! 刻意**不做自我替換 exe**：靜默改寫執行檔正是防毒判「木馬 dropper」的頭號特徵，
-//! 與「降低誤刪」的目標直接衝突。流程比照 ZeitFrei-Tool：
+//! 本專案是 NSIS 安裝版，不直接改寫執行中的 exe。流程採用 ZeitFrei-Tool 的可靠性原則，
+//! 但把「自行替換 exe」改成由 Tauri 產生的官方 NSIS 安裝程式處理：
 //!   1. 打 Worker `/api/desktop/latest` 拿最新版本
 //!   2. 比版本，較新才提示
-//!   3. 使用者要更新 → 下載官方 NSIS 安裝檔到暫存、（有提供時）驗 sha256 → 啟動安裝檔
-//!   4. 使用者在安裝精靈點一次「下一步」完成，工具本身不碰系統
+//!   3. 防連點，下載官方 NSIS 到暫存，強制驗 SHA-256、檔案大小與 PE 標頭
+//!   4. Windows 以 `/S /R` 靜默安裝並重開；脫離父行程失敗時退回一般安裝程式
 //!
 //! 更新端點與下載連結都非機密，比對邏輯全在本地。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,26 @@ use super::secrets::MANAGED_BASE_URL;
 
 /// 目前版本（編譯時由 Cargo 帶入）。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MIN_INSTALLER_BYTES: usize = 100_000;
+const MAX_INSTALLER_BYTES: usize = 256 * 1024 * 1024;
+static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct UpdateGuard;
+
+impl UpdateGuard {
+    fn acquire() -> Result<Self, String> {
+        UPDATE_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self)
+            .map_err(|_| "更新已在進行中，請稍候，不要重複點擊。".to_string())
+    }
+}
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +104,27 @@ fn endpoint() -> String {
     format!("{}/api/desktop/latest", MANAGED_BASE_URL.trim_end_matches('/'))
 }
 
+fn fetch_latest() -> Result<LatestResponse, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("無法建立更新連線：{e}"))?;
+    let response = client
+        .get(endpoint())
+        .send()
+        .map_err(|_| "暫時無法檢查更新（可能沒有網路）。".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("檢查更新失敗（{}）。", response.status().as_u16()));
+    }
+    let latest: LatestResponse = response
+        .json()
+        .map_err(|_| "檢查更新回應無法解析。".to_string())?;
+    if latest.version.trim().is_empty() {
+        return Err("伺服器未提供版本資訊。".into());
+    }
+    Ok(latest)
+}
+
 /// 檢查更新。連不上時回 `ok=false`，不當成錯誤（純資訊查詢）。
 pub fn check_update() -> UpdateCheck {
     let current = CURRENT_VERSION.to_string();
@@ -96,28 +138,10 @@ pub fn check_update() -> UpdateCheck {
         message: msg.to_string(),
     };
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return fail(&format!("無法建立連線：{e}")),
+    let latest = match fetch_latest() {
+        Ok(value) => value,
+        Err(error) => return fail(&error),
     };
-
-    let resp = match client.get(endpoint()).send() {
-        Ok(r) => r,
-        Err(_) => return fail("暫時無法檢查更新（可能沒有網路）。"),
-    };
-    if !resp.status().is_success() {
-        return fail(&format!("檢查更新失敗（{}）。", resp.status().as_u16()));
-    }
-    let latest: LatestResponse = match resp.json() {
-        Ok(v) => v,
-        Err(_) => return fail("檢查更新回應無法解析。"),
-    };
-    if latest.version.trim().is_empty() {
-        return fail("伺服器未提供版本資訊。");
-    }
 
     let available = is_newer(&latest.version, &current);
     UpdateCheck {
@@ -140,30 +164,29 @@ pub fn check_update() -> UpdateCheck {
 pub struct DownloadResult {
     pub path: String,
     pub launched: bool,
+    /// true＝已用官方 NSIS 靜默安裝並要求完成後重開。
+    pub automatic: bool,
+    /// true＝安裝程式已脫離目前行程，前端收到回應後可關閉舊程式。
+    pub should_exit: bool,
     pub message: String,
 }
 
-/// 下載安裝檔到暫存並啟動它（使用者手動點一次完成安裝）。
-///
-/// 若 `/api/desktop/latest` 給了 sha256 就驗證，不符不啟動——防止半途損毀或被掉包。
+/// 下載安裝檔到暫存，強制驗證後啟動 NSIS 更新。
 pub fn download_and_launch() -> Result<DownloadResult, String> {
-    let info = check_update();
-    if !info.ok {
-        return Err(info.message);
-    }
-    if !info.update_available {
+    let _guard = UpdateGuard::acquire()?;
+    let latest = fetch_latest()?;
+    let current = CURRENT_VERSION.to_string();
+    if !is_newer(&latest.version, &current) {
         return Ok(DownloadResult {
             path: String::new(),
             launched: false,
-            message: format!("已是最新版（{}），不需要更新。", info.current),
+            automatic: false,
+            should_exit: false,
+            message: format!("已是最新版（{current}），不需要更新。"),
         });
     }
-    if info.url.trim().is_empty() {
-        return Err("伺服器沒有提供下載連結。".into());
-    }
-
-    // 再抓一次拿 sha256（check_update 的結構沒帶 sha256 出來，這裡直接讀原始回應）。
-    let expected_sha = fetch_expected_sha();
+    let url = validate_download_url(&latest.url)?;
+    let expected_sha = validate_sha256(latest.sha256.as_deref())?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(300))
@@ -171,50 +194,110 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
         .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get(&info.url)
+        .get(&url)
         .send()
         .map_err(|e| format!("下載失敗：{e}"))?;
     if !resp.status().is_success() {
         return Err(format!("下載失敗（{}）。", resp.status().as_u16()));
     }
+    if resp
+        .content_length()
+        .is_some_and(|size| size < MIN_INSTALLER_BYTES as u64 || size > MAX_INSTALLER_BYTES as u64)
+    {
+        return Err("伺服器提供的安裝檔大小不合理，已停止更新。".into());
+    }
     let bytes = resp.bytes().map_err(|e| format!("下載中斷：{e}"))?;
-
-    if let Some(expected) = expected_sha.as_deref() {
-        let got = sha256_hex(&bytes);
-        if !got.eq_ignore_ascii_case(expected) {
-            return Err(format!(
-                "安裝檔校驗不符，已中止（預期 {expected}，實得 {got}）。請改用官方下載頁。"
-            ));
-        }
+    validate_installer_bytes(&bytes)?;
+    let got = sha256_hex(&bytes);
+    if !got.eq_ignore_ascii_case(&expected_sha) {
+        return Err("安裝檔完整性驗證失敗，已停止更新。請改用官方下載連結。".into());
     }
 
-    let dest = download_target(&info.url, &info.latest);
-    std::fs::write(&dest, &bytes).map_err(|e| format!("寫入暫存失敗：{e}"))?;
+    let dest = download_target(&url, &latest.version);
+    let partial = dest.with_extension("download");
+    let _ = std::fs::remove_file(&partial);
+    std::fs::write(&partial, &bytes).map_err(|e| format!("寫入更新暫存檔失敗：{e}"))?;
+    let _ = std::fs::remove_file(&dest);
+    std::fs::rename(&partial, &dest).map_err(|e| format!("準備安裝檔失敗：{e}"))?;
 
-    // 啟動安裝檔（ShellExecute）；不隱藏視窗、不自動關閉本程式，交給使用者。
-    let launched = open::that(&dest).is_ok();
+    let (launched, automatic, should_exit) = launch_installer(&dest)?;
     Ok(DownloadResult {
         path: dest.display().to_string(),
         launched,
-        message: if launched {
-            "已下載安裝檔並開啟，請依畫面完成安裝。".into()
+        automatic,
+        should_exit,
+        message: if automatic {
+            "安裝檔已驗證，正在自動安裝；工具將關閉並由新版重新開啟。".into()
         } else {
-            format!("已下載到：{}\n請手動開啟完成安裝。", dest.display())
+            format!("已驗證並開啟安裝程式：{}\n請依畫面完成更新。", dest.display())
         },
     })
 }
 
-fn fetch_expected_sha() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .ok()?;
-    let resp = client.get(endpoint()).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
+fn validate_download_url(url: &str) -> Result<String, String> {
+    let value = url.trim();
+    let prefix = format!("{}/download/", MANAGED_BASE_URL.trim_end_matches('/'));
+    let lower = value.to_ascii_lowercase();
+    if !value.starts_with(&prefix)
+        || !lower.ends_with(".exe")
+        || lower.contains("..")
+        || lower.contains("%2e")
+        || value.contains('\\')
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err("更新下載連結不是官方安裝檔，已停止更新。".into());
     }
-    let latest: LatestResponse = resp.json().ok()?;
-    latest.sha256.filter(|s| !s.trim().is_empty())
+    Ok(value.to_string())
+}
+
+fn validate_sha256(value: Option<&str>) -> Result<String, String> {
+    let checksum = value.unwrap_or("").trim();
+    if checksum.len() != 64 || !checksum.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("伺服器未提供有效的安裝檔 SHA-256，已停止更新。".into());
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+fn validate_installer_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < MIN_INSTALLER_BYTES || bytes.len() > MAX_INSTALLER_BYTES {
+        return Err("下載的安裝檔大小不合理，已停止更新。".into());
+    }
+    if !bytes.starts_with(b"MZ") {
+        return Err("下載內容不是 Windows 安裝程式，已停止更新。".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn launch_installer(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // 與工具箱更新器相同：脫離 Tauri 的父 Job，避免舊程式退出時連帶殺掉安裝器。
+    const FLAGS: u32 = 0x0800_0000 | 0x0000_0200 | 0x0100_0000;
+    let automatic = Command::new(path)
+        .args(["/S", "/R"])
+        .creation_flags(FLAGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if automatic.is_ok() {
+        return Ok((true, true, true));
+    }
+
+    // BREAKAWAY 被系統政策拒絕時，保留可見的官方安裝程式讓玩家手動完成。
+    open::that(path)
+        .map(|_| (true, false, false))
+        .map_err(|e| format!("安裝檔已下載，但無法啟動：{e}"))
+}
+
+#[cfg(not(windows))]
+fn launch_installer(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+    open::that(path)
+        .map(|_| (true, false, false))
+        .map_err(|e| format!("安裝檔已下載，但無法啟動：{e}"))
 }
 
 /// 暫存檔名：保留原副檔名（通常 .exe），避免被當成未知格式。
@@ -274,5 +357,30 @@ mod tests {
         // 沒有副檔名時退回 exe
         let p2 = download_target("https://x/download", "0.5.0");
         assert!(p2.to_string_lossy().ends_with(".exe"));
+    }
+
+    #[test]
+    fn updater_accepts_only_official_exe_downloads() {
+        assert!(validate_download_url(
+            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-setup.exe"
+        )
+        .is_ok());
+        assert!(validate_download_url("https://example.com/fake.exe").is_err());
+        assert!(validate_download_url(
+            "https://modpack-i18n.jolin34563.workers.dev/download/../fake.exe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn updater_requires_a_valid_checksum_and_pe_file() {
+        assert!(validate_sha256(Some(&"a".repeat(64))).is_ok());
+        assert!(validate_sha256(None).is_err());
+        assert!(validate_sha256(Some("xyz")).is_err());
+
+        let mut installer = vec![0u8; MIN_INSTALLER_BYTES];
+        installer[0..2].copy_from_slice(b"MZ");
+        assert!(validate_installer_bytes(&installer).is_ok());
+        assert!(validate_installer_bytes(b"not an installer").is_err());
     }
 }

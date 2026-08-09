@@ -23,6 +23,7 @@ use super::placeholder::{self, GuardStats};
 use super::secrets::resolve_ai_config;
 use super::shared_tm;
 use super::tm::Tm;
+use super::turnstile::{managed_ai_turnstile_proof, MANAGED_AI_PROTOCOL};
 
 /// 每批條數（去重後的「唯一英文」）
 const BATCH: usize = 140;
@@ -488,6 +489,8 @@ struct Engine {
     model: Arc<String>,
     /// 只在代管模式使用；送往自家 Worker，由 Worker 驗證登入與伺服器會員身分。
     managed_session: Arc<String>,
+    /// Cloudflare Siteverify 通過後由 Worker 簽發；只存在記憶體，且綁定 Discord 使用者。
+    managed_turnstile: Arc<String>,
     managed: bool,
 }
 
@@ -495,10 +498,15 @@ impl Engine {
     fn connect() -> Result<Self, String> {
         // AI 來源由使用者明確選擇；自訂模式缺金鑰時直接回報，代管模式再驗 Discord。
         let cfg = resolve_ai_config()?;
-        let managed_session = if cfg.managed {
-            managed_ai_session_cookie()?
+        let (managed_session, managed_turnstile) = if cfg.managed {
+            (
+                managed_ai_session_cookie()?,
+                // Turnstile 為選用：拿不到通行憑證也照樣走（Worker 端未設定金鑰就不強制），
+                // 才不會在還沒設定 Turnstile 時把代管翻譯整個擋掉。
+                managed_ai_turnstile_proof().unwrap_or_default(),
+            )
         } else {
-            String::new()
+            (String::new(), String::new())
         };
 
         if let Err(probe) = probe_ai_ready(
@@ -507,6 +515,7 @@ impl Engine {
             &cfg.model,
             cfg.managed,
             &managed_session,
+            &managed_turnstile,
         ) {
             return Err(if cfg.managed {
                 probe
@@ -529,6 +538,7 @@ impl Engine {
             api_key: Arc::new(cfg.api_key),
             model: Arc::new(cfg.model),
             managed_session: Arc::new(managed_session),
+            managed_turnstile: Arc::new(managed_turnstile),
             managed: cfg.managed,
         })
     }
@@ -589,6 +599,7 @@ fn run_batches(
             let api_key = Arc::clone(&engine.api_key);
             let model = Arc::clone(&engine.model);
             let managed_session = Arc::clone(&engine.managed_session);
+            let managed_turnstile = Arc::clone(&engine.managed_turnstile);
             let managed = engine.managed;
             let translations = Arc::clone(&translations);
             let items: Vec<(usize, String)> = chunk.clone();
@@ -613,6 +624,7 @@ fn run_batches(
                         &model,
                         managed,
                         &managed_session,
+                        &managed_turnstile,
                         slice,
                         slice_ctx,
                         &hints,
@@ -826,6 +838,7 @@ fn translate_chunk(
     model: &str,
     managed: bool,
     managed_session: &str,
+    managed_turnstile: &str,
     chunk: &[(usize, String)],
     contexts: &[Option<&'static str>],
     hints: &[(String, String)],
@@ -851,9 +864,10 @@ fn translate_chunk(
             .json(&body);
         if managed {
             req = req
-                .header("X-Zeitfrei-AI-Protocol", "2")
+                .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
                 .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Zeitfrei-Session", managed_session);
+                .header("X-Zeitfrei-Session", managed_session)
+                .header("X-Zeitfrei-Turnstile", managed_turnstile);
         } else if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -895,6 +909,9 @@ fn translate_chunk(
         }
         if code == 426 && managed {
             return Err("這個版本已不能使用開發者代管 AI，請更新工具後再試。".into());
+        }
+        if code == 428 && managed {
+            return Err("Cloudflare 安全驗證已過期，請回到工具重新驗證。".into());
         }
         if code == 401 && managed {
             return Err("使用開發者代管 AI 前，請先登入 Discord。".into());
@@ -1024,6 +1041,7 @@ fn probe_ai_ready(
     model: &str,
     managed: bool,
     managed_session: &str,
+    managed_turnstile: &str,
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(25))
@@ -1065,6 +1083,7 @@ fn probe_ai_ready(
         model,
         managed,
         managed_session,
+        managed_turnstile,
         &probe,
         &[None],
         &[],

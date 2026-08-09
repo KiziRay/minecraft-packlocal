@@ -5,18 +5,21 @@ mod engine;
 
 use engine::{
     apply_to_instance, build_font_pack_str_with_options, build_resource_pack, cancel_discord_login,
-    check_cancelled, check_discord_auth_status, convert_langmap_s2tw, converter_name, count_map,
+    cancel_turnstile_verification, check_cancelled, check_discord_auth_status,
+    clear_turnstile_proof, convert_langmap_s2tw, converter_name, count_map,
     detect_minecraft_version, detect_pack_format, diagnose_launch, discover_default_reference,
     ensure_result_layout, ensure_space, ensure_user_glossary_template, fill_missing_with_ai,
     find_pack_near, find_session_file, fix_minemenu_unicode_escapes, get_ai_mode,
     get_api_settings_public, get_minimize_on_close, has_session_file, load_pack_zh,
     load_phrase_dict, load_reference_zh_tw, load_session, login_discord_blocking, logout_discord,
-    managed_ai_available, merge_fill_missing, normalize_user_path, pack_format_for_version,
+    managed_ai_available, merge_fill_missing, normalize_user_path, package_translation,
+    pack_format_for_version,
     remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir, restore_last_apply,
     sanitize_folder_name, save_api_settings, save_session, scan_instance, set_ai_mode,
     set_minimize_on_close, subtract_covered, suggest_output_base, translate_ftbquests,
-    translate_origins, translate_quests_books, translate_text_overlays, user_glossary_path,
-    validate_open_url, write_coverage_report, ApiSettingsPublic, ApplyResult, BuildOptions,
+    translate_origins, translate_quests_books, translate_text_overlays, turnstile_status,
+    user_glossary_path, validate_open_url, verify_turnstile_blocking, write_coverage_report,
+    ApiSettingsPublic, ApplyResult, BuildOptions,
     CoverageStats, DiscordAuthStatus, FontPackOptions, FontPackResult, LangMap, LaunchDiagnosis,
     RestoreResult, ScanReport, TranslateSession, UpdateCheck, CANCEL_MESSAGE, DISCORD_INVITE_URL,
     MIN_FREE_BYTES, RESULT_DIR_NAME, SESSION_FILE,
@@ -1429,6 +1432,42 @@ fn open_url(url: String) -> Result<bool, String> {
     Ok(true)
 }
 
+/// 工具自管的隱藏工作目錄（`%APPDATA%\modpack-i18n-tool\work`）。
+/// 一鍵流程預設把中繼檔放這裡，使用者選的位置就不會被塞一個「翻譯結果」資料夾。
+#[tauri::command]
+fn managed_output_base() -> String {
+    dirs::data_dir()
+        .map(|d| d.join("modpack-i18n-tool").join("work"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+/// 檢查選取的位置是不是一個可直接安裝的遊戲實例（找得到 minecraft 目錄）。
+/// 回 { ok, mcDir, hasResourcepacks }，讓前端決定要不要走「直接覆蓋安裝、不建資料夾」。
+#[tauri::command]
+fn check_install_target(instance_path: String) -> serde_json::Value {
+    match resolve_minecraft_dir(&PathBuf::from(&instance_path)) {
+        Ok(mc) => {
+            let has_rp = mc.join("resourcepacks").is_dir();
+            serde_json::json!({
+                "ok": true,
+                "mcDir": mc.display().to_string(),
+                "hasResourcepacks": has_rp
+            })
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }),
+    }
+}
+
+/// 把「翻譯結果」打包成單一 zip，供使用者手動分享整包翻譯檔。
+/// 只有勾「建立打包檔案」才會用到；預設一鍵流程是直接覆蓋安裝進遊戲、不打包。
+/// `work_root`＝翻譯結果資料夾（通常是工作階段的 output_dir）。
+#[tauri::command]
+fn create_share_package(work_root: String, dest_dir: String, name: String) -> Result<String, String> {
+    let zip = package_translation(&PathBuf::from(&work_root), &PathBuf::from(&dest_dir), &name)?;
+    Ok(zip.display().to_string())
+}
+
 /// Notion 風格完整說明（獨立視窗）
 #[tauri::command]
 fn open_guide_window(app: AppHandle) -> Result<(), String> {
@@ -1500,9 +1539,13 @@ fn set_ai_mode_cmd(ai_mode: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn discord_login(app: AppHandle) -> serde_json::Value {
-    tauri::async_runtime::spawn_blocking(move || login_discord_blocking(app))
+    let result = tauri::async_runtime::spawn_blocking(move || login_discord_blocking(app))
         .await
-        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "error": "登入流程發生問題" }))
+        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "error": "登入流程發生問題" }));
+    if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        clear_turnstile_proof();
+    }
+    result
 }
 
 #[tauri::command]
@@ -1521,7 +1564,21 @@ async fn discord_auth_status() -> Result<DiscordAuthStatus, String> {
 #[tauri::command]
 fn discord_logout() -> Result<String, String> {
     logout_discord()?;
+    clear_turnstile_proof();
     Ok("已登出 Discord".into())
+}
+
+#[tauri::command]
+async fn turnstile_verify(app: AppHandle) -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(move || verify_turnstile_blocking(app))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "error": "安全驗證流程發生問題" }))
+}
+
+#[tauri::command]
+fn cancel_turnstile_verification_cmd() -> bool {
+    cancel_turnstile_verification();
+    true
 }
 
 /// 是否已儲存自訂 API 金鑰；代管模式的可用性由 `ai_status` 判斷。
@@ -1531,7 +1588,7 @@ fn has_api_key() -> bool {
 }
 
 /// 給 UI 顯示 AI 來源狀態。
-/// 自訂 API 只檢查本機是否有金鑰；代管 AI 會即時驗證 Discord 登入與官方伺服器會員。
+/// 自訂 API 只檢查本機是否有金鑰；代管 AI 需要 Discord 會員資格與 Turnstile 短效憑證。
 #[tauri::command]
 async fn ai_status() -> serde_json::Value {
     let settings = get_api_settings_public();
@@ -1565,17 +1622,24 @@ async fn ai_status() -> serde_json::Value {
         .as_ref()
         .map(|s| s.message.clone())
         .unwrap_or_else(|| "目前無法確認 Discord 登入狀態。".into());
+    let turnstile = turnstile_status();
+    let identity_ready = logged_in && in_guild && service_available;
+    // Turnstile 已取消（服務端未設金鑰）：代管 AI 只看 Discord 身分是否就緒，不再要求安全驗證。
+    // 回報 turnstileVerified=true 讓 UI 不再顯示/觸發安全驗證步驟。
+    let ready = managed_ai_available() && identity_ready;
     serde_json::json!({
-        "ready": managed_ai_available() && logged_in && in_guild && service_available,
+        "ready": ready,
         "aiMode": "managed",
         "usingOwnKey": false,
         "managedFree": true,
         "loggedIn": logged_in,
         "inGuild": in_guild,
         "serviceAvailable": service_available,
+        "turnstileVerified": true,
+        "turnstileExpiresAt": turnstile.expires_at,
         "inviteUrl": DISCORD_INVITE_URL,
         "displayName": status.as_ref().map(|s| s.nickname.clone()).unwrap_or_default(),
-        "message": message
+        "message": if identity_ready { "開發者提供的翻譯已可使用。".to_string() } else { message }
     })
 }
 
@@ -1629,7 +1693,7 @@ async fn check_update() -> UpdateCheck {
         })
 }
 
-/// 下載新版安裝檔並開啟（使用者手動點一次完成）。不自動替換執行檔。
+/// 下載並驗證新版 NSIS；優先靜默安裝＋重開，系統不允許時退回可見安裝程式。
 #[tauri::command]
 async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
     let r = tauri::async_runtime::spawn_blocking(download_and_launch)
@@ -1638,11 +1702,21 @@ async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
     match r {
         Ok(d) => {
             emit_log(&app, "info", &d.message);
-            Ok(serde_json::json!({
+            let should_exit = d.should_exit;
+            let response = serde_json::json!({
                 "path": d.path,
                 "launched": d.launched,
+                "automatic": d.automatic,
                 "message": d.message,
-            }))
+            });
+            if should_exit {
+                let exit_app = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    exit_app.exit(0);
+                });
+            }
+            Ok(response)
         }
         Err(e) => {
             emit_error(&app, &e);
@@ -1748,6 +1822,9 @@ pub fn run() {
             open_path,
             open_url,
             open_guide_window,
+            create_share_package,
+            managed_output_base,
+            check_install_target,
             create_font_pack,
             save_api_key,
             save_api_settings_cmd,
@@ -1758,6 +1835,8 @@ pub fn run() {
             cancel_discord_login_cmd,
             discord_auth_status,
             discord_logout,
+            turnstile_verify,
+            cancel_turnstile_verification_cmd,
             get_api_settings,
             get_default_reference_pack,
             get_ui_prefs,

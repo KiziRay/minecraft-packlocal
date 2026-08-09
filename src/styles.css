@@ -190,6 +190,7 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: 0.55; }
 .managed-auth-actions, .login-fallback-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .login-fallback { display: grid; gap: 9px; padding-top: 12px; border-top: 1px solid var(--line); }
 .login-fallback[hidden] { display: none !important; }
+.turnstile-auth-row { display: grid; gap: 9px; padding-top: 12px; border-top: 1px solid var(--line); }
 .advanced-details { border-top: 1px solid var(--line); }
 .advanced-details[hidden] { display: none !important; }
 .advanced-details summary { padding: 12px 0 9px; color: var(--accent); font-size: 14px; font-weight: 700; cursor: pointer; }
@@ -363,3 +364,12 @@ html[data-theme="light"] .guide-shell::after { background: rgba(248, 247, 242, 0
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+/* 分享打包 + 醒目的「支持開發」按鈕（可重複出現） */
+.share-support-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
+.inline-check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+.inline-check input { width: 15px; height: 15px; accent-color: var(--accent); }
+.support-cta { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: #fffaf7; font: inherit; font-weight: 700; cursor: pointer; transition: transform 150ms ease, opacity 150ms ease; }
+.support-cta:hover { transform: translateY(-1px); opacity: 0.94; }
+.support-cta > span { font-size: 15px; }
+.footer-promo .promo-card[data-url="https://zeitfrei.bobaboba.me"] { border-color: var(--accent); }

@@ -19,11 +19,13 @@ mod pack_out;
 mod placeholder;
 mod quests_books;
 mod secrets;
+mod share_pack;
 mod security;
 mod session;
 mod shared_tm;
 mod text_overlay;
 mod tm;
+mod turnstile;
 mod updater;
 
 pub use apply_instance::{apply_to_instance, restore_last_apply, ApplyResult, RestoreResult};
@@ -62,9 +64,14 @@ pub use secrets::{
     set_minimize_on_close, ApiSettingsPublic,
 };
 pub use security::{normalize_user_path, sanitize_folder_name, validate_open_url};
+pub use share_pack::package_translation;
 pub use session::{
     count_map, find_pack_near, find_session_file, has_session_file, load_pack_zh, load_session,
     remaining_pending, save_session, TranslateSession, SESSION_FILE,
 };
 pub use text_overlay::translate_text_overlays;
+pub use turnstile::{
+    cancel_turnstile_verification, clear_turnstile_proof, turnstile_status,
+    verify_turnstile_blocking,
+};
 pub use updater::{check_update as check_update_engine, download_and_launch, UpdateCheck};

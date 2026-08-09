@@ -1,4 +1,4 @@
-# 架構說明（0.4.0）
+# 架構說明（1.0.1）
 
 ## 1. 總覽
 
@@ -29,13 +29,16 @@
 ```
 桌面 App ──GET  /api/desktop/latest──► Worker（回最新版本）→ 檢查更新
         ├─GET  /api/desktop-auth────► cloud.zeitfrei.uk（Discord OAuth）
-        └─POST /v1/chat/completions─► Worker ──驗證 session／會員──► 上游 AI
+        ├─POST /api/turnstile/start─► Worker ──► 瀏覽器 Turnstile ──► Siteverify
+        │                                      └─短效 HMAC 憑證→ 127.0.0.1 callback
+        └─POST /v1/chat/completions─► Worker ──驗證 session／會員／Turnstile 憑證──► 上游 AI
                                             └─► cloud.zeitfrei.uk/member-tier
 ```
 
 - Worker 原始碼在 `worker/`，已部署 `modpack-i18n.jolin34563.workers.dev`。
-- **金鑰只在 Worker secret**，exe 只有非機密的 `MANAGED_BASE_URL`。
-- 代管模式沿用 ZeitFrei 桌面登入 callback；Worker 要求新版協定標頭、有效 session 與官方 Discord 會員資格，任一不符即拒絕。
+- **DeepSeek、Turnstile 與 HMAC 金鑰只在 Worker secret**，exe 只有非機密的 `MANAGED_BASE_URL`。
+- 代管模式沿用 ZeitFrei 桌面登入 callback；Worker 協定 v3 要求有效 session、官方 Discord 會員資格與 Turnstile 短效憑證，任一不符即拒絕。
+- Turnstile 原始 token 只使用一次並由 Worker 呼叫 Siteverify；桌面端只收到綁定 Discord user id 的短效憑證，且只保存在記憶體。
 - 使用者自填金鑰時客戶端**直連上游、不經 Worker**（見 `secrets::resolve_ai_config`）。
 
 ## 2. 一鍵翻譯資料流
@@ -113,6 +116,7 @@ instance (mods/…)
 |------|------|
 | API 金鑰、Base URL、模型、AI 來源、縮小偏好 | `%APPDATA%\modpack-i18n-tool\secrets.json` |
 | Discord 桌面登入 session | `%APPDATA%\modpack-i18n-tool\discord-session.json` |
+| Turnstile 短效憑證 | 僅目前行程記憶體；不寫入磁碟 |
 | 使用者自訂譯名 | `%APPDATA%\modpack-i18n-tool\glossary.json` |
 | 翻譯記憶 | `%APPDATA%\modpack-i18n-tool\tm.json` |
 | 前端 | 無本地 storage 硬性依賴；偏好走後端 |
@@ -121,7 +125,7 @@ instance (mods/…)
 
 ## 6. 與 ZeitFrei 生態
 
-- 開發者代管 AI 沿用 `cloud.zeitfrei.uk` 的 Discord 桌面登入與會員端點；不接點數系統。
+- 開發者代管 AI 沿用 `cloud.zeitfrei.uk` 的 Discord 桌面登入與會員端點，並由 Cloudflare Turnstile 保護共用額度；不接點數系統。
 - 自訂 API 完全獨立，不需要 ZeitFrei 帳號或 Discord 會員資格。
 - 推廣連結與珍奶贊助為**外開瀏覽器**（`open_url`）。
 - 技術選擇對齊 ZeitFrei-Tool（Tauri 2 靜態前端），翻譯資料與工具設定仍由本專案管理。

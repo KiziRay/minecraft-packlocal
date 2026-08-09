@@ -1,4 +1,4 @@
-# Tauri Commands 契約（1.0.0）
+# Tauri Commands 契約（1.0.1）
 
 前端：`window.__TAURI__.core.invoke("command_name", { … })`  
 Rust：`snake_case`；JS 參數 **camelCase**。
@@ -100,12 +100,14 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `save_api_settings_cmd` | apiKey, baseUrl | string（金鑰空＝保留） |
 | `set_ai_mode_cmd` | aiMode：`managed`／`custom` | string |
 | `has_api_key` | — | bool；只代表是否已儲存自訂 API 金鑰 |
-| `ai_status` | — | 見下方；代管模式會即時驗證 Discord |
+| `ai_status` | — | 見下方；代管模式會檢查 Discord 與本機短效 Turnstile 憑證 |
 | `get_api_settings` | — | `{ baseUrl, hasKey, keyMasked, aiMode }` |
 | `discord_login` | — | `{ ok, user? , error? }`；開啟既有桌面 OAuth 流程 |
 | `cancel_discord_login_cmd` | — | bool |
 | `discord_auth_status` | — | `DiscordAuthStatus` |
 | `discord_logout` | — | string |
+| `turnstile_verify` | — | `{ ok, expiresAt?, error? }`；瀏覽器完成驗證後由本機 callback 接收短效憑證 |
+| `cancel_turnstile_verification_cmd` | — | bool |
 | `get_default_reference_pack` | — | string \| null |
 | `get_ui_prefs` | — | `{ minimizeOnClose }` |
 | `set_ui_prefs` | minimizeOnClose | string |
@@ -114,7 +116,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `diagnose_launch_failure` | instancePath | `LaunchDiagnosis`（見下）；讀當機報告判斷缺模組 vs 我們的檔 |
 | `restore_last_apply_cmd` | instancePath | `RestoreResult`；一鍵反轉上次套用 |
 | `check_update` | — | `UpdateCheck`（見下） |
-| `download_update` | — | `{ path, launched, message }`；下載並開啟安裝檔 |
+| `download_update` | — | `{ path, launched, automatic, message }`；驗證後安裝並重開，必要時退回可見安裝程式 |
 | `open_glossary` | — | string（自訂譯名檔路徑）；不存在會先建範本 |
 | `suggest_resourcepacks_dir` | instancePath | string（相容舊） |
 | `suggest_output_dir` | instancePath | string（建議繁中翻譯輸出） |
@@ -126,24 +128,28 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 ```json
 { "ready": true, "aiMode": "managed", "usingOwnKey": false,
   "managedFree": true, "loggedIn": true, "inGuild": true,
-  "serviceAvailable": true, "displayName": "玩家名稱",
-  "inviteUrl": "https://discord.gg/zeitfrei", "message": "Discord 登入與官方伺服器會員驗證完成。" }
+  "serviceAvailable": true, "turnstileVerified": true,
+  "turnstileExpiresAt": 1786320000, "displayName": "玩家名稱",
+  "inviteUrl": "https://discord.gg/zeitfrei", "message": "Cloudflare 安全驗證已完成。" }
 ```
 
-- `managed`：需要 Discord 登入且仍在 ZeitFrei 官方伺服器。桌面端、Rust 連線層與 Worker 都會檢查；Worker 缺少新版協定、session 或會員資格時直接拒絕。
+- `managed`：需要 Discord 登入、仍在官方伺服器，並完成 Cloudflare Turnstile。Worker 協定 v3 缺少 session、會員資格或短效憑證時直接拒絕。
 - `custom`：使用者自己的金鑰與 API 位置，直接連上游，不需要 Discord 驗證。
 - Discord 登入沿用 `https://cloud.zeitfrei.uk/api/desktop-auth` 與本機 `127.0.0.1:19420..19430/callback`，不需要新增 Discord Developer Portal callback。
+- Turnstile 使用 `127.0.0.1:19431..19440/turnstile-callback`；原始 token 由 Worker 呼叫 Siteverify，桌面端只在記憶體保存綁定 Discord user id 的短效 HMAC 憑證。
 - `discord-login-url` event payload 為 `{ "url": "https://…" }`，供前端顯示瀏覽器未自動開啟時的備用網址。
+- `turnstile-url` event 同樣回 `{ "url": "https://…" }`，供前端重新開啟驗證頁。
 
 ### 檢查更新（`UpdateCheck`）
 
 ```json
-{ "current": "0.5.0", "latest": "0.5.0", "updateAvailable": false,
-  "url": "https://…", "notes": "", "ok": true, "message": "已是最新版（0.5.0）" }
+{ "current": "1.0.1", "latest": "1.0.1", "updateAvailable": false,
+  "url": "https://…", "notes": "", "ok": true, "message": "已是最新版（1.0.1）" }
 ```
 
 - `ok:false` 代表「暫時查不到」（沒網路等），**不是錯誤**，UI 顯示提示即可。
-- `download_update` 只在有新版時下載安裝檔並 `open::that` 開啟；**不自我替換 exe**。
+- `download_update` 防止重複執行，只接受官方 Worker `/download/*.exe`；必須通過 SHA-256、100 KB～256 MB 與 `MZ` PE 標頭檢查。
+- Windows 優先以 NSIS `/S /R` 靜默升級並重新開啟；安裝器無法脫離父行程時，退回一般可見安裝程式。工具不自行覆寫執行中的 exe。
 - 前端接線：按鈕 id 用 `#btn-check-update`（`app.js` 末端自足區塊會自動接上，
   並在啟動時安靜檢查一次、把狀態寫進 `#update-status`）；也可呼叫 `window.zfCheckUpdate()`。
 

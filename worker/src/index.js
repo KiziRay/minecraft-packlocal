@@ -1,14 +1,24 @@
 // modpack-i18n Cloudflare Worker
 //
-// 兩個職責：
+// 主要職責：
 //  1. GET  /api/desktop/latest   → 桌面版更新檢查（回最新版本 + 下載連結）
-//  2. POST /v1/chat/completions  → AI 翻譯代理（注入伺服器端 DeepSeek 金鑰）
+//  2. GET/POST /turnstile        → Cloudflare 真人驗證與短效憑證
+//  3. POST /v1/chat/completions  → 驗證 Discord + Turnstile 後代理 AI
+//  4. /download、/tm             → R2 安裝檔與社群翻譯記憶
 //
 // 為什麼要代理而不是把金鑰編進 exe：
 //  - 金鑰若進 exe，任何人反編譯就能抽出，開發者的免費額度幾天內被刷爆。
 //  - 代理讓金鑰只存在 Worker secret，且可限流／隨時切換／統計用量。
 //
 // 客戶端在使用者「沒有自填金鑰」時走這裡；使用者自填金鑰則直連上游，不經本 Worker。
+
+import {
+  completeTurnstile,
+  renderTurnstile,
+  startTurnstile,
+  turnstileConfigured,
+  verifyTurnstileAccess,
+} from "./turnstile.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
@@ -28,6 +38,18 @@ export default {
     // 安裝檔下載：直接從 R2 串流。/download/<檔名>
     if (url.pathname.startsWith("/download/") && (request.method === "GET" || request.method === "HEAD")) {
       return download(url, env, request.method === "HEAD");
+    }
+
+    if (url.pathname === "/turnstile" && request.method === "GET") {
+      return renderTurnstile(request, env);
+    }
+    if (url.pathname === "/api/turnstile/start" && request.method === "POST") {
+      const access = await authorizeManagedIdentity(request, env);
+      if (!access.ok) return access.response;
+      return startTurnstile(request, env, access.userId);
+    }
+    if (url.pathname === "/api/turnstile/verify" && request.method === "POST") {
+      return completeTurnstile(request, env);
     }
 
     if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
@@ -50,6 +72,7 @@ export default {
         service: "modpack-i18n",
         version: env.LATEST_VERSION,
         hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
+        turnstileReady: turnstileConfigured(env),
       });
     }
 
@@ -331,7 +354,34 @@ async function proxyChat(request, env) {
 }
 
 async function authorizeManagedAi(request, env) {
-  const expectedProtocol = String(env.MANAGED_AI_PROTOCOL || "2");
+  const identity = await authorizeManagedIdentity(request, env);
+  if (!identity.ok) return identity;
+
+  // Turnstile 目前停用（使用者要求取消；服務端金鑰未完整設定）。維持「Discord 登入即可」。
+  // 要重新啟用：wrangler 設 TURNSTILE_ENFORCED="1"，並設好 TURNSTILE_SECRET_KEY / TURNSTILE_PROOF_SECRET secret。
+  if (String(env.TURNSTILE_ENFORCED || "") === "1" && turnstileConfigured(env)) {
+    const proof = String(request.headers.get("x-zeitfrei-turnstile") || "").trim();
+    const checked = await verifyTurnstileAccess(proof, env, identity.userId);
+    if (!checked.ok) {
+      return {
+        ok: false,
+        response: json(
+          {
+            error: {
+              message: "Cloudflare Turnstile verification required",
+              type: checked.type,
+            },
+          },
+          checked.type === "turnstile_unavailable" ? 503 : 428
+        ),
+      };
+    }
+  }
+  return identity;
+}
+
+async function authorizeManagedIdentity(request, env) {
+  const expectedProtocol = String(env.MANAGED_AI_PROTOCOL || "3");
   if (request.headers.get("x-zeitfrei-ai-protocol") !== expectedProtocol) {
     return {
       ok: false,
@@ -439,7 +489,7 @@ function corsHeaders() {
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization, x-zeitfrei-ai-protocol, x-zeitfrei-client-version, x-zeitfrei-session",
+    "access-control-allow-headers": "content-type, authorization, x-zeitfrei-ai-protocol, x-zeitfrei-client-version, x-zeitfrei-session, x-zeitfrei-turnstile",
   };
 }
 

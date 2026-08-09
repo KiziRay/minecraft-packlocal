@@ -17,6 +17,7 @@ const UI_SCALE_STEP = 0.05;
 let uiScale = 1;
 let latestAiStatus = null;
 let discordLoginUrl = "";
+let turnstileUrl = "";
 let aiModeChangePromise = Promise.resolve();
 
 function clampUiScale(value) {
@@ -416,6 +417,9 @@ function setBusy(busy) {
     "btn-discord-join",
     "btn-discord-refresh",
     "btn-discord-logout",
+    "btn-turnstile-verify",
+    "btn-turnstile-open",
+    "btn-turnstile-cancel",
     "btn-open-login-url",
     "btn-copy-login-url",
     "btn-cancel-login",
@@ -480,6 +484,23 @@ async function pickDir(title) {
   return typeof selected === "string" ? selected : null;
 }
 
+/** 把翻譯結果打包成單一 zip，讓使用者可手動分享整包翻譯檔。 */
+async function packageShare() {
+  const outputDir = ($("output").value || "").trim();
+  if (!outputDir) return log("請先完成翻譯（還沒有可打包的翻譯結果）。");
+  const work = outputDir.replace(/[\\/]+$/, "") + "\\翻譯結果";
+  try {
+    const dest = await pickDir("選擇打包檔要存到哪個資料夾");
+    if (!dest) return;
+    const name = ($("pack-name").value || "模組包翻譯分享").trim();
+    appendLog("打包中…");
+    const zip = await invoke("create_share_package", { workRoot: work, destDir: dest, name });
+    appendLog("已打包成分享檔：\n" + zip + "\n把這個檔傳給別人，對方解壓後就是整包翻譯檔。");
+  } catch (e) {
+    log("打包失敗：\n" + String(e));
+  }
+}
+
 function syncAiPanel(refreshStatus = true) {
   const panel = $("ai-panel");
   const enabled = !!$("use-ai")?.checked;
@@ -516,6 +537,13 @@ async function refreshAiStatus() {
     const mode = String((s && (s.aiMode || s.ai_mode)) || aiModeFromUi());
     const usingOwnKey = !!(s && (s.usingOwnKey || s.using_own_key));
     const message = String(s && s.message ? s.message : "").trim();
+    const managedIdentityReady = !!(
+      s &&
+      (s.loggedIn || s.logged_in) &&
+      (s.inGuild || s.in_guild) &&
+      (s.serviceAvailable ?? s.service_available) !== false
+    );
+    const managedTurnstileReady = !!(s && (s.turnstileVerified || s.turnstile_verified));
     syncAiModeUi(mode);
     statusEl.textContent = ready
       ? usingOwnKey
@@ -523,13 +551,17 @@ async function refreshAiStatus() {
         : "AI：開發者 API 可用"
       : mode === "custom"
         ? "AI：請先設定自訂 API"
-        : "AI：尚未完成 Discord 驗證";
+        : managedIdentityReady && !managedTurnstileReady
+          ? "AI：請完成安全驗證"
+          : "AI：尚未完成 Discord 驗證";
     if (statusRow) statusRow.dataset.state = ready ? (usingOwnKey ? "own" : "managed") : "error";
 
     if (mode === "managed") {
       const loggedIn = !!(s && (s.loggedIn || s.logged_in));
       const inGuild = !!(s && (s.inGuild || s.in_guild));
       const serviceAvailable = s && (s.serviceAvailable ?? s.service_available) !== false;
+      const turnstileVerified = !!(s && (s.turnstileVerified || s.turnstile_verified));
+      const identityReady = loggedIn && inGuild && serviceAvailable;
       const displayName = String((s && (s.displayName || s.display_name)) || "").trim();
       const title = $("discord-auth-title");
       const authNote = $("discord-auth-note");
@@ -548,9 +580,28 @@ async function refreshAiStatus() {
       if ($("btn-discord-login")) $("btn-discord-login").hidden = loggedIn;
       if ($("btn-discord-logout")) $("btn-discord-logout").hidden = !loggedIn;
       if ($("btn-discord-join")) $("btn-discord-join").hidden = inGuild;
+      const turnstileTitle = $("turnstile-auth-title");
+      const turnstileNote = $("turnstile-auth-note");
+      if (turnstileTitle) {
+        turnstileTitle.textContent = turnstileVerified
+          ? "Cloudflare 安全驗證完成"
+          : identityReady
+            ? "Cloudflare 尚未驗證"
+            : "Cloudflare 等待 Discord 驗證";
+      }
+      if (turnstileNote) {
+        turnstileNote.textContent = turnstileVerified
+          ? "短效憑證只保留在本次開啟的工具記憶體中。"
+          : identityReady
+            ? "完成後即可使用開發者提供的翻譯額度。"
+            : "先完成 Discord 登入與伺服器資格確認。";
+      }
+      if ($("btn-turnstile-verify")) {
+        $("btn-turnstile-verify").hidden = !identityReady || turnstileVerified;
+      }
       if (noteEl) {
         noteEl.textContent = ready
-          ? "登入資格會在每次翻譯時由伺服器再次確認。"
+          ? "Discord 資格與安全憑證會在每次代管翻譯時再次確認。"
           : message || "請先登入 Discord 並加入 ZeitFrei 官方伺服器。";
       }
     } else if (noteEl) {
@@ -590,7 +641,7 @@ async function changeAiMode(mode) {
 
 async function ensureAiReadyForAction() {
   await aiModeChangePromise;
-  const status = await refreshAiStatus();
+  let status = await refreshAiStatus();
   if (status && status.ready !== false) return true;
   const mode = String((status && (status.aiMode || status.ai_mode)) || aiModeFromUi());
   const message = String((status && status.message) || "目前無法確認 AI 狀態。");
@@ -600,6 +651,16 @@ async function ensureAiReadyForAction() {
     $("api-key")?.focus();
   } else {
     $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const loggedIn = !!(status && (status.loggedIn || status.logged_in));
+    const inGuild = !!(status && (status.inGuild || status.in_guild));
+    const serviceAvailable = status && (status.serviceAvailable ?? status.service_available) !== false;
+    const turnstileVerified = !!(status && (status.turnstileVerified || status.turnstile_verified));
+    if (loggedIn && inGuild && serviceAvailable && !turnstileVerified) {
+      if (await beginTurnstileVerification()) {
+        status = await refreshAiStatus();
+        return !!(status && status.ready !== false);
+      }
+    }
   }
   return false;
 }
@@ -638,6 +699,43 @@ async function beginDiscordLogin() {
     appendError("Discord 登入失敗：" + formatInvokeError(e));
   } finally {
     if (loginButton) loginButton.disabled = false;
+    await refreshAiStatus();
+  }
+}
+
+async function beginTurnstileVerification() {
+  const verifyButton = $("btn-turnstile-verify");
+  const openButton = $("btn-turnstile-open");
+  const cancelButton = $("btn-turnstile-cancel");
+  if (verifyButton) verifyButton.disabled = true;
+  if (openButton) openButton.hidden = true;
+  if (cancelButton) cancelButton.hidden = false;
+  if ($("turnstile-auth-title")) $("turnstile-auth-title").textContent = "等待 Cloudflare 驗證";
+  if ($("turnstile-auth-note")) $("turnstile-auth-note").textContent = "請在瀏覽器完成驗證，再回到工具。";
+  try {
+    const result = await invoke("turnstile_verify");
+    if (result && result.ok) {
+      turnstileUrl = "";
+      appendLog("Cloudflare 安全驗證完成。");
+      return true;
+    }
+    const reason = String((result && result.error) || "驗證未完成");
+    const message = reason === "cancelled"
+      ? "已取消安全驗證。"
+      : reason === "timeout"
+        ? "安全驗證逾時，請重新驗證。"
+        : reason === "browser_open_failed"
+          ? "瀏覽器沒有自動開啟，請按「重新開啟驗證頁」。"
+          : "安全驗證未完成：" + reason;
+    appendLog(message, "warn");
+    return false;
+  } catch (e) {
+    appendError("Cloudflare 安全驗證失敗：" + formatInvokeError(e));
+    return false;
+  } finally {
+    if (verifyButton) verifyButton.disabled = false;
+    if (cancelButton) cancelButton.hidden = true;
+    if (openButton) openButton.hidden = !turnstileUrl;
     await refreshAiStatus();
   }
 }
@@ -718,6 +816,10 @@ async function onRun() {
       msg += "\n\n" + (result.minemenuMsg || result.minemenu_msg);
     }
     setLogFinal(msg);
+    if ($("chk-package")?.checked) {
+      appendLog("你勾了「建立打包檔案」，接著選存放位置…");
+      await packageShare();
+    }
   } catch (e) {
     handleRunFailure(e, "翻譯失敗");
     if (!isCancellation(e)) {
@@ -935,6 +1037,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     /* 瀏覽器仍可能由後端直接開啟，不阻擋登入。 */
   }
+  try {
+    await listen("turnstile-url", (ev) => {
+      const payload = (ev && ev.payload) || {};
+      turnstileUrl = String(payload.url || "").trim();
+      if ($("btn-turnstile-open")) $("btn-turnstile-open").hidden = !turnstileUrl;
+    });
+  } catch (e) {
+    /* 後端仍會直接開啟瀏覽器；事件只供手動重開。 */
+  }
 
   $("use-ai").onchange = () => syncAiPanel();
   document.querySelectorAll('input[name="ai-source"]').forEach((radio) => {
@@ -944,6 +1055,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   if ($("btn-discord-login")) $("btn-discord-login").onclick = beginDiscordLogin;
   if ($("btn-discord-refresh")) $("btn-discord-refresh").onclick = refreshAiStatus;
+  if ($("btn-turnstile-verify")) $("btn-turnstile-verify").onclick = beginTurnstileVerification;
+  if ($("btn-turnstile-open")) {
+    $("btn-turnstile-open").onclick = () => openExternalUrl(turnstileUrl);
+  }
+  if ($("btn-turnstile-cancel")) {
+    $("btn-turnstile-cancel").onclick = async () => {
+      await invoke("cancel_turnstile_verification_cmd");
+      $("btn-turnstile-cancel").hidden = true;
+    };
+  }
   if ($("btn-discord-join")) {
     $("btn-discord-join").onclick = () => {
       const invite = (latestAiStatus && (latestAiStatus.inviteUrl || latestAiStatus.invite_url)) || "https://discord.gg/zeitfrei";
@@ -954,6 +1075,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("btn-discord-logout").onclick = async () => {
       try {
         await invoke("discord_logout");
+        turnstileUrl = "";
+        if ($("btn-turnstile-open")) $("btn-turnstile-open").hidden = true;
         appendLog("已登出 Discord。");
       } catch (e) {
         appendError("Discord 登出失敗：" + formatInvokeError(e));
@@ -1078,8 +1201,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     },
     { passive: false }
   );
-  // 推廣連結：Discord／支持開發
-  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
+  // 推廣連結：Discord／支持開發（含主畫面醒目的支持鈕，可重複出現）
+  document.querySelectorAll(".promo-card[data-url], .support-cta[data-url]").forEach((el) => {
     el.addEventListener("click", async () => {
       const url = el.getAttribute("data-url");
       if (!url) return;
@@ -1159,11 +1282,20 @@ window.addEventListener("DOMContentLoaded", async () => {
         await detectVersionForInstance(p, false);
         if (!($("output").value || "").trim()) {
           try {
+            // 預設把中繼檔放工具自管的暫存區，不在使用者資料夾建立「翻譯結果」。
+            // 想要一份看得到的輸出，可按下方「使用啟動器建議的位置」。
             const base =
+              (await invoke("managed_output_base").catch(() => null)) ||
               (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null)) ||
               (await invoke("suggest_resourcepacks_dir", { instancePath: p }));
-            $("output").value = base;
-            appendLog("已建議結果位置：\n" + base);
+            if (base) {
+              $("output").value = base;
+              appendLog(
+                "翻譯結果會放在工具暫存區（不在你的資料夾另建「翻譯結果」）：\n" +
+                  base +
+                  "\n完成後按「套用到遊戲」直接覆蓋安裝；想留一份可分享的檔就勾「打包檔」。"
+              );
+            }
           } catch (_) {
             /* 略 */
           }
@@ -1198,6 +1330,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
+  if ($("btn-package")) {
+    $("btn-package").onclick = () => packageShare();
+  }
   $("btn-open").onclick = async () => {
     const outputInput = document.body.dataset.appPage === "font" ? $("font-output") : $("output");
     const outputDir = (outputInput?.value || "").trim();
@@ -1221,10 +1356,12 @@ window.addEventListener("DOMContentLoaded", async () => {
 // 介面由 GPT 維護；本區塊只負責把「檢查更新」接到後端，且完全防禦式：
 // 有 #btn-check-update 就接上點擊；沒有也不影響其他功能。
 // 契約：invoke("check_update") → { current, latest, updateAvailable, url, notes, ok, message }
-//       invoke("download_update") → { path, launched, message }
+//       invoke("download_update") → { path, launched, automatic, message }
 (function wireUpdateChecker() {
   const _invoke =
     (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) || null;
+  let latestUpdateInfo = null;
+  let updateInFlight = false;
 
   async function runUpdateCheck(interactive) {
     if (!_invoke) return;
@@ -1245,6 +1382,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
       return;
     }
+    latestUpdateInfo = info;
     if (status) status.textContent = info.message || "";
     if (!info.updateAvailable) {
       if (interactive && typeof appendLog === "function") appendLog(info.message || "已是最新版");
@@ -1262,20 +1400,54 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     if (interactive) {
       const ok = window.confirm(
-        "發現新版本 " + info.latest + "。\n要現在下載安裝檔嗎？（下載後需手動點一次完成安裝）"
+        "發現新版本 " + info.latest + "。\n要立即下載、驗證並自動安裝嗎？\n\n安裝完成後工具會重新開啟。"
       );
       if (ok) await runDownload();
     }
   }
 
-  async function runDownload() {
-    if (!_invoke) return;
+  async function openManualDownload() {
+    const url = latestUpdateInfo && latestUpdateInfo.url;
+    if (!url || !_invoke) return;
     try {
-      if (typeof appendLog === "function") appendLog("正在下載新版安裝檔…");
+      await _invoke("open_url", { url });
+      if (typeof appendLog === "function") appendLog("已用瀏覽器開啟官方安裝檔下載。", "warn");
+    } catch (e) {
+      if (typeof appendLog === "function") appendLog("無法開啟手動下載：" + String(e), "error");
+    }
+  }
+
+  async function runDownload() {
+    if (!_invoke || updateInFlight) return;
+    updateInFlight = true;
+    const btn = document.getElementById("btn-check-update");
+    const status = document.getElementById("update-status");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "正在更新…";
+    }
+    if (status) status.textContent = "正在下載並驗證安裝檔";
+    try {
+      if (typeof appendLog === "function") appendLog("正在下載並驗證新版安裝檔，請勿關閉工具…");
       const r = await _invoke("download_update");
-      if (typeof appendLog === "function") appendLog((r && r.message) || "已下載。");
+      const message = (r && r.message) || "更新安裝程式已啟動。";
+      if (typeof appendLog === "function") appendLog(message);
+      if (status) status.textContent = r && r.automatic ? "正在安裝，稍後會重新開啟" : "請依安裝畫面完成更新";
     } catch (e) {
       if (typeof appendLog === "function") appendLog("下載更新失敗：" + String(e), "error");
+      if (status) status.textContent = "自動更新失敗";
+      if (latestUpdateInfo && latestUpdateInfo.url) {
+        const manual = window.confirm("自動更新失敗。\n要改用瀏覽器下載官方安裝檔嗎？");
+        if (manual) await openManualDownload();
+      }
+    } finally {
+      updateInFlight = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = latestUpdateInfo && latestUpdateInfo.latest
+          ? "下載新版 " + latestUpdateInfo.latest
+          : "檢查更新";
+      }
     }
   }
 
