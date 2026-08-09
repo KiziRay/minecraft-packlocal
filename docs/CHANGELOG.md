@@ -2,8 +2,16 @@
 
 格式：版本 — 日期（台北）— 摘要。
 
-## 未發佈（開發中）
+## 1.0.0 — 2026-08-10（台北）— 公開發佈
 
+- **任務／書本系統翻譯（新增，`engine/quests_books.rs`）**：Better Questing、HQM、Heracles、Modonomicon
+  的顯示文字。採「顯示欄位白名單」路徑感知——只翻 name／title／subtitle／description／text… 可達的字串，
+  結構欄位（`id`／`type`／`icon`…）與序列化元件不動；BQ 的 `name:8`／`desc:8` 型別後綴會先剝除。串入一鍵與補翻流程。
+- **文件補全**：新增 `docs/支援範圍與免責聲明.md`（哪些能翻、哪些不能翻＋免責條款）；README／USER-GUIDE
+  補支援矩陣與共享翻譯記憶隱私說明；「覆蓋範圍說明.txt」更新支援清單與未支援項（GuideME Markdown、
+  `.zip` 資料包、KubeJS 腳本硬字串、基岩版）。
+- **公開發佈**：GitHub `KiziRay/minecraft-packlocal`（PolyForm Noncommercial 1.0.0）；Release 附安裝版／免安裝版與 `SHA256SUMS.txt`。
+- 以下項目隨本版一併發佈：
 - **社群共享翻譯記憶**（`engine/shared_tm.rs` + Worker `/tm/lookup`、`/tm/contribute`）：
   **隱藏、預設開、零設定**。翻譯時先查社群共享庫，命中就免送 AI；AI 新產出的譯文匿名回饋。
   - **以 `(模組, lang key, 原文雜湊)` 為單位**——跨整合包安全：任何含同模組同版本的包都能重用，
