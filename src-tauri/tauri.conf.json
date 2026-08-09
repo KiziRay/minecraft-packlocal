@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "模組包翻譯工具",
-  "mainBinaryName": "模組包翻譯工具",
-  "version": "0.5.1",
+  "mainBinaryName": "Minecraft 模組包翻譯工具",
+  "version": "1.0.0",
   "identifier": "uk.zeitfrei.modpack-i18n",
   "build": {
     "frontendDist": "../src"

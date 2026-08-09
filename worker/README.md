@@ -9,7 +9,19 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 | GET | `/api/desktop/latest` | 回 `{version, url, notes, sha256}`，桌面版檢查更新用 |
 | GET | `/download/<檔名>` | 從 R2 bucket `modpack-i18n` 串流安裝檔（更新下載用） |
 | POST | `/v1/chat/completions` | AI 代理：注入伺服器端 DeepSeek 金鑰後轉發上游 |
-| GET | `/health` | 健康檢查 |
+| POST | `/tm/lookup` | 社群共享翻譯記憶查詢（`{items:[{ns,kh}]}` → `{hits:{kh:zh}}`） |
+| POST | `/tm/contribute` | 貢獻翻譯（`{items:[{ns,kh,zh}]}`）；存 R2 `tm/v1/<ns>.json` |
+| GET | `/health` | 健康檢查（`hasKey` 表代管金鑰是否設好） |
+
+共享翻譯記憶：依模組分片存 R2（`tm/v1/<namespace>.json.gz = {keyhash: zh}`），keyhash＝
+`sha256(ns\0key\0src)[:24]`。只存字串、無個資。
+
+**省容量／避免重複儲存的設計**：
+- **gzip 壓縮**分片（繁中 JSON 常縮到 1/3 以下；實測重複性高的資料省 ~90%）。
+- **keyed map**：同一條只有一個鍵，天生去重、不會重複儲存。
+- **客戶端只回饋「本次新由 AI 產出」的條目**（共享庫命中、術語表、本機記憶都不重送）。
+- **只有真的有新條目才寫分片**（`changed` 才 put），沒新增就不動 R2。
+- 讀改寫為 last-write-wins（偶發遺漏下次翻譯自動補回）。有 KV 權限可再升級成 KV。
 
 目前線上：`0.5.0`，安裝檔
 `https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-0.5.0-setup.exe`

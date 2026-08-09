@@ -24,6 +24,9 @@ pub struct TranslateSession {
     pub pending_count: usize,
     pub keys_zh: usize,
     pub note: String,
+    /// 使用者指定的目標 MC 版本（補翻／修復重建 pack.mcmeta 時沿用）。舊檔沒有 → None。
+    #[serde(default)]
+    pub target_version: Option<String>,
 }
 
 /// 可能存放工作階段的目錄（翻譯結果／舊版相容）

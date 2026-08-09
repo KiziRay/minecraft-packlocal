@@ -1,7 +1,7 @@
 {
   "name": "modpack-i18n-tool",
   "private": true,
-  "version": "0.5.1",
+  "version": "1.0.0",
   "description": "Minecraft 模組包→台灣繁體中文（Tauri 2；不改 jar）",
   "scripts": {
     "tauri": "tauri",

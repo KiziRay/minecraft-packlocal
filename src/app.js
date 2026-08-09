@@ -57,6 +57,7 @@ function nowStamp() {
 function renderLog() {
   const el = $("log");
   if (!el) return;
+  el.classList.remove("log-empty");
   el.textContent = progressLogLines.join("\n");
   el.scrollTop = el.scrollHeight;
 }
@@ -372,6 +373,7 @@ function setBusy(busy) {
     "font-oversample",
     "btn-glossary",
     "minimize-on-close",
+    "target-version",
     "tab-translate",
     "tab-font",
   ].forEach((id) => {
@@ -423,7 +425,43 @@ async function pickDir(title) {
 }
 
 function syncAiPanel() {
-  $("ai-panel").style.display = $("use-ai").checked ? "block" : "none";
+  const panel = $("ai-panel");
+  const enabled = !!$("use-ai")?.checked;
+  if (panel) {
+    panel.style.display = enabled ? "block" : "none";
+    panel.setAttribute("aria-hidden", enabled ? "false" : "true");
+  }
+}
+
+async function refreshAiStatus() {
+  const statusEl = $("key-status");
+  const noteEl = $("ai-source-note");
+  const statusRow = statusEl?.closest(".ai-status");
+  if (!statusEl) return;
+  try {
+    const s = await invoke("ai_status");
+    const ready = s && s.ready !== false;
+    const usingOwnKey = !!(s && (s.usingOwnKey || s.using_own_key));
+    const managedFree = !!(s && (s.managedFree || s.managed_free));
+    const message = String(s && s.message ? s.message : "").trim();
+    statusEl.textContent = ready
+      ? usingOwnKey
+        ? "AI：使用自己的金鑰"
+        : managedFree
+          ? "AI：開發者代管翻譯可用"
+          : "AI：目前可用"
+      : "AI：目前無法使用";
+    if (statusRow) statusRow.dataset.state = ready ? (usingOwnKey ? "own" : "managed") : "error";
+    if (noteEl) {
+      noteEl.textContent = message || (ready
+        ? "可直接使用 AI；自備金鑰可在進階設定中填寫。"
+        : "請稍後再試，或在進階設定確認自己的 API 設定。");
+    }
+  } catch (e) {
+    statusEl.textContent = "AI：狀態暫時無法確認";
+    if (statusRow) statusRow.dataset.state = "error";
+    if (noteEl) noteEl.textContent = "不影響簡繁轉換；需要補翻英文時請稍後再確認。";
+  }
 }
 
 async function refreshApiSettings() {
@@ -432,14 +470,35 @@ async function refreshApiSettings() {
     // 不在介面顯示具體服務商網址
     const bu = (s.baseUrl || s.base_url || "").trim();
     $("base-url").value = /deepseek/i.test(bu) ? "" : bu;
-    // 永不顯示金鑰內容（含遮罩）
-    if (s.hasKey || s.has_key) {
-      $("key-status").textContent = "AI 金鑰：已設定";
-    } else {
-      $("key-status").textContent = "AI 金鑰：尚未設定（展開下方填寫）";
-    }
   } catch (e) {
-    $("key-status").textContent = "AI 金鑰：狀態不明";
+    /* AI 狀態由 refreshAiStatus 顯示；設定讀取失敗不阻擋本機翻譯。 */
+  }
+}
+
+async function detectVersionForInstance(instancePath, silent) {
+  const select = $("target-version");
+  const status = $("version-status");
+  if (!select || !instancePath) return null;
+  try {
+    const detected = await invoke("detect_mc_version", { instancePath });
+    if (detected && !Array.from(select.options).some((option) => option.value === detected)) {
+      select.add(new Option(detected, detected));
+    }
+    if (detected) {
+      if (!select.value || select.dataset.autoDetected === "true") {
+        select.value = detected;
+        select.dataset.autoDetected = "true";
+        if (status) status.textContent = "已自動偵測：Minecraft " + detected;
+      } else if (status && !silent) {
+        status.textContent = "已手動指定：Minecraft " + select.value;
+      }
+    } else if (status && !silent) {
+      status.textContent = "找不到版本，可從下拉選單手動指定";
+    }
+    return detected || null;
+  } catch (e) {
+    if (status && !silent) status.textContent = "版本偵測失敗，可手動指定";
+    return null;
   }
 }
 
@@ -451,6 +510,7 @@ async function onSaveAdv() {
     });
     $("api-key").value = ""; // 輸入框清空，畫面上不留金鑰
     await refreshApiSettings();
+    await refreshAiStatus();
     log("設定已儲存。");
   } catch (e) {
     log("儲存失敗：\n" + String(e));
@@ -464,11 +524,9 @@ async function onRun() {
   if (!outputDir) return log("請先選擇「翻譯結果放哪」。");
 
   const useAi = !!$("use-ai").checked;
-  if (useAi) {
-    const ok = await invoke("has_api_key");
-    if (!ok) {
-      return log("你勾了 AI，但還沒有金鑰。請展開「填寫／修改 AI 金鑰」儲存。");
-    }
+  let targetVersion = ($("target-version")?.value || "").trim();
+  if (!targetVersion) {
+    targetVersion = (await detectVersionForInstance(instancePath, true)) || "";
   }
 
   setBusy(true);
@@ -484,6 +542,7 @@ async function onRun() {
       packName: ($("pack-name").value || "繁體中文翻譯").trim(),
       useAi,
       referencePack: null,
+      targetVersion: targetVersion || null,
     });
     setProgress(100, "全部完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
@@ -520,9 +579,13 @@ async function onRepair() {
 
   const useAi = !!$("use-ai").checked;
   if (useAi) {
-    const ok = await invoke("has_api_key");
-    if (!ok) {
-      appendLog("沒有 AI 金鑰：仍可修復檔案，只是不會再上網補譯。");
+    try {
+      const ai = await invoke("ai_status");
+      if (ai && ai.ready === false) {
+        appendLog("AI 目前無法使用：仍可修復既有檔案，但不會補翻新的文字。", "warn");
+      }
+    } catch (_) {
+      /* 修復本身仍可交給後端處理 */
     }
   }
 
@@ -552,9 +615,13 @@ async function onSupplement() {
   if (!outputDir) {
     return log("請選與上次相同的「翻譯結果」位置。");
   }
-  const ok = await invoke("has_api_key");
-  if (!ok) {
-    return log("「再補一些」需要 AI 金鑰，請先儲存金鑰。");
+  try {
+    const ai = await invoke("ai_status");
+    if (ai && ai.ready === false) {
+      return log("目前沒有可用的 AI 翻譯，請稍後再試或檢查進階設定。");
+    }
+  } catch (_) {
+    return log("目前無法確認 AI 狀態，請稍後再試。");
   }
   try {
     const st = await invoke("session_status", { outputDir });
@@ -645,6 +712,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initTheme();
   syncAiPanel();
   refreshApiSettings();
+  refreshAiStatus();
   loadUiPrefs();
   setProgress(0, "尚未開始");
   showAppPage("translate");
@@ -702,6 +770,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   $("use-ai").onchange = syncAiPanel;
+  if ($("target-version")) {
+    $("target-version").onchange = () => {
+      const value = $("target-version").value;
+      $("target-version").dataset.autoDetected = "false";
+      if ($("version-status")) {
+        $("version-status").textContent = value
+          ? "已手動指定：Minecraft " + value
+          : "將從遊戲實例自動偵測";
+      }
+    };
+  }
   if ($("minimize-on-close")) {
     $("minimize-on-close").onchange = async () => {
       try {
@@ -835,6 +914,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       const p = await pickDir("選擇遊戲／整合包資料夾");
       if (p) {
         $("instance").value = p;
+        await detectVersionForInstance(p, false);
         if (!($("output").value || "").trim()) {
           try {
             const base =

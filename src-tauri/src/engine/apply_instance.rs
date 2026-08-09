@@ -19,6 +19,140 @@ pub struct ApplyResult {
     pub warnings: Vec<String>,
 }
 
+/// 套用清單：記錄每個寫入的檔（相對遊戲目錄），以及它是「新增」還是「覆蓋既有」。
+/// 有了它，「還原上次套用」才能精準反轉：新增的刪掉、覆蓋的從備份還原。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ApplyManifest {
+    stamp: String,
+    mc_dir: String,
+    backup_dir: String,
+    /// 這次新增（原本不存在）→ 還原時刪除
+    added: Vec<String>,
+    /// 這次覆蓋（原本存在，已備份）→ 還原時從備份複製回來
+    overwritten: Vec<String>,
+}
+
+const APPLY_MANIFEST: &str = "套用清單.json";
+
+fn rel_to(mc: &Path, target: &Path) -> String {
+    target
+        .strip_prefix(mc)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// 一鍵還原：反轉最近一次套用（新增的刪掉、覆蓋的還原）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreResult {
+    pub backup_dir: String,
+    pub removed: usize,
+    pub restored: usize,
+    pub player_summary: String,
+}
+
+pub fn restore_last_apply(instance_path: &Path) -> Result<RestoreResult, String> {
+    let mc = resolve_minecraft_dir(instance_path)?;
+    let parent = mc.parent().unwrap_or(&mc);
+    // 找最新的 翻譯套用備份_*
+    let mut backups: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(parent) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir()
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.starts_with("翻譯套用備份_"))
+                    .unwrap_or(false)
+            {
+                backups.push(p);
+            }
+        }
+    }
+    if backups.is_empty() {
+        return Err("找不到任何『翻譯套用備份_』資料夾，沒有可還原的套用紀錄。".into());
+    }
+    backups.sort(); // 時間戳在名字裡，字典序≈時間序
+    let backup_root = backups.last().unwrap().clone();
+
+    let manifest_path = backup_root.join(APPLY_MANIFEST);
+    let mut removed = 0usize;
+    let mut restored = 0usize;
+
+    if let Ok(text) = fs::read_to_string(&manifest_path) {
+        let manifest: ApplyManifest = serde_json::from_str(&text)
+            .map_err(|e| format!("套用清單讀取失敗：{e}"))?;
+        // 新增的 → 刪除
+        for rel in &manifest.added {
+            let p = mc.join(rel);
+            if p.is_file() && fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+        // 覆蓋的 → 從備份複製回來（備份鏡像 mc 相對結構）
+        for rel in &manifest.overwritten {
+            let from = backup_root.join(rel);
+            let to = mc.join(rel);
+            if from.is_file() {
+                if let Some(parent) = to.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::copy(&from, &to).is_ok() {
+                    restored += 1;
+                }
+            }
+        }
+    } else {
+        // 舊備份沒有清單：退回「把備份內容整包蓋回去」（只能還原覆蓋，無法刪掉新增的）
+        for sub in ["resourcepacks", "config", "minemenu", "patchouli_books", "kubejs", "datapacks"] {
+            let from = backup_root.join(sub);
+            if from.is_dir() {
+                restored += restore_tree(&from, &mc.join(sub));
+            }
+        }
+    }
+
+    let player_summary = format!(
+        "已還原上次套用。\n\
+• 備份來源：\n{}\n\
+• 移除本次新增檔：{} 個\n\
+• 還原被覆蓋檔：{} 個\n\n\
+現在再開一次遊戲：\n\
+• 若開得起來 → 先前是翻譯檔造成的，歡迎把當機報告給我們修\n\
+• 若還是開不起來 → 不是翻譯，多半是整合包缺模組（可用『診斷開不了』看是缺什麼）\n\
+（本工具不改 mods/*.jar）",
+        backup_root.display(),
+        removed,
+        restored
+    );
+    Ok(RestoreResult {
+        backup_dir: backup_root.display().to_string(),
+        removed,
+        restored,
+        player_summary,
+    })
+}
+
+fn restore_tree(from: &Path, to: &Path) -> usize {
+    let mut n = 0usize;
+    for entry in walkdir::WalkDir::new(from).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path.strip_prefix(from).unwrap_or(path);
+        let target = to.join(rel);
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::copy(path, &target).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// 將「翻譯結果」套用到遊戲：resourcepacks zip + config/ftbquests + minemenu
 /// + patchouli_books / config/openloader / kubejs（若 work 有）。
 /// 絕不改 mods/*.jar。套用前備份會被覆蓋的目標。
@@ -169,6 +303,14 @@ pub fn apply_to_instance(
     );
     let _ = fs::write(backup_root.join("還原說明.txt"), bak_note);
 
+    // 套用清單（供一鍵還原）
+    let mut manifest = ApplyManifest {
+        stamp: stamp.clone(),
+        mc_dir: mc.display().to_string(),
+        backup_dir: backup_root.display().to_string(),
+        ..Default::default()
+    };
+
     // ── 複製 zip ──
     let mut zip_copied = None;
     if let Some(zip) = zip_src {
@@ -179,6 +321,7 @@ pub fn apply_to_instance(
             .and_then(|s| s.to_str())
             .unwrap_or("繁體中文翻譯.zip");
         let dest = rp.join(name);
+        let existed = dest.is_file();
         fs::copy(&zip, &dest).map_err(|e| {
             format!(
                 "複製資源包失敗（請確認遊戲已關閉且路徑可寫）：{e}\n來源：{}\n目標：{}",
@@ -186,6 +329,7 @@ pub fn apply_to_instance(
                 dest.display()
             )
         })?;
+        record_written(&mut manifest, &mc, &dest, existed);
         zip_copied = Some(dest.display().to_string());
     }
 
@@ -193,7 +337,7 @@ pub fn apply_to_instance(
     let mut quests_copied = false;
     if quests_src.is_dir() {
         fs::create_dir_all(mc.join("config")).map_err(|e| e.to_string())?;
-        merge_copy_dir(&quests_src, &quests_dest)?;
+        merge_copy_dir(&quests_src, &quests_dest, &mc, &mut manifest)?;
         quests_copied = true;
     }
 
@@ -202,14 +346,16 @@ pub fn apply_to_instance(
     if menu_src.is_file() {
         let menu_dir = mc.join("minemenu");
         fs::create_dir_all(&menu_dir).map_err(|e| e.to_string())?;
+        let existed = menu_dest.is_file();
         fs::copy(&menu_src, &menu_dest).map_err(|e| format!("複製快捷選單失敗：{e}"))?;
+        record_written(&mut manifest, &mc, &menu_dest, existed);
         minemenu_copied = true;
     }
 
     // ── 複製 patchouli_books ──
     let mut patchouli_copied = false;
     if has_patchouli {
-        merge_copy_dir(&patchouli_src, &patchouli_dest)?;
+        merge_copy_dir(&patchouli_src, &patchouli_dest, &mc, &mut manifest)?;
         patchouli_copied = true;
     }
 
@@ -217,28 +363,33 @@ pub fn apply_to_instance(
     let mut openloader_copied = false;
     if has_openloader {
         fs::create_dir_all(mc.join("config")).map_err(|e| e.to_string())?;
-        merge_copy_dir(&openloader_src, &openloader_dest)?;
+        merge_copy_dir(&openloader_src, &openloader_dest, &mc, &mut manifest)?;
         openloader_copied = true;
     }
 
     // ── 複製 kubejs（work 僅含翻譯產出；merge，不碰 mods）──
     let mut kubejs_copied = false;
     if has_kubejs {
-        merge_copy_dir(&kubejs_src, &kubejs_dest)?;
+        merge_copy_dir(&kubejs_src, &kubejs_dest, &mc, &mut manifest)?;
         kubejs_copied = true;
     }
 
     let mut fancymenu_copied = false;
     if has_fancymenu {
         fs::create_dir_all(mc.join("config")).map_err(|e| e.to_string())?;
-        merge_copy_dir(&fancymenu_src, &fancymenu_dest)?;
+        merge_copy_dir(&fancymenu_src, &fancymenu_dest, &mc, &mut manifest)?;
         fancymenu_copied = true;
     }
 
     let mut datapacks_copied = false;
     if has_datapacks {
-        merge_copy_dir(&datapacks_src, &datapacks_dest)?;
+        merge_copy_dir(&datapacks_src, &datapacks_dest, &mc, &mut manifest)?;
         datapacks_copied = true;
+    }
+
+    // 寫套用清單（供「一鍵還原」精準反轉）
+    if let Ok(js) = serde_json::to_string_pretty(&manifest) {
+        let _ = fs::write(backup_root.join(APPLY_MANIFEST), js + "\n");
     }
 
     let overlay_line = {
@@ -275,8 +426,12 @@ pub fn apply_to_instance(
 【請你】\n\
 1. 開遊戲 → 語言選「繁體中文（台灣）」\n\
 2. 資源包啟用剛複製的 zip\n\
-3. 不滿意可從備份還原（見備份內「還原說明.txt」）\n\
-4. 本工具不保證 100% 中文，任務／寫死字串／圖片文字可能仍英文",
+3. 本工具不保證 100% 中文，任務／寫死字串／圖片文字可能仍英文\n\
+\n\
+【萬一遊戲／世界開不起來】\n\
+• 多半是整合包本身缺模組（結構／前置），跟翻譯無關——按「診斷開不了」會讀當機報告告訴你缺什麼。\n\
+• 想排除是不是翻譯造成的：按「還原上次套用」一鍵復原（新增的刪掉、覆蓋的還原），再開一次。\n\
+• 資源包（語言檔）很安全；會影響世界載入的是資料包／任務類，還原後即可排除。",
         backup_root.display(),
         zip_copied
             .as_ref()
@@ -419,8 +574,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 把 src 樹合併進 dst（覆蓋同名檔）
-fn merge_copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
+/// 把 src 樹合併進 dst（覆蓋同名檔）；記錄每個寫入檔是新增或覆蓋（供還原）。
+fn merge_copy_dir(
+    src: &Path,
+    dst: &Path,
+    mc: &Path,
+    manifest: &mut ApplyManifest,
+) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in walkdir::WalkDir::new(src)
         .into_iter()
@@ -435,6 +595,7 @@ fn merge_copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            let existed = target.is_file();
             fs::copy(path, &target).map_err(|e| {
                 format!(
                     "套用複製失敗（請關遊戲後重試）{} → {}：{e}",
@@ -442,7 +603,18 @@ fn merge_copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
                     target.display()
                 )
             })?;
+            record_written(manifest, mc, &target, existed);
         }
     }
     Ok(())
+}
+
+/// 記錄一個寫入的檔到套用清單。
+fn record_written(manifest: &mut ApplyManifest, mc: &Path, target: &Path, existed_before: bool) {
+    let rel = rel_to(mc, target);
+    if existed_before {
+        manifest.overwritten.push(rel);
+    } else {
+        manifest.added.push(rel);
+    }
 }

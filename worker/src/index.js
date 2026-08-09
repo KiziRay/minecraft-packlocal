@@ -34,9 +34,23 @@ export default {
       return proxyChat(request, env);
     }
 
+    // 共享翻譯記憶（社群）：keyed by (模組, key, 原文) 的雜湊，存 R2、依模組分片。
+    if (url.pathname === "/tm/lookup" && request.method === "POST") {
+      return tmLookup(request, env);
+    }
+    if (url.pathname === "/tm/contribute" && request.method === "POST") {
+      return tmContribute(request, env);
+    }
+
     // 健康檢查
     if (url.pathname === "/" || url.pathname === "/health") {
-      return json({ ok: true, service: "modpack-i18n", version: env.LATEST_VERSION });
+      // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）——設好 secret 後可用來自我驗證
+      return json({
+        ok: true,
+        service: "modpack-i18n",
+        version: env.LATEST_VERSION,
+        hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
+      });
     }
 
     return json({ error: "not found" }, 404);
@@ -52,6 +66,125 @@ function latest(env) {
     notes: env.RELEASE_NOTES || "",
     sha256: env.INSTALLER_SHA256 || "",
   });
+}
+
+// ───────────────────────── 共享翻譯記憶（R2，依模組分片）─────────────────────────
+//
+// 儲存：tm/v1/<namespace>.json = { "<keyhash>": "zh", … }。keyhash = sha256(ns\0key\0src)[:24]。
+// 用 R2（沒有 KV 權限）；讀改寫為 last-write-wins，偶爾遺漏會在下次翻譯自動補回。
+// 只存字串，無任何身分/個資。
+
+const TM_MAX_ITEMS = 5000;
+const TM_MAX_ZH_LEN = 400;
+const TM_SHARD_CAP = 200000; // 單模組分片最多條數（防惡意灌爆）
+
+function tmShardKey(ns) {
+  return `tm/v1/${ns}.json.gz`;
+}
+
+// gzip 壓縮／解壓（省 R2 容量：繁中 JSON 通常縮到 1/3 以下）
+async function gzipBytes(str) {
+  const cs = new CompressionStream("gzip");
+  const w = cs.writable.getWriter();
+  w.write(new TextEncoder().encode(str));
+  w.close();
+  return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+}
+async function gunzipToStr(buf) {
+  const ds = new DecompressionStream("gzip");
+  const w = ds.writable.getWriter();
+  w.write(new Uint8Array(buf));
+  w.close();
+  return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+}
+function tmValidNs(s) {
+  return typeof s === "string" && s.length >= 1 && s.length <= 64 && /^[a-z0-9_.\-]+$/.test(s);
+}
+function tmValidKh(s) {
+  return typeof s === "string" && /^[0-9a-f]{16,64}$/.test(s);
+}
+async function tmReadShard(env, ns) {
+  const obj = await env.DOWNLOADS.get(tmShardKey(ns));
+  if (!obj) return null;
+  try {
+    const buf = await obj.arrayBuffer();
+    return JSON.parse(await gunzipToStr(buf));
+  } catch (_) {
+    return null;
+  }
+}
+
+async function tmLookup(request, env) {
+  if (!env.DOWNLOADS) return json({ hits: {} });
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return json({ error: "bad json" }, 400);
+  }
+  const items = Array.isArray(body.items) ? body.items.slice(0, TM_MAX_ITEMS) : [];
+  const byNs = new Map();
+  for (const it of items) {
+    if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh)) continue;
+    if (!byNs.has(it.ns)) byNs.set(it.ns, new Set());
+    byNs.get(it.ns).add(it.kh);
+  }
+  const hits = {};
+  const nss = [...byNs.keys()];
+  const CONC = 8;
+  for (let i = 0; i < nss.length; i += CONC) {
+    await Promise.all(
+      nss.slice(i, i + CONC).map(async (ns) => {
+        const shard = await tmReadShard(env, ns);
+        if (!shard) return;
+        for (const kh of byNs.get(ns)) {
+          const zh = shard[kh];
+          if (typeof zh === "string" && zh) hits[kh] = zh;
+        }
+      })
+    );
+  }
+  return json({ hits });
+}
+
+async function tmContribute(request, env) {
+  if (!env.DOWNLOADS) return json({ ok: false, accepted: 0 });
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return json({ error: "bad json" }, 400);
+  }
+  const items = Array.isArray(body.items) ? body.items.slice(0, TM_MAX_ITEMS) : [];
+  const byNs = new Map();
+  for (const it of items) {
+    if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh)) continue;
+    const zh = typeof it.zh === "string" ? it.zh.trim() : "";
+    if (!zh || zh.length > TM_MAX_ZH_LEN) continue;
+    if (!byNs.has(it.ns)) byNs.set(it.ns, {});
+    byNs.get(it.ns)[it.kh] = zh;
+  }
+  let accepted = 0;
+  for (const [ns, entries] of byNs) {
+    const shard = (await tmReadShard(env, ns)) || {};
+    let changed = false;
+    for (const [kh, zh] of Object.entries(entries)) {
+      if (Object.keys(shard).length >= TM_SHARD_CAP && !(kh in shard)) continue;
+      if (shard[kh] !== zh) {
+        shard[kh] = zh;
+        changed = true;
+        accepted++;
+      }
+    }
+    // 只有真的有新條目才寫（避免重複寫入）；寫的是 gzip 後的位元組（省容量）
+    if (changed) {
+      const gz = await gzipBytes(JSON.stringify(shard));
+      await env.DOWNLOADS.put(tmShardKey(ns), gz, {
+        httpMetadata: { contentType: "application/gzip" },
+      });
+    }
+  }
+  return json({ ok: true, accepted });
 }
 
 // ───────────────────────── 安裝檔下載（R2）─────────────────────────
@@ -85,9 +218,10 @@ async function download(url, env, headOnly) {
 // ───────────────────────── AI 代理 ─────────────────────────
 
 async function proxyChat(request, env) {
-  const key = env.DEEPSEEK_KEY;
+  // trim：擋掉空字串／只有換行的 secret（貼進遮罩提示常見的坑），也避免結尾換行害上游 401。
+  const key = env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim();
   if (!key) {
-    // secret 還沒設：明確告訴客戶端這是「服務端未就緒」，不是使用者金鑰問題。
+    // secret 未設或值為空：明確告訴客戶端這是「服務端未就緒」，不是使用者金鑰問題。
     return json(
       { error: { message: "managed translation not configured", type: "server_not_ready" } },
       503

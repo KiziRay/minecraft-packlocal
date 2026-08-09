@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "modpack-i18n-tool"
-version = "0.5.1"
+version = "1.0.0"
 dependencies = [
  "dirs 5.0.1",
  "open",

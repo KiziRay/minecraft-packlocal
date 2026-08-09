@@ -4,8 +4,10 @@
 mod engine;
 
 use engine::{
-    apply_to_instance, build_font_pack_str_with_options, build_resource_pack, check_cancelled,
-    convert_langmap_s2tw, converter_name, count_map, detect_pack_format,
+    apply_to_instance, restore_last_apply, diagnose_launch, LaunchDiagnosis, RestoreResult,
+    build_font_pack_str_with_options, build_resource_pack, check_cancelled,
+    convert_langmap_s2tw, converter_name, count_map, detect_minecraft_version, detect_pack_format,
+    pack_format_for_version,
     discover_default_reference, ensure_result_layout, ensure_space, ensure_user_glossary_template,
     MIN_FREE_BYTES,
     fill_missing_with_ai, find_pack_near, find_session_file, fix_minemenu_unicode_escapes,
@@ -14,7 +16,7 @@ use engine::{
     normalize_user_path, remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir,
     save_api_settings, save_session, scan_instance, sanitize_folder_name, set_minimize_on_close,
     subtract_covered, suggest_output_base, translate_ftbquests, translate_origins,
-    translate_text_overlays,
+    translate_quests_books, translate_text_overlays,
     user_glossary_path, validate_open_url, write_coverage_report, ApiSettingsPublic,
     ApplyResult, BuildOptions, CoverageStats, FontPackOptions, FontPackResult, LangMap, ScanReport,
     TranslateSession, UpdateCheck, CANCEL_MESSAGE, RESULT_DIR_NAME, SESSION_FILE,
@@ -167,6 +169,7 @@ async fn one_click_translate(
     pack_name: String,
     use_ai: bool,
     reference_pack: Option<String>,
+    target_version: Option<String>,
 ) -> Result<OneClickResult, String> {
     let instance = match normalize_path_strict(&instance_path) {
         Ok(p) => p,
@@ -193,11 +196,14 @@ async fn one_click_translate(
     let reference_pack = reference_pack
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let target_version = target_version
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     reset_cancel();
     let app2 = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_one_click(&app2, instance, out, pack_name, use_ai, reference_pack)
+        run_one_click(&app2, instance, out, pack_name, use_ai, reference_pack, target_version)
     })
     .await
     .map_err(|e| format!("工作中斷：{e}"))?;
@@ -227,6 +233,47 @@ fn cancel_task() -> String {
     "已送出停止要求，正在收尾…".into()
 }
 
+/// 偵測整合包的 Minecraft 版本（給 UI 預填版本選單）。偵測不到回 null。
+#[tauri::command]
+fn detect_mc_version(instance_path: String) -> Option<String> {
+    let inst = normalize_path(&instance_path);
+    let mc = resolve_minecraft_dir(&inst).unwrap_or(inst);
+    detect_minecraft_version(&mc)
+}
+
+/// 診斷「遊戲／世界開不起來」：讀當機報告與 log，判斷是缺模組還是我們的檔。
+#[tauri::command]
+async fn diagnose_launch_failure(instance_path: String) -> Result<LaunchDiagnosis, String> {
+    let inst = normalize_path_strict(&instance_path)?;
+    tauri::async_runtime::spawn_blocking(move || diagnose_launch(&inst))
+        .await
+        .map_err(|e| format!("工作中斷：{e}"))
+}
+
+/// 一鍵還原上次套用（新增的刪掉、覆蓋的還原），用來排除「是不是翻譯造成開不起來」。
+#[tauri::command]
+async fn restore_last_apply_cmd(
+    app: AppHandle,
+    instance_path: String,
+) -> Result<RestoreResult, String> {
+    let inst = normalize_path_strict(&instance_path)?;
+    let app2 = app.clone();
+    let r = tauri::async_runtime::spawn_blocking(move || {
+        emit_progress(&app2, 20, "還原：讀取上次套用的備份…");
+        let r = restore_last_apply(&inst);
+        if r.is_ok() {
+            emit_progress(&app2, 100, "還原完成");
+        }
+        r
+    })
+    .await
+    .map_err(|e| format!("工作中斷：{e}"))?;
+    if let Err(e) = &r {
+        emit_error(&app, e);
+    }
+    r
+}
+
 fn run_one_click(
     app: &AppHandle,
     instance: PathBuf,
@@ -234,6 +281,7 @@ fn run_one_click(
     pack_name: String,
     use_ai: bool,
     reference_pack: Option<String>,
+    target_version: Option<String>,
 ) -> Result<OneClickResult, String> {
     emit_progress(app, 2, "準備中（此階段不呼叫 AI）…");
     if !instance.exists() {
@@ -367,6 +415,7 @@ fn run_one_click(
                 "本地+參考包整理完成，待 AI 僅 {} 條。{}",
                 pending_before_n, ref_note
             ),
+            target_version: target_version.clone(),
         },
     );
 
@@ -460,7 +509,28 @@ fn run_one_click(
     // ═══ 階段 C：寫出資源包 ═══
     emit_progress(app, 91, "正在建立翻譯檔與資源包…");
     let mc_for_fmt = resolve_minecraft_dir(&instance).unwrap_or_else(|_| instance.clone());
-    let pack_format = detect_pack_format(&mc_for_fmt);
+    // 使用者指定版本 → 用它；否則偵測。用來決定 pack.mcmeta 相容宣告。
+    let resolved_version = target_version
+        .clone()
+        .or_else(|| detect_minecraft_version(&mc_for_fmt));
+    let pack_format = resolved_version
+        .as_deref()
+        .and_then(pack_format_for_version)
+        .unwrap_or_else(|| detect_pack_format(&mc_for_fmt));
+    if let Some(v) = &resolved_version {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "目標版本：{v}{}",
+                if target_version.is_some() {
+                    "（你指定的）"
+                } else {
+                    "（自動偵測）"
+                }
+            ),
+        );
+    }
     let built = build_resource_pack(
         &zh,
         &BuildOptions {
@@ -468,6 +538,7 @@ fn run_one_click(
             pack_description: "台灣用語繁體中文翻譯資源包".into(),
             output_dir: work.display().to_string(),
             pack_format,
+            target_version: resolved_version.clone(),
         },
     )?;
 
@@ -548,6 +619,27 @@ fn run_one_click(
             }
         }
     }
+    // ═══ 階段 E3：任務／書本（Better Questing／HQM／Heracles／Modonomicon）═══
+    let qb_note;
+    {
+        let app_qb = app.clone();
+        match translate_quests_books(&mc_for_extra, &work, use_ai, move |pct, msg| {
+            let mapped = 99 + (pct as u16 * 1 / 100) as u8;
+            emit_progress(&app_qb, mapped.min(99), msg);
+        }) {
+            Ok(o) => {
+                qb_note = o.note;
+                if o.files_written > 0 {
+                    emit_progress(app, 99, &format!("任務／書本已寫出 {} 個檔", o.files_written));
+                }
+            }
+            Err(e) => {
+                qb_note = format!("任務／書本略過／失敗：{e}");
+                emit_error(app, &qb_note);
+                error_lines.push(qb_note.clone());
+            }
+        }
+    }
 
     // 覆蓋報告把 overlay 併入 quests_note
     if !overlay_note.is_empty() {
@@ -562,6 +654,13 @@ fn run_one_click(
             origins_note.clone()
         } else {
             format!("{quest_note}；{origins_note}")
+        };
+    }
+    if !qb_note.is_empty() {
+        quest_note = if quest_note.is_empty() {
+            qb_note.clone()
+        } else {
+            format!("{quest_note}；{qb_note}")
         };
     }
     if !ai_note.is_empty() {
@@ -601,6 +700,7 @@ fn run_one_click(
                 "完整流程後產生。可「只補缺漏」續翻。剩餘約 {} 條。{}",
                 pending_count, quest_note
             ),
+            target_version: resolved_version.clone(),
         },
     );
 
@@ -667,7 +767,15 @@ fn run_one_click(
 }
 
 /// 補翻／修復時沿用同一個 pack_format，否則重建出來的 zip 會被遊戲標成「不相容」。
+/// 優先用工作階段記錄的目標版本（使用者當初指定的），其次偵測。
 fn session_pack_format(session: &TranslateSession) -> u32 {
+    if let Some(f) = session
+        .target_version
+        .as_deref()
+        .and_then(pack_format_for_version)
+    {
+        return f;
+    }
     let inst = PathBuf::from(session.instance_path.trim());
     if !inst.exists() {
         return 0; // 交給 build_resource_pack 用保底值
@@ -786,6 +894,7 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
                 pack_description: "台灣用語繁體中文翻譯資源包".into(),
                 output_dir: work.display().to_string(),
                 pack_format: session_pack_format(&session),
+            target_version: session.target_version.clone(),
             },
         )?;
         session.pack_path = built.pack_path.clone();
@@ -849,6 +958,7 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
             pack_description: "台灣用語繁體中文翻譯資源包".into(),
             output_dir: work.display().to_string(),
             pack_format: session_pack_format(&session),
+            target_version: session.target_version.clone(),
         },
     )?;
 
@@ -876,6 +986,19 @@ fn run_supplement(app: &AppHandle, out: PathBuf) -> Result<OneClickResult, Strin
             if let Ok(o) = translate_origins(&mc, &work, true, move |pct, msg| {
                 let mapped = 97 + (pct as u16 * 1 / 100) as u8;
                 emit_progress(&app_or, mapped.min(98), msg);
+            }) {
+                if !o.note.is_empty() {
+                    overlay_note = if overlay_note.is_empty() {
+                        o.note
+                    } else {
+                        format!("{overlay_note}；{}", o.note)
+                    };
+                }
+            }
+            let app_qb = app.clone();
+            if let Ok(o) = translate_quests_books(&mc, &work, true, move |pct, msg| {
+                let mapped = 98 + (pct as u16 * 1 / 100) as u8;
+                emit_progress(&app_qb, mapped.min(99), msg);
             }) {
                 if !o.note.is_empty() {
                     overlay_note = if overlay_note.is_empty() {
@@ -1072,6 +1195,7 @@ fn run_repair(app: &AppHandle, out: PathBuf, use_ai: bool) -> Result<OneClickRes
             pack_description: "台灣用語繁體中文翻譯資源包（修復重建）".into(),
             output_dir: work.display().to_string(),
             pack_format: session_pack_format(&session),
+            target_version: session.target_version.clone(),
         },
     )?;
     actions.push(format!("已寫入 zip：{}", built.pack_path));
@@ -1571,6 +1695,9 @@ pub fn run() {
             set_ui_prefs,
             quit_app,
             cancel_task,
+            detect_mc_version,
+            diagnose_launch_failure,
+            restore_last_apply_cmd,
             check_update,
             download_update,
             open_glossary,

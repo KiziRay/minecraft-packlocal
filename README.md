@@ -8,7 +8,19 @@
 - 不宣稱 100% 漢化
 - **免安裝任何額外東西**（簡繁轉換內建於執行檔）
 
-目前版本：**0.4.0**（以 `src-tauri/Cargo.toml` 為準）
+目前版本：**1.0.0**（以 `src-tauri/Cargo.toml` 為準）
+
+## 支援範圍（一句話）
+
+**會翻**：Forge／NeoForge／Fabric／Quilt 的語言檔；FTB Quests、Patchouli 書本、OpenLoader、KubeJS、FancyMenu、資料包文字；Origins／Apoli 能力；Better Questing／HQM／Heracles／Modonomicon 任務／書本。支援 Minecraft **1.13～1.21.x 與年份版 26.x**。
+**不翻**：圖片上的字、寫死在程式碼／KubeJS 腳本裡的字串、GuideME 的 Markdown 書本、`.zip` 資料包、基岩版。
+完整清單與**免責條款** → [`docs/支援範圍與免責聲明.md`](./docs/支援範圍與免責聲明.md)。
+
+## 下載
+
+- **Release**：見本專案 [Releases](https://github.com/KiziRay/minecraft-packlocal/releases) 的最新版（安裝檔 + 免安裝版 + `SHA256SUMS.txt`）。
+- 工具內建「檢查更新」會自動抓最新安裝檔並**核對 SHA-256** 後再開啟。
+- 下載後請用 `SHA256SUMS.txt` 自行核對雜湊，確認檔案未被竄改（公開原始碼不等於自動保證檔案安全）。
 
 ## 這個工具跟「丟給 AI 翻」差在哪
 
@@ -76,7 +88,7 @@ Tauri 2 + Rust + 靜態前端（`src/index.html` + `app.js` + `styles.css`，`fr
 
 ## 授權與免責
 
-模組／地圖著作權屬原作者。本工具依現況提供，不保證完整或正確。詳見程式內免責與 `docs/USER-GUIDE.md`。
+模組／地圖著作權屬原作者。本工具依現況提供，不保證完整或正確。完整支援範圍與免責條款見 [`docs/支援範圍與免責聲明.md`](./docs/支援範圍與免責聲明.md)，使用說明見 [`docs/USER-GUIDE.md`](./docs/USER-GUIDE.md)。
 
 本專案的原始程式碼與 ZeitFrei 自有專案素材採用 [PolyForm Noncommercial 1.0.0](./LICENSE)。玩家可以個人或其他非商業目的使用、修改與分享，但不得直接或間接用於商業產品、付費服務、商業散布或轉授權；需要商業使用請先取得書面同意。第三方程式、資料與素材維持原本授權，請查看 [`NOTICE.md`](./NOTICE.md)。
 

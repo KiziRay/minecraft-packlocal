@@ -20,6 +20,7 @@ use super::glossary::{self, Glossary};
 use super::jar_scan::LangMap;
 use super::placeholder::{self, GuardStats};
 use super::secrets::resolve_ai_config;
+use super::shared_tm;
 use super::tm::Tm;
 
 /// 每批條數（去重後的「唯一英文」）
@@ -40,6 +41,8 @@ pub struct AiFillReport {
     pub filled: usize,
     pub glossary_hits: usize,
     pub tm_hits: usize,
+    /// 社群共享翻譯記憶命中（免送 AI）
+    pub shared_hits: usize,
     pub ai_translated: usize,
     /// 佔位符壞掉、已退回原文
     pub rejected: usize,
@@ -49,8 +52,8 @@ pub struct AiFillReport {
 impl AiFillReport {
     pub fn note(&self) -> String {
         let mut parts = vec![format!(
-            "補譯 {} 條（術語表 {}、翻譯記憶 {}、AI {}）",
-            self.filled, self.glossary_hits, self.tm_hits, self.ai_translated
+            "補譯 {} 條（術語表 {}、共享庫 {}、翻譯記憶 {}、AI {}）",
+            self.filled, self.glossary_hits, self.shared_hits, self.tm_hits, self.ai_translated
         )];
         if self.rejected > 0 {
             parts.push(format!("{} 條因佔位符不符退回原文", self.rejected));
@@ -189,37 +192,86 @@ where
         return Ok(AiFillReport::default());
     }
 
-    // 相同原文只處理一次
+    let mut report = AiFillReport::default();
+    let mut guard = GuardStats::default();
+
+    // ── 社群共享翻譯記憶（keyed：模組·key·原文）：先撈，命中就免送 AI ──
+    // 隱藏、預設開；查不到／服務未就緒都靜默略過。以 (ns,key,srcHash) 為單位，跨整合包安全。
+    on_progress(43, "查詢社群共享翻譯（不需你設定）…");
+    let shared = shared_tm::lookup(&jobs);
+    let mut shared_done: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if !shared.is_empty() {
+        for (i, (ns, k, src)) in jobs.iter().enumerate() {
+            if let Some(cand) = shared.get(&i) {
+                // 共享來的一樣要過佔位符守衛才敢用
+                if let Some(safe) = placeholder::guard(src, cand, &mut guard) {
+                    zh.entry(ns.clone()).or_default().insert(k.clone(), safe);
+                    report.filled += 1;
+                    report.shared_hits += 1;
+                    shared_done.insert(i);
+                }
+            }
+        }
+        if report.shared_hits > 0 {
+            on_progress(
+                44,
+                &format!("社群共享庫命中 {} 條（免送 AI）", report.shared_hits),
+            );
+        }
+    }
+
+    // 剩下未命中的才進去重＋術語表＋本機記憶＋AI
+    let remaining: Vec<usize> = (0..jobs.len()).filter(|i| !shared_done.contains(i)).collect();
     let mut unique: Vec<String> = Vec::new();
     let mut ctx: Vec<Option<&'static str>> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut job_uid: Vec<usize> = Vec::with_capacity(jobs.len());
-    for (_, key, en) in &jobs {
+    let mut job_uid: HashMap<usize, usize> = HashMap::new(); // job index → uid
+    for &i in &remaining {
+        let (_, key, en) = &jobs[i];
         if let Some(&id) = seen.get(en) {
-            job_uid.push(id);
             if ctx[id].is_none() {
                 ctx[id] = context_hint(key);
             }
+            job_uid.insert(i, id);
         } else {
             let id = unique.len();
             seen.insert(en.clone(), id);
             unique.push(en.clone());
             ctx.push(context_hint(key));
-            job_uid.push(id);
+            job_uid.insert(i, id);
         }
     }
 
-    let resolved = resolve_unique(&unique, &ctx, use_ai, 44, 44, &mut on_progress)?;
+    if !unique.is_empty() {
+        let resolved = resolve_unique(&unique, &ctx, use_ai, 44, 44, &mut on_progress)?;
+        // 併入子報告的計數
+        let sub = &resolved.report;
+        report.glossary_hits += sub.glossary_hits;
+        report.tm_hits += sub.tm_hits;
+        report.ai_translated += sub.ai_translated;
+        report.rejected += sub.rejected;
+        report.notes.extend(sub.notes.clone());
 
-    // 寫回語言表
-    let mut report = resolved.report;
-    for (i, (ns, k, _)) in jobs.iter().enumerate() {
-        let uid = job_uid[i];
-        if let Some(text) = resolved.translations.get(&uid) {
-            zh.entry(ns.clone())
-                .or_default()
-                .insert(k.clone(), text.clone());
-            report.filled += 1;
+        // 寫回語言表 + 蒐集「這次新由 AI 產出的」以貢獻給社群
+        let mut to_share: Vec<(String, String, String, String)> = Vec::new();
+        for &i in &remaining {
+            let Some(&uid) = job_uid.get(&i) else {
+                continue;
+            };
+            if let Some(text) = resolved.translations.get(&uid) {
+                let (ns, k, src) = &jobs[i];
+                zh.entry(ns.clone())
+                    .or_default()
+                    .insert(k.clone(), text.clone());
+                report.filled += 1;
+                if resolved.ai_uids.contains(&uid) {
+                    to_share.push((ns.clone(), k.clone(), src.clone(), text.clone()));
+                }
+            }
+        }
+        // 匿名回饋給社群（fire-and-forget；失敗不影響）
+        if !to_share.is_empty() {
+            shared_tm::contribute(&to_share);
         }
     }
 
@@ -267,6 +319,8 @@ where
 struct Resolved {
     translations: HashMap<usize, String>,
     report: AiFillReport,
+    /// 這些 uid 的譯文是「本次新由 AI 產出」（用來只回饋新內容給社群，不重傳術語表/記憶）。
+    ai_uids: std::collections::HashSet<usize>,
 }
 
 /// 術語表 → 翻譯記憶 → AI，三層依序解決 `unique` 裡的每一條。
@@ -293,6 +347,7 @@ fn resolve_unique(
     let mut translations: HashMap<usize, String> = HashMap::new();
     let mut report = AiFillReport::default();
     let mut guard = GuardStats::default();
+    let mut ai_uids: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // ── 第 1、2 層：查表，完全不用網路 ──
     let mut need_ai: Vec<(usize, String)> = Vec::new();
@@ -329,6 +384,7 @@ fn resolve_unique(
         return Ok(Resolved {
             translations,
             report,
+            ai_uids,
         });
     }
 
@@ -349,6 +405,7 @@ fn resolve_unique(
         return Ok(Resolved {
             translations,
             report,
+            ai_uids,
         });
     }
 
@@ -386,6 +443,7 @@ fn resolve_unique(
                 tm.insert(src, &safe);
                 translations.insert(*uid, safe);
                 report.ai_translated += 1;
+                ai_uids.insert(*uid);
             }
             None => {
                 // 退回原文：語言表維持英文，遊戲不會壞
@@ -405,6 +463,7 @@ fn resolve_unique(
     Ok(Resolved {
         translations,
         report,
+        ai_uids,
     })
 }
 

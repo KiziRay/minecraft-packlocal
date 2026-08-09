@@ -54,3 +54,7 @@ src-tauri/target
 worker/.wrangler
 .dev.vars
 
+
+# 免安裝版建置暫存（最小化前端）
+.build-frontend/
+dist/

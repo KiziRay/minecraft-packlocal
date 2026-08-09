@@ -15,8 +15,9 @@
         <span class="brand-copy"><strong>zeitfrei / modpack-i18n</strong><small>DESKTOP TOOL</small></span>
       </a>
       <div class="topbar-actions">
-        <kbd class="version-key">0.4.0</kbd>
+        <kbd class="version-key">0.5.1</kbd>
         <button type="button" id="btn-theme" class="text-button theme-button" aria-pressed="true" title="切換到淺色模式"><span id="theme-glyph" aria-hidden="true">◐</span><span id="theme-label">深色</span></button>
+        <button type="button" id="btn-check-update" class="text-button update-button"><span>檢查更新</span><span id="update-status" class="update-status" aria-live="polite"></span></button>
         <button type="button" id="btn-guide" class="text-button">使用說明</button>
       </div>
     </header>
@@ -46,7 +47,7 @@
               <div class="service-intro">
                 <div class="section-heading">
                   <span class="md-symbol">##</span>
-                  <div><h2 id="translation-title">翻譯整合包</h2><p>選好來源與輸出位置，就可以開始。</p></div>
+                  <div><h2 id="translation-title">翻譯整合包</h2><p>選好遊戲實例與輸出位置，剩下的交給工具處理。</p></div>
                 </div>
                 <img class="service-art" src="assets/art/translation-service-illustration.png" alt="" />
               </div>
@@ -69,13 +70,41 @@
                   <label for="pack-name">資源包名稱</label>
                   <input id="pack-name" type="text" value="台灣繁體中文翻譯" autocomplete="off" />
                 </div>
+                <div class="field-block compact-field version-field">
+                  <label for="target-version">Minecraft 版本</label>
+                  <p class="field-help">會先自動偵測，也可以手動指定。</p>
+                  <select id="target-version" aria-describedby="version-status">
+                    <option value="">自動偵測</option>
+                    <option value="1.13">1.13</option>
+                    <option value="1.14.4">1.14.4</option>
+                    <option value="1.15.2">1.15.2</option>
+                    <option value="1.16.5">1.16.5</option>
+                    <option value="1.17.1">1.17.1</option>
+                    <option value="1.18.2">1.18.2</option>
+                    <option value="1.19.2">1.19.2</option>
+                    <option value="1.19.4">1.19.4</option>
+                    <option value="1.20.1">1.20.1</option>
+                    <option value="1.20.4">1.20.4</option>
+                    <option value="1.20.6">1.20.6</option>
+                    <option value="1.21">1.21</option>
+                    <option value="1.21.1">1.21.1</option>
+                    <option value="1.21.4">1.21.4</option>
+                    <option value="1.21.5">1.21.5</option>
+                    <option value="1.21.8">1.21.8</option>
+                    <option value="1.21.9">1.21.9</option>
+                    <option value="26.1">26.1</option>
+                    <option value="26.2">26.2</option>
+                    <option value="26.3">26.3</option>
+                  </select>
+                  <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲實例</small>
+                </div>
               </div>
 
               <div class="subsection-heading"><span class="md-symbol">###</span><h3>翻譯方式</h3></div>
               <div class="option-list">
                 <label class="option-row" for="use-ai">
                   <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
-                  <span><strong>補上原本沒有繁中的文字</strong><small>需要 AI 金鑰；已有中文的內容仍會先做台灣用語轉換。</small></span>
+                  <span><strong>補上原本沒有繁中的文字</strong><small>可使用開發者代管 AI；也能在進階設定填入自己的金鑰。</small></span>
                 </label>
                 <label class="option-row" for="minimize-on-close">
                   <input type="checkbox" id="minimize-on-close" checked /><span class="check-box" aria-hidden="true"></span>
@@ -84,9 +113,10 @@
               </div>
 
               <div id="ai-panel" class="ai-panel">
-                <p class="ai-status"><span class="status-dot"></span><span id="key-status">AI 金鑰：正在確認</span></p>
-                <details id="adv-details" class="advanced-details"><summary>AI 設定</summary><div class="advanced-body">
-                  <div class="field-block"><label for="api-key">API 金鑰</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="只會儲存在本機" /></div>
+                <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
+                <p id="ai-source-note" class="ai-source-note">AI 為選用功能；已有中文的內容仍會先做台灣用語轉換。</p>
+                <details id="adv-details" class="advanced-details"><summary>進階 AI 設定（可選）</summary><div class="advanced-body">
+                  <div class="field-block"><label for="api-key">自備 API 金鑰</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="只會儲存在本機" /></div>
                   <div class="field-block"><label for="base-url">API 位置</label><input id="base-url" type="text" autocomplete="off" placeholder="留白使用預設服務" /></div>
                   <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
                 </div></details>
@@ -142,7 +172,7 @@
         <aside class="status-column">
           <section class="status-section progress-card" aria-labelledby="progress-title">
             <div class="status-header"><div><p class="eyebrow">STATUS</p><h2 id="progress-title">執行狀態</h2></div><button type="button" id="btn-open" class="text-button">開啟輸出</button></div>
-            <div class="status-message"><span class="status-dot"></span><span id="prog-msg" aria-live="polite">準備開始</span><strong id="prog-pct">0%</strong></div>
+            <div class="status-message"><span class="status-dot"></span><span id="prog-msg" aria-live="polite">尚未開始</span><strong id="prog-pct">0%</strong></div>
             <ol class="linear-steps" id="linear-steps" aria-label="翻譯流程">
               <li class="lin-step" data-step="prep"><span class="step-line"></span><span>準備</span></li>
               <li class="lin-step" data-step="scan"><span class="step-line"></span><span>掃描</span></li>
@@ -154,7 +184,9 @@
             <div class="prog-bar"><div id="prog-fill" class="prog-fill"></div></div>
             <img class="status-art" src="assets/art/translation-status-illustration.png" alt="" />
             <div class="log-label"><span>活動紀錄</span><span class="muted-code">session.log</span></div>
-            <pre id="log" class="log" aria-live="polite">選好整合包資料夾後，按下「開始翻譯」。</pre>
+            <pre id="log" class="log log-empty" aria-live="polite">選好遊戲實例後，按下「開始翻譯」。
+
+翻譯過程會顯示在這裡；完成後可以開啟輸出，確認無誤再套用。</pre>
           </section>
           <section class="side-note output-note"><img class="output-art" src="assets/art/resource-pack-output-illustration.png" alt="" /><div><p class="eyebrow">OUTPUT</p><h3>輸出會放什麼？</h3><p>工具會建立獨立的翻譯結果資料夾，不會把內容偷偷塞進原本的整合包。</p><code>翻譯結果/<br />├─ resourcepacks/<br />├─ config/<br />└─ 覆蓋範圍說明.txt</code></div></section>
         </aside>
@@ -170,12 +202,13 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v0.4.0</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p>
-          <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔，將簡體中文轉成台灣用語，並找出沒有繁中的英文文字。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾。</p></li><li><span>2</span><p>選取翻譯輸出位置；工具會建立獨立的 <code>翻譯結果/</code>。</p></li><li><span>3</span><p>需要補英文時勾選 AI，確認金鑰後按「開始翻譯」。</p></li><li><span>4</span><p>完成後按「開啟輸出」，或在確認結果後按「套用到遊戲」。</p></li></ol></section>
+          <p class="eyebrow">PLAYER GUIDE / v0.5.1</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p>
+          <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔，將簡體中文轉成台灣用語，並找出沒有繁中的英文文字。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>選取翻譯輸出位置；工具會建立獨立的 <code>翻譯結果/</code>。</p></li><li><span>3</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在進階設定填入自己的金鑰。</p></li><li><span>4</span><p>完成後按「開啟輸出」，確認結果後再按「套用到遊戲」。</p></li></ol></section>
+          <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在翻譯頁手動指定。這會用來產生對應的資源包格式，補翻與修復工作階段也會沿用同一版本。</p></section>
           <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>套用到遊戲</th><td>複製翻譯結果到整合包，會先備份可能被覆蓋的檔案。</td></tr><tr><th>修復工作階段</th><td>找回輸出位置或工作階段資訊後再繼續。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>
           <section><h2 id="g-font">字體資源包</h2><p>字體資源包是獨立服務，不會翻譯文字。它會把你選的字體檔與 Minecraft 字體設定打包成資源包，協助模組介面與遊戲文字使用你喜歡的字體。</p><ul><li><strong>字體大小：</strong>調整 Minecraft renderer 使用的基準尺寸。</li><li><strong>字重感：</strong>做小幅的 renderer 層近似；不會改寫字體檔的真正筆畫。</li><li><strong>水平／垂直位移：</strong>修正字體在遊戲裡偏左、偏右、偏上或偏下。</li><li><strong>清晰度：</strong>調整 oversample。越高通常越平滑，也可能增加資源需求。</li></ul><div class="guide-callout"><strong>想要真正的粗體？</strong><span>請選用 Regular、Medium、SemiBold 或 Bold 等對應字重的字體檔。工具不會修改或重新繪製字體。</span></div></section>
           <section><h2 id="g-apply">輸出與套用</h2><p>翻譯和字體服務都會輸出到資源包資料夾。請把產生的資源包放到啟動器實例的 <code>resourcepacks</code>，再從 Minecraft 的「設定 → 資源包」啟用。</p><div class="guide-callout guide-callout-warn"><strong>套用前請關閉 Minecraft。</strong><span>工具會備份會被覆蓋的目標，但仍建議保留原始整合包與輸出資料夾。</span></div></section>
-          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。關閉 AI 仍可以處理既有中文、簡繁轉換與資源包輸出。API 金鑰只儲存在本機設定檔，不會寫進翻譯結果或程式預設值。</p><p>送往 AI 的內容只包含待翻譯字串。請自行確認你使用的 AI 服務條款，不要把含有個人資料、私密伺服器資訊或不應外傳的文字送出。</p></section>
+          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。關閉 AI 仍可以處理既有中文、簡繁轉換與資源包輸出。沒有填入自己的金鑰時，工具會使用開發者代管的免費翻譯，額度有限；也可以在進階設定改用自己的金鑰與 API 位置。</p><p>API 金鑰只儲存在本機設定檔，不會寫進翻譯結果或程式預設值。送往 AI 的內容只包含待翻譯字串與必要的通用語境。請自行確認服務條款，不要送出個人資料或私密伺服器資訊。</p></section>
           <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲出現紅字或閃退怎麼辦？</strong>先停用資源包，確認原本整合包可正常啟動。語言檔工具不會修復缺少模組、版本不相容或世界存檔問題。</p><p><strong>中文字變成方框怎麼辦？</strong>使用字體資源包，選擇支援繁中的字體檔，再到遊戲資源包選單啟用。</p><p><strong>圖片裡的字會翻譯嗎？</strong>不會。本工具目前只處理遊戲文字與相關語言檔。</p><p><strong>翻譯一定完美嗎？</strong>不一定。模組上下文可能不足，請在遊戲裡檢查結果，並用術語表固定重要名稱。</p></section>
           <section><h2 id="g-disclaimer">免責說明</h2><div class="disclaimer"><p>本工具由 ZeitFrei 以方便玩家整理模組包文字為目的提供。翻譯結果可能因模組版本、原文上下文、第三方 AI 服務或字體檔品質而有錯誤、不完整或不符合個人偏好的情況。</p><p>使用者應自行確認模組整合包、字體檔、翻譯內容及第三方服務的授權與使用條款。請不要使用你沒有權利散布的字體或內容。</p><p>本工具不保證遊戲一定能啟動、不保證翻譯完整、不負責模組本身的錯誤、存檔損壞、版本衝突、第三方 API 費用或任何因使用輸出結果造成的直接或間接損失。套用前請備份整合包與存檔。</p></div></section>
           <p class="guide-footer">zeitfrei / modpack-i18n · 請在使用前閱讀以上說明</p>

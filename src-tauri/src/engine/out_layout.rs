@@ -144,13 +144,18 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 3. 可合併社群／先前全翻參考包，AI 只補「仍是英文」的字\n\
 4. FTB Quests 任務文字（輸出到 config/ftbquests，需套用才進遊戲）\n\
 5. 文字覆寫：patchouli_books／openloader／kubejs 等（需套用才進遊戲）\n\
-6. 一鍵套用前會備份會被覆蓋的檔案（不改 mods/*.jar）\n\
+6. 任務／書本系統：Better Questing／HQM／Heracles／Modonomicon（顯示欄位，best-effort）\n\
+7. Origins／Apoli 能力名稱與說明（路徑感知，不動識別字）\n\
+8. 一鍵套用前會備份會被覆蓋的檔案（不改 mods/*.jar）\n\
 \n\
-═══ 通常蓋不到／仍可能英文 ═══\n\
-1. 寫死在程式裡的字串、圖片上的字、部分書本／對話\n\
-2. 未掃到的特殊格式、動態生成文字\n\
-3. 世界閃退、缺模組、結構包問題（與翻譯無關，本工具不修）\n\
-4. 機翻腔、專有名詞不一致（社群包也會寫「不保證完美」）\n\
+═══ 通常蓋不到／仍可能英文（誠實列出）═══\n\
+1. 圖片上的字（紅線，本工具不處理圖片）\n\
+2. 寫死在 Java 程式碼／KubeJS 腳本裡的字串（不解析程式碼）\n\
+3. GuideME 的 Markdown 書本、被壓成 .zip 的資料包（本版尚未支援，未來可加）\n\
+4. 基岩版（Bedrock）整合包（格式不同，不支援）\n\
+5. 未掃到的特殊格式、動態生成文字\n\
+6. 世界閃退、缺模組、結構包問題（與翻譯無關，本工具不修）\n\
+7. 機翻腔、專有名詞不一致（社群包也會寫「不保證完美」）\n\
 \n\
 ═══ 不該做的事（本工具紅線）═══\n\
 1. 不直接改 mods/*.jar 內容\n\

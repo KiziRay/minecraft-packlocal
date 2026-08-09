@@ -2,10 +2,12 @@ mod apply_instance;
 mod cancel;
 mod convert;
 mod deepseek;
+mod diagnose;
 mod disk;
 mod font_pack;
 mod ftbquests;
 mod glossary;
+mod hashutil;
 mod jar_scan;
 mod lenient_json;
 mod merge_ref;
@@ -14,18 +16,21 @@ mod origins;
 mod out_layout;
 mod pack_out;
 mod placeholder;
+mod quests_books;
 mod secrets;
 mod security;
 mod session;
+mod shared_tm;
 mod text_overlay;
 mod tm;
 mod updater;
 
-pub use apply_instance::{apply_to_instance, ApplyResult};
+pub use apply_instance::{apply_to_instance, restore_last_apply, ApplyResult, RestoreResult};
 pub use cancel::{
     check as check_cancelled, request as request_cancel, reset as reset_cancel, CANCEL_MESSAGE,
 };
 pub use convert::{convert_langmap_s2tw, converter_name};
+pub use diagnose::{diagnose as diagnose_launch, LaunchDiagnosis};
 pub use disk::{ensure_space, MIN_FREE_BYTES};
 pub use deepseek::fill_missing_with_ai;
 pub use font_pack::{build_font_pack_str_with_options, FontPackOptions, FontPackResult};
@@ -39,10 +44,14 @@ pub use merge_ref::{
 };
 pub use minemenu::fix_minemenu_unicode_escapes;
 pub use origins::translate_origins;
+pub use quests_books::translate_quests_books;
 pub use out_layout::{
     ensure_result_layout, suggest_output_base, write_coverage_report, CoverageStats, RESULT_DIR_NAME,
 };
-pub use pack_out::{build_resource_pack, detect_pack_format, BuildOptions};
+pub use pack_out::{
+    build_resource_pack, detect_minecraft_version, detect_pack_format, pack_format_for_version,
+    BuildOptions,
+};
 pub use secrets::{
     get_api_settings_public, get_minimize_on_close, load_deepseek_key, save_api_settings,
     set_minimize_on_close, ApiSettingsPublic,

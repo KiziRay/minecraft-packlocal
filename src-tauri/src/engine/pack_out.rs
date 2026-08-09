@@ -19,7 +19,12 @@ const FALLBACK_PACK_FORMAT: u32 = 15;
 /// 很多人就以為翻譯失敗了。所以這裡值得認真判斷，而不是寫死一個數字。
 ///
 /// 對照表僅列各版本線的**起始版**；查表時取「不大於目標版本」的最後一筆。
+/// 只列到 1.21.8（單一 `pack_format` 整數制的最後一段）；1.21.9＋與年份版（26.x）
+/// 改用 `min_format`/`max_format` 範圍制，見 [`is_modern_pack_version`] 與 [`pack_mcmeta_value`]。
 const VERSION_TO_FORMAT: &[(&str, u32)] = &[
+    ("1.13", 4),
+    ("1.14", 4),
+    ("1.15", 5),
     ("1.16", 6),
     ("1.16.2", 6),
     ("1.17", 7),
@@ -52,9 +57,70 @@ pub fn detect_pack_format(minecraft_dir: &Path) -> u32 {
     FALLBACK_PACK_FORMAT
 }
 
-/// 由版本字串（`1.20.1`、`1.21.4`）查出 pack_format。
+/// 1.21.9＋與年份版（26.x…）改用範圍制 `min_format`/`max_format`。
+/// 我們的翻譯包只有語言檔，實際上跨版本都能用，所以宣告一段寬範圍讓新版一律接受，
+/// 同時保留 legacy `pack_format` 給 1.21.8 以下。這樣不必硬編每個 26.x 的確切格式號
+/// （Mojang 2026 起改年份制、格式號還在往上跑），未來版本也自動涵蓋。
+const MODERN_MIN_FORMAT: u32 = 6; // 涵蓋 1.16 之後的整個現代區間
+const MODERN_MAX_FORMAT: u32 = 999; // 遠高於目前（26.1≈84），未來多年不必動
+
+/// 目標版本是否屬於「範圍制」（1.21.9＋ 或年份制 26.x…）。
+///
+/// 判準：不是 `1.x` 開頭（→ 年份制），或是 `1.21.9` 以上。
+pub fn is_modern_pack_version(version: &str) -> bool {
+    let Some(v) = parse_version(version) else {
+        return false;
+    };
+    if v[0] != 1 {
+        // 26.x、27.x… 年份制
+        return true;
+    }
+    // 1.x：1.21.9 起
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    minor > 21 || (minor == 21 && patch >= 9)
+}
+
+/// 產生 `pack.mcmeta` 的 `pack` 物件。
+/// - 舊版（≤1.21.8）：單一 `pack_format`（與過去完全一致，零回歸風險）。
+/// - 新版（1.21.9＋／年份制）：`min_format`/`max_format` 範圍 ＋ 保留 legacy `pack_format`。
+pub fn pack_mcmeta_value(
+    target_version: Option<&str>,
+    legacy_format: u32,
+    description: &str,
+) -> serde_json::Value {
+    let fmt = if legacy_format == 0 {
+        FALLBACK_PACK_FORMAT
+    } else {
+        legacy_format
+    };
+    let modern = target_version.map(is_modern_pack_version).unwrap_or(false);
+    if modern {
+        serde_json::json!({
+            "pack": {
+                "pack_format": fmt,
+                "min_format": [MODERN_MIN_FORMAT, 0],
+                "max_format": [MODERN_MAX_FORMAT, 0],
+                "description": description
+            }
+        })
+    } else {
+        serde_json::json!({
+            "pack": {
+                "pack_format": fmt,
+                "description": description
+            }
+        })
+    }
+}
+
+/// 由版本字串（`1.20.1`、`1.21.4`）查出 pack_format。年份制（26.x）回 `None`
+/// （交給範圍制的 mcmeta 處理），呼叫端據此不要當成確切整數用。
 pub fn pack_format_for_version(version: &str) -> Option<u32> {
     let target = parse_version(version)?;
+    if target[0] != 1 {
+        return None; // 年份制沒有單一整數格式號
+    }
     let mut best: Option<(Vec<u32>, u32)> = None;
     for (v, fmt) in VERSION_TO_FORMAT {
         let Some(parsed) = parse_version(v) else {
@@ -265,8 +331,12 @@ pub struct BuildOptions {
     pub pack_folder_name: String,
     pub pack_description: String,
     pub output_dir: String,
-    /// Minecraft 資源包 pack_format；0＝預設 15（1.20.1 常見）
+    /// legacy `pack_format`（≤1.21.8 用）；0＝保底 15
     pub pack_format: u32,
+    /// 目標 Minecraft 版本字串（使用者指定或偵測到）。決定 pack.mcmeta 用整數制或範圍制。
+    /// `None`＝沿用舊行為（只寫 legacy pack_format）。
+    #[serde(default)]
+    pub target_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,17 +378,12 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
     }
     fs::create_dir_all(&pack_dir).map_err(|e| e.to_string())?;
 
-    let pack_format = if opts.pack_format == 0 {
-        15
-    } else {
-        opts.pack_format
-    };
-    let meta = serde_json::json!({
-        "pack": {
-            "pack_format": pack_format,
-            "description": opts.pack_description
-        }
-    });
+    // 依目標版本決定整數制或範圍制（新版 26.x 需要範圍制才不會被標不相容）
+    let meta = pack_mcmeta_value(
+        opts.target_version.as_deref(),
+        opts.pack_format,
+        &opts.pack_description,
+    );
     fs::write(
         pack_dir.join("pack.mcmeta"),
         serde_json::to_string_pretty(&meta).unwrap() + "\n",
@@ -429,6 +494,55 @@ mod tests {
         assert_eq!(pack_format_for_version("1.19.2"), Some(9));
         assert_eq!(pack_format_for_version("1.21.1"), Some(34));
         assert_eq!(pack_format_for_version("1.21.4"), Some(46));
+        // 表已下探到 1.13
+        assert_eq!(pack_format_for_version("1.13.2"), Some(4));
+        assert_eq!(pack_format_for_version("1.15.2"), Some(5));
+    }
+
+    #[test]
+    fn year_based_versions_have_no_single_integer_format() {
+        // 26.x 是範圍制，沒有單一整數格式號
+        assert_eq!(pack_format_for_version("26.2"), None);
+        assert_eq!(pack_format_for_version("27.1"), None);
+    }
+
+    #[test]
+    fn modern_version_detection() {
+        // 年份制
+        assert!(is_modern_pack_version("26.2"));
+        assert!(is_modern_pack_version("26.1"));
+        // 1.21.9 起
+        assert!(is_modern_pack_version("1.21.9"));
+        assert!(is_modern_pack_version("1.22.0"));
+        // 舊制
+        assert!(!is_modern_pack_version("1.21.8"));
+        assert!(!is_modern_pack_version("1.20.1"));
+        assert!(!is_modern_pack_version("1.16.5"));
+    }
+
+    #[test]
+    fn classic_version_writes_single_pack_format() {
+        let v = pack_mcmeta_value(Some("1.20.1"), 15, "台灣繁中");
+        assert_eq!(v["pack"]["pack_format"], 15);
+        // 舊版不寫範圍欄位（維持與過去一致、零回歸）
+        assert!(v["pack"].get("min_format").is_none());
+    }
+
+    #[test]
+    fn modern_version_writes_range_plus_legacy() {
+        let v = pack_mcmeta_value(Some("26.2"), 68, "台灣繁中");
+        // 新版讀範圍
+        assert_eq!(v["pack"]["min_format"][0], MODERN_MIN_FORMAT);
+        assert_eq!(v["pack"]["max_format"][0], MODERN_MAX_FORMAT);
+        // 同時保留 legacy 給 1.21.8 以下
+        assert_eq!(v["pack"]["pack_format"], 68);
+    }
+
+    #[test]
+    fn no_target_version_keeps_legacy_behaviour() {
+        let v = pack_mcmeta_value(None, 0, "x");
+        assert_eq!(v["pack"]["pack_format"], FALLBACK_PACK_FORMAT);
+        assert!(v["pack"].get("min_format").is_none());
     }
 
     #[test]

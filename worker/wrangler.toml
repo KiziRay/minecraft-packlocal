@@ -5,9 +5,10 @@ compatibility_date = "2026-08-01"
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "0.5.1"
+LATEST_VERSION = "1.0.0"
 # 安裝檔直連（NSIS）。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-0.5.1-setup.exe"
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/modpack-i18n-1.0.0-setup.exe"
+RELEASE_NOTES = "1.0.0：新增 Better Questing／HQM／Heracles／Modonomicon 任務書本翻譯；補全支援範圍與免責文件；公開發佈。"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-chat"
@@ -17,7 +18,7 @@ UPSTREAM_MODEL = "deepseek-chat"
 DAILY_TOKEN_BUDGET = "20000000"
 
 # 更新安裝檔的 sha256（上傳後填；客戶端會驗證，不符不啟動）。留空＝不驗證。
-INSTALLER_SHA256 = "f857ce48db0ee47881e17ef3b18e93d70392b5f37c1955446b8cf89d9e44ca63"
+INSTALLER_SHA256 = "cd5d6dcb20690f689f7543fea66e54cca1c5759816e561de0b6836f757205d4f"
 
 # 安裝檔存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
 [[r2_buckets]]
