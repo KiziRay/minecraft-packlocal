@@ -15,6 +15,9 @@ pub const SESSION_FILE: &str = "翻譯工作階段.json";
 #[serde(rename_all = "camelCase")]
 pub struct TranslateSession {
     pub version: u32,
+    /// Number of complete review passes after the first translation.
+    #[serde(default)]
+    pub review_pass: u32,
     pub instance_path: String,
     pub output_dir: String,
     pub pack_name: String,

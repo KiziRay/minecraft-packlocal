@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::glossary_modpack;
+
 /// 單一批次最多附幾條術語提示（控制 prompt 長度）。
 const MAX_HINTS_PER_BATCH: usize = 60;
 
@@ -346,6 +348,12 @@ pub fn load(extra: Option<&Path>) -> Glossary {
         display.insert(en.to_ascii_lowercase(), (*en).to_string());
     }
 
+    // 第 3 層：模組包常見術語；只覆寫同名香草詞，不覆蓋使用者設定。
+    for (en, zh) in glossary_modpack::TERMS {
+        exact.insert(en.to_ascii_lowercase(), (*zh).to_string());
+        display.insert(en.to_ascii_lowercase(), (*en).to_string());
+    }
+
     let mut user_entries = 0usize;
     for path in [Some(user_glossary_path()), extra.map(|p| p.to_path_buf())]
         .into_iter()
@@ -480,6 +488,20 @@ mod tests {
             let k = en.to_ascii_lowercase();
             assert!(seen.insert(k), "術語表重複條目：{en}");
         }
+    }
+
+    #[test]
+    fn modpack_terms_are_unique_and_loaded() {
+        let mut seen = std::collections::HashSet::new();
+        for (en, _) in glossary_modpack::TERMS {
+            let k = en.to_ascii_lowercase();
+            assert!(seen.insert(k), "模組包術語重複條目：{en}");
+        }
+        let g = load(None);
+        assert_eq!(g.exact("Modpack"), Some("模組包"));
+        assert_eq!(g.exact("Mechanical Press"), Some("機械壓床"));
+        assert_eq!(g.exact("Quest Chapter"), Some("任務章節"));
+        assert_eq!(g.exact("Storage Bus"), Some("儲存匯流排"));
     }
 
     #[test]

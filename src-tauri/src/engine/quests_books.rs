@@ -225,10 +225,10 @@ where
 
 fn collect_files(mc: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    // 這些系統的檔案常見落點：
+    // 手翻同路徑：任務／書本可能落在不同模組各自的資料夾
     // - config／defaultconfigs：Better Questing、HQM、Heracles
-    // - hqm：部分 HQM 版本放實例頂層
-    // - data／kubejs/data／datapacks／paxi/datapacks：Modonomicon、資料驅動 Heracles
+    // - openloader／global_packs：包作者嵌在 datapack 裡的任務書
+    // - hqm／data／kubejs／datapacks／paxi：各版本常見落點
     let roots = [
         mc.join("config"),
         mc.join("defaultconfigs"),
@@ -237,6 +237,8 @@ fn collect_files(mc: &Path) -> Vec<PathBuf> {
         mc.join("kubejs").join("data"),
         mc.join("datapacks"),
         mc.join("paxi").join("datapacks"),
+        mc.join("config").join("openloader"),
+        mc.join("global_packs"),
     ];
     for root in roots {
         if !root.is_dir() {

@@ -27,15 +27,36 @@ const MAX_ITEMS: usize = 3000;
 /// 譯文太長不共享（整頁書本之類，重用率低又佔空間）。
 const MAX_ZH_LEN: usize = 400;
 
+#[derive(Clone, Debug)]
+pub struct SharedTmJob {
+    pub namespace: String,
+    pub key: String,
+    pub source: String,
+    pub context: Option<String>,
+}
+
+pub fn normalize_source(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// `(ns, key, src)` 的穩定鍵。取前 24 hex（96 bits，碰撞機率可忽略）。
-pub fn keyhash(ns: &str, key: &str, src: &str) -> String {
-    let mut buf = String::with_capacity(ns.len() + key.len() + src.len() + 2);
-    buf.push_str(ns);
-    buf.push('\0');
-    buf.push_str(key);
-    buf.push('\0');
-    buf.push_str(src);
+fn short_hash(parts: &[&str]) -> String {
+    let mut buf = String::new();
+    for part in parts {
+        buf.push_str(part);
+        buf.push('\0');
+    }
     sha256_hex(buf.as_bytes())[..24].to_string()
+}
+
+pub fn keyhash(ns: &str, key: &str, src: &str) -> String {
+    let normalized = normalize_source(src);
+    short_hash(&[ns.trim(), key.trim(), normalized.as_str()])
+}
+
+pub fn semantic_hash(key: &str, src: &str, context: Option<&str>) -> String {
+    let normalized = normalize_source(src);
+    short_hash(&[key.trim(), normalized.as_str(), context.unwrap_or("").trim()])
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
@@ -52,7 +73,7 @@ fn base() -> String {
 }
 
 /// 批次查詢：回傳 job 索引 → 譯文（只含命中）。任何失敗都回空表（靜默略過）。
-pub fn lookup(jobs: &[(String, String, String)]) -> HashMap<usize, String> {
+pub fn lookup(jobs: &[SharedTmJob]) -> HashMap<usize, String> {
     let mut out = HashMap::new();
     if jobs.is_empty() {
         return out;
@@ -65,10 +86,16 @@ pub fn lookup(jobs: &[(String, String, String)]) -> HashMap<usize, String> {
     let mut kh_by_job: Vec<String> = Vec::with_capacity(jobs.len());
     let mut seen: HashMap<String, ()> = HashMap::new();
     let mut items: Vec<Value> = Vec::new();
-    for (ns, key, src) in jobs {
-        let kh = keyhash(ns, key, src);
-        if seen.insert(format!("{ns}:{kh}"), ()).is_none() {
-            items.push(json!({ "ns": ns, "kh": kh }));
+    for job in jobs {
+        let kh = keyhash(&job.namespace, &job.key, &job.source);
+        let sk = semantic_hash(&job.key, &job.source, job.context.as_deref());
+        if seen.insert(format!("{}:{kh}", job.namespace), ()).is_none() {
+            items.push(json!({
+                "ns": job.namespace,
+                "kh": kh,
+                "sk": sk,
+                "ctx": job.context,
+            }));
         }
         kh_by_job.push(kh);
     }
@@ -105,7 +132,7 @@ pub fn lookup(jobs: &[(String, String, String)]) -> HashMap<usize, String> {
 }
 
 /// 批次貢獻（fire-and-forget）：`(ns, key, src, zh)`。失敗不影響翻譯。
-pub fn contribute(entries: &[(String, String, String, String)]) {
+pub fn contribute(entries: &[(String, String, String, String, Option<String>)]) {
     if entries.is_empty() {
         return;
     }
@@ -114,11 +141,19 @@ pub fn contribute(entries: &[(String, String, String, String)]) {
     };
     let items: Vec<Value> = entries
         .iter()
-        .filter(|(_, _, src, zh)| {
+        .filter(|(_, _, src, zh, _)| {
             let zh = zh.trim();
             !zh.is_empty() && zh.len() <= MAX_ZH_LEN && !src.trim().is_empty() && zh != src.trim()
         })
-        .map(|(ns, key, src, zh)| json!({ "ns": ns, "kh": keyhash(ns, key, src), "zh": zh.trim() }))
+        .map(|(ns, key, src, zh, context)| {
+            json!({
+                "ns": ns,
+                "kh": keyhash(ns, key, src),
+                "sk": semantic_hash(key, src, context.as_deref()),
+                "ctx": context,
+                "zh": zh.trim(),
+            })
+        })
         .collect();
     if items.is_empty() {
         return;
@@ -147,6 +182,18 @@ mod tests {
         // 原文改了（模組更新）→ 不同鍵（不重用過期譯文）
         assert_ne!(a, keyhash("create", "item.create.wrench", "Spanner"));
         assert_eq!(a.len(), 24);
+    }
+
+    #[test]
+    fn hashes_normalize_layout_but_keep_context_separate() {
+        assert_eq!(
+            keyhash("create", "item.create.wrench", "Wrench\n"),
+            keyhash("create", "item.create.wrench", "  Wrench  ")
+        );
+        assert_ne!(
+            semantic_hash("item.create.wrench", "Wrench", Some("物品名")),
+            semantic_hash("item.create.wrench", "Wrench", Some("提示說明"))
+        );
     }
 
     #[test]

@@ -1,9 +1,15 @@
-# Tauri Commands 契約（1.0.1）
+# Tauri Commands 契約（工具 1.0.2；資源包版本另行偵測）
 
 前端：`window.__TAURI__.core.invoke("command_name", { … })`  
 Rust：`snake_case`；JS 參數 **camelCase**。
 
 ---
+
+# 備份控制補充
+
+`delete_apply_backups_cmd(instancePath, outputDir?)` 會刪除翻譯結果資料夾內、由工具建立的 `翻譯套用備份_*` 目錄，回傳 `DeleteBackupResult`。未傳 `outputDir` 時仍會相容搜尋舊版實例旁的備份；它不會刪除其他名稱的資料夾。
+
+`delete_result_folder_cmd(outputDir)` 會完整刪除指定結果位置下的 `翻譯結果/` 工作資料夾（包含備份），但不會刪除使用者選的上層資料夾；後端會先檢查它是否像工具建立的結果資料夾。
 
 ## 翻譯管線
 
@@ -12,29 +18,32 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | 參數 | 型別 | 說明 |
 |------|------|------|
 | instancePath | string | 遊戲／實例路徑 |
-| outputDir | string | 結果根目錄 |
-| packName | string | 資源包名 |
+| outputDir | string | 翻譯結果位置；預設是每個實例的自動位置，也可由前端指定玩家選的資料夾。若不是 `翻譯結果` 本身，後端會在裡面建立 `翻譯結果/` |
+| packName | string | 相容舊版的參數；後端會忽略並依整合包版本產生名稱 |
 | useAi | bool | 是否 AI 補缺 |
+| backupBeforeApply | bool | 是否在翻譯完成套用前建立備份；預設前端會勾選 |
 | referencePack | string \| null | 參考 zip 路徑 |
 | targetVersion | string \| null | **使用者指定的 MC 版本**（如 `1.20.1`、`26.2`）；`null`＝自動偵測 |
 
-回傳 `OneClickResult`（camelCase）：`report`, `packPath`, `workRoot`, `namespaces`, `filesWritten`, `keysTotal`, `aiFilled`, `minemenuMsg`, `playerSummary`。
+回傳 `OneClickResult`（camelCase）：`report`, `packPath`, `workRoot`, `namespaces`, `filesWritten`, `keysTotal`, `aiFilled`, `jarTranslation`, `minemenuMsg`, `playerSummary`。`jarTranslation` 會列出掃描、重建、寫入語言檔與略過錯誤。
 
 事件：過程中 `translate-progress`、`translate-log`。
 
-### 開不了遊戲：診斷與還原（前端接線）
+### 開不了遊戲：診斷與還原
 
 套用結果面板建議加兩顆按鈕，玩家遇到「加了翻譯後開不起來」時用：
 
-- **診斷開不了** → `diagnose_launch_failure(instancePath)` →
-  `{ verdict, summary, missing[], translationRelated, source }`。
+- **讀取最近記錄** → `diagnose_launch_failure(instancePath)` →
+  `{ verdict, summary, missing[], translationRelated, source, errorCode, primaryError, evidence[] }`。
   `verdict`：`missing_mod`（缺模組，非翻譯，`missing[]` 點名缺什麼）／`maybe_our_files`
   （建議先還原排除）／`content_missing`／`unknown`／`no_logs`。把 `summary` 顯示給玩家即可。
-- **還原上次套用** → `restore_last_apply_cmd(instancePath)` →
+- **還原上次套用** → `restore_last_apply_cmd(instancePath, outputDir?)` →
   `{ backupDir, removed, restored, playerSummary }`。反轉最近一次套用（新增的刪掉、覆蓋的還原）。
 
 設計原則：資源包（語言檔）安全；會影響世界載入的是資料包／任務類。套用時已寫
 `套用清單.json` 到備份夾，還原據此精準反轉。
+
+- **貼上錯誤分析** → `diagnose_error_text(text)`：只在本機分析貼上的 crash report、latest.log 或錯誤碼；`errorCode` 是工具的判斷代碼，不是 Minecraft 的退出碼。
 
 ### 版本控制器（前端接線）
 
@@ -51,8 +60,10 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | 參數 | 型別 |
 |------|------|
 | outputDir | string |
+| useAi | bool |
+| backupBeforeApply | bool | 是否在重新套用前建立備份；預設前端會勾選 |
 
-需已有工作階段 + AI 金鑰。回傳同 `OneClickResult` 形狀。
+需已有工作階段。`useAi=false` 時仍會套用本機術語表與翻譯記憶，無法離線補上的內容保留原文；回傳同 `OneClickResult` 形狀。
 
 ### `repair_translation_pack`
 
@@ -60,8 +71,26 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 |------|------|
 | outputDir | string |
 | useAi | bool |
+| backupBeforeApply | bool | 是否在重新套用前建立備份；預設前端會勾選 |
 
 重建 zip／session；可選 AI。
+
+### `detect_pack_translation_name`
+
+| 參數 | 型別 |
+|------|------|
+| instancePath | string |
+
+回 `{ version, packName, source, metadataPath }`。`version` 來自 CurseForge／Modrinth 等整合包文件，找不到時使用 `R1`；不會使用工具版本。
+
+### `inspect_jar_documentation`
+
+| 參數 | 型別 |
+|------|------|
+| instancePath | string |
+| outputDir | string |
+
+只讀掃描 `mods/*.jar` 內的文字文件與 class 可讀字串線索，輸出到工作區 `jar-documentation/`；不執行 JAR，也不把 class 線索直接改回 JAR。翻譯流程另會將語言檔寫入 `jar-translated/` 的完整副本。
 
 ### `apply_translation_to_game`
 
@@ -70,8 +99,11 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | instancePath | string |
 | outputDir | string |
 | packName | string \| null |
+| backupBeforeApply | bool | 是否在套用前保留被覆蓋檔案；未勾選時不建立工具備份 |
 
-回傳 `ApplyResult`：`backupDir`, `zipCopied`, `questsCopied`, `minemenuCopied`, `playerSummary`, `warnings`。
+另外回傳的 `ApplyResult` 會包含 `backupCreated`；未建立備份時 `backupDir` 為空字串、`backupCreated` 為 `false`。
+
+回傳 `ApplyResult`：`backupDir`, `backupCreated`, `zipCopied`, `jarsCopied`, `questsCopied`, `minemenuCopied`, `playerSummary`, `warnings`。`jarsCopied` 是已覆蓋到 `mods` 的翻譯 JAR 數量。
 
 ---
 
@@ -96,6 +128,8 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `open_url` | url | bool（僅 http/s） |
 | `open_guide_window` | — | 舊第二窗；UI 改用 overlay |
 | `create_font_pack` | fontPath, outputDir, packName, packDesc | FontPackResult |
+| `managed_output_for_instance` | instancePath | 每台電腦每個實例獨立的工作區 |
+| `upload_share_package_cmd` | workRoot, name | `{ url, expiresAt }`；需 Discord、官方伺服器會員與 Cloudflare 驗證，連結保留 24 小時 |
 | `save_api_key` | key | string |
 | `save_api_settings_cmd` | apiKey, baseUrl | string（金鑰空＝保留） |
 | `set_ai_mode_cmd` | aiMode：`managed`／`custom` | string |
@@ -115,6 +149,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `cancel_task` | — | string；要求中止進行中的長任務 |
 | `diagnose_launch_failure` | instancePath | `LaunchDiagnosis`（見下）；讀當機報告判斷缺模組 vs 我們的檔 |
 | `restore_last_apply_cmd` | instancePath | `RestoreResult`；一鍵反轉上次套用 |
+| `delete_apply_backups_cmd` | instancePath | `DeleteBackupResult`；只刪除本工具建立的翻譯套用備份 |
 | `check_update` | — | `UpdateCheck`（見下） |
 | `download_update` | — | `{ path, launched, automatic, message }`；驗證後安裝並重開，必要時退回可見安裝程式 |
 | `open_glossary` | — | string（自訂譯名檔路徑）；不存在會先建範本 |
@@ -143,13 +178,13 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 ### 檢查更新（`UpdateCheck`）
 
 ```json
-{ "current": "1.0.1", "latest": "1.0.1", "updateAvailable": false,
-  "url": "https://…", "notes": "", "ok": true, "message": "已是最新版（1.0.1）" }
+{ "current": "1.0.2", "latest": "1.0.2", "updateAvailable": false,
+  "url": "https://…", "notes": "", "ok": true, "message": "已是最新版（1.0.2）" }
 ```
 
 - `ok:false` 代表「暫時查不到」（沒網路等），**不是錯誤**，UI 顯示提示即可。
-- `download_update` 防止重複執行，只接受官方 Worker `/download/*.exe`；必須通過 SHA-256、100 KB～256 MB 與 `MZ` PE 標頭檢查。
-- Windows 優先以 NSIS `/S /R` 靜默升級並重新開啟；安裝器無法脫離父行程時，退回一般可見安裝程式。工具不自行覆寫執行中的 exe。
+   - `download_update` 防止重複執行，只接受官方 Worker `/download/*-portable.exe`；必須通過 SHA-256、100 KB～256 MB 與 `MZ` PE 標頭檢查。
+- Windows 會下載並驗證官方免安裝 EXE，再由脫離 Tauri Job 的背景排程等待目前工具關閉，替換同一路徑後重新開啟；若無法自動替換，則保留下載檔供使用者手動開啟。
 - 前端接線：按鈕 id 用 `#btn-check-update`（`app.js` 末端自足區塊會自動接上，
   並在啟動時安靜檢查一次、把狀態寫進 `#update-status`）；也可呼叫 `window.zfCheckUpdate()`。
 

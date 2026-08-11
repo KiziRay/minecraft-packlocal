@@ -174,8 +174,7 @@ where
 {
     on_progress(42, "AI：組裝待譯清單…");
 
-    // jobs: (ns, key, 原文)
-    let mut jobs: Vec<(String, String, String)> = Vec::new();
+    let mut jobs: Vec<shared_tm::SharedTmJob> = Vec::new();
     for (ns, map) in en_only {
         for (k, en) in map {
             if zh.get(ns).and_then(|m| m.get(k)).is_some() {
@@ -185,7 +184,12 @@ where
             if t.is_empty() || looks_untranslatable(t) {
                 continue;
             }
-            jobs.push((ns.clone(), k.clone(), en.clone()));
+            jobs.push(shared_tm::SharedTmJob {
+                namespace: ns.clone(),
+                key: k.clone(),
+                source: en.clone(),
+                context: context_hint(k).map(str::to_owned),
+            });
         }
     }
 
@@ -203,11 +207,11 @@ where
     let shared = shared_tm::lookup(&jobs);
     let mut shared_done: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if !shared.is_empty() {
-        for (i, (ns, k, src)) in jobs.iter().enumerate() {
+        for (i, job) in jobs.iter().enumerate() {
             if let Some(cand) = shared.get(&i) {
                 // 共享來的一樣要過佔位符守衛才敢用
-                if let Some(safe) = placeholder::guard(src, cand, &mut guard) {
-                    zh.entry(ns.clone()).or_default().insert(k.clone(), safe);
+                if let Some(safe) = placeholder::guard(&job.source, cand, &mut guard) {
+                    zh.entry(job.namespace.clone()).or_default().insert(job.key.clone(), safe);
                     report.filled += 1;
                     report.shared_hits += 1;
                     shared_done.insert(i);
@@ -228,20 +232,19 @@ where
         .collect();
     let mut unique: Vec<String> = Vec::new();
     let mut ctx: Vec<Option<&'static str>> = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<(String, Option<&'static str>), usize> = HashMap::new();
     let mut job_uid: HashMap<usize, usize> = HashMap::new(); // job index → uid
     for &i in &remaining {
-        let (_, key, en) = &jobs[i];
-        if let Some(&id) = seen.get(en) {
-            if ctx[id].is_none() {
-                ctx[id] = context_hint(key);
-            }
+        let job = &jobs[i];
+        let hint = context_hint(&job.key);
+        let dedupe_key = (job.source.clone(), hint);
+        if let Some(&id) = seen.get(&dedupe_key) {
             job_uid.insert(i, id);
         } else {
             let id = unique.len();
-            seen.insert(en.clone(), id);
-            unique.push(en.clone());
-            ctx.push(context_hint(key));
+            seen.insert(dedupe_key, id);
+            unique.push(job.source.clone());
+            ctx.push(hint);
             job_uid.insert(i, id);
         }
     }
@@ -257,19 +260,25 @@ where
         report.notes.extend(sub.notes.clone());
 
         // 寫回語言表 + 蒐集「這次新由 AI 產出的」以貢獻給社群
-        let mut to_share: Vec<(String, String, String, String)> = Vec::new();
+        let mut to_share: Vec<(String, String, String, String, Option<String>)> = Vec::new();
         for &i in &remaining {
             let Some(&uid) = job_uid.get(&i) else {
                 continue;
             };
             if let Some(text) = resolved.translations.get(&uid) {
-                let (ns, k, src) = &jobs[i];
-                zh.entry(ns.clone())
+                let job = &jobs[i];
+                zh.entry(job.namespace.clone())
                     .or_default()
-                    .insert(k.clone(), text.clone());
+                    .insert(job.key.clone(), text.clone());
                 report.filled += 1;
                 if resolved.ai_uids.contains(&uid) {
-                    to_share.push((ns.clone(), k.clone(), src.clone(), text.clone()));
+                    to_share.push((
+                        job.namespace.clone(),
+                        job.key.clone(),
+                        job.source.clone(),
+                        text.clone(),
+                        job.context.clone(),
+                    ));
                 }
             }
         }

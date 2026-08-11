@@ -17,11 +17,18 @@ const JSON_HEADERS = {
 };
 
 export function turnstileConfigured(env) {
-  return !!(
-    clean(env.TURNSTILE_SITE_KEY) &&
-    clean(env.TURNSTILE_SECRET_KEY) &&
-    clean(env.TURNSTILE_PROOF_SECRET).length >= 32
-  );
+  const status = turnstileStatus(env);
+  return status.siteKey && status.siteSecret && status.proofSecret;
+}
+
+// Safe diagnostics only: never expose secret values or their lengths.
+export function turnstileStatus(env) {
+  return {
+    siteKey: Boolean(clean(env.TURNSTILE_SITE_KEY)),
+    siteSecret: Boolean(clean(env.TURNSTILE_SECRET_KEY)),
+    proofSecret: clean(env.TURNSTILE_PROOF_SECRET).length >= 32,
+    enforced: String(env.TURNSTILE_ENFORCED || "") === "1",
+  };
 }
 
 export function isAllowedLoopbackCallback(value) {

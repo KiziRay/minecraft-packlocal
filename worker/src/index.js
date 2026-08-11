@@ -4,7 +4,7 @@
 //  1. GET  /api/desktop/latest   → 桌面版更新檢查（回最新版本 + 下載連結）
 //  2. GET/POST /turnstile        → Cloudflare 真人驗證與短效憑證
 //  3. POST /v1/chat/completions  → 驗證 Discord + Turnstile 後代理 AI
-//  4. /download、/tm             → R2 安裝檔與社群翻譯記憶
+//  4. /download、/tm             → R2 免安裝 EXE 與社群翻譯記憶
 //
 // 為什麼要代理而不是把金鑰編進 exe：
 //  - 金鑰若進 exe，任何人反編譯就能抽出，開發者的免費額度幾天內被刷爆。
@@ -17,6 +17,7 @@ import {
   renderTurnstile,
   startTurnstile,
   turnstileConfigured,
+  turnstileStatus,
   verifyTurnstileAccess,
 } from "./turnstile.mjs";
 
@@ -35,7 +36,7 @@ export default {
       return latest(env);
     }
 
-    // 安裝檔下載：直接從 R2 串流。/download/<檔名>
+    // 免安裝 EXE 下載：直接從 R2 串流。/download/<檔名>
     if (url.pathname.startsWith("/download/") && (request.method === "GET" || request.method === "HEAD")) {
       return download(url, env, request.method === "HEAD");
     }
@@ -64,6 +65,14 @@ export default {
       return tmContribute(request, env);
     }
 
+    // 分享檔使用獨立的 SHARES R2 bucket，不會寫入安裝檔或翻譯記憶。
+    if (url.pathname === "/api/share/upload" && request.method === "POST") {
+      return shareUpload(request, env);
+    }
+    if (url.pathname.startsWith("/s/") && (request.method === "GET" || request.method === "HEAD")) {
+      return shareDownload(url, env, request.method === "HEAD");
+    }
+
     // 健康檢查
     if (url.pathname === "/" || url.pathname === "/health") {
       // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）——設好 secret 後可用來自我驗證
@@ -73,10 +82,14 @@ export default {
         version: env.LATEST_VERSION,
         hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
         turnstileReady: turnstileConfigured(env),
+        turnstile: turnstileStatus(env),
       });
     }
 
     return json({ error: "not found" }, 404);
+  },
+  async scheduled(_event, env) {
+    await cleanupShares(env);
   },
 };
 
@@ -87,19 +100,20 @@ function latest(env) {
     version: env.LATEST_VERSION || "0.0.0",
     url: env.DOWNLOAD_URL || "",
     notes: env.RELEASE_NOTES || "",
-    sha256: env.INSTALLER_SHA256 || "",
+    sha256: env.UPDATE_SHA256 || env.INSTALLER_SHA256 || "",
   });
 }
 
 // ───────────────────────── 共享翻譯記憶（R2，依模組分片）─────────────────────────
 //
-// 儲存：tm/v1/<namespace>.json = { "<keyhash>": "zh", … }。keyhash = sha256(ns\0key\0src)[:24]。
-// 用 R2（沒有 KV 權限）；讀改寫為 last-write-wins，偶爾遺漏會在下次翻譯自動補回。
-// 只存字串，無任何身分/個資。
+// 儲存：tm/v1/<namespace>.json.gz 是精確鍵，tm/v2/global.json.gz 是跨模組候選。
+// 只在上下文一致時命中；不同譯文會標記 conflict，避免後來的 AI 結果靜默覆蓋先前結果。
+// 只存匿名文字與語境，不存本機路徑、Discord 身分或整合包檔案。
 
 const TM_MAX_ITEMS = 5000;
 const TM_MAX_ZH_LEN = 400;
 const TM_SHARD_CAP = 200000; // 單模組分片最多條數（防惡意灌爆）
+const TM_GLOBAL_CAP = 300000;
 
 function tmShardKey(ns) {
   return `tm/v1/${ns}.json.gz`;
@@ -137,6 +151,45 @@ async function tmReadShard(env, ns) {
   }
 }
 
+async function tmReadGlobal(env) {
+  const obj = await env.DOWNLOADS.get("tm/v2/global.json.gz");
+  if (!obj) return {};
+  try {
+    const buf = await obj.arrayBuffer();
+    return JSON.parse(await gunzipToStr(buf));
+  } catch (_) {
+    return {};
+  }
+}
+
+function tmRecord(value) {
+  if (typeof value === "string") return { zh: value, ctx: "", conflict: false };
+  if (!value || typeof value !== "object" || typeof value.zh !== "string") return null;
+  return {
+    zh: value.zh,
+    ctx: typeof value.ctx === "string" ? value.ctx : "",
+    conflict: value.conflict === true,
+  };
+}
+
+function tmCanUse(value, ctx) {
+  const record = tmRecord(value);
+  if (!record || !record.zh.trim() || record.conflict) return null;
+  if (record.ctx && ctx && record.ctx !== ctx) return null;
+  return record.zh;
+}
+
+function tmMerge(target, key, next) {
+  const previous = tmRecord(target[key]);
+  if (!previous) {
+    target[key] = next;
+    return next.conflict ? "conflict" : "accepted";
+  }
+  if (previous.zh === next.zh && (!previous.ctx || !next.ctx || previous.ctx === next.ctx)) return "duplicate";
+  target[key] = { ...previous, conflict: true };
+  return "conflict";
+}
+
 async function tmLookup(request, env) {
   if (!env.DOWNLOADS) return json({ hits: {} });
   let body;
@@ -147,10 +200,14 @@ async function tmLookup(request, env) {
   }
   const items = Array.isArray(body.items) ? body.items.slice(0, TM_MAX_ITEMS) : [];
   const byNs = new Map();
+  const queries = new Map();
   for (const it of items) {
     if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh)) continue;
-    if (!byNs.has(it.ns)) byNs.set(it.ns, new Set());
-    byNs.get(it.ns).add(it.kh);
+    const ctx = typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "";
+    const sk = tmValidKh(it.sk) ? it.sk : "";
+    if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
+    byNs.get(it.ns).set(it.kh, { ctx, sk });
+    queries.set(it.kh, { ctx, sk });
   }
   const hits = {};
   const nss = [...byNs.keys()];
@@ -160,12 +217,21 @@ async function tmLookup(request, env) {
       nss.slice(i, i + CONC).map(async (ns) => {
         const shard = await tmReadShard(env, ns);
         if (!shard) return;
-        for (const kh of byNs.get(ns)) {
-          const zh = shard[kh];
-          if (typeof zh === "string" && zh) hits[kh] = zh;
+        for (const [kh, query] of byNs.get(ns)) {
+          const zh = tmCanUse(shard[kh], query.ctx);
+          if (zh) hits[kh] = zh;
         }
       })
     );
+  }
+  const missing = [...queries.entries()].filter(([kh]) => !hits[kh]);
+  if (missing.length) {
+    const global = await tmReadGlobal(env);
+    for (const [kh, query] of missing) {
+      if (!query.sk) continue;
+      const zh = tmCanUse(global[query.sk], query.ctx);
+      if (zh) hits[kh] = zh;
+    }
   }
   return json({ hits });
 }
@@ -180,23 +246,39 @@ async function tmContribute(request, env) {
   }
   const items = Array.isArray(body.items) ? body.items.slice(0, TM_MAX_ITEMS) : [];
   const byNs = new Map();
+  const globalEntries = new Map();
   for (const it of items) {
-    if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh)) continue;
+    if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh) || !tmValidKh(it.sk)) continue;
     const zh = typeof it.zh === "string" ? it.zh.trim() : "";
     if (!zh || zh.length > TM_MAX_ZH_LEN) continue;
-    if (!byNs.has(it.ns)) byNs.set(it.ns, {});
-    byNs.get(it.ns)[it.kh] = zh;
+    const record = {
+      zh,
+      ctx: typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "",
+      conflict: false,
+    };
+    if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
+    byNs.get(it.ns).set(it.kh, record);
+    const previousGlobal = globalEntries.get(it.sk);
+    if (!previousGlobal) {
+      globalEntries.set(it.sk, record);
+    } else if (previousGlobal.zh !== record.zh || (previousGlobal.ctx && record.ctx && previousGlobal.ctx !== record.ctx)) {
+      previousGlobal.conflict = true;
+    }
   }
   let accepted = 0;
+  let conflicts = 0;
   for (const [ns, entries] of byNs) {
     const shard = (await tmReadShard(env, ns)) || {};
     let changed = false;
-    for (const [kh, zh] of Object.entries(entries)) {
+    for (const [kh, next] of entries) {
       if (Object.keys(shard).length >= TM_SHARD_CAP && !(kh in shard)) continue;
-      if (shard[kh] !== zh) {
-        shard[kh] = zh;
+      const result = tmMerge(shard, kh, next);
+      if (result === "accepted") {
         changed = true;
         accepted++;
+      } else if (result === "conflict") {
+        changed = true;
+        conflicts++;
       }
     }
     // 只有真的有新條目才寫（避免重複寫入）；寫的是 gzip 後的位元組（省容量）
@@ -207,10 +289,31 @@ async function tmContribute(request, env) {
       });
     }
   }
-  return json({ ok: true, accepted });
+  if (globalEntries.size) {
+    const global = await tmReadGlobal(env);
+    let changed = false;
+    for (const [sk, next] of globalEntries) {
+      if (Object.keys(global).length >= TM_GLOBAL_CAP && !(sk in global)) continue;
+      const result = tmMerge(global, sk, next);
+      if (result === "accepted") {
+        accepted++;
+        changed = true;
+      } else if (result === "conflict") {
+        conflicts++;
+        changed = true;
+      }
+    }
+    if (changed) {
+      const gz = await gzipBytes(JSON.stringify(global));
+      await env.DOWNLOADS.put("tm/v2/global.json.gz", gz, {
+        httpMetadata: { contentType: "application/gzip" },
+      });
+    }
+  }
+  return json({ ok: true, accepted, conflicts });
 }
 
-// ───────────────────────── 安裝檔下載（R2）─────────────────────────
+// ───────────────────────── 免安裝 EXE 下載（R2）─────────────────────────
 
 async function download(url, env, headOnly) {
   if (!env.DOWNLOADS) {
@@ -236,6 +339,134 @@ async function download(url, env, headOnly) {
   }
   headers.set("access-control-allow-origin", "*");
   return new Response(headOnly ? null : obj.body, { headers });
+}
+
+// ───────────────────────── 一日分享檔（獨立 R2）─────────────────────────
+
+const SHARE_PREFIX = "v1/";
+const SHARE_TTL_SECONDS = 24 * 60 * 60;
+
+async function shareUpload(request, env) {
+  if (!env.SHARES) return json({ error: "share storage not configured" }, 503);
+  const access = await authorizeManagedAi(request, env);
+  if (!access.ok) return access.response;
+  const type = String(request.headers.get("content-type") || "").split(";")[0].toLowerCase();
+  const maxBytes = Math.min(parseInt(env.SHARE_MAX_BYTES || "104857600", 10) || 104857600, 104857600);
+  const declared = parseInt(request.headers.get("content-length") || "0", 10);
+  if (type !== "application/zip") return json({ error: "zip content type required" }, 415);
+  if (declared > maxBytes) return json({ error: "share file too large" }, 413);
+
+  const token = randomShareToken();
+  const expiresAt = Math.floor(Date.now() / 1000) + SHARE_TTL_SECONDS;
+  const key = SHARE_PREFIX + token + ".zip";
+  const rawName = String(request.headers.get("x-zeitfrei-pack-name") || "");
+  let packName = "Minecraft 模組翻譯資源包";
+  try {
+    const decoded = decodeURIComponent(rawName);
+    const cleaned = decoded.replace(/[\\/\u0000-\u001f\u007f]/g, "").trim().slice(0, 120);
+    if (cleaned) packName = cleaned;
+  } catch (_) {}
+  const object = await env.SHARES.put(key, request.body, {
+    httpMetadata: { contentType: "application/zip", cacheControl: "no-store" },
+    customMetadata: {
+      expiresAt: String(expiresAt),
+      uploader: access.userId,
+      service: "packlocal-share",
+      name: packName,
+    },
+  });
+  if (!object) return json({ error: "share upload failed" }, 500);
+  const base = String(env.SHARE_PUBLIC_URL || new URL(request.url).origin).replace(/\/+$/, "");
+  return json({ url: `${base}/s/${token}`, expiresAt });
+}
+
+async function shareDownload(url, env, headOnly) {
+  if (!env.SHARES) return json({ error: "share storage not configured" }, 503);
+  const token = decodeURIComponent(url.pathname.slice("/s/".length).replace(/\/download$/, ""));
+  if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return json({ error: "bad share token" }, 400);
+  const object = await env.SHARES.get(SHARE_PREFIX + token + ".zip");
+  if (!object) return json({ error: "share not found or expired" }, 404);
+  const expiresAt = Number(object.customMetadata?.expiresAt || 0);
+  if (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000)) {
+    await env.SHARES.delete(SHARE_PREFIX + token + ".zip");
+    return json({ error: "share expired" }, 404);
+  }
+  const downloadRequested = headOnly || url.pathname.endsWith("/download") || url.searchParams.get("download") === "1";
+  if (!downloadRequested) {
+    return renderShareLanding(url, env, token, object, expiresAt);
+  }
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-type", "application/zip");
+  headers.set("content-length", String(object.size));
+  headers.set("cache-control", "no-store, max-age=0");
+  headers.set("content-disposition", `attachment; filename*=UTF-8''packlocal-${token}.zip`);
+  return new Response(headOnly ? null : object.body, { headers });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderShareLanding(url, env, token, object, expiresAt) {
+  const name = String(object.customMetadata?.name || "Minecraft 模組翻譯資源包");
+  const title = name + "｜模組包翻譯分享";
+  const base = String(env.SHARE_PUBLIC_URL || url.origin).replace(/\/+$/, "");
+  const canonical = base + "/s/" + token;
+  const downloadUrl = canonical + "?download=1";
+  const expires = new Date(expiresAt * 1000).toLocaleString("zh-TW", { dateStyle: "medium", timeStyle: "short" });
+  const html = [
+    "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "<meta name=\"robots\" content=\"noindex,nofollow\">",
+    "<meta property=\"og:type\" content=\"website\">",
+    "<meta property=\"og:title\" content=\"" + escapeHtml(title) + "\">",
+    "<meta property=\"og:description\" content=\"24 小時有效的 Minecraft 繁體中文翻譯資源包分享。\">",
+    "<meta property=\"og:url\" content=\"" + escapeHtml(canonical) + "\">",
+    "<meta name=\"twitter:card\" content=\"summary\">",
+    "<title>" + escapeHtml(title) + "</title>",
+    "<style>body{margin:0;background:#101214;color:#e8e5df;font:16px/1.6 system-ui,sans-serif}main{max-width:680px;margin:8vh auto;padding:28px}article{border:1px solid #3d4147;border-radius:14px;background:#191c20;padding:28px;box-shadow:0 20px 70px #0006}p{color:#b8b8b2}.tag{color:#e29a62;font-size:12px;letter-spacing:.14em;text-transform:uppercase}a.button{display:inline-block;background:#dd8951;color:#17110d;text-decoration:none;font-weight:700;padding:11px 18px;border-radius:8px;margin:12px 0}footer{margin-top:28px;font-size:13px;color:#8e918d}footer a{color:#d8a47d;margin-right:14px}</style>",
+    "</head><body><main><article><div class=\"tag\">ZEITFREI · PACKLOCAL SHARE</div>",
+    "<h1>" + escapeHtml(name) + "</h1>",
+    "<p>這是可直接覆蓋到 Minecraft 實例的翻譯資源包。連結只保留 24 小時，下載後請解壓到對應的遊戲資料夾。</p>",
+    "<p>有效期限：<strong>" + escapeHtml(expires) + "</strong></p>",
+    "<a class=\"button\" href=\"" + escapeHtml(downloadUrl) + "\">下載翻譯檔</a>",
+    "<footer>需要更多遊戲與工具？<a href=\"https://cloud.zeitfrei.uk/\">cloud.zeitfrei.uk 遊戲下載</a><a href=\"https://cloud.zeitfrei.uk/zeitfreitool\">ZeitFrei 工具箱</a></footer>",
+    "</article></main></body></html>",
+  ].join("");
+  return new Response(html, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store, max-age=0",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors *; base-uri 'none'",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+function randomShareToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function cleanupShares(env) {
+  if (!env.SHARES) return;
+  const listing = await env.SHARES.list({ prefix: SHARE_PREFIX, limit: 1000 });
+  const now = Math.floor(Date.now() / 1000);
+  const expired = await Promise.all(
+    listing.objects.map(async (object) => {
+      const head = await env.SHARES.head(object.key);
+      return head && Number(head.customMetadata?.expiresAt || 0) <= now ? object.key : null;
+    })
+  );
+  await Promise.all(expired.filter(Boolean).map((key) => env.SHARES.delete(key)));
 }
 
 // ───────────────────────── AI 代理 ─────────────────────────
@@ -357,9 +588,24 @@ async function authorizeManagedAi(request, env) {
   const identity = await authorizeManagedIdentity(request, env);
   if (!identity.ok) return identity;
 
-  // Turnstile 目前停用（使用者要求取消；服務端金鑰未完整設定）。維持「Discord 登入即可」。
-  // 要重新啟用：wrangler 設 TURNSTILE_ENFORCED="1"，並設好 TURNSTILE_SECRET_KEY / TURNSTILE_PROOF_SECRET secret。
-  if (String(env.TURNSTILE_ENFORCED || "") === "1" && turnstileConfigured(env)) {
+  // 代管 AI 與分享檔共用 Discord 會員及 Turnstile 閘門；舊版缺少新標頭時會先被拒絕。
+  // 強制模式下，設定不完整也必須拒絕，不能退化成只檢查 Discord。
+  const turnstileEnforced = String(env.TURNSTILE_ENFORCED || "") === "1";
+  if (turnstileEnforced && !turnstileConfigured(env)) {
+    return {
+      ok: false,
+      response: json(
+        {
+          error: {
+            message: "Cloudflare Turnstile is not configured",
+            type: "turnstile_unavailable",
+          },
+        },
+        503
+      ),
+    };
+  }
+  if (turnstileEnforced) {
     const proof = String(request.headers.get("x-zeitfrei-turnstile") || "").trim();
     const checked = await verifyTurnstileAccess(proof, env, identity.userId);
     if (!checked.ok) {

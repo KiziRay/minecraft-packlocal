@@ -7,10 +7,10 @@
 
 | 措施 | 為什麼降低誤判 | 位置 |
 |------|----------------|------|
-| **不自我替換 exe** | 靜默改寫執行檔是防毒判「木馬 dropper」的頭號特徵。更新改成「下載安裝檔→使用者手動點一次」 | `engine/updater.rs` |
-| **更新安裝檔 sha256 驗證** | 半途損毀／被掉包會被擋，也讓行為可預期 | `engine/updater.rs` |
+| **免安裝更新替換** | 更新器先驗證檔案，再由背景排程等待舊程式結束後替換；失敗時保留下載檔供手動開啟 | `engine/updater.rs` |
+| **更新 EXE sha256 驗證** | 半途損毀／被掉包會被擋，也讓行為可預期 | `engine/updater.rs` |
 | **不生隱藏 powershell／主控台** | 隱藏子程序是常見惡意行為特徵。簡繁轉換已改內建純 Rust，不再外呼 python | `engine/convert.rs` |
-| **NSIS `currentUser` 安裝** | 不要求系統管理員提權；要求提權會提高 SmartScreen 與防毒的敏感度 | `tauri.conf.json` |
+| **免安裝 EXE** | 不寫入 Program Files、不要求系統管理員提權；使用者可直接把工具放在有權限的資料夾 | `tauri.conf.json` |
 | **完整版本資訊／發行者／版權** | 有 publisher、copyright、描述的檔案比「空白中繼資料」可信 | `tauri.conf.json` |
 | **release profile：strip + lto** | 體積小、無除錯符號，減少啟發式雜訊 | `Cargo.toml` |
 | **AI 金鑰不進 exe** | 內嵌憑證／金鑰會被部分引擎當可疑字串；改用 Worker 代理 | `engine/secrets.rs` |
@@ -36,13 +36,13 @@
 
 改版發佈流程（配合 `worker/`）：
 
-1. `npm run build` 產生新 `模組包翻譯工具_x.y.z.exe`（NSIS）。
+1. `npm run build` 產生 `src-tauri/target/release/Minecraft 模組整合包翻譯工具.exe`（免安裝版）。
 2. 簽章（見上）。
-3. 算 sha256：`certutil -hashfile <安裝檔> SHA256`。
-4. 上傳安裝檔到固定下載網址。
+3. 算 sha256：`certutil -hashfile <免安裝 EXE> SHA256`。
+4. 將 EXE 上傳到 Worker 使用的 R2 `DOWNLOADS` bucket，檔名使用 `*-portable.exe`。
 5. 更新 Worker 的版本資訊（見 `worker/wrangler.toml` 的 `LATEST_VERSION`、`DOWNLOAD_URL`，
    可加 `RELEASE_NOTES`、`sha256`）：改完 `cd worker && npx wrangler deploy`。
 6. 客戶端「檢查更新」就會抓到新版並提示下載。
 
-> `/api/desktop/latest` 目前回 `{version, url, notes}`；若要開啟安裝檔 sha256 驗證，
+> `/api/desktop/latest` 目前回 `{version, url, notes, sha256}`；
 > 在 Worker 回應加上 `sha256` 欄位即可，客戶端會自動比對。

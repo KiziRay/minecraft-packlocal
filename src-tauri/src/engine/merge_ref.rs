@@ -164,36 +164,92 @@ fn ns_from_lang_path(path: &Path, _root: &Path) -> Option<String> {
     Some(ns)
 }
 
-/// 常見預設參考包路徑（本機搜尋，不 AI）
+/// 在常見資料夾與各磁碟的淺層路徑尋找 CTE2／繁中參考包。
+///
+/// 不寫死任何使用者名稱或工作區路徑。對不在常見資料夾的參考包，
+/// 前端仍提供手動選取資料夾，避免為了自動搜尋掃描整顆磁碟。
 pub fn discover_default_reference() -> Option<PathBuf> {
-    let candidates = [
-        r"C:\Users\jolin\Downloads\zeitfreigame\CTE2TW\CTE2 TW (2.0.3).zip",
-        r"C:\Users\jolin\Downloads\zeitfreigame\CTE2\CTE2-繁體中文翻譯包.zip",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.is_file() {
-            return Some(p);
+    let mut roots = Vec::new();
+    for root in [
+        dirs::download_dir(),
+        dirs::document_dir(),
+        dirs::desktop_dir(),
+        std::env::current_dir().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        roots.push(root);
+    }
+
+    // 支援像 D:\\Down\\ccc\\CTE2 這種自訂磁碟路徑，但只看常見的第一層資料夾。
+    for drive in b'A'..=b'Z' {
+        let letter = drive as char;
+        for name in ["Downloads", "Download", "Down", "Games", "Mods", "Projects"] {
+            roots.push(PathBuf::from(format!("{}:\\{}", letter, name)));
         }
     }
-    // 目錄內第一個大 zip
-    let dir = PathBuf::from(r"C:\Users\jolin\Downloads\zeitfreigame\CTE2TW");
-    if dir.is_dir() {
-        let mut zips: Vec<_> = std::fs::read_dir(&dir)
-            .ok()?
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&root)
+            .max_depth(5)
+            .follow_links(false)
+            .into_iter()
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
+        {
+            let path = entry.path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let lower = name.to_ascii_lowercase();
+            let looks_like_reference = lower.contains("cte2")
+                || name.contains("繁體")
+                || name.contains("翻譯")
+                || name.contains("僅翻譯");
+            if !looks_like_reference {
+                continue;
+            }
+            if path.is_file()
+                && path
+                    .extension()
                     .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("zip"))
+                    .map(|s| s.eq_ignore_ascii_case("zip") || s.eq_ignore_ascii_case("jar"))
                     .unwrap_or(false)
-            })
-            .collect();
-        zips.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
-        if let Some(p) = zips.into_iter().next() {
-            return Some(p);
+            {
+                candidates.push(path.to_path_buf());
+            } else if path.is_dir() && has_reference_lang(path) {
+                candidates.push(path.to_path_buf());
+            }
         }
     }
-    None
+
+    candidates.sort_by_key(|path| {
+        (
+            !path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase().contains("cte2"))
+                .unwrap_or(false),
+            std::cmp::Reverse(path.metadata().map(|m| m.len()).unwrap_or(0)),
+        )
+    });
+    candidates.into_iter().next()
+}
+
+fn has_reference_lang(root: &Path) -> bool {
+    WalkDir::new(root)
+        .max_depth(8)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.eq_ignore_ascii_case("zh_tw.json"))
+                    .unwrap_or(false)
+        })
 }

@@ -1,4 +1,4 @@
-# 架構說明（1.0.1）
+# 架構說明（工具 1.0.2）
 
 ## 1. 總覽
 
@@ -15,13 +15,15 @@
                             │
         ┌───────────────────┼───────────────────┐
         ▼                   ▼                   ▼
-   engine/jar_scan     engine/merge_ref    engine/deepseek
+   engine/jar_scan     engine/jar_translate engine/jar_docs
+   engine/pack_version
+   engine/merge_ref    engine/deepseek    engine/diagnose
    engine/convert      engine/pack_out     engine/ftbquests
    engine/text_overlay engine/session      engine/apply_instance
    engine/out_layout   engine/secrets      engine/security
    engine/minemenu     engine/font_pack    engine/glossary
    engine/placeholder  engine/tm           engine/cancel
-   engine/updater
+   engine/updater      engine/share_upload
 ```
 
 ## 1b. 雲端（Cloudflare Worker）
@@ -60,14 +62,23 @@ instance (mods/…)
     │
     ├─ zh-Hant-TW 轉換（整圖再保險，內建純 Rust）
     │
+    ├─ rewrite_translated_jars ──► 翻譯結果/jar-translated/*.jar
+    │     （完整複製 JAR，只改語言檔；含簽章 JAR 安全略過）
+    │
     ├─ build_resource_pack ──► 翻譯結果/resourcepacks/*.zip
     │
     ├─ translate_ftbquests ──► 翻譯結果/config/ftbquests
     │
     ├─ translate_text_overlays ──► patchouli / openloader / …
     │
+    ├─ jar_docs（只讀 JAR 文件與 class 文字線索）
+    ├─ apply_to_instance（備份後直接套用、啟用資源包，含翻譯 JAR）
     └─ write_coverage_report + 錯誤日誌 + session 更新
 ```
+
+資源包名稱和工具版本分開：`pack_version` 讀取 CurseForge `manifest.json`、Modrinth `modrinth.index.json` 等文件；名稱格式為「模組包翻譯工具+月日+整合包版本」，找不到版本時使用 `R1`。同一工作區可以反覆複查，`TranslateSession.review_pass` 記錄複查次數。
+
+分享檔只取可安裝內容，經 `/api/share/upload` 上傳到獨立的 Cloudflare R2 `SHARES` bucket。更新用免安裝 EXE／翻譯記憶仍使用 `DOWNLOADS`，兩者不共用資料路徑。Worker 每次下載都檢查 24 小時期限，排程只負責清理過期物件。
 
 **原則**：
 1. 本地全部整理完才 AI；AI 只收字串。
@@ -94,7 +105,8 @@ instance (mods/…)
 | `ResultLayout` | `out_layout.rs` | work_root / resourcepacks / config |
 | `BuildOptions` | `pack_out.rs` | 包名、描述、output、pack_format |
 | `CoverageStats` | `out_layout.rs` | 覆蓋報告數字 |
-| `ApplyResult` | `apply_instance.rs` | 套用摘要與備份路徑 |
+| `JarTranslationReport` | `jar_translate.rs` | JAR 掃描／重建／語言檔統計與錯誤 |
+| `ApplyResult` | `apply_instance.rs` | 套用摘要、翻譯 JAR 數量與備份路徑 |
 | `Placeholders` | `placeholder.rs` | positional／keyed／soft 三類佔位符 |
 | `GuardStats` | `placeholder.rs` | 檢查／修復／退回計數 |
 | `Glossary` | `glossary.rs` | 術語表（內建 + 使用者覆寫） |

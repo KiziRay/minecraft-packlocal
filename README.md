@@ -2,9 +2,9 @@
 
 把整合包裡**能翻譯、且影響遊玩**的文字，盡量整理成**台灣用語繁體中文**。
 
-- **不修改** `mods/*.jar`
+- **原始 `mods/*.jar` 只讀**：工具會建立翻譯副本；套用前是否備份同名檔由玩家選擇
 - **不處理**圖片／貼圖上的字
-- 產出資源包 zip + 任務／書本等可覆蓋檔；可一鍵套用（先備份）
+- 產出資源包 zip + 任務／書本等可覆蓋檔；可一鍵套用（可選擇是否備份）
 - 不宣稱 100% 漢化
 - **免安裝任何額外東西**（簡繁轉換內建於執行檔）
 
@@ -18,10 +18,12 @@
 **不翻**：圖片上的字、寫死在程式碼／KubeJS 腳本裡的字串、GuideME 的 Markdown 書本、`.zip` 資料包、基岩版。
 完整清單與**免責條款** → [`docs/支援範圍與免責聲明.md`](./docs/支援範圍與免責聲明.md)。
 
+模組 JAR 內的 `assets/<模組>/lang/*.json`／`.lang` 會被讀取並建立繁中副本；簽章 JAR 會安全略過，避免重打包後失效。
+
 ## 下載
 
-- **Release**：見本專案 [Releases](https://github.com/KiziRay/minecraft-packlocal/releases) 的最新版（安裝檔 + 免安裝版 + `SHA256SUMS.txt`）。
-- 工具內建「檢查更新」會從官方 Worker 下載安裝檔，強制核對 SHA-256 與檔案格式，再自動安裝並重開；自動流程失敗時可改用瀏覽器下載。
+- **Release**：見本專案 [Releases](https://github.com/KiziRay/minecraft-packlocal/releases) 的最新版（免安裝版 + `SHA256SUMS.txt`）。
+- 工具內建「檢查更新」會從官方 Worker 下載免安裝 EXE，強制核對 SHA-256 與檔案格式，再自動替換並重開；自動流程失敗時可改用瀏覽器下載。
 - 下載後請用 `SHA256SUMS.txt` 自行核對雜湊，確認檔案未被竄改（公開原始碼不等於自動保證檔案安全）。
 
 ## 這個工具跟「丟給 AI 翻」差在哪
@@ -32,19 +34,21 @@
 | 譯名一致性 | 同一隻怪三種叫法 | 內建官方台灣譯名 + 你的自訂詞 |
 | 費用 | 每個整合包重付一次 | 翻譯記憶跨包重用 |
 | 簡繁 | 常吐簡中 | 一律過 zh-Hant-TW（台灣用語） |
-| 範圍 | 只有你貼進去的 | jar lang、任務、書本、覆寫檔全掃 |
+| 範圍 | 只有你貼進去的 | jar 語言檔副本、任務、書本、覆寫檔全掃 |
 
 ---
 
 ## 玩家怎麼用
 
 1. 執行免安裝程式（建置後在 `src-tauri/target/release/`）。
-2. 選**遊戲實例**資料夾、**結果根目錄**。
-3. （建議）選社群繁中參考 zip；勾選 AI 後使用開發者代管服務，或填入自己的 API。
-4. **開始一鍵翻譯** → 完成後**關遊戲** → **一鍵套用到遊戲**。
+2. 選**遊戲實例**資料夾；「翻譯結果位置」會自動建立。若想另外保存翻譯結果，可在翻譯前勾選並選取結果資料夾，留白則沿用自動位置。
+3. （建議）選社群繁中參考資料；工具會自動尋找 CTE2 等繁中內容，也可手動選取。勾選 AI 後使用開發者代管服務，或填入自己的 API。
+4. **開始一鍵翻譯** → 選擇是否備份後直接套用；需要時可重複按**再次複查翻譯**。
 5. 遊戲內：語言「繁體中文（台灣）」→ 啟用資源包。
 
 完整說明：程式內「完整使用說明」，或 `docs/USER-GUIDE.md`。
+
+翻譯完成後可按「翻譯完成後分享」，先自行檢查並確認沒有私人內容，才會建立 24 小時短連結。分享檔只包含可安裝翻譯內容，不包含本機路徑或工作階段紀錄；分享頁會提供 cloud.zeitfrei.uk 的遊戲下載與工具箱連結。遇到閃退可切到「錯誤分析」貼上 crash report／latest.log；工具會協助分辨模組問題與翻譯問題。
 
 ---
 
@@ -54,6 +58,8 @@
 |------|------|------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 開發 | 架構、模組、資料流 |
 | [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | 開發 | 環境、建置、除錯、設定路徑 |
+| [docs/LOCALIZE-202608.md](./docs/LOCALIZE-202608.md) | 開發 | **202608**：最快且盡完整本地化、缺漏／優化 backlog、波次 |
+| [docs/SEARCH-MAP.md](./docs/SEARCH-MAP.md) | 開發 | 多根搜尋地圖（手翻同路徑） |
 | [docs/API-COMMANDS.md](./docs/API-COMMANDS.md) | 前後端 | Tauri command 契約 |
 | [docs/EXTENDING.md](./docs/EXTENDING.md) | 開發 | 如何加新文字來源 |
 | [docs/USER-GUIDE.md](./docs/USER-GUIDE.md) | 玩家／文案 | 使用說明全文結構 |
@@ -73,7 +79,7 @@ npm install
 npm run dev          # 開發
 npm run check        # cargo check（DoD：0 error 0 warning）
 npm run test         # cargo test --lib
-# npm run build      # 正式建置（產 exe／NSIS）— 需要時再跑
+# npm run build      # 建置免安裝 EXE（不產生 NSIS）— 需要時再跑
 ```
 
 設定與快取存放於 `%APPDATA%\modpack-i18n-tool\`：

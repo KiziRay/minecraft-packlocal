@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::jar_scan::resolve_minecraft_dir;
-use super::out_layout::{ensure_result_layout, ResultLayout};
+use super::out_layout::{ensure_result_layout, ResultLayout, RESULT_DIR_NAME};
 use super::session::{find_session_file, load_session};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {
     pub backup_dir: String,
+    pub backup_created: bool,
     pub zip_copied: Option<String>,
+    pub jars_copied: usize,
     pub quests_copied: bool,
     pub minemenu_copied: bool,
     pub player_summary: String,
@@ -52,24 +54,13 @@ pub struct RestoreResult {
     pub player_summary: String,
 }
 
-pub fn restore_last_apply(instance_path: &Path) -> Result<RestoreResult, String> {
+/// 從指定的翻譯結果位置找最近一次套用備份；沒有指定時相容舊版實例旁備份。
+pub fn restore_last_apply_in(
+    instance_path: &Path,
+    result_root: Option<&Path>,
+) -> Result<RestoreResult, String> {
     let mc = resolve_minecraft_dir(instance_path)?;
-    let parent = mc.parent().unwrap_or(&mc);
-    // 找最新的 翻譯套用備份_*
-    let mut backups: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = fs::read_dir(parent) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir()
-                && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.starts_with("翻譯套用備份_"))
-                    .unwrap_or(false)
-            {
-                backups.push(p);
-            }
-        }
-    }
+    let mut backups = find_backup_dirs(&mc, result_root);
     if backups.is_empty() {
         return Err("找不到任何『翻譯套用備份_』資料夾，沒有可還原的套用紀錄。".into());
     }
@@ -105,7 +96,19 @@ pub fn restore_last_apply(instance_path: &Path) -> Result<RestoreResult, String>
         }
     } else {
         // 舊備份沒有清單：退回「把備份內容整包蓋回去」（只能還原覆蓋，無法刪掉新增的）
-        for sub in ["resourcepacks", "config", "minemenu", "patchouli_books", "kubejs", "datapacks"] {
+        for sub in [
+            "mods",
+            "resourcepacks",
+            "config",
+            "minemenu",
+            "patchouli_books",
+            "kubejs",
+            "datapacks",
+            "defaultconfigs",
+            "global_packs",
+            "paxi",
+            "data",
+        ] {
             let from = backup_root.join(sub);
             if from.is_dir() {
                 restored += restore_tree(&from, &mc.join(sub));
@@ -121,7 +124,7 @@ pub fn restore_last_apply(instance_path: &Path) -> Result<RestoreResult, String>
 現在再開一次遊戲：\n\
 • 若開得起來 → 先前是翻譯檔造成的，歡迎把當機報告給我們修\n\
 • 若還是開不起來 → 不是翻譯，多半是整合包缺模組（可用『診斷開不了』看是缺什麼）\n\
-（本工具不改 mods/*.jar）",
+（原始 mods/*.jar 不會直接修改；翻譯副本會先備份後套用）",
         backup_root.display(),
         removed,
         restored
@@ -132,6 +135,91 @@ pub fn restore_last_apply(instance_path: &Path) -> Result<RestoreResult, String>
         restored,
         player_summary,
     })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteBackupResult {
+    pub deleted: usize,
+    pub failed: Vec<String>,
+    pub player_summary: String,
+}
+
+pub fn delete_apply_backups_in(
+    instance_path: &Path,
+    result_root: Option<&Path>,
+) -> Result<DeleteBackupResult, String> {
+    let mc = resolve_minecraft_dir(instance_path)?;
+    let backups = find_backup_dirs(&mc, result_root);
+
+    let mut deleted = 0usize;
+    let mut failed = Vec::new();
+    for backup in backups {
+        match fs::remove_dir_all(&backup) {
+            Ok(()) => deleted += 1,
+            Err(error) => failed.push(format!("{}：{}", backup.display(), error)),
+        }
+    }
+
+    let player_summary = if failed.is_empty() {
+        if deleted == 0 {
+            "沒有找到工具建立的備份檔案。".to_string()
+        } else {
+            format!("已刪除 {} 個翻譯套用備份。", deleted)
+        }
+    } else {
+        format!("已刪除 {} 個備份，但有 {} 個無法刪除。", deleted, failed.len())
+    };
+
+    Ok(DeleteBackupResult {
+        deleted,
+        failed,
+        player_summary,
+    })
+}
+
+fn find_backup_dirs(mc: &Path, result_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut containers = Vec::new();
+    let mut add_container = |path: PathBuf| {
+        if !containers.iter().any(|existing| existing == &path) {
+            containers.push(path);
+        }
+    };
+
+    if let Some(root) = result_root {
+        let work_root = if root.file_name().and_then(|name| name.to_str()) == Some(RESULT_DIR_NAME) {
+            root.to_path_buf()
+        } else {
+            root.join(RESULT_DIR_NAME)
+        };
+        add_container(work_root);
+        add_container(root.to_path_buf());
+    }
+    if let Some(parent) = mc.parent() {
+        // 舊版備份在 Minecraft 資料夾旁；保留讀取與刪除相容性。
+        add_container(parent.to_path_buf());
+    }
+
+    let mut backups = Vec::new();
+    for container in containers {
+        if let Ok(entries) = fs::read_dir(container) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.starts_with("翻譯套用備份_"))
+                        .unwrap_or(false)
+                    && !backups.iter().any(|existing| existing == &path)
+                {
+                    backups.push(path);
+                }
+            }
+        }
+    }
+    backups.sort();
+    backups
 }
 
 fn restore_tree(from: &Path, to: &Path) -> usize {
@@ -155,11 +243,12 @@ fn restore_tree(from: &Path, to: &Path) -> usize {
 
 /// 將「翻譯結果」套用到遊戲：resourcepacks zip + config/ftbquests + minemenu
 /// + patchouli_books / config/openloader / kubejs（若 work 有）。
-/// 絕不改 mods/*.jar。套用前備份會被覆蓋的目標。
+/// 不修改原始 mods/*.jar；翻譯副本套用前會備份被覆蓋的目標。
 pub fn apply_to_instance(
     instance_path: &Path,
     output_or_work: &Path,
     pack_name_hint: Option<&str>,
+    create_backup: bool,
 ) -> Result<ApplyResult, String> {
     if !instance_path.exists() {
         return Err("找不到遊戲資料夾，請重新選擇。".into());
@@ -183,12 +272,22 @@ pub fn apply_to_instance(
     let kubejs_src = work.join("kubejs");
     let fancymenu_src = work.join("config").join("fancymenu");
     let datapacks_src = work.join("datapacks");
+    let defaultconfigs_src = work.join("defaultconfigs");
+    let global_packs_src = work.join("global_packs");
+    let paxi_src = work.join("paxi");
+    let data_src = work.join("data");
+    let jar_src = work.join("jar-translated");
 
     let has_patchouli = dir_has_files(&patchouli_src);
     let has_openloader = dir_has_files(&openloader_src);
     let has_kubejs = dir_has_files(&kubejs_src);
     let has_fancymenu = dir_has_files(&fancymenu_src);
     let has_datapacks = dir_has_files(&datapacks_src);
+    let has_defaultconfigs = dir_has_files(&defaultconfigs_src);
+    let has_global_packs = dir_has_files(&global_packs_src);
+    let has_paxi = dir_has_files(&paxi_src);
+    let has_data = dir_has_files(&data_src);
+    let has_jars = dir_has_files(&jar_src);
 
     if zip_src.is_none()
         && !quests_src.is_dir()
@@ -198,6 +297,11 @@ pub fn apply_to_instance(
         && !has_kubejs
         && !has_fancymenu
         && !has_datapacks
+        && !has_defaultconfigs
+        && !has_global_packs
+        && !has_paxi
+        && !has_data
+        && !has_jars
     {
         return Err(format!(
             "在「{}」找不到可套用的 zip／任務／快捷選單／文字覆寫。請先完成一鍵翻譯。",
@@ -206,14 +310,25 @@ pub fn apply_to_instance(
     }
 
     let stamp = backup_stamp();
-    let backup_root = mc
-        .parent()
-        .unwrap_or(&mc)
+    // 備份跟著翻譯結果走，刪除結果資料夾時可以一次清理；不再散落在遊戲資料夾旁。
+    let backup_root = layout
+        .work_root
         .join(format!("翻譯套用備份_{stamp}"));
-    fs::create_dir_all(&backup_root).map_err(|e| format!("無法建立備份目錄：{e}"))?;
+    if create_backup {
+        fs::create_dir_all(&backup_root).map_err(|e| format!("無法建立備份目錄：{e}"))?;
+    }
+
+    let quests_dest = mc.join("config").join("ftbquests");
+    let menu_dest = mc.join("minemenu").join("menu.json");
+    let patchouli_dest = mc.join("patchouli_books");
+    let openloader_dest = mc.join("config").join("openloader");
+    let kubejs_dest = mc.join("kubejs");
+    let fancymenu_dest = mc.join("config").join("fancymenu");
+    let datapacks_dest = mc.join("datapacks");
 
     // ── 備份現有資源包 ──
-    if let Some(ref zip) = zip_src {
+    if create_backup {
+        if let Some(ref zip) = zip_src {
         let name = zip
             .file_name()
             .and_then(|s| s.to_str())
@@ -237,57 +352,71 @@ pub fn apply_to_instance(
             );
             copy_dir_recursive(&folder, &bak)?;
         }
-    }
+        }
 
-    // ── 備份 ftbquests ──
-    let quests_dest = mc.join("config").join("ftbquests");
-    if quests_src.is_dir() && quests_dest.is_dir() {
-        let bak = backup_root.join("config").join("ftbquests");
-        copy_dir_recursive(&quests_dest, &bak)?;
-    }
+        // ── 備份 ftbquests ──
+        if quests_src.is_dir() && quests_dest.is_dir() {
+            let bak = backup_root.join("config").join("ftbquests");
+            copy_dir_recursive(&quests_dest, &bak)?;
+        }
 
-    // ── 備份 minemenu ──
-    let menu_dest = mc.join("minemenu").join("menu.json");
-    if menu_src.is_file() && menu_dest.is_file() {
-        let bak = backup_root.join("minemenu");
-        fs::create_dir_all(&bak).ok();
-        let _ = fs::copy(&menu_dest, bak.join("menu.json"));
-    }
+        // ── 備份 minemenu ──
+        if menu_src.is_file() && menu_dest.is_file() {
+            let bak = backup_root.join("minemenu");
+            fs::create_dir_all(&bak).ok();
+            let _ = fs::copy(&menu_dest, bak.join("menu.json"));
+        }
 
-    // ── 備份 patchouli_books ──
-    let patchouli_dest = mc.join("patchouli_books");
-    if has_patchouli && patchouli_dest.is_dir() {
-        let bak = backup_root.join("patchouli_books");
-        copy_dir_recursive(&patchouli_dest, &bak)?;
-    }
+        // ── 備份 patchouli_books ──
+        if has_patchouli && patchouli_dest.is_dir() {
+            let bak = backup_root.join("patchouli_books");
+            copy_dir_recursive(&patchouli_dest, &bak)?;
+        }
 
-    // ── 備份 config/openloader ──
-    let openloader_dest = mc.join("config").join("openloader");
-    if has_openloader && openloader_dest.is_dir() {
-        let bak = backup_root.join("config").join("openloader");
-        copy_dir_recursive(&openloader_dest, &bak)?;
-    }
+        // ── 備份 config/openloader ──
+        if has_openloader && openloader_dest.is_dir() {
+            let bak = backup_root.join("config").join("openloader");
+            copy_dir_recursive(&openloader_dest, &bak)?;
+        }
 
-    // ── 備份 kubejs（僅 work 會覆寫的相對路徑）──
-    let kubejs_dest = mc.join("kubejs");
-    if has_kubejs && kubejs_dest.is_dir() {
-        backup_matching_tree(&kubejs_src, &kubejs_dest, &backup_root.join("kubejs"))?;
-    }
+        // ── 備份 kubejs（僅 work 會覆寫的相對路徑）──
+        if has_kubejs && kubejs_dest.is_dir() {
+            backup_matching_tree(&kubejs_src, &kubejs_dest, &backup_root.join("kubejs"))?;
+        }
 
-    let fancymenu_dest = mc.join("config").join("fancymenu");
-    if has_fancymenu && fancymenu_dest.is_dir() {
-        let bak = backup_root.join("config").join("fancymenu");
-        copy_dir_recursive(&fancymenu_dest, &bak)?;
-    }
+        if has_fancymenu && fancymenu_dest.is_dir() {
+            let bak = backup_root.join("config").join("fancymenu");
+            copy_dir_recursive(&fancymenu_dest, &bak)?;
+        }
 
-    let datapacks_dest = mc.join("datapacks");
-    if has_datapacks && datapacks_dest.is_dir() {
-        let bak = backup_root.join("datapacks");
-        copy_dir_recursive(&datapacks_dest, &bak)?;
+        if has_datapacks && datapacks_dest.is_dir() {
+            let bak = backup_root.join("datapacks");
+            copy_dir_recursive(&datapacks_dest, &bak)?;
+        }
+
+        for (source, name) in [
+            (&defaultconfigs_src, "defaultconfigs"),
+            (&global_packs_src, "global_packs"),
+            (&paxi_src, "paxi"),
+            (&data_src, "data"),
+        ] {
+            if dir_has_files(source) && mc.join(name).is_dir() {
+                copy_dir_recursive(&mc.join(name), &backup_root.join(name))?;
+            }
+        }
+
+        // ── 備份即將被翻譯 JAR 覆蓋的 mods 檔案 ──
+        if has_jars {
+            let mods_dest = mc.join("mods");
+            if mods_dest.is_dir() {
+                backup_matching_tree(&jar_src, &mods_dest, &backup_root.join("mods"))?;
+            }
+        }
     }
 
     // 寫備份說明
-    let bak_note = format!(
+    if create_backup {
+        let bak_note = format!(
         "【翻譯套用備份】\n\
 時間戳：{stamp}\n\
 遊戲目錄：{}\n\
@@ -295,24 +424,30 @@ pub fn apply_to_instance(
 \n\
 還原方式：\n\
 1. 關閉遊戲\n\
-2. 把本備份內 resourcepacks / config / minemenu / patchouli_books / kubejs / datapacks 對應複製回遊戲\n\
+2. 把本備份內 mods / resourcepacks / config / minemenu / patchouli_books / kubejs / datapacks 對應複製回遊戲\n\
 3. 勿刪未備份的其他自訂檔\n\
-4. 本工具從不改 mods/*.jar\n",
+4. 原始 mods/*.jar 不會直接修改；翻譯副本會在備份後套用\n",
         mc.display(),
         work.display()
     );
-    let _ = fs::write(backup_root.join("還原說明.txt"), bak_note);
+        let _ = fs::write(backup_root.join("還原說明.txt"), bak_note);
+    }
 
     // 套用清單（供一鍵還原）
     let mut manifest = ApplyManifest {
         stamp: stamp.clone(),
         mc_dir: mc.display().to_string(),
-        backup_dir: backup_root.display().to_string(),
+        backup_dir: if create_backup {
+            backup_root.display().to_string()
+        } else {
+            String::new()
+        },
         ..Default::default()
     };
 
     // ── 複製 zip ──
     let mut zip_copied = None;
+    let mut jars_copied = 0usize;
     if let Some(zip) = zip_src {
         let rp = mc.join("resourcepacks");
         fs::create_dir_all(&rp).map_err(|e| e.to_string())?;
@@ -387,9 +522,38 @@ pub fn apply_to_instance(
         datapacks_copied = true;
     }
 
+    for (source, name) in [
+        (&defaultconfigs_src, "defaultconfigs"),
+        (&global_packs_src, "global_packs"),
+        (&paxi_src, "paxi"),
+        (&data_src, "data"),
+    ] {
+        if dir_has_files(source) {
+            merge_copy_dir(source, &mc.join(name), &mc, &mut manifest)?;
+        }
+    }
+
+    if has_jars {
+        merge_copy_dir(&jar_src, &mc.join("mods"), &mc, &mut manifest)?;
+        jars_copied = count_files(&jar_src);
+    }
+
+    if let Some(ref copied) = zip_copied {
+        if let Some(name) = Path::new(copied).file_name().and_then(|s| s.to_str()) {
+            enable_resource_pack(
+                &mc,
+                name,
+                create_backup.then_some(&backup_root),
+                &mut manifest,
+            )?;
+        }
+    }
+
     // 寫套用清單（供「一鍵還原」精準反轉）
-    if let Ok(js) = serde_json::to_string_pretty(&manifest) {
-        let _ = fs::write(backup_root.join(APPLY_MANIFEST), js + "\n");
+    if create_backup {
+        if let Ok(js) = serde_json::to_string_pretty(&manifest) {
+            let _ = fs::write(backup_root.join(APPLY_MANIFEST), js + "\n");
+        }
     }
 
     let overlay_line = {
@@ -417,9 +581,10 @@ pub fn apply_to_instance(
     };
 
     let player_summary = format!(
-        "已套用到遊戲（先備份再複製；目標＝整合包可遊玩文字→台灣繁中（除圖片）；不改 jar）\n\
+        "已套用到遊戲（依備份選項複製；目標＝整合包可遊玩文字→台灣繁中（除圖片））\n\
 • 備份目錄：\n{}\n\
 • 資源包：{}\n\
+• 翻譯 JAR：{} 個（是否備份原檔依選項，再覆蓋到 mods）\n\
 • 任務 ftbquests：{}\n\
 • 快捷選單：{}\n\
 • 文字覆寫：{}\n\n\
@@ -432,11 +597,16 @@ pub fn apply_to_instance(
 • 多半是整合包本身缺模組（結構／前置），跟翻譯無關——按「診斷開不了」會讀當機報告告訴你缺什麼。\n\
 • 想排除是不是翻譯造成的：按「還原上次套用」一鍵復原（新增的刪掉、覆蓋的還原），再開一次。\n\
 • 資源包（語言檔）很安全；會影響世界載入的是資料包／任務類，還原後即可排除。",
-        backup_root.display(),
+        if create_backup {
+            backup_root.display().to_string()
+        } else {
+            "未建立備份（依你的選擇）".to_string()
+        },
         zip_copied
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or("（本次無 zip）"),
+        jars_copied,
         if quests_copied {
             "已覆蓋 config/ftbquests"
         } else {
@@ -451,8 +621,14 @@ pub fn apply_to_instance(
     );
 
     Ok(ApplyResult {
-        backup_dir: backup_root.display().to_string(),
+        backup_dir: if create_backup {
+            backup_root.display().to_string()
+        } else {
+            String::new()
+        },
+        backup_created: create_backup,
         zip_copied,
+        jars_copied,
         quests_copied,
         minemenu_copied,
         player_summary,
@@ -522,6 +698,17 @@ fn dir_has_files(dir: &Path) -> bool {
         .into_iter()
         .filter_map(|e| e.ok())
         .any(|e| e.path().is_file())
+}
+
+fn count_files(dir: &Path) -> usize {
+    if !dir.is_dir() {
+        return 0;
+    }
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .count()
 }
 
 /// 只備份 work 裡會覆寫到 dest 的相對路徑（避免整包 kubejs 過大）
@@ -616,5 +803,150 @@ fn record_written(manifest: &mut ApplyManifest, mc: &Path, target: &Path, existe
         manifest.overwritten.push(rel);
     } else {
         manifest.added.push(rel);
+    }
+}
+
+fn enable_resource_pack(
+    mc: &Path,
+    zip_name: &str,
+    backup_root: Option<&Path>,
+    manifest: &mut ApplyManifest,
+) -> Result<(), String> {
+    let options = mc.join("options.txt");
+    let existed = options.is_file();
+    let original = if existed {
+        fs::read_to_string(&options).map_err(|e| format!("讀取 options.txt 失敗：{e}"))?
+    } else {
+        String::new()
+    };
+    if let Some(backup_root) = backup_root {
+        if existed {
+            fs::copy(&options, backup_root.join("options.txt"))
+                .map_err(|e| format!("備份 options.txt 失敗：{e}"))?;
+        }
+    }
+
+    let entry = format!("file/{zip_name}");
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in original.lines() {
+        if let Some(value) = line.strip_prefix("resourcePacks:") {
+            found = true;
+            let mut list = value.trim().to_string();
+            if !list.contains(&format!("\"{entry}\"")) {
+                if list == "[]" {
+                    list = format!("[\"{entry}\"]");
+                } else if list.ends_with(']') {
+                    list.pop();
+                    if !list.ends_with('[') {
+                        list.push(',');
+                    }
+                    list.push_str(&format!("\"{entry}\"]"));
+                }
+            }
+            lines.push(format!("resourcePacks:{list}"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        lines.push(format!("resourcePacks:[\"{entry}\"]"));
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    fs::write(&options, updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
+    record_written(manifest, mc, &options, existed);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enables_pack_and_keeps_existing_resource_packs() {
+        let root = std::env::temp_dir().join(format!("apply_options_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let backup = root.join("backup");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(mc.join("options.txt"), "guiScale:3\nresourcePacks:[\"vanilla\"]\n").unwrap();
+        let mut manifest = ApplyManifest::default();
+        enable_resource_pack(&mc, "pack.zip", Some(&backup), &mut manifest).unwrap();
+        let options = fs::read_to_string(mc.join("options.txt")).unwrap();
+        assert!(options.contains("\"vanilla\""));
+        assert!(options.contains("\"file/pack.zip\""));
+        assert!(backup.join("options.txt").is_file());
+        assert!(manifest.overwritten.contains(&"options.txt".to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_translated_jars_after_backing_up_originals() {
+        let root = std::env::temp_dir().join(format!("apply_jars_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(work.join("jar-translated")).unwrap();
+        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
+        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
+
+        let result = apply_to_instance(&mc, &work, None, true).unwrap();
+        assert_eq!(result.jars_copied, 1);
+        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
+        assert!(PathBuf::from(&result.backup_dir).starts_with(&work));
+        assert_eq!(
+            fs::read(PathBuf::from(&result.backup_dir).join("mods/example.jar")).unwrap(),
+            b"original"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skips_backup_when_player_disables_it() {
+        let root = std::env::temp_dir().join(format!("apply_no_backup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(work.join("jar-translated")).unwrap();
+        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
+        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
+
+        let result = apply_to_instance(&mc, &work, None, false).unwrap();
+        assert!(!result.backup_created);
+        assert!(result.backup_dir.is_empty());
+        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
+        let backup_count = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("翻譯套用備份_")
+            })
+            .count();
+        assert_eq!(backup_count, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deletes_only_tool_backup_directories() {
+        let root = std::env::temp_dir().join(format!("delete_backups_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(root.join("翻譯套用備份_20260811_1")).unwrap();
+        fs::create_dir_all(root.join("翻譯套用備份_20260811_2")).unwrap();
+        fs::create_dir_all(root.join("player-backup")).unwrap();
+
+        let result = delete_apply_backups_in(&mc, None).unwrap();
+        assert_eq!(result.deleted, 2);
+        assert!(root.join("player-backup").is_dir());
+        assert!(!root.join("翻譯套用備份_20260811_1").exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

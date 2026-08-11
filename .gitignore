@@ -27,6 +27,8 @@ dist-ssr
 .claudecode/
 AGENTS.md
 CLAUDE.md
+# 完整內部開發文件（僅本機保留，不公開）
+開發文件.md
 
 # 本機舊版執行檔；正式版本請用 GitHub Release 管理
 *.exe
@@ -49,6 +51,7 @@ src-tauri/icons/icon.png
 secrets.json
 *.key
 src-tauri/target
+src-tauri/target-portable/
 
 # Cloudflare Worker 本地狀態（不進版控）
 worker/.wrangler

@@ -11,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 
 const THEME_STORAGE_KEY = "modpack-i18n-theme";
 const UI_SCALE_STORAGE_KEY = "modpack-i18n-ui-scale";
+const BACKUP_STORAGE_KEY = "modpack-i18n-backup-before-apply";
 const UI_SCALE_MIN = 1;
 const UI_SCALE_MAX = 1.5;
 const UI_SCALE_STEP = 0.05;
@@ -19,6 +20,9 @@ let latestAiStatus = null;
 let discordLoginUrl = "";
 let turnstileUrl = "";
 let aiModeChangePromise = Promise.resolve();
+let translationState = "idle";
+let shareConfirmationOpen = false;
+let shareUploadInFlight = false;
 
 function clampUiScale(value) {
   const parsed = Number(value);
@@ -57,6 +61,73 @@ function initUiScale() {
 
 function adjustUiScale(delta) {
   applyUiScale(uiScale + delta);
+}
+
+function shouldBackupBeforeApply() {
+  return $("backup-before-apply") ? $("backup-before-apply").checked : true;
+}
+
+function loadBackupPreference() {
+  const input = $("backup-before-apply");
+  if (!input) return;
+  try {
+    const saved = localStorage.getItem(BACKUP_STORAGE_KEY);
+    if (saved === "0" || saved === "1") input.checked = saved === "1";
+  } catch (_) {
+    /* 使用預設的安全選項 */
+  }
+}
+
+function saveBackupPreference() {
+  try {
+    localStorage.setItem(BACKUP_STORAGE_KEY, shouldBackupBeforeApply() ? "1" : "0");
+  } catch (_) {
+    /* 儲存失敗不影響本次套用 */
+  }
+}
+
+function customOutputEnabled() {
+  return !!$("choose-output-dir")?.checked;
+}
+
+function selectedOutputDir() {
+  const input = $("output");
+  if (!input) return "";
+  const chosen = customOutputEnabled() ? (input.value || "").trim() : "";
+  return chosen || (input.dataset.autoPath || "").trim() || (input.value || "").trim();
+}
+
+function syncOutputField() {
+  const input = $("output");
+  if (!input) return;
+  const custom = customOutputEnabled();
+  const autoPath = (input.dataset.autoPath || "").trim();
+  if (!custom && autoPath) input.value = autoPath;
+  input.readOnly = progressBusy || !custom;
+  input.setAttribute("aria-readonly", input.readOnly ? "true" : "false");
+  const hasInstance = !!($("instance")?.value || "").trim();
+  const picker = $("btn-output-pick");
+  if (picker) picker.hidden = !hasInstance || !custom || progressBusy;
+  const deleter = $("btn-delete-output");
+  if (deleter) deleter.hidden = !hasInstance || !selectedOutputDir() || progressBusy;
+}
+
+function setAutoOutputDir(path) {
+  const input = $("output");
+  if (!input) return;
+  const value = String(path || "").trim();
+  input.dataset.autoPath = value;
+  if (!customOutputEnabled()) input.value = value;
+  const status = $("output-status");
+  if (status) status.textContent = value
+    ? "翻譯會在這個位置建立「翻譯結果」；完成後直接套用到整合包資料夾。"
+    : "請先選擇整合包資料夾。";
+  syncOutputField();
+}
+
+function resultWorkDir(outputDir) {
+  const clean = String(outputDir || "").replace(/[\\/]+$/, "");
+  return /(?:^|[\\/])翻譯結果$/i.test(clean) ? clean : clean + "\\翻譯結果";
 }
 
 function applyTheme(theme) {
@@ -361,7 +432,7 @@ function setProgress(percent, message, opts) {
 
 async function onApply() {
   const instancePath = ($("instance").value || "").trim();
-  const outputDir = ($("output").value || "").trim();
+  const outputDir = selectedOutputDir();
   if (!instancePath) return log("套用需要「遊戲資料夾」。");
   if (!outputDir) return log("套用需要「翻譯結果」位置。");
   setBusy(true);
@@ -374,6 +445,7 @@ async function onApply() {
       instancePath,
       outputDir,
       packName: ($("pack-name").value || "").trim() || null,
+      backupBeforeApply: shouldBackupBeforeApply(),
     });
     setProgress(100, "套用完成");
     setLogFinal(result.playerSummary || result.player_summary || JSON.stringify(result, null, 2));
@@ -406,11 +478,14 @@ function setBusy(busy) {
     "btn-run",
     "btn-supplement",
     "btn-repair",
-    "btn-apply",
+    "btn-delete-backups",
+    "btn-output-pick",
+    "btn-delete-output",
     "btn-inst",
-    "btn-out",
     "btn-save-adv",
     "use-ai",
+    "backup-before-apply",
+    "choose-output-dir",
     "ai-source-managed",
     "ai-source-custom",
     "btn-discord-login",
@@ -426,13 +501,15 @@ function setBusy(busy) {
     "btn-font-pick",
     "btn-font-out",
     "btn-font-build",
+    "btn-reference-pick",
+    "btn-share-confirm",
+    "btn-share-cancel",
     "font-size",
     "font-weight",
     "font-shift-x",
     "font-shift-y",
     "font-oversample",
     "btn-glossary",
-    "minimize-on-close",
     "target-version",
     "tab-translate",
     "tab-font",
@@ -441,7 +518,7 @@ function setBusy(busy) {
     if (el) el.disabled = busy;
   });
   // 翻譯中鎖定路徑與資源包名稱（不可改）
-  ["pack-name", "instance", "output", "font-pack-name", "font-file", "font-output"].forEach((id) => {
+  ["pack-name", "instance", "output", "reference-pack", "font-pack-name", "font-file", "font-output"].forEach((id) => {
     const el = $(id);
     if (el) {
       el.readOnly = !!busy;
@@ -450,15 +527,19 @@ function setBusy(busy) {
   });
   const guide = $("btn-guide");
   if (guide) guide.disabled = false;
+  syncOutputField();
+  syncUiState();
 }
 
 /** 分頁：translate | font */
 function showAppPage(page) {
-  const name = page === "font" ? "font" : "translate";
+  const name = page === "font" || page === "diagnose" ? page : "translate";
   const pageTr = $("page-translate");
   const pageFont = $("page-font");
+  const pageDiagnose = $("page-diagnose");
   const tabTr = $("tab-translate");
   const tabFont = $("tab-font");
+  const tabDiagnose = $("tab-diagnose");
   if (pageTr) {
     pageTr.hidden = name !== "translate";
     pageTr.classList.toggle("active", name === "translate");
@@ -475,7 +556,64 @@ function showAppPage(page) {
     tabFont.classList.toggle("active", name === "font");
     tabFont.setAttribute("aria-selected", name === "font" ? "true" : "false");
   }
+  if (pageDiagnose) {
+    pageDiagnose.hidden = name !== "diagnose";
+    pageDiagnose.classList.toggle("active", name === "diagnose");
+  }
+  if (tabDiagnose) {
+    tabDiagnose.classList.toggle("active", name === "diagnose");
+    tabDiagnose.setAttribute("aria-selected", name === "diagnose" ? "true" : "false");
+  }
   document.body.dataset.appPage = name;
+  syncUiState();
+}
+
+function setTranslationState(state) {
+  translationState = ["idle", "ready", "running", "complete", "failed"].includes(state)
+    ? state
+    : "idle";
+  document.body.dataset.translationState = translationState;
+  syncUiState();
+}
+
+function toggleHidden(id, hidden) {
+  const el = $(id);
+  if (!el) return;
+  el.hidden = !!hidden;
+}
+
+function syncUiState() {
+  const hasInstance = !!($("instance")?.value || "").trim();
+  const hasOutput = !!selectedOutputDir();
+  const complete = translationState === "complete";
+  const failed = translationState === "failed";
+  const locked = progressBusy || shareUploadInFlight;
+  const page = document.body.dataset.appPage || "translate";
+
+  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details"]
+    .forEach((id) => toggleHidden(id, !hasInstance));
+  toggleHidden("btn-run", !hasInstance || progressBusy);
+  toggleHidden("btn-supplement", !complete || locked);
+  toggleHidden("btn-repair", !failed || locked);
+  toggleHidden("btn-glossary", !hasInstance || locked);
+  toggleHidden("btn-package", !complete || locked);
+  toggleHidden("btn-open", page === "diagnose" || !(hasOutput && (page === "font" ? !!($("font-output")?.value || "").trim() : true)));
+  toggleHidden("btn-diagnose-latest", !hasInstance || locked);
+  toggleHidden("btn-restore", !hasInstance || locked);
+  toggleHidden("btn-delete-backups", !hasInstance || locked);
+
+  const packageButton = $("btn-package");
+  if (packageButton) packageButton.disabled = !complete || locked;
+  const confirmPanel = $("share-confirm-panel");
+  if (confirmPanel) confirmPanel.hidden = !shareConfirmationOpen || !complete;
+  const confirmButton = $("btn-share-confirm");
+  const reviewed = !!$("share-confirm-reviewed")?.checked;
+  const privateFiles = !!$("share-confirm-private")?.checked;
+  if (confirmButton) confirmButton.disabled = !reviewed || !privateFiles || shareUploadInFlight;
+  if ($("btn-share-cancel")) $("btn-share-cancel").disabled = shareUploadInFlight;
+
+  syncAiPanel(false);
+  syncOutputField();
 }
 
 async function pickDir(title) {
@@ -484,28 +622,75 @@ async function pickDir(title) {
   return typeof selected === "string" ? selected : null;
 }
 
-/** 把翻譯結果打包成單一 zip，讓使用者可手動分享整包翻譯檔。 */
-async function packageShare() {
-  const outputDir = ($("output").value || "").trim();
-  if (!outputDir) return log("請先完成翻譯（還沒有可打包的翻譯結果）。");
-  const work = outputDir.replace(/[\\/]+$/, "") + "\\翻譯結果";
+/** 將已完成的翻譯結果上傳到獨立分享區，連結只保留一天。 */
+function packageShare() {
+  if (translationState !== "complete") {
+    return log("請先完成翻譯，再檢查結果並建立分享檔。");
+  }
+  shareConfirmationOpen = true;
+  syncUiState();
+  $("share-confirm-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function confirmShareUpload() {
+  if (!$("share-confirm-reviewed")?.checked || !$("share-confirm-private")?.checked) {
+    return log("請先勾選兩項確認，再上傳分享檔。");
+  }
+  if (shareUploadInFlight) return;
+  shareUploadInFlight = true;
+  syncUiState();
   try {
-    const dest = await pickDir("選擇打包檔要存到哪個資料夾");
-    if (!dest) return;
+    await uploadSharePackage();
+  } finally {
+    shareUploadInFlight = false;
+    closeShareConfirmation();
+  }
+}
+
+function closeShareConfirmation() {
+  shareConfirmationOpen = false;
+  ["share-confirm-reviewed", "share-confirm-private"].forEach((id) => {
+    const el = $(id);
+    if (el) el.checked = false;
+  });
+  syncUiState();
+}
+
+async function uploadSharePackage() {
+  const outputDir = selectedOutputDir();
+  if (!outputDir) return log("請先完成翻譯（還沒有可打包的翻譯結果）。");
+  const work = resultWorkDir(outputDir);
+  try {
+    const auth = await invoke("discord_auth_status");
+    if (!auth || !(auth.loggedIn || auth.logged_in) || !(auth.inGuild || auth.in_guild)) {
+      return log("分享前請先登入 Discord 並加入 ZeitFrei 官方伺服器。");
+    }
+    const turnstile = await invoke("turnstile_status");
+    if (!turnstile || !(turnstile.verified)) {
+      if (!(await beginTurnstileVerification())) return;
+    }
     const name = ($("pack-name").value || "模組包翻譯分享").trim();
-    appendLog("打包中…");
-    const zip = await invoke("create_share_package", { workRoot: work, destDir: dest, name });
-    appendLog("已打包成分享檔：\n" + zip + "\n把這個檔傳給別人，對方解壓後就是整包翻譯檔。");
+    appendLog("正在整理可安裝檔案並上傳…");
+    const result = await invoke("upload_share_package_cmd", { workRoot: work, name });
+    const url = result.url || result;
+    const expires = Number(result.expiresAt || result.expires_at || 0);
+    try {
+      await navigator.clipboard.writeText(url);
+      appendLog("分享連結已複製：\n" + url);
+    } catch (_) {
+      appendLog("分享連結：\n" + url);
+    }
+    if (expires) appendLog("這個連結只會保留 24 小時，逾期就不能下載。", "warn");
   } catch (e) {
-    log("打包失敗：\n" + String(e));
+    log("分享失敗：\n" + formatInvokeError(e));
   }
 }
 
 function syncAiPanel(refreshStatus = true) {
   const panel = $("ai-panel");
-  const enabled = !!$("use-ai")?.checked;
+  const enabled = !!$("use-ai")?.checked && !!($("instance")?.value || "").trim();
   if (panel) {
-    panel.style.display = enabled ? "block" : "none";
+    panel.hidden = !enabled;
     panel.setAttribute("aria-hidden", enabled ? "false" : "true");
   }
   if (enabled && refreshStatus) refreshAiStatus();
@@ -647,7 +832,6 @@ async function ensureAiReadyForAction() {
   const message = String((status && status.message) || "目前無法確認 AI 狀態。");
   appendLog(message, "warn");
   if (mode === "custom") {
-    if ($("adv-details")) $("adv-details").open = true;
     $("api-key")?.focus();
   } else {
     $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -767,6 +951,50 @@ async function detectVersionForInstance(instancePath, silent) {
   }
 }
 
+async function refreshInstanceTarget(instancePath) {
+  try {
+    const target = await invoke("check_install_target", { instancePath });
+    const mcDir = target && (target.mcDir || target.mc_dir);
+    if (!target || target.ok === false) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function refreshPackTranslationName(instancePath) {
+  try {
+    const info = await invoke("detect_pack_translation_name", { instancePath });
+    const name = info && (info.packName || info.pack_name);
+    if ($("pack-name") && name) $("pack-name").value = name;
+    if ($("pack-version-status")) {
+      const version = info && info.version ? info.version : "R1";
+      const source = info && info.source ? info.source : "未找到版本檔，使用複查編號";
+      $("pack-version-status").textContent = `資源包版本：${version}（${source}）`;
+    }
+  } catch (_) {
+    if ($("pack-version-status")) $("pack-version-status").textContent = "整合包版本尚未偵測，完成翻譯時會使用 R1。";
+  }
+}
+
+async function refreshReferencePack() {
+  const input = $("reference-pack");
+  const status = $("reference-status");
+  if (!input || (input.value || "").trim()) return input?.value || "";
+  try {
+    const found = await invoke("get_default_reference_pack");
+    if (found) {
+      input.value = found;
+      if (status) status.textContent = "已找到本機參考翻譯，翻譯時會優先套用。";
+      return found;
+    }
+  } catch (_) {
+    /* 參考翻譯是選用功能，找不到時仍可繼續。 */
+  }
+  if (status) status.textContent = "未找到參考翻譯；你仍可直接開始，或手動選取資料夾。";
+  return "";
+}
+
 async function onSaveAdv() {
   try {
     await invoke("save_api_settings_cmd", {
@@ -784,9 +1012,13 @@ async function onSaveAdv() {
 
 async function onRun() {
   const instancePath = ($("instance").value || "").trim();
-  const outputDir = ($("output").value || "").trim();
+  let outputDir = selectedOutputDir();
   if (!instancePath) return log("請先選擇「遊戲資料夾」。");
-  if (!outputDir) return log("請先選擇「翻譯結果放哪」。");
+  if (!outputDir) {
+    outputDir = (await invoke("managed_output_base").catch(() => "")) || "";
+    if (outputDir) setAutoOutputDir(outputDir);
+  }
+  if (!outputDir) return log("翻譯結果位置還沒準備好，請重新選擇遊戲資料夾。");
 
   const useAi = !!$("use-ai").checked;
   if (useAi && !(await ensureAiReadyForAction())) return;
@@ -796,18 +1028,25 @@ async function onRun() {
   }
 
   setBusy(true);
+  setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始翻譯");
-  appendLog("完成後請關閉遊戲，再按「套用到遊戲」。");
+  if ($("btn-package")) $("btn-package").disabled = true;
+  appendLog(
+    shouldBackupBeforeApply()
+      ? "翻譯完成後會先備份，再直接套用到這個遊戲實例。"
+      : "翻譯完成後會直接套用，不建立備份。"
+  );
   setProgress(1, "準備中…");
 
   try {
     const result = await invoke("one_click_translate", {
       instancePath,
       outputDir,
-      packName: ($("pack-name").value || "繁體中文翻譯").trim(),
+      packName: ($("pack-name").value || "").trim(),
       useAi,
-      referencePack: null,
+      backupBeforeApply: shouldBackupBeforeApply(),
+      referencePack: (($('reference-pack')?.value || "").trim() || null),
       targetVersion: targetVersion || null,
     });
     setProgress(100, "全部完成！");
@@ -816,11 +1055,10 @@ async function onRun() {
       msg += "\n\n" + (result.minemenuMsg || result.minemenu_msg);
     }
     setLogFinal(msg);
-    if ($("chk-package")?.checked) {
-      appendLog("你勾了「建立打包檔案」，接著選存放位置…");
-      await packageShare();
-    }
+    setTranslationState("complete");
+    appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「翻譯完成後分享」。");
   } catch (e) {
+    setTranslationState("failed");
     handleRunFailure(e, "翻譯失敗");
     if (!isCancellation(e)) {
       appendLog("可把上方錯誤訊息留下來方便排查。");
@@ -832,7 +1070,7 @@ async function onRun() {
 
 /** 修復：重建 zip／對齊工作階段；可選一併 AI 補缺。不修世界閃退。 */
 async function onRepair() {
-  const outputDir = ($("output").value || "").trim();
+  const outputDir = selectedOutputDir();
   if (!outputDir) {
     return log("請先選好與上次相同的「翻譯結果」位置。");
   }
@@ -851,6 +1089,7 @@ async function onRepair() {
   if (useAi && !(await ensureAiReadyForAction())) return;
 
   setBusy(true);
+  setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始修復");
   appendLog("這不能修好「進世界閃退」。");
@@ -860,10 +1099,13 @@ async function onRepair() {
     const result = await invoke("repair_translation_pack", {
       outputDir,
       useAi,
+      backupBeforeApply: shouldBackupBeforeApply(),
     });
     setProgress(100, "修復完成！");
     setLogFinal(result.playerSummary || result.player_summary || JSON.stringify(result, null, 2));
+    setTranslationState("complete");
   } catch (e) {
+    setTranslationState("failed");
     handleRunFailure(e, "修復失敗");
   } finally {
     setBusy(false);
@@ -872,15 +1114,12 @@ async function onRepair() {
 
 /** 只補缺漏：不重掃 mods，讀工作階段 + AI */
 async function onSupplement() {
-  const outputDir = ($("output").value || "").trim();
+  const outputDir = selectedOutputDir();
   if (!outputDir) {
     return log("請選與上次相同的「翻譯結果」位置。");
   }
-  if (!$("use-ai").checked) {
-    $("use-ai").checked = true;
-    syncAiPanel();
-  }
-  if (!(await ensureAiReadyForAction())) return;
+  const useAi = !!$("use-ai")?.checked;
+  if (useAi && !(await ensureAiReadyForAction())) return;
   try {
     const st = await invoke("session_status", { outputDir });
     if (!(st.ok || st.OK)) {
@@ -901,16 +1140,24 @@ async function onSupplement() {
   }
 
   setBusy(true);
+  setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始再補一些");
   setProgress(3, "準備中…");
 
   try {
-    const result = await invoke("supplement_translate", { outputDir });
+    const result = await invoke("supplement_translate", {
+      outputDir,
+      useAi,
+      backupBeforeApply: shouldBackupBeforeApply(),
+    });
     setProgress(100, "補譯完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
     setLogFinal(msg);
+    setTranslationState("complete");
+    appendLog("複查完成，結果已重新套用到遊戲。", "info");
   } catch (e) {
+    setTranslationState("failed");
     handleRunFailure(e, "再補一些失敗");
   } finally {
     setBusy(false);
@@ -947,6 +1194,35 @@ async function onOpenGlossary() {
   }
 }
 
+function showDiagnosis(result) {
+  const box = $("diagnose-result");
+  if (!box) return;
+  const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
+  const missing = Array.isArray(result?.missing) ? result.missing : [];
+  box.textContent = [
+    `判定：${result?.summary || "沒有足夠資料"}`,
+    result?.errorCode || result?.error_code ? `分析代碼：${result.errorCode || result.error_code}` : "",
+    result?.primaryError || result?.primary_error ? `最接近的錯誤：${result.primaryError || result.primary_error}` : "",
+    missing.length ? `可能缺少：${missing.join(", ")}` : "",
+    evidence.length ? `找到的線索：\n${evidence.join("\n")}` : "",
+    result?.translationRelated || result?.translation_related
+      ? "這次結果可能和翻譯檔有關，建議先停用剛建立的資源包再重試。"
+      : "目前沒有證據顯示是翻譯造成的。",
+  ].filter(Boolean).join("\n\n");
+}
+
+async function diagnosePastedText() {
+  const text = ($("error-input")?.value || "").trim();
+  if (!text) return log("請先貼上錯誤報告或錯誤碼。");
+  try {
+    const result = await invoke("diagnose_error_text", { text });
+    showDiagnosis(result);
+    appendLog("錯誤分析完成：" + (result.errorCode || result.error_code || "UNKNOWN"));
+  } catch (e) {
+    showDiagnosis({ summary: "分析失敗：" + formatInvokeError(e) });
+  }
+}
+
 async function loadUiPrefs() {
   try {
     const p = await invoke("get_ui_prefs");
@@ -965,12 +1241,43 @@ async function loadUiPrefs() {
 window.addEventListener("DOMContentLoaded", async () => {
   initTheme();
   initUiScale();
+  loadBackupPreference();
   syncAiPanel(false);
   await refreshApiSettings();
   refreshAiStatus();
   loadUiPrefs();
   setProgress(0, "尚未開始");
   showAppPage("translate");
+  setTranslationState("idle");
+  ["instance", "output", "font-output"].forEach((id) => {
+    const input = $(id);
+    if (!input) return;
+    input.addEventListener("input", () => {
+      if (id === "instance" && !input.value.trim()) {
+        setTranslationState("idle");
+      } else {
+        if (id === "output" && customOutputEnabled()) input.dataset.customPath = input.value.trim();
+        syncUiState();
+      }
+    });
+  });
+  if ($("choose-output-dir")) {
+    $("choose-output-dir").addEventListener("change", () => {
+      const input = $("output");
+      if (!input) return;
+      const autoPath = (input.dataset.autoPath || "").trim();
+      if (customOutputEnabled()) {
+        if ((input.value || "").trim() === autoPath) {
+          input.value = (input.dataset.customPath || "").trim();
+        }
+      } else {
+        const typed = (input.value || "").trim();
+        if (typed && typed !== autoPath) input.dataset.customPath = typed;
+        if (autoPath) input.value = autoPath;
+      }
+      syncUiState();
+    });
+  }
   ["font-size", "font-weight", "font-shift-x", "font-shift-y", "font-oversample"].forEach((id) => {
     const input = $(id);
     const output = $(id + "-value");
@@ -985,7 +1292,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("tab-translate").onclick = () => showAppPage("translate");
   }
   if ($("tab-font")) {
-    $("tab-font").onclick = () => showAppPage("font");
+  $("tab-font").onclick = () => showAppPage("font");
+  if ($("tab-diagnose")) $("tab-diagnose").onclick = () => showAppPage("diagnose");
   }
   if ($("btn-theme")) {
     $("btn-theme").onclick = () => {
@@ -1047,7 +1355,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     /* 後端仍會直接開啟瀏覽器；事件只供手動重開。 */
   }
 
-  $("use-ai").onchange = () => syncAiPanel();
+  $("use-ai").onchange = () => syncUiState();
   document.querySelectorAll('input[name="ai-source"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       if (radio.checked) aiModeChangePromise = changeAiMode(radio.value);
@@ -1130,6 +1438,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
+  if ($("backup-before-apply")) {
+    $("backup-before-apply").onchange = saveBackupPreference;
+  }
   if ($("btn-quit")) {
     $("btn-quit").onclick = async () => {
       try {
@@ -1145,7 +1456,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-glossary")) $("btn-glossary").onclick = onOpenGlossary;
   if ($("btn-supplement")) $("btn-supplement").onclick = onSupplement;
   if ($("btn-repair")) $("btn-repair").onclick = onRepair;
-  if ($("btn-apply")) $("btn-apply").onclick = onApply;
   function openGuideOverlay() {
     const ov = $("guide-overlay");
     if (!ov) return;
@@ -1274,41 +1584,65 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   }
 
+  if ($("btn-reference-pick")) {
+    $("btn-reference-pick").onclick = async () => {
+      try {
+        const selected = await pickDir("選取參考翻譯資料夾");
+        if (selected) {
+          $("reference-pack").value = selected;
+          if ($("reference-status")) $("reference-status").textContent = "已指定參考翻譯，開始翻譯時會優先套用。";
+          syncUiState();
+        }
+      } catch (e) {
+        log(String(e));
+      }
+    };
+  }
+
   $("btn-inst").onclick = async () => {
     try {
       const p = await pickDir("選擇遊戲／整合包資料夾");
       if (p) {
         $("instance").value = p;
+        setTranslationState("ready");
         await detectVersionForInstance(p, false);
+        await refreshPackTranslationName(p);
+        await refreshReferencePack();
+        $("output").value = "";
+        $("output").dataset.autoPath = "";
+        $("output").dataset.customPath = "";
         if (!($("output").value || "").trim()) {
           try {
-            // 預設把中繼檔放工具自管的暫存區，不在使用者資料夾建立「翻譯結果」。
-            // 想要一份看得到的輸出，可按下方「使用啟動器建議的位置」。
             const base =
+              (await invoke("managed_output_for_instance", { instancePath: p }).catch(() => null)) ||
               (await invoke("managed_output_base").catch(() => null)) ||
               (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null)) ||
               (await invoke("suggest_resourcepacks_dir", { instancePath: p }));
             if (base) {
-              $("output").value = base;
+              setAutoOutputDir(base);
               appendLog(
-                "翻譯結果會放在工具暫存區（不在你的資料夾另建「翻譯結果」）：\n" +
-                  base +
-                  "\n完成後按「套用到遊戲」直接覆蓋安裝；想留一份可分享的檔就勾「打包檔」。"
+                "翻譯結果位置已準備好：\n" + base +
+                  "\n翻譯完成會直接套用到整合包資料夾。"
               );
             }
           } catch (_) {
             /* 略 */
           }
         }
+        syncUiState();
       }
     } catch (e) {
       log(String(e));
     }
   };
-  $("btn-out").onclick = async () => {
+  if ($("btn-output-pick")) $("btn-output-pick").onclick = async () => {
     try {
       const p = await pickDir("選擇翻譯結果要放的資料夾");
-      if (p) $("output").value = p;
+      if (p) {
+        $("output").value = p;
+        $("output").dataset.customPath = p;
+        syncUiState();
+      }
     } catch (e) {
       log(String(e));
     }
@@ -1323,7 +1657,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         const p =
           (await invoke("suggest_output_dir", { instancePath }).catch(() => null)) ||
           (await invoke("suggest_resourcepacks_dir", { instancePath }));
-        $("output").value = p;
+        setAutoOutputDir(p);
         appendLog("已建議結果位置：\n" + p);
       } catch (e) {
         log("無法建議路徑：\n" + String(e));
@@ -1333,13 +1667,96 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-package")) {
     $("btn-package").onclick = () => packageShare();
   }
+  if ($("btn-share-confirm")) $("btn-share-confirm").onclick = confirmShareUpload;
+  if ($("btn-share-cancel")) $("btn-share-cancel").onclick = closeShareConfirmation;
+  ["share-confirm-reviewed", "share-confirm-private"].forEach((id) => {
+    $(id)?.addEventListener("change", syncUiState);
+  });
+  if ($("btn-diagnose")) $("btn-diagnose").onclick = diagnosePastedText;
+  if ($("btn-diagnose-latest")) {
+    $("btn-diagnose-latest").onclick = async () => {
+      const instancePath = ($("instance").value || "").trim();
+      if (!instancePath) return log("請先選擇遊戲資料夾。");
+      try {
+        const result = await invoke("diagnose_launch_failure", { instancePath });
+        showDiagnosis(result);
+      } catch (e) {
+        showDiagnosis({ summary: "讀取最近記錄失敗：" + formatInvokeError(e) });
+      }
+    };
+  }
+  if ($("btn-restore")) {
+    $("btn-restore").onclick = async () => {
+      const instancePath = ($("instance").value || "").trim();
+      if (!instancePath) return log("請先選擇遊戲資料夾。");
+      if (!window.confirm("這會還原上一次套用前的檔案，確定要繼續嗎？")) return;
+      try {
+        const result = await invoke("restore_last_apply_cmd", {
+          instancePath,
+          outputDir: selectedOutputDir() || null,
+        });
+        appendLog(result.playerSummary || result.player_summary || "已還原上一次套用。", "warn");
+      } catch (e) {
+        appendError("還原失敗：" + formatInvokeError(e));
+      }
+    };
+  }
+  if ($("btn-delete-backups")) {
+    $("btn-delete-backups").onclick = async () => {
+      const instancePath = ($("instance").value || "").trim();
+      if (!instancePath) return log("請先選擇遊戲實例。");
+      if (
+        !window.confirm(
+          "這會刪除翻譯結果資料夾內所有由工具建立的備份，且無法還原。確定要刪除嗎？"
+        )
+      ) {
+        return;
+      }
+      try {
+        const result = await invoke("delete_apply_backups_cmd", {
+          instancePath,
+          outputDir: selectedOutputDir() || null,
+        });
+        appendLog(
+          result.playerSummary || result.player_summary || "備份刪除完成。",
+          result.failed?.length ? "warn" : "info"
+        );
+        syncUiState();
+      } catch (e) {
+        appendError("刪除備份失敗");
+        appendError(formatInvokeError(e));
+      }
+    };
+  }
+  if ($("btn-delete-output")) {
+    $("btn-delete-output").onclick = async () => {
+      const outputDir = selectedOutputDir();
+      if (!outputDir) return log("還沒有可刪除的翻譯結果資料夾。");
+      if (!window.confirm("這會完整刪除工具建立的翻譯結果資料夾與其中備份，確定要繼續嗎？")) return;
+      try {
+        const result = await invoke("delete_result_folder_cmd", { outputDir });
+        appendLog(result.playerSummary || result.player_summary || "翻譯結果資料夾已刪除。", "warn");
+        setTranslationState("ready");
+        const input = $("output");
+        if (input) {
+          input.dataset.autoPath = "";
+          input.dataset.customPath = "";
+          input.value = "";
+        }
+        syncUiState();
+      } catch (e) {
+        appendError("刪除翻譯結果失敗");
+        appendError(formatInvokeError(e));
+      }
+    };
+  }
   $("btn-open").onclick = async () => {
     const outputInput = document.body.dataset.appPage === "font" ? $("font-output") : $("output");
     const outputDir = (outputInput?.value || "").trim();
     if (!outputDir) return log("還沒選結果位置。");
     try {
       // 優先開「翻譯結果」
-      const work = outputDir.replace(/[\\/]+$/, "") + "\\翻譯結果";
+      const work = resultWorkDir(outputDir);
       try {
         await invoke("open_path", { path: work });
       } catch (_) {
@@ -1400,7 +1817,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     if (interactive) {
       const ok = window.confirm(
-        "發現新版本 " + info.latest + "。\n要立即下載、驗證並自動安裝嗎？\n\n安裝完成後工具會重新開啟。"
+        "發現新版本 " + info.latest + "。\n要立即下載、驗證並自動更新嗎？\n\n更新完成後工具會重新開啟。"
       );
       if (ok) await runDownload();
     }
@@ -1411,7 +1828,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!url || !_invoke) return;
     try {
       await _invoke("open_url", { url });
-      if (typeof appendLog === "function") appendLog("已用瀏覽器開啟官方安裝檔下載。", "warn");
+      if (typeof appendLog === "function") appendLog("已用瀏覽器開啟官方免安裝版下載。", "warn");
     } catch (e) {
       if (typeof appendLog === "function") appendLog("無法開啟手動下載：" + String(e), "error");
     }
@@ -1426,18 +1843,18 @@ window.addEventListener("DOMContentLoaded", async () => {
       btn.disabled = true;
       btn.textContent = "正在更新…";
     }
-    if (status) status.textContent = "正在下載並驗證安裝檔";
+      if (status) status.textContent = "正在下載並驗證免安裝版";
     try {
-      if (typeof appendLog === "function") appendLog("正在下載並驗證新版安裝檔，請勿關閉工具…");
+      if (typeof appendLog === "function") appendLog("正在下載並驗證新版 EXE，請勿關閉工具…");
       const r = await _invoke("download_update");
-      const message = (r && r.message) || "更新安裝程式已啟動。";
+      const message = (r && r.message) || "免安裝更新檔已啟動。";
       if (typeof appendLog === "function") appendLog(message);
-      if (status) status.textContent = r && r.automatic ? "正在安裝，稍後會重新開啟" : "請依安裝畫面完成更新";
+      if (status) status.textContent = r && r.automatic ? "正在更新，稍後會重新開啟" : "請開啟下載的免安裝版完成更新";
     } catch (e) {
       if (typeof appendLog === "function") appendLog("下載更新失敗：" + String(e), "error");
       if (status) status.textContent = "自動更新失敗";
       if (latestUpdateInfo && latestUpdateInfo.url) {
-        const manual = window.confirm("自動更新失敗。\n要改用瀏覽器下載官方安裝檔嗎？");
+        const manual = window.confirm("自動更新失敗。\n要改用瀏覽器下載官方免安裝版嗎？");
         if (manual) await openManualDownload();
       }
     } finally {

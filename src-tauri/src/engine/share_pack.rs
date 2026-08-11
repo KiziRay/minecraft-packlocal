@@ -24,7 +24,7 @@ pub fn package_translation(work_root: &Path, dest_dir: &Path, name: &str) -> Res
     let has_files = WalkDir::new(work_root)
         .into_iter()
         .filter_map(|e| e.ok())
-        .any(|e| e.path().is_file());
+        .any(|e| e.path().is_file() && is_shareable_path(work_root, e.path()));
     if !has_files {
         return Err("翻譯結果是空的，沒有可打包的檔案。".into());
     }
@@ -53,6 +53,9 @@ fn zip_dir(src: &Path, zip_path: &Path) -> Result<(), String> {
             _ => continue,
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !is_shareable_path(src, path) {
+            continue;
+        }
         if path.is_file() {
             zip.start_file(rel_str, opts).map_err(|e| e.to_string())?;
             let bytes = std::fs::read(path)
@@ -64,6 +67,26 @@ fn zip_dir(src: &Path, zip_path: &Path) -> Result<(), String> {
     }
     zip.finish().map_err(|e| format!("打包完成失敗：{e}"))?;
     Ok(())
+}
+
+fn is_shareable_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(first) = components.next().and_then(|part| part.as_os_str().to_str()) else {
+        return false;
+    };
+    match first {
+        "resourcepacks" | "patchouli_books" | "kubejs" | "minemenu" | "datapacks"
+        | "jar-translated"
+        | "defaultconfigs" | "global_packs" | "paxi" | "data" => true,
+        "config" => matches!(
+            components.next().and_then(|part| part.as_os_str().to_str()),
+            Some("ftbquests" | "openloader" | "fancymenu")
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -81,8 +104,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let work = root.join("翻譯結果");
         let rp = work.join("resourcepacks");
+        let jars = work.join("jar-translated");
         fs::create_dir_all(&rp).unwrap();
+        fs::create_dir_all(&jars).unwrap();
         fs::write(rp.join("pack.zip"), b"dummy-pack").unwrap();
+        fs::write(jars.join("example.jar"), b"translated-jar").unwrap();
         fs::write(work.join("覆蓋範圍說明.txt"), "coverage").unwrap();
 
         let dest = root.join("out");
@@ -96,7 +122,8 @@ mod tests {
             .map(|i| ar.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(names.iter().any(|n| n.contains("resourcepacks/pack.zip")), "{names:?}");
-        assert!(names.iter().any(|n| n.contains("覆蓋範圍說明.txt")), "{names:?}");
+        assert!(names.iter().any(|n| n.contains("jar-translated/example.jar")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("覆蓋範圍說明.txt")), "{names:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -117,7 +144,8 @@ mod tests {
         let root = scratch("name");
         let _ = fs::remove_dir_all(&root);
         let work = root.join("w");
-        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(work.join("resourcepacks")).unwrap();
+        fs::write(work.join("resourcepacks/pack.zip"), b"x").unwrap();
         fs::write(work.join("a.txt"), "x").unwrap();
         // 全是不合法字元 → 用預設名
         let zip = package_translation(&work, &root.join("out"), "///").unwrap();

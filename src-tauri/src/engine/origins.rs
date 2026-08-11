@@ -203,11 +203,15 @@ where
 
 fn collect_origins_files(mc: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    // Origins 可能出現的位置：datapacks、kubejs/data、以及實例頂層 data
+    // 手翻同路徑：Origins 可能落在多個「資料包根」底下（不同模組／包結構不同）
     let roots = [
         mc.join("datapacks"),
         mc.join("kubejs").join("data"),
         mc.join("data"),
+        mc.join("config").join("openloader"),
+        mc.join("global_packs"),
+        mc.join("paxi").join("datapacks"),
+        mc.join("defaultconfigs"),
     ];
     for root in roots {
         if !root.is_dir() {

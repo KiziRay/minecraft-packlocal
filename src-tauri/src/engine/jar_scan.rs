@@ -184,14 +184,26 @@ where
         }
     }
 
-    // ─── 3) kubejs / config 鬆散 lang（不含 versions 快取）───
-    on_progress(30, "本地整理：讀 KubeJS／設定內語言檔…");
-    for sub in ["kubejs", "config"] {
+    // ─── 3) 鬆散 lang：手翻同路徑、多根（不同模組常塞不同資料夾）───
+    // 含 openloader 巢狀 pack、defaultconfigs、global_packs、datapacks 等。
+    // 只收 `…/lang/<locale>.json|.lang`，不碰 gameplay id。
+    on_progress(30, "本地整理：讀各資料夾語言檔…");
+    // (相對 minecraft 根的路徑片段, max_depth) — openloader 巢狀較深
+    let loose_roots: &[(&str, usize)] = &[
+        ("kubejs", 12),
+        ("config", 16), // config/openloader/data/<pack>/data|assets/…/lang
+        ("defaultconfigs", 12),
+        ("datapacks", 14),
+        ("global_packs", 14),
+        ("paxi", 12),
+        ("data", 10),
+    ];
+    for (sub, depth) in loose_roots {
         let root = mc.join(sub);
         if !root.is_dir() {
             continue;
         }
-        match harvest_loose_lang_tree(&root, &mut raw, 8, &mut errors) {
+        match harvest_loose_lang_tree(&root, &mut raw, *depth, &mut errors) {
             Ok(n) => {
                 loose += n;
                 if n > 0 {

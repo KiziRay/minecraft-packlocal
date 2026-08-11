@@ -27,8 +27,7 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": ["nsis"],
+    "active": false,
     "publisher": "ZeitFrei",
     "copyright": "© 2026 ZeitFrei",
     "category": "Utility",
@@ -40,11 +39,6 @@
       "icons/zeitfrei-generated-v2/128x128@2x.png",
       "icons/zeitfrei-generated-v2/icon.icns",
       "icons/zeitfrei-generated-v2/icon.ico"
-    ],
-    "windows": {
-      "nsis": {
-        "installMode": "currentUser"
-      }
-    }
+    ]
   }
 }

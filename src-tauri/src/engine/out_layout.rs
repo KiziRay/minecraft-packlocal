@@ -84,17 +84,18 @@ fn write_readme(layout: &ResultLayout) -> Result<(), String> {
 目錄結構：\n\
   {RESULT_DIR_NAME}/\n\
     resourcepacks/     ← 把這裡的 .zip 複製到遊戲 resourcepacks 並啟用\n\
-    config/ftbquests/  ← 任務／劇情：備份後覆蓋到遊戲 config\\ftbquests\n\
+    config/ftbquests/  ← 任務／劇情：依備份選項覆蓋到遊戲 config\\ftbquests\n\
     config/openloader/ ← 文字覆寫（若有）\n\
     patchouli_books/   ← 書本（若有）\n\
     kubejs/            ← 語言覆寫（若有）\n\
+    jar-translated/    ← 翻譯後 JAR 副本（套用時依備份選項放入 mods）\n\
     minemenu/          ← 若有快捷選單修正檔\n\
     翻譯工作階段.json  ← 補翻／修復用，勿亂刪\n\
     覆蓋範圍說明.txt   ← 會翻什麼／不會翻什麼（社群誠實原則）\n\
 \n\
 建議流程：\n\
 1. 關閉遊戲\n\
-2. 用工具「一鍵套用到遊戲」（會先備份）或手動複製\n\
+2. 用工具「一鍵套用到遊戲」（可選擇是否備份）或手動複製\n\
 3. 開遊戲 → 語言繁中（台灣）→ 啟用資源包\n\
 \n\
 工作根目錄：\n{}\n",
@@ -110,7 +111,11 @@ pub struct CoverageStats {
     pub keys_zh: usize,
     pub keys_pending: usize,
     pub ai_filled: usize,
+    pub ai_enabled: bool,
     pub jars_scanned: usize,
+    pub jars_rewritten: usize,
+    pub jar_lang_files: usize,
+    pub jar_errors: usize,
     pub quests_note: String,
     pub ref_note: String,
     pub pack_path: String,
@@ -124,15 +129,29 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
     } else {
         0.0
     };
+    let source_summary = if stats.ai_enabled {
+        format!("（含本機合併與 AI 新補；AI 本次新寫入約 {} 條）", stats.ai_filled)
+    } else {
+        "（只含本機合併與內建轉換）".to_string()
+    };
+    let reference_summary = if stats.ai_enabled {
+        "3. 可合併社群／先前全翻參考包；AI 只補「仍是英文」的字\n"
+    } else {
+        "3. 可合併社群／先前全翻參考包；不使用線上翻譯服務\n"
+    };
+    let ai_rule = if stats.ai_enabled {
+        "4. 不用 AI 做分類找檔；AI 只翻字串\n"
+    } else {
+        "4. 不用線上服務做分類找檔；掃描與分類都在本機完成\n"
+    };
     let body = format!(
         "【覆蓋範圍說明 — 請先讀】\n\
 （依全球 Minecraft／整合包玩家社群常見期望撰寫；本工具不宣稱 100% 漢化）\n\
 \n\
 ═══ 這次大概蓋到什麼 ═══\n\
-• 中文鍵約 {} 條（含本機合併＋AI 新補）\n\
-• AI 本次新寫入約 {} 條\n\
+• 中文鍵約 {} 條{}\n\
 • 仍待補英文約 {} 條（語言檔層級粗估完成度約 {:.1}%）\n\
-• 掃過模組 jar 約 {} 個（只讀語言檔，不改 jar）\n\
+• 掃過模組 jar 約 {} 個；翻譯副本重建 {} 個、寫入 {} 個語言檔、{} 個失敗\n\
 • 資源包：{}\n\
 • pack_format：{}（不相容時遊戲會提示，可回報版本）\n\
 • 參考包：{}\n\
@@ -141,12 +160,12 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 ═══ 會處理（期望對齊）═══\n\
 1. mods／資源包／KubeJS 等語言檔 → 產出 zh_tw 資源包 zip\n\
 2. 簡中 → 台灣繁體（OpenCC s2twp，本機）\n\
-3. 可合併社群／先前全翻參考包，AI 只補「仍是英文」的字\n\
+{}\
 4. FTB Quests 任務文字（輸出到 config/ftbquests，需套用才進遊戲）\n\
 5. 文字覆寫：patchouli_books／openloader／kubejs 等（需套用才進遊戲）\n\
 6. 任務／書本系統：Better Questing／HQM／Heracles／Modonomicon（顯示欄位，best-effort）\n\
 7. Origins／Apoli 能力名稱與說明（路徑感知，不動識別字）\n\
-8. 一鍵套用前會備份會被覆蓋的檔案（不改 mods/*.jar）\n\
+8. JAR 原檔只讀；翻譯副本是否在套用前備份同名 mods 檔，由玩家選項決定\n\
 \n\
 ═══ 通常蓋不到／仍可能英文（誠實列出）═══\n\
 1. 圖片上的字（紅線，本工具不處理圖片）\n\
@@ -158,10 +177,10 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 7. 機翻腔、專有名詞不一致（社群包也會寫「不保證完美」）\n\
 \n\
 ═══ 不該做的事（本工具紅線）═══\n\
-1. 不直接改 mods/*.jar 內容\n\
+1. 不直接改 mods/*.jar 原檔；只建立翻譯副本並在套用時替換\n\
 2. 不把機翻吹成官方全漢化\n\
-3. 不刪你的原任務／原資源包而不備份（套用會先備份）\n\
-4. 不用 AI 做分類找檔；AI 只翻字串\n\
+3. 不會自行刪除原任務／原資源包；是否建立套用備份由玩家選項決定\n\
+{}\
 5. 不把簡中當繁中交差\n\
 \n\
 ═══ 建議你怎麼用 ═══\n\
@@ -171,10 +190,13 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 \n\
 產生位置：\n{}\n",
         stats.keys_zh,
-        stats.ai_filled,
+        source_summary,
         stats.keys_pending,
         covered_pct,
         stats.jars_scanned,
+        stats.jars_rewritten,
+        stats.jar_lang_files,
+        stats.jar_errors,
         stats.pack_path,
         stats.pack_format,
         if stats.ref_note.is_empty() {
@@ -187,6 +209,8 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
         } else {
             stats.quests_note.as_str()
         },
+        reference_summary,
+        ai_rule,
         layout.work_root.display()
     );
     fs::write(&path, body).map_err(|e| e.to_string())?;
@@ -245,4 +269,47 @@ pub fn suggest_output_base(instance_path: &Path) -> Result<PathBuf, String> {
     let base = instance_root.join("繁中翻譯輸出");
     fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn coverage_report_omits_ai_when_disabled() {
+        let root = std::env::temp_dir().join(format!("coverage_report_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let work = root.join(RESULT_DIR_NAME);
+        fs::create_dir_all(&work).unwrap();
+        let layout = ResultLayout {
+            user_base: root.clone(),
+            work_root: work,
+            resourcepacks: root.join(RESULT_DIR_NAME).join("resourcepacks"),
+            config: root.join(RESULT_DIR_NAME).join("config"),
+            minemenu: root.join(RESULT_DIR_NAME).join("minemenu"),
+        };
+        let path = write_coverage_report(
+            &layout,
+            &CoverageStats {
+                keys_zh: 3,
+                keys_pending: 1,
+                ai_filled: 0,
+                ai_enabled: false,
+                jars_scanned: 1,
+                jars_rewritten: 1,
+                jar_lang_files: 1,
+                jar_errors: 0,
+                quests_note: String::new(),
+                ref_note: "未找到參考包。".into(),
+                pack_path: "pack.zip".into(),
+                pack_format: 15,
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(path).unwrap();
+        assert!(!text.contains("AI"));
+        assert!(text.contains("不使用線上翻譯服務"));
+        let _ = fs::remove_dir_all(root);
+    }
 }

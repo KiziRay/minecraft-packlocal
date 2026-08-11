@@ -35,6 +35,10 @@ pub struct LaunchDiagnosis {
     pub translation_related: bool,
     /// 依據來源（哪個檔）
     pub source: String,
+    /// A stable local classification code, not a Minecraft exit code.
+    pub error_code: String,
+    pub primary_error: String,
+    pub evidence: Vec<String>,
 }
 
 fn re(src: &'static str) -> &'static Regex {
@@ -52,7 +56,7 @@ pub fn diagnose(instance_or_mc: &Path) -> LaunchDiagnosis {
     let mc = super::jar_scan::resolve_minecraft_dir(instance_or_mc)
         .unwrap_or_else(|_| instance_or_mc.to_path_buf());
 
-    let Some((text, source)) = read_newest_log(&mc) else {
+    let Some((text, source)) = read_combined_logs(&mc) else {
         return LaunchDiagnosis {
             verdict: "no_logs".into(),
             summary: "找不到當機報告或執行紀錄（crash-reports／logs/latest.log）。\n\
@@ -61,6 +65,9 @@ pub fn diagnose(instance_or_mc: &Path) -> LaunchDiagnosis {
             missing: vec![],
             translation_related: false,
             source: String::new(),
+            error_code: "NO_LOGS".into(),
+            primary_error: String::new(),
+            evidence: Vec::new(),
         };
     };
 
@@ -89,6 +96,9 @@ pub fn classify(log: &str, source: &str) -> LaunchDiagnosis {
             missing,
             translation_related: false,
             source: source.to_string(),
+            error_code: "MISSING_MOD".into(),
+            primary_error: extract_primary_error(log),
+            evidence: collect_evidence(log),
         };
     }
 
@@ -104,6 +114,9 @@ pub fn classify(log: &str, source: &str) -> LaunchDiagnosis {
             missing: vec![],
             translation_related: true,
             source: source.to_string(),
+            error_code: "TRANSLATED_FILE_LOAD".into(),
+            primary_error: extract_primary_error(log),
+            evidence: collect_evidence(log),
         };
     }
 
@@ -117,6 +130,9 @@ pub fn classify(log: &str, source: &str) -> LaunchDiagnosis {
             missing: vec![],
             translation_related: false,
             source: source.to_string(),
+            error_code: "CONTENT_REGISTRY".into(),
+            primary_error: extract_primary_error(log),
+            evidence: collect_evidence(log),
         };
     }
 
@@ -126,16 +142,20 @@ pub fn classify(log: &str, source: &str) -> LaunchDiagnosis {
         summary: "無法從紀錄明確判斷原因。建議：\n\
 1. 先按「還原上次套用」移除我們的檔，再開一次——藉此排除是不是翻譯造成的。\n\
 2. 若還原後仍開不起來，多半是整合包本身（缺模組／版本不合），把當機報告提供給整合包作者。\n\
-（本工具不改 mods/*.jar，也不處理閃退本身。）"
+（本工具不直接寫入原始 mods/*.jar；翻譯副本可能影響載入，還原即可排除。本工具不處理閃退本身。）"
             .into(),
         missing: vec![],
         translation_related: true,
         source: source.to_string(),
+        error_code: "UNKNOWN".into(),
+        primary_error: extract_primary_error(log),
+        evidence: collect_evidence(log),
     }
 }
 
 // ─── 讀取最新紀錄 ───────────────────────────────────────────
 
+#[allow(dead_code)]
 fn read_newest_log(mc: &Path) -> Option<(String, String)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     // crash-reports/*.txt（最新的通常最相關）
@@ -180,6 +200,40 @@ fn read_bounded(path: &Path) -> Option<String> {
 }
 
 // ─── 分類判斷 ───────────────────────────────────────────────
+
+fn read_combined_logs(mc: &Path) -> Option<(String, String)> {
+    let latest = mc.join("logs").join("latest.log");
+    let newest_crash = fs::read_dir(mc.join("crash-reports"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("txt"))
+        .max_by_key(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+
+    let mut parts = Vec::new();
+    let mut sources = Vec::new();
+    if let Some(path) = newest_crash {
+        if let Some(text) = read_bounded(&path) {
+            parts.push(format!("--- crash report: {} ---\n{}", path.display(), text));
+            sources.push(path.display().to_string());
+        }
+    }
+    if let Some(text) = read_bounded(&latest) {
+        parts.push(format!("--- latest.log: {} ---\n{}", latest.display(), text));
+        sources.push(latest.display().to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some((parts.join("\n"), sources.join(" + ")))
+    }
+}
 
 fn looks_like_dependency_failure(log: &str) -> bool {
     let l = log.to_ascii_lowercase();
@@ -248,6 +302,48 @@ fn looks_like_missing_registry(log: &str) -> bool {
         || l.contains("unknown registry")
         || l.contains("non-registered")
         || l.contains("registry remapping")
+        || l.contains("unbound value")
+        || l.contains("unbound values in registry")
+}
+
+fn extract_primary_error(log: &str) -> String {
+    for line in log.lines().rev() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if (lower.contains("exception")
+            || lower.contains("error")
+            || lower.contains("unbound value")
+            || lower.contains("failed to load"))
+            && !trimmed.starts_with("at ")
+        {
+            return trimmed.chars().take(400).collect();
+        }
+    }
+    String::new()
+}
+
+fn collect_evidence(log: &str) -> Vec<String> {
+    let mut evidence = Vec::new();
+    for line in log.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("unbound value")
+            || lower.contains("unbound values in registry")
+            || lower.contains("missing or unsupported")
+            || lower.contains("requires a mod")
+            || lower.contains("failed to load datapacks")
+            || lower.contains("encountered an unexpected exception")
+        {
+            let line = trimmed.chars().take(400).collect::<String>();
+            if !evidence.contains(&line) {
+                evidence.push(line);
+            }
+            if evidence.len() >= 8 {
+                break;
+            }
+        }
+    }
+    evidence
 }
 
 #[cfg(test)]
@@ -301,6 +397,18 @@ mod tests {
         let d = classify(log, "log");
         assert_eq!(d.verdict, "content_missing");
         assert!(!d.translation_related);
+        assert_eq!(d.error_code, "CONTENT_REGISTRY");
+    }
+
+    #[test]
+    fn unbound_registry_value_is_not_blamed_on_translation() {
+        let log = "Unbound values in registry: structory_towers:end/end_tower\n\
+            IllegalStateException: Trying to access unbound value";
+        let d = classify(log, "crash-report.txt");
+        assert_eq!(d.verdict, "content_missing");
+        assert_eq!(d.error_code, "CONTENT_REGISTRY");
+        assert!(!d.translation_related);
+        assert!(!d.evidence.is_empty());
     }
 
     #[test]

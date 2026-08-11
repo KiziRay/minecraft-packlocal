@@ -1,19 +1,24 @@
-# 開發文件（0.4.0）
+# 開發文件
+
+> 產品 semver 以 `Cargo.toml`／`tauri.conf.json`／`package.json` 為準。  
+> **202608 目標規格**（最快 + 盡完整本地化、缺漏與優化 backlog）：**[`LOCALIZE-202608.md`](./LOCALIZE-202608.md)**（必讀）。  
+> 搜尋多根地圖：[`SEARCH-MAP.md`](./SEARCH-MAP.md)。
 
 ## 1. 產品目標
 
-一鍵將 Minecraft **整合包實例**中可覆蓋、可遊玩的文字，整理為**台灣用語繁體中文**：
+一鍵將 Minecraft **整合包實例**中可覆蓋、可遊玩的文字，整理為**台灣用語繁體中文**，並在**速度**（少 AI、可續跑、可快取）與**完整度**（多根來源、顯示欄位安全）上對齊 [`LOCALIZE-202608.md`](./LOCALIZE-202608.md)。
 
 | 做 | 不做 |
 |----|------|
-| 語言檔 → zh_tw 資源包 zip | 改 mods jar |
-| FTB Quests snbt | 圖片／貼圖文字 OCR |
-| patchouli／openloader／fancymenu 等覆寫 | 保證 100% 中文化 |
-| 內建 zh-Hant-TW 轉換（純 Rust） | 世界閃退修復 |
-| 可選 AI 補缺字串 | 用 AI 掃檔／分類 |
-| 一鍵套用（先備份） | 強制覆蓋執行中遊戲檔 |
+| 語言檔 → zh_tw 資源包 zip + JAR 翻譯副本 | 直接修改原始 mods jar |
+| FTB Quests snbt；BQ／HQM／Heracles／Modonomicon | 圖片／貼圖文字 OCR |
+| patchouli／openloader／fancymenu／資料包顯示欄 | 保證 100% 螢幕無英文 |
+| Origins 等路徑感知顯示字 | 用 AI 掃檔／分類 |
+| 內建 zh-Hant-TW 轉換（純 Rust） | 世界缺模組／結構 unbound 的「修好整合包」（只診斷） |
+| 可選 AI 補缺字串 + TM／術語 | 強制覆蓋執行中遊戲檔 |
+| 一鍵套用（可選備份） | 基岩版 |
 
-品質路徑：本機掃 + 社群參考包合併 + AI 只補洞，對齊 CTE2 手修「有繁中底再補」思維。
+品質路徑：本機多根掃 + 社群／既有譯文合併 + **格式護盾下** AI 只補洞，對齊手翻「有繁中底再補、不同模組不同資料夾」。
 
 ## 2. 環境
 
@@ -38,11 +43,11 @@ npm run dev
 npm run check            # cargo check，必須 0 error 0 warning
 npm run test             # cargo test --lib
 
-# 正式包（需要發佈時再跑；日常可不建 exe）
+# 免安裝版（需要發佈時再跑；日常可不建 exe）
 npm run build
-# 產物約：
-#   src-tauri/target/release/Minecraft 模組包專用翻譯工具.exe
-#   NSIS 安裝包（若 bundle 啟用）
+# 產物：
+#   src-tauri/target/release/Minecraft 模組整合包翻譯工具.exe
+# 不會產生 NSIS 安裝包；更新也只使用這個免安裝 EXE。
 ```
 
 `tauri.conf.json`：
@@ -59,14 +64,14 @@ npm run build
 | 40–43% | 參考包／舊包合併 | 否 |
 | 41–88% | fill_missing_with_ai：術語表 → 翻譯記憶 → AI（可關） | 部分 |
 | 88–91% | 最終 zh-Hant-TW 轉換 | 否 |
-| 91–93% | build_resource_pack | 否 |
+| 91–93% | JAR 副本重建 + build_resource_pack | 否 |
 | 93–96% | ftbquests | 可 |
 | 94–99% | text_overlays | 可 |
 | 100% | session + 覆蓋報告 + 錯誤檔 | 否 |
 
 補翻：`supplement_translate` 讀 session + pack，不重掃 mods。  
 修復：`repair_translation_pack` 重建 zip／底稿，可選 AI。  
-套用：`apply_translation_to_game` 備份後 merge 複製。
+套用：`apply_translation_to_game` 依玩家選項備份後 merge 複製。
 
 ## 5. AI 參數（deepseek.rs）
 
@@ -123,7 +128,7 @@ npm run build
 | 停止沒反應 | 檢查點密度；`cancel::check()` 只在階段邊界，長單批要等該批結束 |
 | 補翻失敗 | 翻譯工作階段.json 路徑、session_status |
 | 套用失敗 | 遊戲是否關閉、路徑權限、備份目錄 |
-| 仍英文 | 是否套用、語言台灣繁中、資源包優先級、是否寫死／圖片 |
+| 仍英文 | 是否套用、語言台灣繁中、`jar-translated` 是否有對應副本、是否為簽章／寫死／圖片 |
 | API 失敗 | Base URL、金鑰、日誌「翻譯錯誤日誌.txt」 |
 
 日誌：
@@ -179,7 +184,14 @@ npm run build
 
 ## 11. 相關文件
 
-- 架構：`../ARCHITECTURE.md`
-- 擴充來源：`EXTENDING.md`
-- Command 表：`API-COMMANDS.md`
-- 維修規則：`../AGENTS.md`
+| 檔案 | 用途 |
+|------|------|
+| **`LOCALIZE-202608.md`** | **202608：缺漏／可優化／速度＋完整度波次（開發優先序）** |
+| `SEARCH-MAP.md` | 手翻同路徑多根搜尋規格 |
+| `EXTENDING.md` | 新文字來源怎麼加 |
+| `API-COMMANDS.md` | Tauri command 表 |
+| `COMMUNITY.md` | 社群期望與紅線 |
+| `支援範圍與免責聲明.md` | 玩家可見支援邊界 |
+| `CHANGELOG.md` | 版本變更 |
+| `../ARCHITECTURE.md` | 架構（若有） |
+| `../AGENTS.md` | 維修規則 |

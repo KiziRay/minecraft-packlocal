@@ -2,13 +2,15 @@
   "name": "modpack-i18n-tool",
   "private": true,
   "version": "1.0.2",
-  "description": "Minecraft 模組包→台灣繁體中文（Tauri 2；不改 jar）",
+  "description": "Minecraft 模組包→台灣繁體中文（Tauri 2；原始 JAR 只讀，建立翻譯副本）",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
     "check": "cargo check --manifest-path src-tauri/Cargo.toml",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "check:worker": "node --check worker/src/index.js && node --check worker/src/turnstile.mjs",
+    "test:worker": "node --test worker/test/*.test.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

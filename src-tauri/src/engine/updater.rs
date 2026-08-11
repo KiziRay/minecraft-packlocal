@@ -20,8 +20,8 @@ use super::secrets::MANAGED_BASE_URL;
 
 /// 目前版本（編譯時由 Cargo 帶入）。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const MIN_INSTALLER_BYTES: usize = 100_000;
-const MAX_INSTALLER_BYTES: usize = 256 * 1024 * 1024;
+const MIN_UPDATE_BYTES: usize = 100_000;
+const MAX_UPDATE_BYTES: usize = 256 * 1024 * 1024;
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 struct UpdateGuard;
@@ -48,7 +48,7 @@ pub struct UpdateCheck {
     pub latest: String,
     /// latest 是否比 current 新
     pub update_available: bool,
-    /// 下載頁或安裝檔連結
+    /// 官方免安裝 EXE 下載連結
     pub url: String,
     /// 更新說明（可空）
     pub notes: String,
@@ -164,14 +164,14 @@ pub fn check_update() -> UpdateCheck {
 pub struct DownloadResult {
     pub path: String,
     pub launched: bool,
-    /// true＝已用官方 NSIS 靜默安裝並要求完成後重開。
+    /// true＝已排程替換免安裝 EXE 並要求完成後重開。
     pub automatic: bool,
     /// true＝安裝程式已脫離目前行程，前端收到回應後可關閉舊程式。
     pub should_exit: bool,
     pub message: String,
 }
 
-/// 下載安裝檔到暫存，強制驗證後啟動 NSIS 更新。
+/// 下載免安裝 EXE 到暫存，強制驗證後排程替換更新。
 pub fn download_and_launch() -> Result<DownloadResult, String> {
     let _guard = UpdateGuard::acquire()?;
     let latest = fetch_latest()?;
@@ -202,15 +202,15 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
     }
     if resp
         .content_length()
-        .is_some_and(|size| size < MIN_INSTALLER_BYTES as u64 || size > MAX_INSTALLER_BYTES as u64)
+        .is_some_and(|size| size < MIN_UPDATE_BYTES as u64 || size > MAX_UPDATE_BYTES as u64)
     {
-        return Err("伺服器提供的安裝檔大小不合理，已停止更新。".into());
+        return Err("伺服器提供的更新 EXE 大小不合理，已停止更新。".into());
     }
     let bytes = resp.bytes().map_err(|e| format!("下載中斷：{e}"))?;
-    validate_installer_bytes(&bytes)?;
+    validate_update_bytes(&bytes)?;
     let got = sha256_hex(&bytes);
     if !got.eq_ignore_ascii_case(&expected_sha) {
-        return Err("安裝檔完整性驗證失敗，已停止更新。請改用官方下載連結。".into());
+        return Err("更新 EXE 完整性驗證失敗，已停止更新。請改用官方下載連結。".into());
     }
 
     let dest = download_target(&url, &latest.version);
@@ -218,16 +218,16 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
     let _ = std::fs::remove_file(&partial);
     std::fs::write(&partial, &bytes).map_err(|e| format!("寫入更新暫存檔失敗：{e}"))?;
     let _ = std::fs::remove_file(&dest);
-    std::fs::rename(&partial, &dest).map_err(|e| format!("準備安裝檔失敗：{e}"))?;
+    std::fs::rename(&partial, &dest).map_err(|e| format!("準備更新 EXE 失敗：{e}"))?;
 
-    let (launched, automatic, should_exit) = launch_installer(&dest)?;
+    let (launched, automatic, should_exit) = launch_portable_update(&dest)?;
     Ok(DownloadResult {
         path: dest.display().to_string(),
         launched,
         automatic,
         should_exit,
         message: if automatic {
-            "安裝檔已驗證，正在自動安裝；工具將關閉並由新版重新開啟。".into()
+            "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。".into()
         } else {
             format!("已驗證並開啟安裝程式：{}\n請依畫面完成更新。", dest.display())
         },
@@ -239,14 +239,14 @@ fn validate_download_url(url: &str) -> Result<String, String> {
     let prefix = format!("{}/download/", MANAGED_BASE_URL.trim_end_matches('/'));
     let lower = value.to_ascii_lowercase();
     if !value.starts_with(&prefix)
-        || !lower.ends_with(".exe")
+        || !lower.ends_with("-portable.exe")
         || lower.contains("..")
         || lower.contains("%2e")
         || value.contains('\\')
         || value.contains('?')
         || value.contains('#')
     {
-        return Err("更新下載連結不是官方安裝檔，已停止更新。".into());
+        return Err("更新下載連結不是官方免安裝 EXE，已停止更新。".into());
     }
     Ok(value.to_string())
 }
@@ -254,14 +254,14 @@ fn validate_download_url(url: &str) -> Result<String, String> {
 fn validate_sha256(value: Option<&str>) -> Result<String, String> {
     let checksum = value.unwrap_or("").trim();
     if checksum.len() != 64 || !checksum.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("伺服器未提供有效的安裝檔 SHA-256，已停止更新。".into());
+        return Err("伺服器未提供有效的更新 EXE SHA-256，已停止更新。".into());
     }
     Ok(checksum.to_ascii_lowercase())
 }
 
-fn validate_installer_bytes(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() < MIN_INSTALLER_BYTES || bytes.len() > MAX_INSTALLER_BYTES {
-        return Err("下載的安裝檔大小不合理，已停止更新。".into());
+fn validate_update_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < MIN_UPDATE_BYTES || bytes.len() > MAX_UPDATE_BYTES {
+        return Err("下載的更新 EXE 大小不合理，已停止更新。".into());
     }
     if !bytes.starts_with(b"MZ") {
         return Err("下載內容不是 Windows 安裝程式，已停止更新。".into());
@@ -270,34 +270,54 @@ fn validate_installer_bytes(bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn launch_installer(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+    let current = std::env::current_exe().map_err(|e| format!("找不到目前工具位置：{e}"))?;
+    let replacement = current.with_extension("new");
+    let backup = current.with_extension("bak");
+    std::fs::copy(path, &replacement).map_err(|e| format!("準備免安裝更新檔失敗：{e}"))?;
 
-    // 與工具箱更新器相同：脫離 Tauri 的父 Job，避免舊程式退出時連帶殺掉安裝器。
+    // 參考 ZeitFrei 工具箱：由脫離 Tauri Job 的隱藏 bat 等待目前 PID 結束，
+    // 再以同一路徑替換 exe 並重開。這樣不需要 NSIS，也不會直接覆蓋鎖定中的 exe。
+    let pid = std::process::id();
+    let current_s = current.to_string_lossy().replace('"', "");
+    let replacement_s = replacement.to_string_lossy().replace('"', "");
+    let backup_s = backup.to_string_lossy().replace('"', "");
+    let script = format!(
+        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nif exist \"{backup}\" del /f /q \"{backup}\" >nul 2>&1\r\nmove /Y \"{current}\" \"{backup}\" >nul 2>&1\r\nmove /Y \"{replacement}\" \"{current}\" >nul 2>&1\r\nif not exist \"{current}\" move /Y \"{backup}\" \"{current}\" >nul 2>&1\r\nif exist \"{current}\" (\r\n  start \"\" \"{current}\"\r\n  ping -n 2 127.0.0.1 >nul\r\n  del /f /q \"{backup}\" >nul 2>&1\r\n)\r\ndel \"%~f0\"\r\n",
+        pid = pid,
+        current = current_s,
+        replacement = replacement_s,
+        backup = backup_s,
+    );
+    let script_path = std::env::temp_dir().join(format!("modpack_i18n_update_{pid}.bat"));
+    std::fs::write(&script_path, script).map_err(|e| format!("建立更新排程失敗：{e}"))?;
     const FLAGS: u32 = 0x0800_0000 | 0x0000_0200 | 0x0100_0000;
-    let automatic = Command::new(path)
-        .args(["/S", "/R"])
+    let launched = Command::new("cmd.exe")
+        .arg("/c")
+        .arg(format!("\"{}\"", script_path.display()))
         .creation_flags(FLAGS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    if automatic.is_ok() {
+        .spawn()
+        .is_ok();
+    if launched {
         return Ok((true, true, true));
     }
 
-    // BREAKAWAY 被系統政策拒絕時，保留可見的官方安裝程式讓玩家手動完成。
+    let _ = std::fs::remove_file(&replacement);
     open::that(path)
         .map(|_| (true, false, false))
-        .map_err(|e| format!("安裝檔已下載，但無法啟動：{e}"))
+        .map_err(|e| format!("更新檔已下載，但無法啟動：{e}"))
 }
 
 #[cfg(not(windows))]
-fn launch_installer(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
     open::that(path)
         .map(|_| (true, false, false))
-        .map_err(|e| format!("安裝檔已下載，但無法啟動：{e}"))
+        .map_err(|e| format!("更新檔已下載，但無法啟動：{e}"))
 }
 
 /// 暫存檔名：保留原副檔名（通常 .exe），避免被當成未知格式。
@@ -362,10 +382,14 @@ mod tests {
     #[test]
     fn updater_accepts_only_official_exe_downloads() {
         assert!(validate_download_url(
-            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-setup.exe"
+            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-portable.exe"
         )
         .is_ok());
         assert!(validate_download_url("https://example.com/fake.exe").is_err());
+        assert!(validate_download_url(
+            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-setup.exe"
+        )
+        .is_err());
         assert!(validate_download_url(
             "https://modpack-i18n.jolin34563.workers.dev/download/../fake.exe"
         )
@@ -378,9 +402,9 @@ mod tests {
         assert!(validate_sha256(None).is_err());
         assert!(validate_sha256(Some("xyz")).is_err());
 
-        let mut installer = vec![0u8; MIN_INSTALLER_BYTES];
-        installer[0..2].copy_from_slice(b"MZ");
-        assert!(validate_installer_bytes(&installer).is_ok());
-        assert!(validate_installer_bytes(b"not an installer").is_err());
+        let mut update = vec![0u8; MIN_UPDATE_BYTES];
+        update[0..2].copy_from_slice(b"MZ");
+        assert!(validate_update_bytes(&update).is_ok());
+        assert!(validate_update_bytes(b"not an executable").is_err());
     }
 }

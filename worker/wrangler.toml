@@ -6,9 +6,9 @@ compatibility_date = "2026-08-01"
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
 LATEST_VERSION = "1.0.2"
-# 安裝檔直連（NSIS）。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.2-setup.exe"
-RELEASE_NOTES = "1.0.2：選有效實例時直接覆蓋安裝、不建資料夾；可勾選打包成分享檔；安全驗證改為選用（Discord 登入即可）；支持開發按鈕移到醒目處。"
+# 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.2-portable.exe"
+RELEASE_NOTES = "1.0.2：資源包版本獨立辨識、JAR 文件複查、翻譯完成直接備份套用、錯誤分析、24 小時隔離分享連結。"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-chat"
@@ -19,6 +19,7 @@ AUTH_BASE_URL = "https://cloud.zeitfrei.uk"
 MANAGED_AI_PROTOCOL = "3"
 TURNSTILE_SITE_KEY = "0x4AAAAAAELdGLixrUpLNaxf"
 TURNSTILE_HOSTNAME = "modpack-i18n.jolin34563.workers.dev"
+TURNSTILE_ENFORCED = "1"
 
 # 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
 # 超過就回 429，客戶端顯示贊助提示。
@@ -26,13 +27,24 @@ DAILY_TOKEN_BUDGET = "20000000"
 # 單一 Discord 帳號每日上限；啟用 USAGE KV 後生效。
 PER_USER_DAILY_TOKEN_BUDGET = "1000000"
 
-# 更新安裝檔的 sha256（上傳後填；客戶端會驗證，不符或留空都不啟動）。
-INSTALLER_SHA256 = "16477e188029943d49317b047d7f5e2b28f6c64f038c102fcdcd8ff161cd6f6d"
+# 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
+UPDATE_SHA256 = "145489079e07fdbb0064e93e80af190ae445af0581128c3d209fc6ccd1d37c63"
 
-# 安裝檔存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
+# 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
+SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"
+SHARE_MAX_BYTES = "104857600"
+
+# 免安裝 EXE 存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
 [[r2_buckets]]
 binding = "DOWNLOADS"
 bucket_name = "modpack-i18n"
+
+[[r2_buckets]]
+binding = "SHARES"
+bucket_name = "modpack-i18n-shares"
+
+[triggers]
+crons = ["0 * * * *"]
 
 # 每日用量計數（KV）— 選用。沒有它時 Worker 仍可運作，只是不在 Worker 層做每日
 # 上限（DeepSeek 帳號餘額仍是最終上限，用完回 402 → 客戶端顯示贊助提示）。
