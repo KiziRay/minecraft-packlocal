@@ -20,7 +20,7 @@
         <button type="button" id="tab-diagnose" class="service-tab" data-page="diagnose" aria-selected="false" role="tab">診斷</button>
       </nav>
       <div class="topbar-actions">
-        <kbd class="version-key">v0.1.4</kbd>
+        <kbd class="version-key">v0.1.6</kbd>
         <button type="button" id="btn-theme" class="theme-switch" aria-pressed="true" title="切換淺色／深色">
           <span class="theme-switch-track" aria-hidden="true">
             <span class="theme-sun">☀</span>
@@ -124,170 +124,202 @@
                 </div>
               </div>
 
-              <details id="more-options" class="advanced-details workshop-fold">
-                <summary>更多選項：結果位置、版本、AI、參考翻譯</summary>
-                <div class="advanced-body">
-              <div class="field-list">
-                <div id="field-output" class="field-block">
-                  <label for="output">翻譯結果位置</label>
-                  <p class="field-help">正常會直接套用到整合包資料夾。想另外保留結果時，翻譯前勾選下方選項；備份也會放在結果資料夾。</p>
-                  <label class="option-row compact-option" for="choose-output-dir">
-                    <input type="checkbox" id="choose-output-dir" /><span class="check-box" aria-hidden="true"></span>
-                    <span><strong>另外指定翻譯結果資料夾</strong><small>勾選後可輸入或選取位置；留白會繼續使用自動建議位置。</small></span>
-                  </label>
-                  <div class="input-row">
-                    <input id="output" type="text" readonly placeholder="選好遊戲資料夾後自動建立" autocomplete="off" />
-                    <button type="button" id="btn-output-pick" class="small-button" hidden>選取</button>
-                    <button type="button" id="btn-delete-output" class="small-button danger-button" hidden>刪除結果</button>
-                  </div>
-                  <small id="output-status" class="field-status">工具會在這裡建立「翻譯結果」資料夾。</small>
-                </div>
-                <div id="field-pack-name" class="field-block compact-field">
-                  <label for="pack-name">資源包名稱</label>
-                  <input id="pack-name" type="text" value="選擇實例後自動命名" readonly autocomplete="off" />
-                  <small id="pack-version-status" class="field-status">會顯示目前整合包名稱與資源包版本，翻譯中不會更改。</small>
-                </div>
-                <div id="field-version" class="field-block compact-field version-field">
-                  <label for="target-version">Minecraft 版本</label>
-                  <p class="field-help">會先自動偵測，也可以手動指定。</p>
-                  <select id="target-version" aria-describedby="version-status">
-                    <option value="">自動偵測</option>
-                    <option value="1.13">1.13</option>
-                    <option value="1.14.4">1.14.4</option>
-                    <option value="1.15.2">1.15.2</option>
-                    <option value="1.16.5">1.16.5</option>
-                    <option value="1.17.1">1.17.1</option>
-                    <option value="1.18.2">1.18.2</option>
-                    <option value="1.19.2">1.19.2</option>
-                    <option value="1.19.4">1.19.4</option>
-                    <option value="1.20.1">1.20.1</option>
-                    <option value="1.20.4">1.20.4</option>
-                    <option value="1.20.6">1.20.6</option>
-                    <option value="1.21">1.21</option>
-                    <option value="1.21.1">1.21.1</option>
-                    <option value="1.21.4">1.21.4</option>
-                    <option value="1.21.5">1.21.5</option>
-                    <option value="1.21.8">1.21.8</option>
-                    <option value="1.21.9">1.21.9</option>
-                    <option value="26.1">26.1</option>
-                    <option value="26.2">26.2</option>
-                    <option value="26.3">26.3</option>
-                  </select>
-                  <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲實例</small>
-                </div>
-              </div>
+              <details id="more-options" class="advanced-details workshop-fold" hidden>
+                <summary>更多選項</summary>
+                <div class="advanced-body more-options-body">
 
-              <div id="translation-options-heading" class="subsection-heading bare"><h3>翻譯方式</h3></div>
-              <div id="translation-options">
-              <div class="option-list">
-                <label class="option-row" for="use-ai">
-                  <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
-                  <span><strong>補上原本沒有繁中的文字（可選）</strong><small>不勾選也能翻譯；工具會使用參考包、術語表與翻譯記憶，其他缺漏保留原文。</small></span>
-                </label>
-                <label class="option-row" for="backup-before-apply">
-                  <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
-                  <span><strong>套用前建立備份（建議）</strong><small>勾選會保留被覆蓋的檔案；再次翻譯同一個整合包與位置時，會沿用完整的既有備份，不會重複建立。</small></span>
-                </label>
-                <details id="translation-advanced" class="advanced-details">
-                  <summary>進階：模式、品質與其他</summary>
-                  <div class="advanced-body">
-                <div class="field-block compact-field translation-mode-field">
-                  <label for="translation-mode">翻譯模式</label>
-                  <select id="translation-mode">
-                    <option value="append" selected>接續翻譯（建議）</option>
-                    <option value="skip-if-complete">已達九成的模組略過</option>
-                    <option value="force">重新翻譯缺漏（忽略翻譯記憶）</option>
-                  </select>
-                  <small class="field-status">接續會優先使用已有翻譯；「重新翻譯」只對目前缺漏生效，仍會保護格式符號。</small>
-                </div>
-                <div class="field-block compact-field translation-quality-field">
-                  <label for="translation-quality">翻譯品質</label>
-                  <select id="translation-quality">
-                    <option value="balanced" selected>一般翻譯（建議）</option>
-                    <option value="fast">介面優先（較快）</option>
-                    <option value="thorough">劇情與書本優先（較仔細）</option>
-                  </select>
-                  <small class="field-status">只影響 AI 批次與提示方式；不開 AI 時不會連線。選完整度時會自動建議一組。</small>
-                </div>
-                <label class="option-row" for="minimize-on-close">
-                  <input type="checkbox" id="minimize-on-close" checked /><span class="check-box" aria-hidden="true"></span>
-                  <span><strong>關閉視窗時縮到背景</strong><small>翻譯繼續進行，不會因為關閉視窗而中斷。</small></span>
-                </label>
-                  </div>
-                </details>
-              </div>
-
-              <div id="ai-panel" class="ai-panel">
-                <div class="ai-source-picker" role="radiogroup" aria-label="AI 來源">
-                  <label class="ai-source-option" for="ai-source-managed">
-                    <input type="radio" id="ai-source-managed" name="ai-source" value="managed" checked />
-                    <span><strong>開發者提供的 API</strong><small>額度有限；必須登入 Discord 並加入官方伺服器。</small></span>
-                  </label>
-                  <label class="ai-source-option" for="ai-source-custom">
-                    <input type="radio" id="ai-source-custom" name="ai-source" value="custom" />
-                    <span><strong>使用自訂 API</strong><small>使用自己的金鑰與額度，不需要 Discord 驗證。</small></span>
-                  </label>
-                </div>
-                <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
-                <p id="ai-source-note" class="ai-source-note">AI 為選用功能；已有中文的內容仍會先做台灣用語轉換。</p>
-                <div id="managed-auth-panel" class="managed-auth-panel">
-                  <div><strong id="discord-auth-title">Discord 尚未驗證</strong><p id="discord-auth-note">使用開發者提供的 API 前，請先登入並加入 ZeitFrei 官方伺服器。</p></div>
-                  <div class="managed-auth-actions">
-                    <button type="button" id="btn-discord-login" class="small-button">登入 Discord</button>
-                    <button type="button" id="btn-discord-join" class="small-button">加入官方伺服器</button>
-                    <button type="button" id="btn-discord-refresh" class="text-button">重新檢查</button>
-                    <button type="button" id="btn-discord-logout" class="text-button" hidden>登出</button>
-                  </div>
-                  <div id="discord-login-fallback" class="login-fallback" hidden>
-                    <p>瀏覽器沒有自動開啟時，可複製這個登入網址。</p>
-                    <div class="input-row"><input id="discord-login-url" type="text" readonly value="正在準備登入網址" /><button type="button" id="btn-copy-login-url" class="small-button">複製</button></div>
-                    <div class="login-fallback-actions"><button type="button" id="btn-open-login-url" class="text-button">重新開啟</button><button type="button" id="btn-cancel-login" class="text-button">取消登入</button></div>
-                  </div>
-                  <div class="turnstile-auth-row">
-                    <div><strong id="turnstile-auth-title">Cloudflare 尚未驗證</strong><p id="turnstile-auth-note">Discord 資格確認後，再完成一次安全驗證。</p></div>
-                    <div class="managed-auth-actions">
-                      <button type="button" id="btn-turnstile-verify" class="small-button" hidden>完成安全驗證</button>
-                      <button type="button" id="btn-turnstile-open" class="text-button" hidden>重新開啟驗證頁</button>
-                      <button type="button" id="btn-turnstile-cancel" class="text-button" hidden>取消驗證</button>
+                  <div class="more-options-grid">
+                  <section class="options-group" id="field-output" aria-labelledby="opt-group-output">
+                    <h3 id="opt-group-output" class="options-group-title">結果位置</h3>
+                    <p class="field-help options-group-help">預設直接套用；另存結果時勾選下方。</p>
+                    <label class="option-row compact-option" for="choose-output-dir">
+                      <input type="checkbox" id="choose-output-dir" /><span class="check-box" aria-hidden="true"></span>
+                      <span><strong>另外指定翻譯結果資料夾</strong><small>勾選後可輸入或選取；留白則用自動建議位置。</small></span>
+                    </label>
+                    <div class="input-row">
+                      <input id="output" type="text" readonly placeholder="選好遊戲資料夾後自動建立" autocomplete="off" />
+                      <button type="button" id="btn-output-pick" class="small-button" hidden>選取</button>
                     </div>
+                    <small id="output-status" class="field-status">工具會在這裡建立「翻譯結果」資料夾。</small>
+                    <div class="output-danger-row">
+                      <button type="button" id="btn-delete-output" class="text-button danger-text-button" hidden>刪除結果</button>
+                    </div>
+                  </section>
+
+                  <section id="pack-version-group" class="options-group" aria-labelledby="opt-group-pack">
+                    <h3 id="opt-group-pack" class="options-group-title">資源包與版本</h3>
+                    <div class="field-list pack-version-row">
+                      <div id="field-pack-name" class="field-block compact-field">
+                        <label for="pack-name">資源包名稱</label>
+                        <input id="pack-name" type="text" value="選擇實例後自動命名" readonly autocomplete="off" />
+                        <small id="pack-version-status" class="field-status">自動命名；翻譯中不會改。</small>
+                      </div>
+                      <div id="field-version" class="field-block compact-field version-field">
+                        <label for="target-version">Minecraft 版本</label>
+                        <select id="target-version" aria-describedby="version-status">
+                          <option value="">自動偵測</option>
+                          <option value="1.13">1.13</option>
+                          <option value="1.14.4">1.14.4</option>
+                          <option value="1.15.2">1.15.2</option>
+                          <option value="1.16.5">1.16.5</option>
+                          <option value="1.17.1">1.17.1</option>
+                          <option value="1.18.2">1.18.2</option>
+                          <option value="1.19.2">1.19.2</option>
+                          <option value="1.19.4">1.19.4</option>
+                          <option value="1.20.1">1.20.1</option>
+                          <option value="1.20.4">1.20.4</option>
+                          <option value="1.20.6">1.20.6</option>
+                          <option value="1.21">1.21</option>
+                          <option value="1.21.1">1.21.1</option>
+                          <option value="1.21.4">1.21.4</option>
+                          <option value="1.21.5">1.21.5</option>
+                          <option value="1.21.8">1.21.8</option>
+                          <option value="1.21.9">1.21.9</option>
+                          <option value="26.1">26.1</option>
+                          <option value="26.2">26.2</option>
+                          <option value="26.3">26.3</option>
+                        </select>
+                        <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲實例</small>
+                      </div>
+                    </div>
+                  </section>
                   </div>
-                </div>
-                <div id="adv-details" class="advanced-details"><div class="advanced-body">
-                  <div class="field-block">
-                    <label for="api-provider">服務商預設（不用填網址）</label>
-                    <select id="api-provider">
-                      <option value="deepseek">DeepSeek</option>
-                      <option value="glm">智譜 GLM</option>
-                      <option value="openai">OpenAI</option>
-                      <option value="qwen">阿里雲通義千問</option>
-                      <option value="other">其他 OpenAI 相容服務</option>
-                    </select>
-                    <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商，工具會自動準備連線設定。</small>
-                  </div>
-                  <div class="field-block"><label for="api-key">API Key</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
-                  <small id="api-key-note" class="field-status">Key 只會儲存在本機；已儲存的 Key 會以固定數量的 `#` 顯示。</small>
-                  <div id="custom-endpoint-fields" hidden>
-                    <div class="field-block"><label for="base-url">Base URL</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://example.com/v1" /></div>
-                    <div class="field-block"><label for="api-model">模型名稱</label><input id="api-model" type="text" autocomplete="off" placeholder="例如 model-name" /></div>
-                  </div>
-                  <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
-                </div></div>
-              </div>
-              <details id="reference-details" class="advanced-details" hidden>
-                <summary>參考翻譯（選用）</summary>
-                <div class="advanced-body">
-                  <p class="field-help">可選本機 CTE2／繁中包資料夾或 zip，也可使用 CFPA 等公開簡中資源包；工具只填缺並轉台灣用語，不會把參考包上傳到共享 R2。CFPA 多為 CC BY-NC-SA，請自行遵守原授權。</p>
-                  <div class="input-row"><input id="reference-pack" type="text" readonly placeholder="尚未指定參考翻譯資料夾或 zip" autocomplete="off" /><button type="button" id="btn-reference-pick" class="small-button">選資料夾</button><button type="button" id="btn-reference-file" class="small-button">選 zip</button></div>
-                  <div class="action-row"><button type="button" id="btn-cfpa-download" class="secondary-button">嘗試下載 CFPA（對應 MC 版本）</button></div>
-                  <small id="reference-status" class="field-status">尚未找到參考翻譯。</small>
-                  <label class="option-row compact-option" for="reference-ack-license">
-                    <input type="checkbox" id="reference-ack-license" />
-                    <span class="check-box" aria-hidden="true"></span>
-                    <span><strong>我了解參考包授權由我自行負責</strong><small>未勾選也能翻；有指定參考包時建議勾一下。</small></span>
-                  </label>
-                </div>
-              </details>
-              </div>
+
+                  <section id="translation-method-group" class="options-group" aria-labelledby="translation-options-heading">
+                    <div id="translation-options-heading" class="options-group-head">
+                      <h3 class="options-group-title">翻譯方式</h3>
+                    </div>
+                    <div id="translation-options">
+                      <div class="option-list">
+                        <label class="option-row" for="use-ai">
+                          <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
+                          <span><strong>補上原本沒有繁中的文字（可選）</strong><small>不勾選也能翻譯；工具會使用參考包、術語表與翻譯記憶，其他缺漏保留原文。</small></span>
+                        </label>
+                        <label class="option-row" for="backup-before-apply">
+                          <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
+                          <span><strong>套用前建立備份（建議）</strong><small>勾選會保留被覆蓋的檔案；再次翻譯同一個整合包與位置時，會沿用完整的既有備份，不會重複建立。</small></span>
+                        </label>
+                      </div>
+                      <details id="translation-advanced" class="advanced-details nested-fold">
+                        <summary>進階：模式、品質與其他</summary>
+                        <div class="advanced-body">
+                          <div class="more-options-inline">
+                          <div class="field-block compact-field translation-mode-field">
+                            <label for="translation-mode">翻譯模式</label>
+                            <select id="translation-mode">
+                              <option value="append" selected>接續翻譯（建議）</option>
+                              <option value="skip-if-complete">已達九成的模組略過</option>
+                              <option value="force">重新翻譯缺漏（忽略翻譯記憶）</option>
+                            </select>
+                            <small class="field-status">接續優先用已有翻譯；「重新翻譯」只對缺漏生效。</small>
+                          </div>
+                          <div class="field-block compact-field translation-quality-field">
+                            <label for="translation-quality">翻譯品質</label>
+                            <select id="translation-quality">
+                              <option value="balanced" selected>一般翻譯（建議）</option>
+                              <option value="fast">介面優先（較快）</option>
+                              <option value="thorough">劇情與書本優先（較仔細）</option>
+                            </select>
+                            <small class="field-status">只影響 AI 批次；不開 AI 時不會連線。</small>
+                          </div>
+                          </div>
+                          <label class="option-row" for="minimize-on-close">
+                            <input type="checkbox" id="minimize-on-close" checked /><span class="check-box" aria-hidden="true"></span>
+                            <span><strong>關閉視窗時縮到背景</strong><small>翻譯繼續進行，不會因為關閉視窗而中斷。</small></span>
+                          </label>
+                        </div>
+                      </details>
+                    </div>
+                  </section>
+
+                  <section id="ai-options-group" class="options-group" aria-labelledby="opt-group-ai">
+                    <h3 id="opt-group-ai" class="options-group-title">AI</h3>
+                    <div id="ai-panel" class="ai-panel">
+                      <div class="ai-source-picker" role="radiogroup" aria-label="AI 來源">
+                        <label class="ai-source-option" for="ai-source-managed">
+                          <input type="radio" id="ai-source-managed" name="ai-source" value="managed" checked />
+                          <span><strong>開發者提供的 API</strong><small>額度有限；需 Discord 與安全驗證。</small></span>
+                        </label>
+                        <label class="ai-source-option" for="ai-source-custom">
+                          <input type="radio" id="ai-source-custom" name="ai-source" value="custom" />
+                          <span><strong>使用自訂 API</strong><small>自備金鑰與額度，無需 Discord。</small></span>
+                        </label>
+                      </div>
+                      <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
+                      <p id="ai-source-note" class="ai-source-note">AI 為選用；已有中文仍會先做台灣用語轉換。</p>
+                      <details id="ai-auth-details" class="advanced-details nested-fold">
+                        <summary>驗證與金鑰</summary>
+                        <div class="advanced-body ai-auth-body">
+                      <div id="managed-auth-panel" class="managed-auth-panel">
+                        <div class="managed-auth-compact">
+                          <div class="auth-status-line">
+                            <strong id="discord-auth-title">Discord 尚未驗證</strong>
+                            <p id="discord-auth-note">請先登入並加入 ZeitFrei 官方伺服器。</p>
+                          </div>
+                          <div class="managed-auth-actions">
+                            <button type="button" id="btn-discord-login" class="small-button">登入 Discord</button>
+                            <button type="button" id="btn-discord-join" class="small-button">加入官方伺服器</button>
+                            <button type="button" id="btn-discord-refresh" class="text-button">重新檢查</button>
+                            <button type="button" id="btn-discord-logout" class="text-button" hidden>登出</button>
+                          </div>
+                        </div>
+                        <div id="discord-login-fallback" class="login-fallback" hidden>
+                          <p>瀏覽器沒有自動開啟時，可複製這個登入網址。</p>
+                          <div class="input-row"><input id="discord-login-url" type="text" readonly value="正在準備登入網址" /><button type="button" id="btn-copy-login-url" class="small-button">複製</button></div>
+                          <div class="login-fallback-actions"><button type="button" id="btn-open-login-url" class="text-button">重新開啟</button><button type="button" id="btn-cancel-login" class="text-button">取消登入</button></div>
+                        </div>
+                        <div class="turnstile-auth-row managed-auth-compact">
+                          <div class="auth-status-line">
+                            <strong id="turnstile-auth-title">Cloudflare 尚未驗證</strong>
+                            <p id="turnstile-auth-note">Discord 確認後，再完成一次安全驗證。</p>
+                          </div>
+                          <div class="managed-auth-actions">
+                            <button type="button" id="btn-turnstile-verify" class="small-button" hidden>完成安全驗證</button>
+                            <button type="button" id="btn-turnstile-open" class="text-button" hidden>重新開啟驗證頁</button>
+                            <button type="button" id="btn-turnstile-cancel" class="text-button" hidden>取消驗證</button>
+                          </div>
+                        </div>
+                      </div>
+                      <div id="adv-details" class="advanced-details"><div class="advanced-body">
+                        <div class="field-block">
+                          <label for="api-provider">服務商預設（不用填網址）</label>
+                          <select id="api-provider">
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="glm">智譜 GLM</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="qwen">阿里雲通義千問</option>
+                            <option value="other">其他 OpenAI 相容服務</option>
+                          </select>
+                          <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商，工具會自動準備連線設定。</small>
+                        </div>
+                        <div class="field-block"><label for="api-key">API Key</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
+                        <small id="api-key-note" class="field-status">Key 只會儲存在本機；已儲存的 Key 會以固定數量的 `#` 顯示。</small>
+                        <div id="custom-endpoint-fields" hidden>
+                          <div class="field-block"><label for="base-url">Base URL</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://example.com/v1" /></div>
+                          <div class="field-block"><label for="api-model">模型名稱</label><input id="api-model" type="text" autocomplete="off" placeholder="例如 model-name" /></div>
+                        </div>
+                        <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
+                      </div></div>
+                        </div>
+                      </details>
+                    </div>
+                  </section>
+
+                  <details id="reference-details" class="advanced-details options-group-fold" hidden>
+                    <summary>參考翻譯（選用）</summary>
+                    <div class="advanced-body">
+                      <p class="field-help">可選本機 CTE2／繁中包資料夾或 zip，也可使用 CFPA 等公開簡中資源包；工具只填缺並轉台灣用語，不會把參考包上傳到共享 R2。CFPA 多為 CC BY-NC-SA，請自行遵守原授權。</p>
+                      <div class="input-row"><input id="reference-pack" type="text" readonly placeholder="尚未指定參考翻譯資料夾或 zip" autocomplete="off" /><button type="button" id="btn-reference-pick" class="small-button">選資料夾</button><button type="button" id="btn-reference-file" class="small-button">選 zip</button></div>
+                      <div class="action-row"><button type="button" id="btn-cfpa-download" class="secondary-button">嘗試下載 CFPA（對應 MC 版本）</button></div>
+                      <small id="reference-status" class="field-status">尚未找到參考翻譯。</small>
+                      <label class="option-row compact-option" for="reference-ack-license">
+                        <input type="checkbox" id="reference-ack-license" />
+                        <span class="check-box" aria-hidden="true"></span>
+                        <span><strong>我了解參考包授權由我自行負責</strong><small>未勾選也能翻；有指定參考包時建議勾一下。</small></span>
+                      </label>
+                    </div>
+                  </details>
+
                 </div>
               </details>
             </section>
@@ -410,11 +442,10 @@
             <section id="rail-log" class="side-block log-card rail-panel" data-rail="translate" aria-labelledby="log-title">
               <div class="log-head">
                 <h2 id="log-title" class="side-heading">日誌</h2>
-                <button type="button" id="btn-clear-log" class="text-button">清除日誌</button>
+                <button type="button" id="btn-clear-log" class="text-button">清除</button>
               </div>
-              <pre id="log" class="log log-empty" aria-live="polite">選好遊戲實例後，按下「開始翻譯」。
-
-翻譯過程會顯示在這裡；完成後可以開啟輸出查看結果。</pre>
+              <p class="log-hint">僅顯示最近狀態；完整紀錄請開啟報告。</p>
+              <pre id="log" class="log log-empty" aria-live="polite">選好遊戲實例後，按下「開始翻譯」。</pre>
             </section>
 
             <div id="rail-actions" class="side-actions rail-panel" data-rail="translate">
@@ -465,7 +496,7 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-states">按鈕何時出現</a><a href="#g-share">分享與參考翻譯</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v0.1.4</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
+          <p class="eyebrow">PLAYER GUIDE / v0.1.6</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
           <section><h2 id="g-translate">翻譯整合包</h2><p>頂欄切到「翻譯」。先選完整度（快速可玩／標準推薦／完整挑戰；百分比為估計），再選遊戲資料夾並按「開始翻譯」。這項服務會讀取模組整合包內的語言檔、FTB 任務、Patchouli 書本、鬆散或 ZIP 資料包、JAR 內書本，以及 KubeJS 明確的顯示 API 字串。簡體中文會轉成台灣用語，沒有繁中的英文才會進入補翻流程。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選完整度三卡之一，再選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>「翻譯結果位置」預設自動建立；想另外保存結果時，在「更多選項」勾選並輸入或選取資料夾，留白會回到自動位置。</p></li><li><span>3</span><p>選擇翻譯模式與品質：接續適合更新、九成略過適合已翻過的大包、重新翻譯適合更換 AI 譯法；品質可選介面優先、一般或劇情與書本優先。</p></li><li><span>4</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在自訂 API 選擇服務商預設後只填 Key，Key 會以 `#` 顯示。</p></li><li><span>5</span><p>先決定是否勾選「套用前建立備份」，翻譯完成後會直接套用到遊戲；再次翻譯同一個整合包時，工具會先尋找相同位置且內容完整的備份。</p></li></ol><div class="guide-callout"><strong>FTB 任務補充是選用的。</strong><span>只有偵測到 FTB Quests 且有相容版本時才會出現；工具會顯示指令，完成翻譯後自動清理自己下載的輔助模組。</span></div></section>
           <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在翻譯頁手動指定。這會用來產生對應的資源包格式，補翻與修復工作階段也會沿用同一版本。</p></section>
           <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>優先貼完整 crash report，也支援 latest.log／debug.log；顯示證據、可疑模組與下一步。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>

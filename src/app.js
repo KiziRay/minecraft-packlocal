@@ -339,9 +339,10 @@ function initTheme() {
   applyTheme(saved);
 }
 
-/** 完整進度／錯誤日誌（時間戳 + 累積） */
+/** UI 日誌：只保留最近幾則供右欄漸進顯示；完整內容看結果資料夾報告檔 */
 const progressLogLines = [];
-const MAX_LOG_LINES = 5000;
+const UI_LOG_VISIBLE = 6;
+const MAX_LOG_LINES = 64;
 let errorLogCount = 0;
 
 function nowStamp() {
@@ -350,11 +351,16 @@ function nowStamp() {
   return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
 }
 
+function visibleLogLines() {
+  if (progressLogLines.length <= UI_LOG_VISIBLE) return progressLogLines.slice();
+  return progressLogLines.slice(-UI_LOG_VISIBLE);
+}
+
 function renderLog() {
   const el = $("log");
   if (!el) return;
   el.classList.remove("log-empty");
-  el.textContent = progressLogLines.join("\n");
+  el.textContent = visibleLogLines().join("\n");
   el.scrollTop = el.scrollHeight;
 }
 
@@ -408,9 +414,9 @@ function setLogFinal(msg) {
   appendLog("────────");
   if (errorLogCount > 0) {
     appendLog("本次共記錄 " + errorLogCount + " 筆錯誤／警告相關行。", "warn");
-    appendLog("完整錯誤也會寫在結果資料夾「翻譯錯誤日誌.txt」（若有）。", "warn");
   }
   appendLog(msg);
+  appendLog("完整紀錄請按「開啟報告」。", "warn");
   maybeHintAiQuota(msg);
 }
 
@@ -775,7 +781,13 @@ function syncUiState() {
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
 
-  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details"]
+  const moreOptions = $("more-options");
+  if (moreOptions) {
+    const hideMore = !hasInstance;
+    moreOptions.hidden = hideMore;
+    if (hideMore) moreOptions.open = false;
+  }
+  ["field-output", "pack-version-group", "translation-method-group", "ai-options-group", "reference-details"]
     .forEach((id) => toggleHidden(id, !hasInstance));
   const runBtn = $("btn-run");
   if (runBtn) {
@@ -1016,10 +1028,15 @@ async function uploadSharePackage() {
 
 function syncAiPanel(refreshStatus = true) {
   const panel = $("ai-panel");
+  const group = $("ai-options-group");
   const enabled = !!$("use-ai")?.checked && !!($("instance")?.value || "").trim();
   if (panel) {
     panel.hidden = !enabled;
     panel.setAttribute("aria-hidden", enabled ? "false" : "true");
+  }
+  if (group) {
+    group.hidden = !enabled;
+    group.setAttribute("aria-hidden", enabled ? "false" : "true");
   }
   if (enabled && refreshStatus) refreshAiStatus();
 }
@@ -1881,6 +1898,21 @@ window.addEventListener("DOMContentLoaded", async () => {
       scheduleBackupStateRefresh();
     });
   });
+  const moreOptions = $("more-options");
+  if (moreOptions) {
+    moreOptions.addEventListener("toggle", () => {
+      if (!moreOptions.open) return;
+      const stage = document.querySelector(".content-column");
+      if (!stage) return;
+      window.requestAnimationFrame(() => {
+        try {
+          moreOptions.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch (_) {
+          /* scrollIntoView 不可用時略過 */
+        }
+      });
+    });
+  }
   if ($("choose-output-dir")) {
     $("choose-output-dir").addEventListener("change", () => {
       const input = $("output");
@@ -2515,19 +2547,30 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   if ($("btn-open-report")) {
     $("btn-open-report").onclick = async () => {
-      const outputDir = ($("output")?.value || "").trim();
+      const outputDir = selectedOutputDir() || ($("output")?.value || "").trim();
       if (!outputDir) return log("還沒選結果位置。");
       const work = resultWorkDir(outputDir);
-      const report = work + "\\覆蓋範圍說明.txt";
-      try {
-        await invoke("open_path", { path: report });
-      } catch (_) {
+      const candidates = [
+        work + "\\覆蓋範圍說明.txt",
+        work + "\\翻譯錯誤日誌.txt",
+        work + "\\翻譯工作階段.json",
+      ];
+      let opened = false;
+      for (const path of candidates) {
         try {
-          await invoke("open_path", { path: work });
-          appendLog("尚未找到覆蓋範圍說明.txt，已改開輸出資料夾。", "warn");
-        } catch (e) {
-          log(String(e));
+          await invoke("open_path", { path });
+          opened = true;
+          break;
+        } catch (_) {
+          /* 試下一個報告檔 */
         }
+      }
+      if (opened) return;
+      try {
+        await invoke("open_path", { path: work });
+        appendLog("尚未找到報告檔，已改開翻譯結果資料夾。", "warn");
+      } catch (e) {
+        log(String(e));
       }
     };
   }

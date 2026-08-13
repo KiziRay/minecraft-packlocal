@@ -5,10 +5,10 @@ compatibility_date = "2026-08-01"
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "0.1.4"
+LATEST_VERSION = "0.1.6"
 # 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.1.4-windows-x64.exe"
-RELEASE_NOTES = "0.1.4：依當初 mockup 對齊翻譯首屏（三卡完整度、步驟追蹤、整體完整度、日誌）。"
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.1.6-windows-x64.exe"
+RELEASE_NOTES = "0.1.6：右欄精簡日誌；更多選項選資料夾後才顯示；進階布局壓短。"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-chat"
@@ -28,7 +28,7 @@ DAILY_TOKEN_BUDGET = "20000000"
 PER_USER_DAILY_TOKEN_BUDGET = "1000000"
 
 # 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
-UPDATE_SHA256 = "02412328f86b4ccd82c1ef6a7f2ea07537a4b7ce06c714ed81e6cff04929af44"
+UPDATE_SHA256 = "a481790f4b6b1a87770612879bd7100a178a32adbb89d43258539ceb5143937c"
 
 # 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
 SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"

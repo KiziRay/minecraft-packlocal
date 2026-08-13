@@ -1,6 +1,6 @@
 [package]
 name = "modpack-i18n-tool"
-version = "0.1.4"
+version = "0.1.6"
 description = "模組包一鍵繁中翻譯"
 authors = ["ZeitFrei"]
 edition = "2021"
