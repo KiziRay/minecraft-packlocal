@@ -1,12 +1,12 @@
 # 變更紀錄
 
-## 0.1.0 — 2026-08-14（台北）— 重新公開發佈
+## 0.1.1 — 2026-08-14（台北）— 重新公開發佈
 
 - **公開樹重置**：以目前本機可發佈工作區重新建立遠端 main 歷史，清除舊 Releases 與 release tags 後重新發佈。
 - **授權確認**：根目錄 LICENSE 使用 PolyForm Noncommercial License 1.0.0，並以 NOTICE.md 標明第三方素材與非商業限制。
-- **版本同步**：package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json 與 UI 顯示同步為 0.1.0。
+- **版本同步**：package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json 與 UI 顯示同步為 0.1.1。
 
-## 本回合整理（已納入 0.1.0）
+## 本回合整理（已納入 0.1.1）
 
 - **開發規格 LOCALIZE-202608**：新增 `docs/LOCALIZE-202608.md`（目標最快且盡完整本地化；缺漏／全球開源可優化技術／速度與完整度 backlog／W0–W6 波次）。`DEVELOPMENT.md`、`COMMUNITY.md`、`EXTENDING.md`、`SEARCH-MAP.md` 已互鏈。
 - UI 改成依流程狀態顯示：未選實例時收起輸出與 AI，翻譯中收起複查／分享，完成後才開放分享。
@@ -36,7 +36,7 @@
 - **字體包可直接套用**：字體資源包建立後可勾選套用到目前整合包 `resourcepacks`；若已有同名資源包會先建立 `字體套用備份_*`。
 - **右欄命中儀表**：進度欄新增 glossary／TM／共享庫／AI／略過／待補摘要，資料來自進度、日誌與完成摘要；完整細節仍寫入 `覆蓋範圍說明.txt`。
 - **參考翻譯加強**：手動參考包支援資料夾與 zip；自動搜尋納入 CFPA、zh_cn／zh_tw、漢化／翻譯等常見命名。參考包只填缺，`zh_cn` 會作為弱來源並在合併後轉台灣用語，不上傳到共享 R2。
-- **0.1.0 三服務優化**：完整度授權（先翻能玩的／標準／盡量完整）、分享 Turnstile 改讀 `ai_status`、字體包 pack_format／拒 TTC／副檔名修正、診斷舊 crash 時間窗與翻譯證據提前、還原 `mc_dir` 校驗與失敗可見、覆蓋報告命中統計、深色工房 UI（完整度三卡、進階摺疊）。
+- **0.1.1 三服務優化**：完整度授權（先翻能玩的／標準／盡量完整）、分享 Turnstile 改讀 `ai_status`、字體包 pack_format／拒 TTC／副檔名修正、診斷舊 crash 時間窗與翻譯證據提前、還原 `mc_dir` 校驗與失敗可見、覆蓋報告命中統計、深色工房 UI（完整度三卡、進階摺疊）。
 - **分享 Turnstile**：分享上傳改讀 `ai_status.turnstileVerified`，不再呼叫未註冊的 `turnstile_status` command。
 - **AGENTS 對齊**：版本敘述改以三處版本檔為準；雲端導航含分享／共享 TM；更新器敘述對齊免安裝 EXE 驗證後替換。
 - **開發文件整理**：重寫 `docs/DEVELOPMENT.md` 作為目前技術總覽，新增 `docs/AI-HANDOFF.md` 給其他 AI 使用，補上 FTB 任務輔助模組、Cloudflare 資料隔離、路徑規則、UI 狀態、驗證命令與已知限制；README 文件地圖與架構圖同步更新。
@@ -63,7 +63,7 @@
 - **Turnstile 依服務端設定決定**：只有 Worker 設好 `TURNSTILE_*` 金鑰並啟用強制模式時才要求安全驗證；未啟用時保留「Discord 登入即可」的相容行為。
 - **支持開發按鈕**：移到主畫面操作區的醒目位置，並可重複出現（操作區＋頁尾）。
 - **詳細使用說明**：新增 `docs/詳細使用說明.md`（實例是什麼、各啟動器資料夾在哪、該選哪個、如何安裝與分享）。
-- 版本 0.1.0；發佈前驗證以本回合命令輸出為準。
+- 版本 0.1.1；發佈前驗證以本回合命令輸出為準。
 
 ## 1.0.1 — 2026-08-10（台北）
 

@@ -15,7 +15,7 @@
         <span class="brand-copy"><strong>zeitfrei / modpack-i18n</strong><small>DESKTOP TOOL</small></span>
       </a>
       <div class="topbar-actions">
-        <kbd class="version-key">0.1.0</kbd>
+        <kbd class="version-key">0.1.1</kbd>
         <button type="button" id="btn-theme" class="text-button theme-button" aria-pressed="true" title="切換到淺色模式"><span id="theme-glyph" aria-hidden="true">◐</span><span id="theme-label">深色</span></button>
         <button type="button" id="btn-check-update" class="text-button update-button"><span>檢查更新</span><span id="update-status" class="update-status" aria-live="polite"></span></button>
         <button type="button" id="btn-scale" class="text-button scale-button" title="Ctrl＋↑／↓或 Ctrl＋滾輪調整介面大小；點擊重設為 100%"><span id="scale-label">介面 100%</span></button>
@@ -396,7 +396,7 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-states">按鈕何時出現</a><a href="#g-share">分享與參考翻譯</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v0.1.0</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
+          <p class="eyebrow">PLAYER GUIDE / v0.1.1</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
           <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔、FTB 任務、Patchouli 書本、鬆散或 ZIP 資料包、JAR 內書本，以及 KubeJS 明確的顯示 API 字串。簡體中文會轉成台灣用語，沒有繁中的英文才會進入補翻流程。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>「翻譯結果位置」預設自動建立；想另外保存結果時，勾選選項並輸入或選取資料夾，留白會回到自動位置。</p></li><li><span>3</span><p>選擇翻譯模式與品質：接續適合更新、九成略過適合已翻過的大包、重新翻譯適合更換 AI 譯法；品質可選介面優先、一般或劇情與書本優先。</p></li><li><span>4</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在自訂 API 選擇服務商預設後只填 Key，Key 會以 `#` 顯示。</p></li><li><span>5</span><p>先決定是否勾選「套用前建立備份」，翻譯完成後會直接套用到遊戲；再次翻譯同一個整合包時，工具會先尋找相同位置且內容完整的備份。</p></li></ol><div class="guide-callout"><strong>FTB 任務補充是選用的。</strong><span>只有偵測到 FTB Quests 且有相容版本時才會出現；工具會顯示指令，完成翻譯後自動清理自己下載的輔助模組。</span></div></section>
           <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在翻譯頁手動指定。這會用來產生對應的資源包格式，補翻與修復工作階段也會沿用同一版本。</p></section>
           <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>優先貼完整 crash report，也支援 latest.log／debug.log；顯示證據、可疑模組與下一步。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>
