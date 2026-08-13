@@ -277,6 +277,131 @@ fn has_reference_lang(root: &Path) -> bool {
         })
 }
 
+/// 依 MC 版本候選標籤（精確 → 大版本），供 CFPA release 比對。
+pub fn cfpa_version_candidates(mc_version: &str) -> Vec<String> {
+    let v = mc_version.trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    out.push(v.to_string());
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() >= 2 {
+        let major_minor = format!("{}.{}", parts[0], parts[1]);
+        if major_minor != v {
+            out.push(major_minor);
+        }
+    }
+    out
+}
+
+fn is_allowed_cfpa_download_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("https://github.com/")
+        || lower.starts_with("https://objects.githubusercontent.com/")
+        || lower.starts_with("https://release-assets.githubusercontent.com/"))
+        && !lower.contains("..")
+}
+
+/// 嘗試從 CFPA GitHub Releases 下載對應 MC 大版本的簡中資源包 zip。
+/// 失敗回 Err（呼叫端應略過、不擋主流程）；成功回本機 zip 路徑。
+pub fn try_download_cfpa_pack(mc_version: &str, dest_dir: &Path) -> Result<PathBuf, String> {
+    let candidates = cfpa_version_candidates(mc_version);
+    if candidates.is_empty() {
+        return Err("尚未指定 Minecraft 版本，無法下載 CFPA。".into());
+    }
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("無法建立下載目錄：{e}"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .user_agent("modpack-i18n-tool/0.1.2 (+https://github.com/KiziRay/minecraft-packlocal)")
+        .build()
+        .map_err(|e| format!("建立下載客戶端失敗：{e}"))?;
+
+    let api = "https://api.github.com/repos/CFPAOrg/Minecraft-Mod-Language-Package/releases?per_page=40";
+    let releases: serde_json::Value = client
+        .get(api)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("連線 CFPA Releases 失敗（可改本機選 zip）：{e}"))?
+        .error_for_status()
+        .map_err(|e| format!("讀取 CFPA Releases 失敗：{e}"))?
+        .json()
+        .map_err(|e| format!("解析 CFPA Releases 失敗：{e}"))?;
+
+    let list = releases
+        .as_array()
+        .ok_or_else(|| "CFPA Releases 回傳格式異常。".to_string())?;
+
+    for cand in &candidates {
+        let cand_l = cand.to_ascii_lowercase();
+        for rel in list {
+            let tag = rel
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let name = rel
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !(tag.contains(&cand_l) || name.contains(&cand_l)) {
+                continue;
+            }
+            let assets = rel.get("assets").and_then(|v| v.as_array());
+            let Some(assets) = assets else { continue };
+            for asset in assets {
+                let asset_name = asset
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let lower_name = asset_name.to_ascii_lowercase();
+                if !lower_name.ends_with(".zip") {
+                    continue;
+                }
+                let url = asset
+                    .get("browser_download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !is_allowed_cfpa_download_url(url) {
+                    continue;
+                }
+                let safe_name = format!(
+                    "cfpa-{}-{}.zip",
+                    cand.replace('.', "_"),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                );
+                let dest = dest_dir.join(safe_name);
+                let bytes = client
+                    .get(url)
+                    .timeout(std::time::Duration::from_secs(180))
+                    .send()
+                    .map_err(|e| format!("下載 CFPA zip 失敗：{e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("下載 CFPA zip HTTP 錯誤：{e}"))?
+                    .bytes()
+                    .map_err(|e| format!("讀取 CFPA zip 失敗：{e}"))?;
+                if bytes.len() < 64 || bytes.len() > 900 * 1024 * 1024 {
+                    return Err("CFPA zip 大小異常，已略過。".into());
+                }
+                if !(bytes.starts_with(b"PK")) {
+                    return Err("下載內容不是有效 zip。".into());
+                }
+                std::fs::write(&dest, &bytes).map_err(|e| format!("寫入 CFPA zip 失敗：{e}"))?;
+                return Ok(dest);
+            }
+        }
+    }
+    Err(format!(
+        "找不到對應 {} 的 CFPA Release zip（可改本機選檔）。",
+        candidates.join(" / ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +426,23 @@ mod tests {
         assert_eq!(namespace.get("item.example.b").unwrap(), "简中 B");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cfpa_version_candidates_prefer_exact_then_major_minor() {
+        assert_eq!(
+            cfpa_version_candidates("1.20.1"),
+            vec!["1.20.1".to_string(), "1.20".to_string()]
+        );
+        assert!(cfpa_version_candidates("").is_empty());
+    }
+
+    #[test]
+    fn cfpa_download_url_allowlist() {
+        assert!(is_allowed_cfpa_download_url(
+            "https://github.com/CFPAOrg/Minecraft-Mod-Language-Package/releases/download/1.20.1/x.zip"
+        ));
+        assert!(!is_allowed_cfpa_download_url("http://evil.example/x.zip"));
+        assert!(!is_allowed_cfpa_download_url("https://evil.example/x.zip"));
     }
 }

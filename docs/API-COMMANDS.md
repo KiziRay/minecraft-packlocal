@@ -166,6 +166,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `turnstile_verify` | — | `{ ok, expiresAt?, error? }`；瀏覽器完成驗證後由本機 callback 接收短效憑證 |
 | `cancel_turnstile_verification_cmd` | — | bool |
 | `get_default_reference_pack` | — | string \| null |
+| `download_cfpa_reference_pack` | `mcVersion`, `destDir?` | `{ path, attribution }`；依 MC 版本嘗試下載 CFPA GitHub Release zip；失敗由前端略過 |
 | `get_ui_prefs` | — | `{ minimizeOnClose }` |
 | `set_ui_prefs` | minimizeOnClose | string |
 | `quit_app` | — | 結束行程 |

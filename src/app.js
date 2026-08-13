@@ -12,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 const THEME_STORAGE_KEY = "modpack-i18n-theme";
 const UI_SCALE_STORAGE_KEY = "modpack-i18n-ui-scale";
 const BACKUP_STORAGE_KEY = "modpack-i18n-backup-before-apply";
+const FONT_PREFS_STORAGE_KEY = "modpack-i18n-font-prefs";
 const UI_SCALE_MIN = 1;
 const UI_SCALE_MAX = 1.5;
 const UI_SCALE_STEP = 0.05;
@@ -709,9 +710,18 @@ function showAppPage(page, opts = {}) {
     tabDiagnose.setAttribute("aria-selected", name === "diagnose" ? "true" : "false");
   }
   document.body.dataset.appPage = name;
+  syncStatusRail(name);
   syncUiState();
   const activePanel = name === "font" ? pageFont : name === "diagnose" ? pageDiagnose : pageTr;
   if (changed && !opts.skipTransition) revealPagePanel(activePanel, opts.skeleton !== false);
+}
+
+function syncStatusRail(page) {
+  const name = page === "font" || page === "diagnose" ? page : "translate";
+  document.querySelectorAll(".rail-panel").forEach((el) => {
+    const rail = el.getAttribute("data-rail") || "translate";
+    el.hidden = rail !== name;
+  });
 }
 
 function setTranslationState(state) {
@@ -736,9 +746,13 @@ function syncUiState() {
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
 
-  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details", "coverage-tier-block"]
+  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details"]
     .forEach((id) => toggleHidden(id, !hasInstance));
-  toggleHidden("btn-run", !hasInstance || progressBusy);
+  const runBtn = $("btn-run");
+  if (runBtn) {
+    runBtn.hidden = progressBusy;
+    runBtn.disabled = !hasInstance || progressBusy;
+  }
   toggleHidden("btn-supplement", !complete || locked);
   toggleHidden("btn-repair", !failed || locked);
   toggleHidden("btn-glossary", !hasInstance || locked);
@@ -1641,21 +1655,33 @@ function showDiagnosis(result) {
   const summary = String(result?.summary || "沒有足夠資料").replace(/\*\*/g, "");
   const gameExitCode = result?.gameExitCode ?? result?.game_exit_code;
   const source = result?.source || "";
-  box.textContent = [
+  const text = [
     `判定：${verdictLabel}\n${summary}`,
     `證據強度：${confidenceLabel}（這是規則命中的程度，不是保證）`,
     result?.errorCode || result?.error_code ? `分析代碼：${result.errorCode || result.error_code}` : "",
     gameExitCode ? `遊戲退出碼：${gameExitCode}（退出碼通常不是根因）` : "",
     result?.primaryError || result?.primary_error ? `最接近的錯誤：${result.primaryError || result.primary_error}` : "",
     missing.length ? `可能缺少：${missing.join(", ")}` : "",
-    suspectedMods.length ? `可疑模組或模組檔：${suspectedMods.join(", ")}` : "",
-    evidence.length ? `找到的線索：\n${evidence.join("\n")}` : "",
-    nextSteps.length ? `建議下一步：\n${nextSteps.map((step, index) => `${index + 1}. ${step}`).join("\n")}` : "",
+    suspectedMods.length ? `可疑模組：${suspectedMods.join(", ")}` : "",
+    evidence.length ? `證據：\n- ${evidence.join("\n- ")}` : "",
+    nextSteps.length ? `建議下一步：\n- ${nextSteps.join("\n- ")}` : "",
     result?.translationRelated || result?.translation_related
       ? "翻譯關聯：記錄有直接指向翻譯輸出的證據。請先關遊戲，再用「還原上一次套用」後重試。"
       : "翻譯關聯：目前沒有直接證據顯示是翻譯造成的。",
-    source ? `讀取來源：${source}` : "",
-  ].filter(Boolean).join("\n\n");
+    source ? `資料來源：${source}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  box.textContent = text;
+  const rail = $("diagnose-rail-summary");
+  if (rail) rail.textContent = `${verdictLabel}｜證據${confidenceLabel}\n${summary}`;
+  const railMsg = $("diagnose-rail-msg");
+  if (railMsg) {
+    railMsg.textContent =
+      result?.verdict === "maybe_our_files"
+        ? "可能與翻譯輸出有關，可考慮「還原上一次套用」。"
+        : "分析完成；完整細節見左側結果卡。";
+  }
   if ((result?.translationRelated || result?.translation_related) && hasApplyBackups) {
     appendLog("可直接按「還原上一次套用」排除翻譯輸出。", "warn");
   }
@@ -1703,6 +1729,58 @@ function wireCoverageTier() {
 }
 
 let fontPreviewUrl = null;
+
+const FONT_PRESETS = {
+  clear: { size: 11, weight: 400, shiftX: 0, shiftY: 0.5, oversample: 5 },
+  compact: { size: 9.5, weight: 400, shiftX: 0, shiftY: 0.3, oversample: 4 },
+  large: { size: 14, weight: 450, shiftX: 0, shiftY: 0.6, oversample: 4 },
+};
+
+function readFontPrefs() {
+  try {
+    const raw = localStorage.getItem(FONT_PREFS_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeFontPrefs() {
+  try {
+    localStorage.setItem(
+      FONT_PREFS_STORAGE_KEY,
+      JSON.stringify({
+        size: Number($("font-size")?.value || 11),
+        weight: Number($("font-weight")?.value || 400),
+        shiftX: Number($("font-shift-x")?.value || 0),
+        shiftY: Number($("font-shift-y")?.value || 0.5),
+        oversample: Number($("font-oversample")?.value || 4),
+        packName: ($("font-pack-name")?.value || "").trim(),
+      })
+    );
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function applyFontPrefs(prefs) {
+  if (!prefs) return;
+  const map = [
+    ["font-size", "size", "font-size-value"],
+    ["font-weight", "weight", "font-weight-value"],
+    ["font-shift-x", "shiftX", "font-shift-x-value"],
+    ["font-shift-y", "shiftY", "font-shift-y-value"],
+    ["font-oversample", "oversample", "font-oversample-value"],
+  ];
+  map.forEach(([id, key, outId]) => {
+    if (prefs[key] == null || !$(id)) return;
+    $(id).value = String(prefs[key]);
+    if ($(outId)) $(outId).textContent = String(prefs[key]);
+  });
+  if (prefs.packName && $("font-pack-name")) $("font-pack-name").value = prefs.packName;
+}
+
 async function updateFontPreview(path) {
   const panel = $("font-preview");
   const sample = $("font-preview-sample");
@@ -1788,10 +1866,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("tab-translate")) {
     $("tab-translate").onclick = () => showAppPage("translate");
   }
-  if ($("tab-font")) {
-  $("tab-font").onclick = () => showAppPage("font");
+  if ($("tab-font")) $("tab-font").onclick = () => showAppPage("font");
   if ($("tab-diagnose")) $("tab-diagnose").onclick = () => showAppPage("diagnose");
-  }
   if ($("btn-theme")) {
     $("btn-theme").onclick = () => {
       const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
@@ -2142,6 +2218,57 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
+  if ($("btn-cfpa-download")) {
+    $("btn-cfpa-download").onclick = async () => {
+      const version = ($("target-version")?.value || "").trim();
+      if (!version) {
+        appendLog("請先選好整合包並確認 Minecraft 版本，再下載 CFPA。", "warn");
+        return;
+      }
+      const btn = $("btn-cfpa-download");
+      if (btn) btn.disabled = true;
+      try {
+        appendLog(`正在嘗試下載 CFPA（${version}）…`);
+        const result = await invoke("download_cfpa_reference_pack", { mcVersion: version, destDir: null });
+        const path = result?.path || "";
+        if (path && $("reference-pack")) {
+          $("reference-pack").value = path;
+          if ($("reference-status")) {
+            $("reference-status").textContent =
+              result?.attribution || "已下載 CFPA 參考包；只填缺並轉台灣用語，不上傳共享 R2。";
+          }
+          if ($("reference-ack-license")) $("reference-ack-license").checked = true;
+          appendLog("CFPA 下載完成：" + path);
+        }
+      } catch (e) {
+        appendLog("CFPA 下載略過：" + formatInvokeError(e), "warn");
+        if ($("reference-status")) {
+          $("reference-status").textContent = "CFPA 下載失敗，可改選本機 zip／資料夾。";
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+        syncUiState();
+      }
+    };
+  }
+
+  document.querySelectorAll(".font-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const preset = FONT_PRESETS[btn.getAttribute("data-preset") || ""];
+      if (!preset) return;
+      applyFontPrefs(preset);
+      writeFontPrefs();
+      updateFontPreview(($("font-file")?.value || "").trim());
+      const rail = $("font-rail-msg");
+      if (rail) rail.textContent = `已套用預設「${btn.textContent}」。可再微調後建立。`;
+    });
+  });
+  applyFontPrefs(readFontPrefs());
+  ["font-size", "font-weight", "font-shift-x", "font-shift-y", "font-oversample", "font-pack-name"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", writeFontPrefs);
+  });
 
   $("btn-inst").onclick = async () => {
     try {

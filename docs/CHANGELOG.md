@@ -1,10 +1,20 @@
 # 變更紀錄
 
+## 0.1.2 — 2026-08-14（台北）— 工房殼完整落地
+
+- **P2 工房殼**：深色 ZeitFrei workshop 首屏（品牌 kicker、完整度三卡常顯、路徑＋主 CTA）；進階選項摺疊；拿掉 Markdown `#`／`>` 文件裝飾。
+- **右欄隨服務切換**：翻譯＝進度＋命中；字體＝建包指引；診斷＝分析摘要。
+- **CFPA 可選下載**：參考翻譯可一鍵嘗試下載對應 MC 版本 CFPA release zip（失敗可略過、改本機選檔）；不上傳共享 R2。
+- **字體預設**：清晰／緊湊／大字＋localStorage 記住設定。
+- **skeleton／fade-in**：啟動與分頁切換保留漸進顯示。
+- 版本三處同步為 0.1.2；Worker `/api/desktop/latest` 應對齊此版。
+
 ## 0.1.1 — 2026-08-14（台北）— 重新公開發佈
 
 - **公開樹重置**：以目前本機可發佈工作區重新建立遠端 main 歷史，清除舊 Releases 與 release tags 後重新發佈。
 - **授權確認**：根目錄 LICENSE 使用 PolyForm Noncommercial License 1.0.0，並以 NOTICE.md 標明第三方素材與非商業限制。
 - **版本同步**：package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json 與 UI 顯示同步為 0.1.1。
+- **更新通道修正**：Worker 最新版資訊對齊 0.1.1，避免誤提示從 0.1.1 升級到舊產品線 1.0.2。
 
 ## 本回合整理（已納入 0.1.1）
 

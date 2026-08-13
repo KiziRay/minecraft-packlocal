@@ -9,6 +9,7 @@ use engine::{
     cancel_turnstile_verification, check_cancelled, check_discord_auth_status,
     clear_turnstile_proof, classify_diagnosis, convert_langmap_s2tw, converter_name, count_map,
     detect_minecraft_version, detect_pack_format, diagnose_launch, discover_default_reference,
+    try_download_cfpa_pack,
     cleanup_transient_work, ensure_result_layout, ensure_space, ensure_user_glossary_template,
     extract_jar_documentation,
     rewrite_translated_jars, translate_jar_display_texts, translate_jar_patchouli,
@@ -2613,6 +2614,33 @@ fn get_default_reference_pack() -> Option<String> {
     discover_default_reference().map(|p| p.display().to_string())
 }
 
+/// 可選：嘗試下載 CFPA 對應 MC 版本 release zip（失敗由前端略過）。
+#[tauri::command]
+async fn download_cfpa_reference_pack(
+    mc_version: String,
+    dest_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let version = mc_version.trim().to_string();
+    if version.is_empty() {
+        return Err("請先選擇或偵測 Minecraft 版本。".into());
+    }
+    let dest = if let Some(d) = dest_dir.filter(|s| !s.trim().is_empty()) {
+        normalize_path_strict(&d)?
+    } else {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| std::env::temp_dir())
+            .join("modpack-i18n-tool")
+            .join("cfpa-cache")
+    };
+    let path = tauri::async_runtime::spawn_blocking(move || try_download_cfpa_pack(&version, &dest))
+        .await
+        .map_err(|e| format!("下載任務失敗：{e}"))??;
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "attribution": "參考來源：CFPAOrg/Minecraft-Mod-Language-Package（多為 CC BY-NC-SA 4.0）；本工具只填缺並轉台灣用語，不上傳至共享 R2。"
+    }))
+}
+
 #[tauri::command]
 fn get_ui_prefs() -> serde_json::Value {
     serde_json::json!({
@@ -2817,6 +2845,7 @@ pub fn run() {
             cancel_turnstile_verification_cmd,
             get_api_settings,
             get_default_reference_pack,
+            download_cfpa_reference_pack,
             get_ui_prefs,
             set_ui_prefs,
             quit_app,

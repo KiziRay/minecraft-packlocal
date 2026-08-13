@@ -74,6 +74,7 @@ pub use jar_patchouli::translate_jar_patchouli;
 pub use jar_translate::{rewrite_translated_jars, JarTranslationReport};
 pub use merge_ref::{
     discover_default_reference, load_reference_zh_tw, merge_fill_missing, subtract_covered,
+    try_download_cfpa_pack,
 };
 pub use minemenu::fix_minemenu_unicode_escapes;
 pub use origins::translate_origins;
