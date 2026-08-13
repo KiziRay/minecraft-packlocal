@@ -10,7 +10,7 @@
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@450;600&family=Noto+Sans+TC:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body class="is-loading">
+<body class="is-loading" data-instance-ready="0" data-app-page="translate">
   <div class="app-atmosphere" aria-hidden="true"></div>
   <div class="app">
     <header class="topbar">
@@ -33,7 +33,7 @@
           </button>
           <div id="overflow-menu" class="overflow-menu" role="menu" hidden>
             <div class="overflow-meta">
-              <kbd class="version-key">v0.2.2</kbd>
+                  <kbd class="version-key">v0.2.3</kbd>
               <span class="overflow-meta-note">自適應布局</span>
             </div>
             <button type="button" id="btn-theme" class="overflow-item" role="menuitem" aria-pressed="true" title="切換淺色／深色">
@@ -76,6 +76,7 @@
                   </div>
                   <p class="field-help path-hint">需包含 mods（內有模組），以及 config／options.txt／resourcepacks 或啟動器實例特徵之一。</p>
                   <p id="instance-validate-status" class="field-status path-validate" aria-live="polite">尚未選擇遊戲資料夾。</p>
+                  <p class="path-gate-hint" id="path-gate-hint">先選好遊戲資料夾並通過檢查後，才會顯示 AI 設定、開始翻譯與右側步驟／日誌。</p>
                 </div>
 
                 <section id="ai-options-group" class="ai-home-panel options-group" aria-labelledby="opt-group-ai">
@@ -170,7 +171,6 @@
                   </div>
                   <div class="action-row share-support-row">
                     <button type="button" id="btn-package" class="secondary-button" disabled>翻譯完成後分享</button>
-                    <button type="button" class="support-cta" data-url="https://zeitfrei.bobaboba.me">支持開發</button>
                   </div>
                   <div id="share-confirm-panel" class="share-confirm-panel" hidden>
                     <strong>上傳前請確認</strong>
@@ -470,8 +470,8 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-states">按鈕何時出現</a><a href="#g-share">分享與參考翻譯</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v0.2.2</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>視窗可自由縮放，布局會依寬高重排並盡量吃滿可用空間。也可按 Ctrl＋↑／↓ 或 Ctrl＋滾輪調介面縮放；在「⋯」選單可重設 100%。</span></div>
-          <section><h2 id="g-translate">翻譯整合包</h2><p>頂欄切到「翻譯」。選遊戲資料夾並按「開始翻譯」。AI 補翻與驗證在主頁；進階設定（結果位置、版本、參考包）在選好資料夾後按「更多選項」。不會宣稱 100%。</p><ol class="guide-steps"><li><span>1</span><p>選取整合包／遊戲實例資料夾（需通過實例檢查）。</p></li><li><span>2</span><p>需要時在主頁設定 AI；更多選項可調結果位置與參考翻譯。</p></li><li><span>3</span><p>按「開始翻譯」；進度與日誌在右側執行面板。</p></li></ol></section>
+          <p class="eyebrow">PLAYER GUIDE / v0.2.3</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>視窗可自由縮放，布局會依寬高重排並盡量吃滿可用空間。也可按 Ctrl＋↑／↓ 或 Ctrl＋滾輪調介面縮放；在「⋯」選單可重設 100%。</span></div>
+          <section><h2 id="g-translate">翻譯整合包</h2><p>頂欄切到「翻譯」。先選遊戲資料夾並通過檢查後，才會顯示 AI、開始翻譯與右側步驟／日誌。進階設定在「更多選項」。不會宣稱 100%。</p><ol class="guide-steps"><li><span>1</span><p>選取整合包／遊戲實例資料夾（需通過實例檢查）。</p></li><li><span>2</span><p>需要時在主頁設定 AI；更多選項可調結果位置與參考翻譯。</p></li><li><span>3</span><p>按「開始翻譯」；進度與日誌在右側執行面板。</p></li></ol></section>
           <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在更多選項手動指定。</p></section>
           <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>優先貼完整 crash report。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名。</td></tr></tbody></table></section>
           <section><h2 id="g-font">字體資源包</h2><p>頂欄切到「字體」。獨立服務，不會翻譯文字。支援 TTF／OTF，拒 TTC。</p></section>
@@ -479,9 +479,9 @@
           <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。代管 API 需 Discord 與 Cloudflare 驗證；也可自備 Key。Key 只存本機。</p></section>
           <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲紅字或閃退？</strong>到「診斷」貼完整 crash report。</p><p><strong>圖片裡的字會翻嗎？</strong>不會。</p></section>
           <section><h2 id="g-disclaimer">免責說明</h2><div class="disclaimer"><p>本工具由 ZeitFrei 提供。翻譯結果可能不完整；請自行確認授權與備份存檔。</p></div></section>
-          <section><h2 id="g-states">按鈕何時出現</h2><p>未選實例時只顯示選資料夾；「更多選項」在選好資料夾後才出現。翻譯進行中只保留停止。</p></section>
+          <section><h2 id="g-states">按鈕何時出現</h2><p>未通過實例檢查前，主區只留選資料夾；AI、開始翻譯、右側步驟／日誌都隱藏。通過後才展開。「支持開發」在頁尾。翻譯進行中只保留停止。</p></section>
           <section><h2 id="g-share">分享與參考翻譯</h2><p>分享需兩項確認；參考包只填缺，不上傳共享 R2。</p></section>
-          <p class="guide-footer">zeitfrei / packlocal · v0.2.2</p>
+          <p class="guide-footer">zeitfrei / packlocal · v0.2.3</p>
         </main>
       </div>
     </div>

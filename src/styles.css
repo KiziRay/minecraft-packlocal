@@ -85,10 +85,18 @@ body {
   background: var(--paper);
   -webkit-user-select: none;
   user-select: none;
+  -webkit-user-drag: none;
 }
+/* 僅可編輯／日誌區可選取；避免 WebView 雙擊全選蓋層 */
 input, textarea, select, pre.log, .log, code, [contenteditable="true"] {
   -webkit-user-select: text;
   user-select: text;
+  -webkit-user-drag: auto;
+}
+button, a, label, summary, .service-tab, .promo-card {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 button, input, select, textarea, summary { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
@@ -142,6 +150,7 @@ code {
   content: "";
   position: absolute;
   inset: 0;
+  pointer-events: none;
   opacity: 0.22;
   background: url("assets/atmosphere-banner.png") center / cover no-repeat;
   mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 70%);
@@ -341,6 +350,9 @@ h1 {
 }
 .content-column { min-width: 0; }
 .page-panel[hidden] { display: none !important; }
+.primary-action[hidden],
+.run-dock[hidden],
+#ai-options-group[hidden] { display: none !important; }
 
 .service-layout {
   display: grid;
@@ -545,24 +557,6 @@ textarea {
 }
 .secondary-actions { margin-top: 12px; }
 .share-support-row { margin-top: 8px; }
-.support-cta {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  min-height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.support-cta:hover {
-  border-color: var(--accent);
-  color: var(--ink);
-}
 
 /* —— Run dock —— */
 .run-dock {
@@ -1001,6 +995,11 @@ textarea {
   z-index: 60;
   background: var(--overlay);
 }
+.drawer-backdrop[hidden],
+.guide-overlay[hidden],
+.settings-drawer[hidden] {
+  pointer-events: none !important;
+}
 .settings-drawer {
   position: fixed;
   top: 0;
@@ -1102,9 +1101,37 @@ body.is-loading .service-tabs::before {
   content: "";
   position: absolute;
   inset: 0;
+  z-index: 1;
+  pointer-events: none;
   border-radius: var(--radius-sm);
   background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--line) 45%, transparent), transparent);
   animation: skeleton-sweep 1.1s linear infinite;
+}
+
+/* 未通過實例檢查：收斂為「選資料夾」引導 */
+body[data-instance-ready="0"][data-app-page="translate"] .workspace-frame.service-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+body[data-instance-ready="0"][data-app-page="translate"] .run-dock,
+body[data-instance-ready="0"] #ai-options-group,
+body[data-instance-ready="0"] .primary-action,
+body[data-instance-ready="0"] .inline-honest {
+  display: none !important;
+}
+body[data-instance-ready="0"][data-app-page="translate"] .stage-sub {
+  max-width: 36rem;
+}
+.path-gate-hint[hidden] { display: none !important; }
+body[data-instance-ready="0"][data-app-page="translate"] .path-gate-hint {
+  display: block;
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
 }
 @keyframes skeleton-sweep {
   from { transform: translateX(-100%); }
@@ -1411,7 +1438,6 @@ body.content-fade-in .service-tabs > *,
   .coverage-card { min-width: 0; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .share-support-row { flex-direction: column; align-items: stretch; }
-  .support-cta { margin-left: 0; width: 100%; justify-content: center; }
   .overflow-menu { right: 0; left: auto; min-width: min(240px, calc(100vw - 24px)); }
 }
 

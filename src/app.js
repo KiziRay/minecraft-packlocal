@@ -846,18 +846,28 @@ function wireShellChrome() {
     setOverflowMenuOpen(false);
   });
 
-  // WebView2：雙擊空白常觸發全選／拖曳選取導致介面卡住
+  // WebView2：擋空白處文字選取／拖曳，不可攔截 button/a/input 的 click
+  const selectionSafeTarget = (t) =>
+    !!(t && t.closest && t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true']"));
+  const interactiveTarget = (t) =>
+    !!(t && t.closest && t.closest("button, a, label, summary, input, textarea, select, option"));
+  document.addEventListener(
+    "selectstart",
+    (ev) => {
+      if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
+      ev.preventDefault();
+    },
+    true
+  );
   document.addEventListener("dragstart", (ev) => {
-    const t = ev.target;
-    if (t && (t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true']"))) return;
+    if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
     ev.preventDefault();
   });
   document.addEventListener("dblclick", (ev) => {
-    const t = ev.target;
-    if (t && (t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true'], button, a, label, summary"))) return;
+    if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
     const sel = window.getSelection?.();
     if (sel && sel.rangeCount) sel.removeAllRanges();
-    ev.preventDefault();
+    // 不 preventDefault click 路徑；只清掉可能蓋住畫面的選取範圍
   });
 }
 
@@ -868,17 +878,33 @@ function syncUiState() {
   const failed = translationState === "failed";
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
+  const instanceReady = hasInstance && !!instanceValidation.ok;
+  document.body.dataset.instanceReady = instanceReady ? "1" : "0";
 
-  const hideMore = !hasInstance;
+  const hideMore = !instanceReady;
   const moreBtn = $("btn-more-options");
   if (moreBtn) moreBtn.hidden = hideMore;
   if (hideMore) closeMoreDrawer();
   ["field-output", "pack-version-group", "translation-method-group", "reference-details"]
-    .forEach((id) => toggleHidden(id, !hasInstance));
+    .forEach((id) => toggleHidden(id, !instanceReady));
+  const gateHint = $("path-gate-hint");
+  if (gateHint) gateHint.hidden = instanceReady || page !== "translate";
+  const aiGroup = $("ai-options-group");
+  if (aiGroup) {
+    aiGroup.hidden = !instanceReady;
+    aiGroup.setAttribute("aria-hidden", instanceReady ? "false" : "true");
+  }
+  const primaryAction = document.querySelector(".primary-action");
+  if (primaryAction) primaryAction.hidden = !instanceReady;
+  const runDock = document.querySelector(".run-dock");
+  if (runDock) {
+    // 翻譯頁未就緒時整欄隱藏；字體／診斷頁仍顯示對應右欄
+    runDock.hidden = page === "translate" && !instanceReady;
+  }
   const runBtn = $("btn-run");
   if (runBtn) {
-    runBtn.hidden = progressBusy;
-    runBtn.disabled = !hasInstance || !instanceValidation.ok || progressBusy;
+    runBtn.hidden = progressBusy || !instanceReady;
+    runBtn.disabled = !instanceReady || progressBusy;
     runBtn.title = !hasInstance
       ? "請先選擇遊戲資料夾"
       : !instanceValidation.ok
@@ -887,7 +913,7 @@ function syncUiState() {
   }
   toggleHidden("btn-supplement", !complete || locked);
   toggleHidden("btn-repair", !failed || locked);
-  toggleHidden("btn-glossary", !hasInstance || locked);
+  toggleHidden("btn-glossary", !instanceReady || locked);
   toggleHidden("btn-package", !complete || locked);
   const fontOutReady = !!($("font-output")?.value || "").trim();
   const translateOutReady = hasOutput;
@@ -1124,11 +1150,7 @@ function syncAiPanel(refreshStatus = true) {
     panel.hidden = !enabled;
     panel.setAttribute("aria-hidden", enabled ? "false" : "true");
   }
-  const group = $("ai-options-group");
-  if (group) {
-    group.hidden = false;
-    group.setAttribute("aria-hidden", "false");
-  }
+  // #ai-options-group 顯示由 syncUiState 的 instanceReady 閘門控制
   if (enabled && refreshStatus) refreshAiStatus();
 }
 
@@ -1991,9 +2013,91 @@ window.addEventListener("DOMContentLoaded", async () => {
   showAppPage("translate", { skipTransition: true });
   setTranslationState("idle");
   wireCoverageTier();
+  // 殼層與頂欄必須在任何 await 之前接線，避免 listen／啟動任務卡住時整頁不能點
+  wireShellChrome();
+  if ($("tab-translate")) $("tab-translate").onclick = () => showAppPage("translate");
+  if ($("tab-font")) $("tab-font").onclick = () => showAppPage("font");
+  if ($("tab-diagnose")) $("tab-diagnose").onclick = () => showAppPage("diagnose");
+  if ($("btn-theme")) {
+    $("btn-theme").onclick = () => {
+      const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+      applyTheme(current === "dark" ? "light" : "dark");
+    };
+  }
+  if ($("btn-scale")) $("btn-scale").onclick = () => applyUiScale(1);
+  if ($("btn-quit")) {
+    $("btn-quit").onclick = async () => {
+      try {
+        await invoke("quit_app");
+      } catch (e) {
+        window.close();
+      }
+    };
+  }
+  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
+    if (el.dataset.wired === "1") return;
+    el.dataset.wired = "1";
+    el.addEventListener("click", async () => {
+      const url = el.getAttribute("data-url");
+      if (!url) return;
+      try {
+        await openExternalUrl(url);
+      } catch (e) {
+        appendLog("無法開啟連結：" + String(e), "warn");
+      }
+    });
+  });
+  if ($("btn-clear-log")) {
+    $("btn-clear-log").onclick = () => {
+      clearLog("日誌已清除");
+      const el = $("log");
+      if (el) el.classList.add("log-empty");
+    };
+  }
+  if ($("btn-inst")) {
+    $("btn-inst").onclick = async () => {
+      try {
+        const p = await pickDir("選擇遊戲／整合包資料夾");
+        if (p) {
+          $("instance").value = p;
+          const ok = await validateSelectedInstance(p);
+          setTranslationState(ok ? "ready" : "idle");
+          await detectVersionForInstance(p, false);
+          await refreshPackTranslationName(p);
+          await refreshReferencePack();
+          $("output").value = "";
+          $("output").dataset.autoPath = "";
+          $("output").dataset.customPath = "";
+          if (!($("output").value || "").trim()) {
+            try {
+              const base =
+                (await invoke("managed_output_for_instance", { instancePath: p }).catch(() => null)) ||
+                (await invoke("managed_output_base").catch(() => null)) ||
+                (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null)) ||
+                (await invoke("suggest_resourcepacks_dir", { instancePath: p }));
+              if (base) {
+                setAutoOutputDir(base);
+                appendLog(
+                  "翻譯結果位置已準備好：\n" + base +
+                    "\n翻譯完成會直接套用到整合包資料夾。"
+                );
+              }
+            } catch (_) {
+              /* 略 */
+            }
+          }
+          syncUiState();
+          await refreshTranslationHelper();
+        }
+      } catch (e) {
+        log(String(e));
+      }
+    };
+  }
   await waitForStartupSkeleton(startupTasks);
   window.clearTimeout(startupRevealFallback);
   revealInitialContent();
+  syncUiState();
   ["instance", "output", "font-output"].forEach((id) => {
     const input = $(id);
     if (!input) return;
@@ -2017,7 +2121,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       scheduleBackupStateRefresh();
     });
   });
-  wireShellChrome();
   if ($("choose-output-dir")) {
     $("choose-output-dir").addEventListener("change", () => {
       const input = $("output");
@@ -2061,58 +2164,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("btn-scale").onclick = () => applyUiScale(1);
   }
 
-  // 即時進度（白話 + 百分比）
-  try {
-    await listen("translate-progress", (ev) => {
-      const p = (ev && ev.payload) || {};
-      const percent = p.percent != null ? p.percent : 0;
-      const message = p.message || "處理中…";
-      setProgress(percent, message);
-      // 失敗類進度再標錯誤（setProgress 也會寫一般進度行）
-      if (/失敗|錯誤|無法|不存在|損壞/.test(String(message))) {
-        appendError(message);
-      }
-    });
-  } catch (e) {
-    /* 無 event 時仍可跑完後顯示 */
-  }
-  // 後端專用日誌通道（錯誤／警告／重要資訊）
-  try {
-    await listen("translate-log", (ev) => {
-      const p = (ev && ev.payload) || {};
-      const level = (p.level || p.Level || "info").toLowerCase();
-      const message = p.message || p.Message || "";
-      if (!message) return;
-      consumeCoverageMessage(message);
-      if (level === "error") appendError(message);
-      else if (level === "warn") appendLog(message, "warn");
-      else appendLog(message, "info");
-    });
-  } catch (e) {
-    /* 略 */
-  }
-
-  try {
-    await listen("discord-login-url", (ev) => {
-      const payload = (ev && ev.payload) || {};
-      discordLoginUrl = String(payload.url || "").trim();
-      if ($("discord-login-url")) $("discord-login-url").value = discordLoginUrl || "登入網址尚未就緒";
-      if ($("discord-login-fallback")) $("discord-login-fallback").hidden = false;
-    });
-  } catch (e) {
-    /* 瀏覽器仍可能由後端直接開啟，不阻擋登入。 */
-  }
-  try {
-    await listen("turnstile-url", (ev) => {
-      const payload = (ev && ev.payload) || {};
-      turnstileUrl = String(payload.url || "").trim();
-      if ($("btn-turnstile-open")) $("btn-turnstile-open").hidden = !turnstileUrl;
-    });
-  } catch (e) {
-    /* 後端仍會直接開啟瀏覽器；事件只供手動重開。 */
-  }
-
-  $("use-ai").onchange = () => syncUiState();
+  if ($("use-ai")) $("use-ai").onchange = () => syncUiState();
   if ($("api-provider")) {
     $("api-provider").onchange = () => syncCustomProviderUi($("api-provider").value);
   }
@@ -2210,8 +2262,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
-  $("btn-save-adv").onclick = onSaveAdv;
-  $("btn-run").onclick = onRun;
+  if ($("btn-save-adv")) $("btn-save-adv").onclick = onSaveAdv;
+  if ($("btn-run")) $("btn-run").onclick = onRun;
   if ($("btn-stop")) $("btn-stop").onclick = onStop;
   if ($("btn-glossary")) $("btn-glossary").onclick = onOpenGlossary;
   if ($("btn-supplement")) $("btn-supplement").onclick = onSupplement;
@@ -2274,8 +2326,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     },
     { passive: false }
   );
-  // 推廣連結：Discord／支持開發（含主畫面醒目的支持鈕，可重複出現）
-  document.querySelectorAll(".promo-card[data-url], .support-cta[data-url]").forEach((el) => {
+  // 推廣連結（若啟動早期已接線則略過）
+  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
+    if (el.dataset.wired === "1") return;
+    el.dataset.wired = "1";
     el.addEventListener("click", async () => {
       const url = el.getAttribute("data-url");
       if (!url) return;
@@ -2453,7 +2507,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     el.addEventListener("change", writeFontPrefs);
   });
 
-  $("btn-inst").onclick = async () => {
+  if ($("btn-inst")) $("btn-inst").onclick = async () => {
     try {
       const p = await pickDir("選擇遊戲／整合包資料夾");
       if (p) {
@@ -2640,7 +2694,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       log(String(e));
     }
   }
-  $("btn-open").onclick = () => openResultFolder(false);
+  if ($("btn-open")) $("btn-open").onclick = () => openResultFolder(false);
   if ($("btn-open-font")) $("btn-open-font").onclick = () => openResultFolder(true);
 
   if ($("btn-clear-log")) {
@@ -2679,6 +2733,54 @@ window.addEventListener("DOMContentLoaded", async () => {
         log(String(e));
       }
     };
+  }
+
+  // 後端事件通道放在所有按鈕接線之後，避免 listen 卡住時整頁失效
+  try {
+    await listen("translate-progress", (ev) => {
+      const p = (ev && ev.payload) || {};
+      const percent = p.percent != null ? p.percent : 0;
+      const message = p.message || "處理中…";
+      setProgress(percent, message);
+      if (/失敗|錯誤|無法|不存在|損壞/.test(String(message))) {
+        appendError(message);
+      }
+    });
+  } catch (e) {
+    /* 無 event 時仍可跑完後顯示 */
+  }
+  try {
+    await listen("translate-log", (ev) => {
+      const p = (ev && ev.payload) || {};
+      const level = (p.level || p.Level || "info").toLowerCase();
+      const message = p.message || p.Message || "";
+      if (!message) return;
+      consumeCoverageMessage(message);
+      if (level === "error") appendError(message);
+      else if (level === "warn") appendLog(message, "warn");
+      else appendLog(message, "info");
+    });
+  } catch (e) {
+    /* 略 */
+  }
+  try {
+    await listen("discord-login-url", (ev) => {
+      const payload = (ev && ev.payload) || {};
+      discordLoginUrl = String(payload.url || "").trim();
+      if ($("discord-login-url")) $("discord-login-url").value = discordLoginUrl || "登入網址尚未就緒";
+      if ($("discord-login-fallback")) $("discord-login-fallback").hidden = false;
+    });
+  } catch (e) {
+    /* 瀏覽器仍可能由後端直接開啟，不阻擋登入。 */
+  }
+  try {
+    await listen("turnstile-url", (ev) => {
+      const payload = (ev && ev.payload) || {};
+      turnstileUrl = String(payload.url || "").trim();
+      if ($("btn-turnstile-open")) $("btn-turnstile-open").hidden = !turnstileUrl;
+    });
+  } catch (e) {
+    /* 後端仍會直接開啟瀏覽器；事件只供手動重開。 */
   }
 
 });
