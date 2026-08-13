@@ -320,7 +320,7 @@ function applyTheme(theme) {
   }
   if (label) label.textContent = normalized === "dark" ? "深色" : "淺色";
   if (glyph) glyph.textContent = normalized === "dark" ? "◐" : "○";
-  if (meta) meta.setAttribute("content", normalized === "dark" ? "#111315" : "#f7f7f5");
+  if (meta) meta.setAttribute("content", normalized === "dark" ? "#14161a" : "#eceef2");
   try {
     localStorage.setItem(THEME_STORAGE_KEY, normalized);
   } catch (_) {
@@ -773,6 +773,79 @@ function toggleHidden(id, hidden) {
   el.hidden = !!hidden;
 }
 
+function isMoreDrawerOpen() {
+  const drawer = $("more-options");
+  return !!(drawer && !drawer.hidden);
+}
+
+function openMoreDrawer() {
+  const drawer = $("more-options");
+  const backdrop = $("more-options-backdrop");
+  const btn = $("btn-more-options");
+  if (!drawer) return;
+  drawer.hidden = false;
+  if (backdrop) backdrop.hidden = false;
+  if (btn) btn.setAttribute("aria-expanded", "true");
+  document.body.classList.add("drawer-open");
+  setOverflowMenuOpen(false);
+}
+
+function closeMoreDrawer() {
+  const drawer = $("more-options");
+  const backdrop = $("more-options-backdrop");
+  const btn = $("btn-more-options");
+  if (drawer) drawer.hidden = true;
+  if (backdrop) backdrop.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  document.body.classList.remove("drawer-open");
+}
+
+function setOverflowMenuOpen(open) {
+  const menu = $("overflow-menu");
+  const btn = $("btn-overflow");
+  if (!menu || !btn) return;
+  menu.hidden = !open;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function wireShellChrome() {
+  const moreBtn = $("btn-more-options");
+  if (moreBtn) {
+    moreBtn.setAttribute("aria-expanded", "false");
+    moreBtn.setAttribute("aria-controls", "more-options");
+    moreBtn.onclick = () => {
+      if (isMoreDrawerOpen()) closeMoreDrawer();
+      else openMoreDrawer();
+    };
+  }
+  if ($("btn-more-close")) $("btn-more-close").onclick = () => closeMoreDrawer();
+  if ($("more-options-backdrop")) {
+    $("more-options-backdrop").onclick = () => closeMoreDrawer();
+  }
+
+  const overflowBtn = $("btn-overflow");
+  if (overflowBtn) {
+    overflowBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const menu = $("overflow-menu");
+      setOverflowMenuOpen(!!(menu && menu.hidden));
+    };
+  }
+  document.addEventListener("click", (ev) => {
+    const wrap = document.querySelector(".overflow-wrap");
+    if (!wrap || wrap.contains(ev.target)) return;
+    setOverflowMenuOpen(false);
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (isMoreDrawerOpen()) {
+      closeMoreDrawer();
+      return;
+    }
+    setOverflowMenuOpen(false);
+  });
+}
+
 function syncUiState() {
   const hasInstance = !!($("instance")?.value || "").trim();
   const hasOutput = !!selectedOutputDir();
@@ -781,12 +854,10 @@ function syncUiState() {
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
 
-  const moreOptions = $("more-options");
-  if (moreOptions) {
-    const hideMore = !hasInstance;
-    moreOptions.hidden = hideMore;
-    if (hideMore) moreOptions.open = false;
-  }
+  const hideMore = !hasInstance;
+  const moreBtn = $("btn-more-options");
+  if (moreBtn) moreBtn.hidden = hideMore;
+  if (hideMore) closeMoreDrawer();
   ["field-output", "pack-version-group", "translation-method-group", "ai-options-group", "reference-details"]
     .forEach((id) => toggleHidden(id, !hasInstance));
   const runBtn = $("btn-run");
@@ -1898,21 +1969,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       scheduleBackupStateRefresh();
     });
   });
-  const moreOptions = $("more-options");
-  if (moreOptions) {
-    moreOptions.addEventListener("toggle", () => {
-      if (!moreOptions.open) return;
-      const stage = document.querySelector(".content-column");
-      if (!stage) return;
-      window.requestAnimationFrame(() => {
-        try {
-          moreOptions.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        } catch (_) {
-          /* scrollIntoView 不可用時略過 */
-        }
-      });
-    });
-  }
+  wireShellChrome();
   if ($("choose-output-dir")) {
     $("choose-output-dir").addEventListener("change", () => {
       const input = $("output");

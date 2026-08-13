@@ -8,7 +8,7 @@
 - 不宣稱 100% 漢化
 - **免安裝任何額外東西**（簡繁轉換內建於執行檔）
 
-目前版本：**0.1.6**（以 src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json 三處同步為準）
+目前版本：**0.2.0**（以 src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json 三處同步為準）
 
 開發者代管 AI 會先檢查 Discord 官方伺服器資格，再透過 Cloudflare Turnstile 完成安全驗證；自訂 API 不需要這些驗證。
 
