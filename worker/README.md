@@ -15,30 +15,32 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 | POST | `/api/turnstile/verify` | 呼叫 Siteverify，成功後回傳短效 HMAC 憑證到本機 callback |
 | POST | `/v1/chat/completions` | AI 代理：驗證 Discord 與 Turnstile 憑證後轉發上游 |
 | POST | `/tm/lookup` | 社群共享翻譯記憶查詢（精確鍵＋帶語境的跨模組候選） |
-| POST | `/tm/contribute` | 貢獻翻譯（模組、語言鍵、原文雜湊、語境、譯文）；存 R2 `tm/v1/<ns>.json.gz` 與 `tm/v2/global.json.gz` |
+| POST | `/tm/contribute` | 貢獻翻譯；存獨立 `TRANSLATIONS` R2 的 `tm/v1/<ns>.json.gz` 與 `tm/v2/global.json.gz` |
+| POST | `/glossary/lookup` | 查詢已確認、無衝突的共享術語 |
+| POST | `/glossary/contribute` | 貢獻依整合包分類的術語；重複去除、衝突停用 |
 | POST | `/api/share/upload` | 登入並通過安全驗證後，上傳可安裝翻譯 ZIP 到獨立 `SHARES` bucket |
 | GET/HEAD | `/s/<token>` | 下載 24 小時有效的分享檔；過期立即回 404 |
 | GET | `/health` | 健康檢查（`hasKey`、`turnstileReady`） |
 
-共享翻譯記憶：依模組分片存 R2（`tm/v1/<namespace>.json.gz`），每筆資料包含譯文、語境與衝突標記；另有
+共享翻譯記憶：依模組分片存獨立 `TRANSLATIONS` R2（`tm/v1/<namespace>.json.gz`），每筆資料包含譯文、語境、整合包分類與衝突標記；另有
 `tm/v2/global.json.gz` 提供安全的跨模組候選。精確 keyhash＝`sha256(ns\0key\0正規化原文)[:24]`，
 跨模組 skhash＝`sha256(key\0正規化原文\0語境)[:24]`。只存字串、無個資。
 
 **省容量／避免重複儲存的設計**：
 - **gzip 壓縮**分片（繁中 JSON 常縮到 1/3 以下；實測重複性高的資料省 ~90%）。
 - **keyed map**：同一條只有一個鍵，空白或換行差異會先正規化，避免重複儲存。
-- **客戶端只回饋「本次新由 AI 產出」的條目**（共享庫命中、術語表、本機記憶都不重送）。
+- **客戶端只回饋通過格式檢查的條目**，Worker 會依鍵去重並合併整合包來源。
 - **只有真的有新條目才寫分片**（`changed` 才 put），沒新增就不動 R2。
 - **不同上下文不共用譯文**；同一鍵出現不同譯文時標記 `conflict`，後續不自動套用，交回本機 AI 或人工檢查。
 - R2 的分片採合併後寫回；若同時間大量貢獻造成寫入競爭，客戶端會在下一次翻譯重新補送，不能把共享記憶當成唯一備份。
 
-分享檔隔離：`DOWNLOADS → modpack-i18n` 只放安裝檔與翻譯記憶；`SHARES → modpack-i18n-shares` 只放一天分享檔。分享 ZIP 使用 allowlist，只包含 `resourcepacks`、`jar-translated`、指定的 `config` 子資料夾、`patchouli_books`、`kubejs`、`datapacks` 等可安裝內容，不包含 session、錯誤日誌、本機路徑或 API 金鑰。
+資料區隔離：`DOWNLOADS → modpack-i18n` 只放更新檔；`TRANSLATIONS → modpack-i18n-translations` 只放共享 TM／術語；`SHARES → modpack-i18n-shares` 只放一天分享檔。分享 ZIP 使用 allowlist，只包含 `resourcepacks`、`jar-translated`、指定的 `config` 子資料夾、`patchouli_books`、`kubejs`、`datapacks` 等可安裝內容，不包含 session、錯誤日誌、本機路徑或 API 金鑰。
 
 `wrangler.toml` 目前以工具 1.0.2 為本機建置目標；是否部署由維護者另行決定。桌面端只接受本 Worker 的 `/download/*.exe`，並強制驗證 SHA-256 後才會啟動免安裝更新。
 
 ## 翻譯記憶與分享頁補充
 
-共享翻譯記憶會先用「模組、語言鍵、正規化原文」做精確比對；跨模組候選還要符合語言鍵、正規化原文與語境。空白或換行不同的相同文字可以重用，不同譯文會標記 conflict 並停止自動套用，避免上下文衝突。只存匿名文字，不存本機路徑、Discord 身分或整合包檔案。
+共享翻譯記憶會先用「模組、語言鍵、正規化原文」做精確比對；跨模組候選還要符合語言鍵、正規化原文與語境。空白或換行不同的相同文字可以重用，不同譯文會標記 conflict 並停止自動套用，避免上下文衝突。共享術語必須有至少兩個不同整合包分類確認後才會自動套用；只存匿名文字，不存本機路徑、Discord 身分或整合包檔案。
 
 分享連結的 GET 請求先回傳可嵌入的介紹頁，只有 download=1 或 /download 才回傳 ZIP。介紹頁提供 cloud.zeitfrei.uk 遊戲下載中心與 cloud.zeitfrei.uk/zeitfreitool 工具箱連結，使用 Open Graph 標籤供論壇、聊天平台與其他第三方平台預覽；連結 24 小時後失效。
 

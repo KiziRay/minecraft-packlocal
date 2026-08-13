@@ -11,7 +11,7 @@
 
 | 項目 | 內容 |
 |------|------|
-| 一句話 | **本機多根搜尋 → 社群／既有譯文優先 → 格式護盾下的 AI 只補洞 → 一鍵套用（可備份）** |
+| 一句話 | **本機多根搜尋 → 社群／既有譯文優先 → 格式護盾下的 AI 分批補洞 → 一鍵套用（可備份）** |
 | 硬約束 A | **永不直接改寫玩家 `mods/*.jar` 本體**；lang 走資源包／`jar-translated` 副本 |
 | 硬約束 B | **不承諾 100% 螢幕無英文**；圖內字、Java 硬編碼、未知 schema 明示為未支援並可擴充 |
 
@@ -32,8 +32,8 @@
 | L3 資料包顯示字 | openloader／datapacks 的 `loc_*`／`effect_tip`／`flavor_text` 等 | **必達**（202608 多根 + 顯示欄位，見 SEARCH-MAP） |
 | L4 能力／種族 | Origins／Apoli `name`／`description`（路徑感知） | **必達**（已有） |
 | L5 選單／覆寫 | FancyMenu、MineMenu 編碼 | **應達** |
-| L6 腳本硬字串 | KubeJS `.js` 字面、CraftTweaker | **列缺漏**（P1） |
-| L7 zip 內資料包 | 未解壓的 datapack zip 內部 | **列缺漏**（P1） |
+| L6 腳本硬字串 | KubeJS 顯示 API 的 `.js`／`.ts` 字面 | **已做（嚴格白名單；CraftTweaker 仍不自動改寫）** |
+| L7 zip 內資料包 | 未解壓的 datapack／resourcepack zip 內部 | **已做（安全上限；原 ZIP 只讀）** |
 | L8 圖內字／硬編碼 | 貼圖文字、Java 字串 | **不做**（文件標明） |
 
 **完整度 KPI（人工可驗）**
@@ -46,7 +46,7 @@
 
 | 指標 | 目標 | 手段方向 |
 |------|------|----------|
-| 零 AI 路徑 | 大包數分鐘級（SSD） | 平行掃 jar、只讀 lang、OpenCC 批次 |
+| 零 AI 路徑 | 大包數分鐘級（SSD） | 平行掃 jar、只讀文字資源、OpenCC 批次 |
 | 有 AI 路徑 | **少呼叫**：TM／術語／社群／既有 zh 優先 | `resolve_unique` 三層擋；Append 模式 |
 | 重跑同一包 | AI 趨近 0 | 持久 TM、session 補翻、檔級 skip |
 | 可中斷 | 停止後狀態可續 | cancel 點 + session pending |
@@ -76,17 +76,17 @@
 | BQ／HQM／Heracles／Modonomicon | 已有 | `quests_books` | |
 | 一鍵套用＋備份 | 已有 | `apply_instance` | |
 | 診斷缺模組閃退 | 已有 | `diagnose` | 與翻譯無關的 Structory 等 |
-| 格式護盾進階（AE 宏、item tag 遮罩表） | **不足** | `placeholder` 已有 %s 等 | 見 §4.1 |
+| 格式護盾進階（AE 宏、item tag 遮罩表） | 已有 | `placeholder` + mask／unmask／guard | `$(...)`、`<item:…>`、`#mod:tag`、Markdown link |
 | 雙層快取（機翻／AI 分檔） | **不足** | 僅 `tm.json` | 見 §4.2 |
-| Append／Skip90／Force 三模式 | **不足** | 補翻近似 Append | 見 §4.3 |
-| 介面 vs 劇情分品質引擎 | **不足** | 單一 AI 路徑 | 見 §4.4 |
-| FTB → lang 匯出橋接 | **不足** | 無 | 見 §3 P1 |
-| KubeJS 腳本字面字串 | **缺** | — | §3 P1 |
-| zip datapack 內文 | **缺** | 只掃鬆散 | §3 P1 |
-| GuideME Markdown | **缺** | — | §3 P2 |
+| Append／Skip90／Force 三模式 | 已有 | `translation_mode` + session + UI | Force 忽略共享／本機 TM，仍保留 glossary／guard |
+| 介面 vs 劇情分品質引擎 | 已有 | `translation_quality` + prompt／batch | fast／balanced／thorough；API 分流不做 |
+| FTB → lang 匯出橋接 | 部分 | FTB SNBT 直接覆寫；保留原格式 | 不把任務資料硬轉成 gameplay lang |
+| KubeJS 腳本字面字串 | 已有 | `script_literals` | 只改 `Text.of`／`Component.literal`／`text.literal` |
+| zip datapack 內文 | 已有 | `archive_overlay` | 安全解壓→共用掃描→重建 ZIP |
+| GuideME Markdown | 已有 | `text_overlay` Markdown | 只處理可讀行，連結／格式先遮罩 |
 | 共享 TM 社群端 | 部分 | `shared_tm` + Worker | 視服務是否上線 |
 | Provider 鏈（多後備） | 部分 | 單一 base/model | 見 §4.5 |
-| 掃描／翻譯進度分離的「預估剩餘」 | **不足** | 有 % 無 ETA | §5 |
+| 掃描／翻譯進度分離的「預估剩餘」 | 已有第一版 | 來源階段進度＋批次進度 | UI 依真實百分比與已用時間估算，早期／等待回應時不亂顯示 |
 
 ---
 
@@ -105,19 +105,19 @@
 
 | ID | 缺漏 | 影響 | 建議方向 | 驗收 |
 |----|------|------|----------|------|
-| M1.1 | **KubeJS／腳本硬字串** | 腳本 UI／提示英文 | 新模組：僅字面字串 + 極嚴白名單路徑；預設關或「進階」 | 測試 fixture 1 檔 |
-| M1.2 | **zip 內 datapack／RP** | 打包資料包未翻 | 安全解壓上限 + 與鬆散相同規則 | 測小 zip |
-| M1.3 | **FTB lang 匯出相容** | 與 FTB Quest Localizer 生態互通 | 可選：snbt→kubejs lang 或讀既有 FTBLang | 文件說明 + 一條整合測 |
-| M1.4 | **Heracles／Modonomicon 邊角路徑** | 任務漏 | 擴 `is_quest_book_path` 片段 | grep 新包路徑 |
-| M1.5 | **Patchouli 在 jar 內書** | 僅掃實例覆寫時漏 | jar 掃時可選抽出 patchouli 頁（或 RP 合併） | 文件標支援範圍 |
-| M1.6 | **覆蓋報告不夠「完整」** | 玩家不知漏哪 | report：依來源計數 + 未支援原因 | 報告檔欄位齊 |
-| M1.7 | **格式自癒寫回 TM** | 壞譯文污染記憶 | 寫 TM 前必須 guard；壞的不入庫 | 測試拒寫 |
+| M1.1 | **KubeJS／腳本硬字串** | 腳本 UI／提示英文 | 已做：僅 `Text.of`／`Component.literal`／`text.literal`，不解析任意邏輯 | `script_literals` 單測 |
+| M1.2 | **zip 內 datapack／RP** | 打包資料包未翻 | 已做：安全解壓上限 + 與鬆散相同規則 + 重建副本 | `archive_overlay` 單測 |
+| M1.3 | **FTB lang 匯出相容** | 與 FTB Quest Localizer 生態互通 | 已做：保留 FTB SNBT 原格式直接覆寫，避免誤轉成 gameplay lang | FTB 流程整合 |
+| M1.4 | **Heracles／Modonomicon 邊角路徑** | 任務漏 | 已擴充路徑片段並在補翻／修復流程重跑 | `quests_books` 路徑單測 |
+| M1.5 | **Patchouli 在 jar 內書** | 僅掃實例覆寫時漏 | 已做：抽出 `data/*/patchouli_books` 成 work/data 覆寫，原 JAR 不改 | `jar_patchouli` 單測 |
+| M1.6 | **覆蓋報告不夠「完整」** | 玩家不知漏哪 | 已做：來源明細 + 略過／錯誤清單 | 報告檔欄位齊 |
+| M1.7 | **格式自癒寫回 TM** | 壞譯文污染記憶 | 已做：`Tm::insert` 與 AI 回寫雙重 guard | 測試拒寫 |
 
 ### P2 — 完整度長尾／體驗
 
 | ID | 缺漏 | 建議 |
 |----|------|------|
-| M2.1 | GuideME／Markdown 手冊 | 新 B 類來源或標未支援 |
+| M2.1 | GuideME／Markdown 手冊 | 已做：白名單根目錄與 Markdown 可讀行 |
 | M2.2 | MineColonies／自訂 GUI 字串 | 路徑提示表擴充 |
 | M2.3 | 基岩版 | 不做，文件寫明 |
 | M2.4 | 圖內 OCR | 不做 |
@@ -165,15 +165,15 @@
 
 **檔案**：擴 `placeholder.rs` 或新 `engine/format_shield.rs`；`deepseek`／`text_overlay` 共用。
 
-### 4.2 雙快取與自癒 — **應優化**
+### 4.2 雙快取與自癒 — **已部分優化**
 
 | 層 | 用途 | 現況 | 目標 |
 |----|------|------|------|
-| TM 機翻級 | Google／快模型 | 單一 `tm.json` | 可選分檔 `tm_mt.json`／`tm_ai.json` 或 namespace 前綴 |
-| 自癒 | 修復 `% s`、括號 | 部分在 guard 修復鏈 | 讀 TM 時跑 heal，壞條目標記不採用 |
+| TM 機翻級 | Google／快模型 | 單一 `tm.json` | 有上下文提示時以原文＋上下文隔離；舊無上下文條目仍相容 |
+| 自癒 | 修復 `% s`、括號 | `guard` + `Tm::insert` 雙重守門 | 壞條目不採用、不寫回，避免污染後續整合包 |
 | 詞典 | 強制譯名 | `glossary.json` | 保持；文件強調「先 glossary 再 AI」 |
 
-### 4.3 翻譯模式：Append／Skip／Force — **應優化**
+### 4.3 翻譯模式：Append／Skip／Force — **已完成**
 
 | 模式 | 行為 | 對應玩家情境 |
 |------|------|----------------|
@@ -181,16 +181,16 @@
 | **Skip-if-complete** | 某 ns 或某來源 ≥ 閾值（如 90%）整段跳過 | 大包已大半漢化 |
 | **Force** | 忽略既有機翻重翻（仍保留 glossary） | 品質升級 |
 
-實作落點：session + `fill_missing_with_ai` 入口參數；UI 三選一。
+實作落點：`translation_mode`、session、`fill_missing_with_mode` 入口參數；UI 三選一。Force 只對目前待補字串生效，不會重翻已有繁中 key。
 
-### 4.4 分品質引擎（快／好）— **應優化**
+### 4.4 分品質引擎（快／好）— **已完成第一版**
 
 | 軌道 | 來源 | 引擎建議 | 產出 |
 |------|------|----------|------|
 | 快 | lang 介面字、短 tooltip | 本機 TM + 可選快速模型／甚至 MT | 單一 RP 底 |
 | 好 | FTB 描述、Patchouli、flavor | 高品質 AI、較小 batch | 可疊第二 RP 或同包後寫 |
 
-MineAI 建議「兩包疊加」；我們可在**單一 work** 內用來源標籤選模型，避免玩家搞兩個 zip（預設單包，進階可拆）。
+本工具在單一 work 內以 `translation_quality` 調整 AI 批次大小與提示：fast 180、balanced 140、thorough 70。API 多後備分流不在本次範圍內，三種品質仍使用使用者選定的同一個 API。
 
 ### 4.5 Provider 鏈與本地 LLM — **應優化**
 
@@ -204,9 +204,11 @@ MineAI 建議「兩包疊加」；我們可在**單一 work** 內用來源標籤
 ### 4.6 來源目錄發現 — **已做一輪，可再優化**
 
 已落地：多根 + 路徑提示 + 內容嗅探 + 顯示欄位（`SEARCH-MAP.md`）。  
-再優化：
+已落地第一版：鬆散語言檔使用檔案大小＋修改時間快取；第二次掃描可跳過未變的語言檔。
+資源包資料夾與 JAR／ZIP 內部仍會重新驗證，避免壓縮內容或外部檔案變更造成舊結果誤用。
 
-- 掃描結果快取（檔 mtime + size → 跳過未變檔）  
+保留後續：
+
 - 嗅探並行化、機制路徑黑名單可持續加  
 - 可選「僅掃描變更」給補翻
 
@@ -227,7 +229,7 @@ Habier：`workspace/`（快取）vs `export/`（給玩家）。
 | 單檔讀取上限 | 見各模組 `MAX_FILE_BYTES` |
 | zip 條目安全名 | `security::is_safe_zip_entry_name` |
 | 步行深度 | SEARCH-MAP 表 |
-| AI 唯一字串上限 | 各模組 `MAX_AI_UNIQUE` |
+| AI 唯一字串上限 | API 內層依品質分批；覆寫／Origins／任務來源外層每 8,000 條一批，會自動續處理 |
 
 新增 zip datapack 支援時**必須**沿用安全解壓，禁止 zip-slip。
 
@@ -244,9 +246,9 @@ Habier：`workspace/`（快取）vs `export/`（給玩家）。
 | S5 | 關閉 AI 時跳過一切網路 | 已大致如此；回歸測 | P0 |
 | S6 | 共享 TM 先查再 AI | 降成本 | P1（服務在線時） |
 | S7 | Skip-if-complete | 大包更新極快 | P1 |
-| S8 | 進度 ETA（依批耗時） | 體感 | P2 |
-| S9 | 磁碟在 Y:/Z: 時提示改本機 work | 避網路碟抖動 | P2 |
-| S10 | jar 掃描 worker 數可設定 | 弱機不炸 | P2 |
+| S8 | 進度 ETA（依目前真實百分比） | 體感 | 已完成第一版 |
+| S9 | 磁碟在 Y:/Z: 或 UNC 時提示風險 | 避網路碟抖動 | 已完成提示 |
+| S10 | jar 掃描 worker 數可設定 | 弱機不炸 | 已完成；可用 `MODPACK_I18N_JAR_WORKERS=1..16` |
 
 ---
 
@@ -256,7 +258,7 @@ Habier：`workspace/`（快取）vs `export/`（給玩家）。
 |----|------|------|----------|
 | C1 | 維持並擴充 SEARCH-MAP 多根／白名單 | P0 | M0.1–0.2 |
 | C2 | format_shield 全管線 | P0 | M0.3、§4.1 |
-| C3 | KubeJS 字面（進階開關） | P1 | M1.1 |
+| C3 | KubeJS 字面（安全白名單） | P1 | M1.1 |
 | C4 | zip datapack | P1 | M1.2 |
 | C5 | FTB lang 橋 | P1 | M1.3 |
 | C6 | 覆蓋報告 3.0 | P1 | M1.6 |
@@ -273,20 +275,21 @@ Habier：`workspace/`（快取）vs `export/`（給玩家）。
 
 | 波次 | 內容 | 完成判準 |
 |------|------|----------|
-| **W0 基線** | 文件落地（本檔 + DEVELOPMENT 索引）；SEARCH-MAP 與實碼一致 | 文件互鏈；cargo check 綠 |
-| **W1 護盾** | format_shield + TM 寫入守衛 + 測試 | 壞 `%s`／`<item:>` 不進 TM |
-| **W2 模式** | Append／Force（Skip 可跟）UI + session | 重跑 Append 不重翻已有 |
-| **W3 加速** | 掃描快取 + AI 動態 batch + 來源並行 | 二次掃描明顯加快 |
-| **W4 來源** | zip datapack 或 KubeJS 進階（擇一先做需求高者） | 支援範圍文件更新 |
-| **W5 報告** | 覆蓋報告依來源 + 未支援列表 | 玩家可指出漏翻類型 |
-| **W6 品質分軌** | 介面快／劇情好（可選模型） | 文件與 UI 說明 |
+| **W0 基線** | 文件落地（本檔 + DEVELOPMENT 索引）；SEARCH-MAP 與實碼一致 | 已完成 |
+| **W1 護盾** | format_shield + TM 寫入守衛 + 測試 | 已完成 |
+| **W2 模式** | Append／Force／Skip90 UI + session | 已完成 |
+| **W3 加速** | AI 動態 batch + JAR 並行；鬆散 lang 掃描快取 | 已完成第一版 |
+| **W4 來源** | ZIP datapack／RP、KubeJS 顯示字串、JAR Patchouli、Markdown | 已完成第一版 |
+| **W5 報告** | 覆蓋報告依來源 + 未支援列表 | 已完成 |
+| **W6 品質分軌** | 介面快／劇情好（同一 API，不做分流） | 已完成第一版 |
 
 狀態欄（維護時改）：
 
 | 波次 | 狀態 | 日期 |
 |------|------|------|
-| W0 | **文件已開** | 2026-08-12 |
-| W1–W6 | 未開始 | — |
+| W0–W2 | **已完成** | 2026-08-12 |
+| W3 | **已完成第一版：鬆散 lang 掃描快取；壓縮來源仍做安全重掃** | 2026-08-12 |
+| W4–W6 | **已完成第一版** | 2026-08-12 |
 
 ---
 

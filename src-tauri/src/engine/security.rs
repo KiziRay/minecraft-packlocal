@@ -256,8 +256,14 @@ pub fn check_font_file(path: &Path) -> Result<(), String> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
-        return Err("請使用 .ttf、.otf 或 .ttc 字體檔。".into());
+    if ext == "ttc" {
+        return Err(
+            "不支援 .ttc（TrueType Collection 集合字體）。請改用單一字形的 .ttf 或 .otf 檔。"
+                .into(),
+        );
+    }
+    if !matches!(ext.as_str(), "ttf" | "otf") {
+        return Err("請使用 .ttf 或 .otf 字體檔。".into());
     }
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() == 0 {
@@ -281,4 +287,29 @@ pub fn normalize_user_path(s: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(t);
     validate_no_parent_dir(&p)?;
     Ok(p)
+}
+
+/// 粗略辨識常見網路路徑，僅用於提示速度與斷線風險，不會拒絕使用者路徑。
+pub fn is_probably_network_path(path: &Path) -> bool {
+    let raw = path.to_string_lossy().replace('/', "\\");
+    if raw.starts_with("\\\\") {
+        return true;
+    }
+    let bytes = raw.as_bytes();
+    bytes.len() >= 2
+        && bytes[1] == b':'
+        && matches!(bytes[0].to_ascii_uppercase(), b'Y' | b'Z')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_path_detection_is_only_a_hint() {
+        assert!(is_probably_network_path(Path::new(r"\\server\packs\instance")));
+        assert!(is_probably_network_path(Path::new(r"Y:\packs\instance")));
+        assert!(is_probably_network_path(Path::new(r"z:/packs/instance")));
+        assert!(!is_probably_network_path(Path::new(r"C:\Games\instance")));
+    }
 }

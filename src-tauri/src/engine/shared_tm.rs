@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use super::hashutil::sha256_hex;
 use super::secrets::MANAGED_BASE_URL;
+use super::translation_scope::TranslationScope;
 
 /// 單次請求最多帶幾條（保護 Worker／回應大小）。
 const MAX_ITEMS: usize = 3000;
@@ -33,6 +34,17 @@ pub struct SharedTmJob {
     pub key: String,
     pub source: String,
     pub context: Option<String>,
+    pub scope: Option<TranslationScope>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedTmEntry {
+    pub namespace: String,
+    pub key: String,
+    pub source: String,
+    pub translated: String,
+    pub context: Option<String>,
+    pub scope: Option<TranslationScope>,
 }
 
 pub fn normalize_source(source: &str) -> String {
@@ -90,12 +102,17 @@ pub fn lookup(jobs: &[SharedTmJob]) -> HashMap<usize, String> {
         let kh = keyhash(&job.namespace, &job.key, &job.source);
         let sk = semantic_hash(&job.key, &job.source, job.context.as_deref());
         if seen.insert(format!("{}:{kh}", job.namespace), ()).is_none() {
-            items.push(json!({
+            let mut item = json!({
                 "ns": job.namespace,
                 "kh": kh,
                 "sk": sk,
                 "ctx": job.context,
-            }));
+            });
+            if let Some(scope) = &job.scope {
+                item["pk"] = json!(scope.pack_key.clone());
+                item["pn"] = json!(scope.pack_name.clone());
+            }
+            items.push(item);
         }
         kh_by_job.push(kh);
     }
@@ -132,7 +149,7 @@ pub fn lookup(jobs: &[SharedTmJob]) -> HashMap<usize, String> {
 }
 
 /// 批次貢獻（fire-and-forget）：`(ns, key, src, zh)`。失敗不影響翻譯。
-pub fn contribute(entries: &[(String, String, String, String, Option<String>)]) {
+pub fn contribute(entries: &[SharedTmEntry]) {
     if entries.is_empty() {
         return;
     }
@@ -141,18 +158,26 @@ pub fn contribute(entries: &[(String, String, String, String, Option<String>)]) 
     };
     let items: Vec<Value> = entries
         .iter()
-        .filter(|(_, _, src, zh, _)| {
-            let zh = zh.trim();
-            !zh.is_empty() && zh.len() <= MAX_ZH_LEN && !src.trim().is_empty() && zh != src.trim()
+        .filter(|entry| {
+            let zh = entry.translated.trim();
+            !zh.is_empty()
+                && zh.len() <= MAX_ZH_LEN
+                && !entry.source.trim().is_empty()
+                && zh != entry.source.trim()
         })
-        .map(|(ns, key, src, zh, context)| {
-            json!({
-                "ns": ns,
-                "kh": keyhash(ns, key, src),
-                "sk": semantic_hash(key, src, context.as_deref()),
-                "ctx": context,
-                "zh": zh.trim(),
-            })
+        .map(|entry| {
+            let mut item = json!({
+                "ns": entry.namespace.clone(),
+                "kh": keyhash(&entry.namespace, &entry.key, &entry.source),
+                "sk": semantic_hash(&entry.key, &entry.source, entry.context.as_deref()),
+                "ctx": entry.context.clone(),
+                "zh": entry.translated.trim(),
+            });
+            if let Some(scope) = &entry.scope {
+                item["pk"] = json!(scope.pack_key.clone());
+                item["pn"] = json!(scope.pack_name.clone());
+            }
+            item
         })
         .collect();
     if items.is_empty() {

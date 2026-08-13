@@ -15,6 +15,9 @@
 | 本地 lang | `jar_scan` | `assets/<ns>/lang/*`、`.lang` |
 | 任務 SNBT | `ftbquests` | FTB Quests 章節／任務 title、description |
 | 文字覆寫 | `text_overlay` | patchouli、openloader 資料包顯示字、fancymenu… |
+| ZIP 文字覆寫 | `archive_overlay` | datapacks／global_packs／resourcepacks／openloader ZIP，安全重建副本 |
+| JAR 內書本 | `jar_patchouli` | `data/<ns>/patchouli_books/**/*.json`，輸出 `work/data` |
+| KubeJS 顯示字串 | `script_literals` | 僅 `Text.of`／`Component.literal`／`text.literal` |
 | Origins | `origins` | powers／origins 的 name、description（避開機制 id） |
 | 任務／書本 | `quests_books` | Better Questing／HQM／Heracles／Modonomicon 顯示欄位 |
 
@@ -49,6 +52,10 @@
 | `datapacks/`、`global_packs/`、`paxi/datapacks/`、`defaultconfigs/`、`data/`、`kubejs/data/` | 同 §4 |
 | `kubejs/` | `/lang/` 下 `.json` |
 | `config/fancymenu/`、`defaultconfigs/fancymenu/` | `.txt`／`.json` 可讀文字 |
+| `config/starterkit/`、`config/armorsets/`、`config/minecolonies/` 等顯示型設定根 | `.json`／`.json5`／文字檔；JSON 仍須通過顯示路徑／欄位白名單 |
+| `guideme/`、`config/guideme/`、`guidebook/` | `.md`／`.txt`／`.json`；Markdown 只處理可讀行 |
+
+ZIP 來源會先檢查路徑、單檔大小、項目數與解壓總大小；原始 ZIP 不寫入，翻譯副本放到結果的 `resourcepacks-extra/` 或相對覆寫根。
 
 ---
 

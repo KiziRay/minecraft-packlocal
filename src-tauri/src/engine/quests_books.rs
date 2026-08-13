@@ -24,12 +24,13 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings;
+use super::deepseek::translate_plain_strings_with_scope;
+use super::translation_scope::TranslationScope;
 
 /// 任務資料庫（DefaultQuests.json）可能很大，放寬到 24MB。
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
-const MAX_WALK_DEPTH: usize = 16;
-const MAX_AI_UNIQUE: usize = 8000;
+const MAX_WALK_DEPTH: usize = 24;
+const AI_BATCH_SIZE: usize = 8000;
 
 /// 顯示欄位白名單（去掉 BQ 型別後綴、轉小寫後比對）。只有這些欄位之下的字串會被翻。
 const DISPLAY_FIELDS: &[&str] = &[
@@ -61,6 +62,7 @@ pub fn translate_quests_books<F>(
     minecraft_dir: &Path,
     output_dir: &Path,
     use_ai: bool,
+    scope: Option<&TranslationScope>,
     mut on_progress: F,
 ) -> Result<QuestsBooksResult, String>
 where
@@ -140,39 +142,36 @@ where
     }
 
     // 2) AI 補其餘（走既有 glossary→TM→AI→遮罩→guard）
-    let mut capped = String::new();
     if use_ai {
         let mut need_ai: Vec<String> = Vec::new();
-        let mut skipped = 0usize;
         for s in &unique {
             if map.contains_key(s) || (looks_chinese(s) && !has_latin_letter(s)) {
                 continue;
             }
-            if need_ai.len() >= MAX_AI_UNIQUE {
-                skipped += 1;
-                continue;
-            }
             need_ai.push(s.clone());
         }
-        if skipped > 0 {
-            capped = format!(
-                "；超過單次上限 {}，本輪未處理 {} 條（再按「再補一些」可續）",
-                MAX_AI_UNIQUE, skipped
-            );
-        }
         if !need_ai.is_empty() {
-            on_progress(30, &format!("任務／書本：AI 翻譯 {} 條…", need_ai.len()));
-            let translated = translate_plain_strings(&need_ai, |pct, msg| {
-                let mapped = 30 + (pct as u16 * 50 / 100) as u8;
-                on_progress(mapped.min(80), msg);
-            })?;
-            for (i, en) in need_ai.iter().enumerate() {
-                if let Some(zh) = translated.get(i) {
-                    let t = zh.trim();
-                    if !t.is_empty() && t != en {
-                        map.insert(en.clone(), t.to_string());
+            let total_batches = need_ai.len().div_ceil(AI_BATCH_SIZE);
+            on_progress(30, &format!("任務／書本：AI 分批翻譯 {} 條…", need_ai.len()));
+            for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
+                super::cancel::check()?;
+                let start = batch_index * AI_BATCH_SIZE;
+                let translated = translate_plain_strings_with_scope(batch, scope, |pct, msg| {
+                    let done = start + batch.len() * pct as usize / 100;
+                    on_progress(30 + ((done * 50) / need_ai.len().max(1)) as u8, msg);
+                })?;
+                for (i, en) in batch.iter().enumerate() {
+                    if let Some(zh) = translated.get(i) {
+                        let t = zh.trim();
+                        if !t.is_empty() && t != en {
+                            map.insert(en.clone(), t.to_string());
+                        }
                     }
                 }
+                on_progress(
+                    30 + (((batch_index + 1) * 50) / total_batches.max(1)) as u8,
+                    &format!("任務／書本：已完成第 {}/{} 批", batch_index + 1, total_batches),
+                );
             }
         }
     } else {
@@ -213,10 +212,10 @@ where
         files_written: written,
         strings_translated: map.len(),
         note: format!(
-            "任務／書本（Better Questing／HQM／Heracles／Modonomicon）：翻譯表 {} 條、寫出 {} 檔{}。需套用才進遊戲。",
+            "任務／書本（Better Questing／HQM／Heracles／Modonomicon）：翻譯表 {} 條、寫出 {} 檔{}。流程完成時會直接套用到遊戲。",
             map.len(),
             written,
-            capped
+            ""
         ),
     })
 }

@@ -26,6 +26,9 @@ const RE_BRACE: &str = r"\{[A-Za-z_][A-Za-z0-9_]*\}|\{\d+\}";
 const RE_NAMED_PERCENT: &str = r"%[A-Za-z_][A-Za-z0-9_]{2,}%";
 /// Patchouli 書本巨集 `$(br)`、`$(l:item)`、`$(/l)`
 const RE_PATCHOULI: &str = r"\$\([^)]{0,64}\)";
+/// Minecraft item/tag references used by books, scripts and recipe text.
+const RE_ITEM_REFERENCE: &str =
+    r"(?:<(?:(?:item|tag|fluid|block):[^<>\s]{1,160})>|#[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+)";
 /// 色碼（含少數設定檔用的 `&a`）
 const RE_COLOR: &str = r"§.|&[0-9a-fk-orA-FK-OR]";
 
@@ -73,7 +76,7 @@ pub fn extract(s: &str) -> Placeholders {
             out.positional.push(whole);
         }
     }
-    for pat in [RE_BRACE, RE_NAMED_PERCENT, RE_PATCHOULI] {
+    for pat in [RE_BRACE, RE_NAMED_PERCENT, RE_PATCHOULI, RE_ITEM_REFERENCE] {
         for m in re(pat).find_iter(s) {
             out.keyed.push(m.as_str().to_string());
         }
@@ -255,6 +258,8 @@ const RE_MASK_TOKENS: &str = concat!(
     r"|%\d+\$[sdifcbxo%]",                            // 位置格式：%1$s %2$d
     r"|%[sdifcbxo%]",                                 // 簡單格式：%s %d %f
     r"|\{[^{}]+\}",                                   // 既有大括號佔位符 {key} {0}
+    r"|<(?:item|tag|fluid|block):[^<>\s]{1,160}>",     // Minecraft item/tag reference
+    r"|#[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+",              // Minecraft tag reference
     // MDX/JSX 與 HTML 標籤：<ItemLink id="ae2:x" />、<br/>、</Row>（屬性必帶 = 才算標籤）
     r#"|</?[A-Za-z][A-Za-z0-9_.-]*(?::[A-Za-z][A-Za-z0-9_.-]*)?(?:\s+[A-Za-z_:][A-Za-z0-9_:.-]*\s*=\s*(?:"[^"]*"|'[^']*'|\{[^{}]*\}))*\s*/?>"#,
 );
@@ -330,6 +335,17 @@ mod tests {
         assert!(p.keyed.contains(&"{0}".to_string()));
         assert!(p.keyed.contains(&"$(br)".to_string()));
         assert!(p.keyed.contains(&"%player%".to_string()));
+    }
+
+    #[test]
+    fn protects_item_and_tag_references() {
+        let p = extract("Use <item:minecraft:diamond> with #forge:ingots/iron");
+        assert!(p.keyed.contains(&"<item:minecraft:diamond>".to_string()));
+        assert!(p.keyed.contains(&"#forge:ingots/iron".to_string()));
+        assert!(is_compatible(
+            "Use <item:minecraft:diamond> with #forge:ingots/iron",
+            "使用 <item:minecraft:diamond> 搭配 #forge:ingots/iron"
+        ));
     }
 
     #[test]
@@ -419,12 +435,34 @@ mod tests {
             "Level {level} of {0}",
             "§aGreen§r and &cred",
             "Press $(l:item)here$(/l) now",
+            "Use <item:minecraft:diamond> and #forge:ingots/iron",
             "See ](./page.md#anchor) link",
             "escaped\\nnewline",
             r#"<ItemLink id="ae2:controller" /> table"#,
         ] {
             assert_eq!(roundtrip(s), s, "round-trip failed for: {s}");
         }
+    }
+
+    #[test]
+    fn patchouli_link_fixture_survives_mask_unmask() {
+        let src = "Open $(l:entries/tools/hammer)Hammer Guide$(/l)$(br)Then craft $(item)Iron Plate$()";
+        let (masked, tokens) = mask(src);
+        assert_ne!(masked, src);
+        assert_eq!(unmask(&masked, &tokens), src);
+    }
+
+    #[test]
+    fn item_and_tag_fixture_survives_translated_sentence() {
+        let src = "Use <item:create:wrench> on #forge:storage_blocks/brass";
+        let (masked, tokens) = mask(src);
+        let restored = unmask(
+            &masked
+                .replace("Use", "使用")
+                .replace("on", "對準"),
+            &tokens,
+        );
+        assert!(is_compatible(src, &restored));
     }
 
     #[test]

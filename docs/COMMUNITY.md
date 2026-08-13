@@ -49,7 +49,7 @@
 ## 已落地
 
 ### 0.3.8
-- `apply_translation_to_game`：備份 → 複製 resourcepacks zip、config/ftbquests、minemenu
+- `apply_translation_to_game`（舊版相容）：備份 → 複製 resourcepacks zip、config/ftbquests、minemenu；現行 UI 會在翻譯流程完成後直接套用
 - `覆蓋範圍說明.txt`：會／不會翻、紅線、粗估完成度
 - 說明 overlay：社群期望／痛點／禁忌／套用步驟
 

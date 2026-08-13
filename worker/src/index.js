@@ -4,7 +4,7 @@
 //  1. GET  /api/desktop/latest   → 桌面版更新檢查（回最新版本 + 下載連結）
 //  2. GET/POST /turnstile        → Cloudflare 真人驗證與短效憑證
 //  3. POST /v1/chat/completions  → 驗證 Discord + Turnstile 後代理 AI
-//  4. /download、/tm             → R2 免安裝 EXE 與社群翻譯記憶
+//  4. /download、/tm、/glossary  → R2 免安裝 EXE 與共享翻譯資料
 //
 // 為什麼要代理而不是把金鑰編進 exe：
 //  - 金鑰若進 exe，任何人反編譯就能抽出，開發者的免費額度幾天內被刷爆。
@@ -64,6 +64,12 @@ export default {
     if (url.pathname === "/tm/contribute" && request.method === "POST") {
       return tmContribute(request, env);
     }
+    if (url.pathname === "/glossary/lookup" && request.method === "POST") {
+      return glossaryLookup(request, env);
+    }
+    if (url.pathname === "/glossary/contribute" && request.method === "POST") {
+      return glossaryContribute(request, env);
+    }
 
     // 分享檔使用獨立的 SHARES R2 bucket，不會寫入安裝檔或翻譯記憶。
     if (url.pathname === "/api/share/upload" && request.method === "POST") {
@@ -106,7 +112,8 @@ function latest(env) {
 
 // ───────────────────────── 共享翻譯記憶（R2，依模組分片）─────────────────────────
 //
-// 儲存：tm/v1/<namespace>.json.gz 是精確鍵，tm/v2/global.json.gz 是跨模組候選。
+// 儲存：TRANSLATIONS R2 的 tm/v1/<namespace>.json.gz 是精確鍵，
+// tm/v2/global.json.gz 是跨模組候選；不與更新檔 DOWNLOADS 混用。
 // 只在上下文一致時命中；不同譯文會標記 conflict，避免後來的 AI 結果靜默覆蓋先前結果。
 // 只存匿名文字與語境，不存本機路徑、Discord 身分或整合包檔案。
 
@@ -114,6 +121,8 @@ const TM_MAX_ITEMS = 5000;
 const TM_MAX_ZH_LEN = 400;
 const TM_SHARD_CAP = 200000; // 單模組分片最多條數（防惡意灌爆）
 const TM_GLOBAL_CAP = 300000;
+const GLOSSARY_MAX_ITEMS = 5000;
+const GLOSSARY_CAP = 300000;
 
 function tmShardKey(ns) {
   return `tm/v1/${ns}.json.gz`;
@@ -141,7 +150,7 @@ function tmValidKh(s) {
   return typeof s === "string" && /^[0-9a-f]{16,64}$/.test(s);
 }
 async function tmReadShard(env, ns) {
-  const obj = await env.DOWNLOADS.get(tmShardKey(ns));
+  const obj = await env.TRANSLATIONS?.get(tmShardKey(ns));
   if (!obj) return null;
   try {
     const buf = await obj.arrayBuffer();
@@ -152,7 +161,7 @@ async function tmReadShard(env, ns) {
 }
 
 async function tmReadGlobal(env) {
-  const obj = await env.DOWNLOADS.get("tm/v2/global.json.gz");
+  const obj = await env.TRANSLATIONS?.get("tm/v2/global.json.gz");
   if (!obj) return {};
   try {
     const buf = await obj.arrayBuffer();
@@ -163,11 +172,12 @@ async function tmReadGlobal(env) {
 }
 
 function tmRecord(value) {
-  if (typeof value === "string") return { zh: value, ctx: "", conflict: false };
+  if (typeof value === "string") return { zh: value, ctx: "", packs: {}, conflict: false };
   if (!value || typeof value !== "object" || typeof value.zh !== "string") return null;
   return {
     zh: value.zh,
     ctx: typeof value.ctx === "string" ? value.ctx : "",
+    packs: value.packs && typeof value.packs === "object" ? value.packs : {},
     conflict: value.conflict === true,
   };
 }
@@ -185,13 +195,18 @@ function tmMerge(target, key, next) {
     target[key] = next;
     return next.conflict ? "conflict" : "accepted";
   }
-  if (previous.zh === next.zh && (!previous.ctx || !next.ctx || previous.ctx === next.ctx)) return "duplicate";
+  if (previous.zh === next.zh && (!previous.ctx || !next.ctx || previous.ctx === next.ctx)) {
+    const before = Object.keys(previous.packs || {}).length;
+    previous.packs = { ...(previous.packs || {}), ...(next.packs || {}) };
+    target[key] = previous;
+    return Object.keys(previous.packs).length > before ? "accepted" : "duplicate";
+  }
   target[key] = { ...previous, conflict: true };
   return "conflict";
 }
 
 async function tmLookup(request, env) {
-  if (!env.DOWNLOADS) return json({ hits: {} });
+  if (!env.TRANSLATIONS) return json({ hits: {} });
   let body;
   try {
     body = await request.json();
@@ -237,7 +252,7 @@ async function tmLookup(request, env) {
 }
 
 async function tmContribute(request, env) {
-  if (!env.DOWNLOADS) return json({ ok: false, accepted: 0 });
+  if (!env.TRANSLATIONS) return json({ ok: false, accepted: 0 });
   let body;
   try {
     body = await request.json();
@@ -254,16 +269,12 @@ async function tmContribute(request, env) {
     const record = {
       zh,
       ctx: typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "",
+      packs: validPackKey(it.pk) ? { [it.pk]: typeof it.pn === "string" ? it.pn.slice(0, 120) : "" } : {},
       conflict: false,
     };
     if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
     byNs.get(it.ns).set(it.kh, record);
-    const previousGlobal = globalEntries.get(it.sk);
-    if (!previousGlobal) {
-      globalEntries.set(it.sk, record);
-    } else if (previousGlobal.zh !== record.zh || (previousGlobal.ctx && record.ctx && previousGlobal.ctx !== record.ctx)) {
-      previousGlobal.conflict = true;
-    }
+    tmMerge(globalEntries, it.sk, record);
   }
   let accepted = 0;
   let conflicts = 0;
@@ -284,7 +295,7 @@ async function tmContribute(request, env) {
     // 只有真的有新條目才寫（避免重複寫入）；寫的是 gzip 後的位元組（省容量）
     if (changed) {
       const gz = await gzipBytes(JSON.stringify(shard));
-      await env.DOWNLOADS.put(tmShardKey(ns), gz, {
+      await env.TRANSLATIONS.put(tmShardKey(ns), gz, {
         httpMetadata: { contentType: "application/gzip" },
       });
     }
@@ -305,10 +316,105 @@ async function tmContribute(request, env) {
     }
     if (changed) {
       const gz = await gzipBytes(JSON.stringify(global));
-      await env.DOWNLOADS.put("tm/v2/global.json.gz", gz, {
+      await env.TRANSLATIONS.put("tm/v2/global.json.gz", gz, {
         httpMetadata: { contentType: "application/gzip" },
       });
     }
+  }
+  return json({ ok: true, accepted, conflicts });
+}
+
+// ───────────────────────── 共享術語表 ─────────────────────────
+// 只回傳「沒有衝突且已被至少一個來源確認」的譯名；同一術語不同譯文會停用，
+// 不讓後來的單一使用者靜默覆蓋既有結果。
+function glossaryKey() {
+  return "glossary/v1/global.json.gz";
+}
+
+async function readGlossary(env) {
+  const object = await env.TRANSLATIONS?.get(glossaryKey());
+  if (!object) return {};
+  try {
+    return JSON.parse(await gunzipToStr(await object.arrayBuffer()));
+  } catch (_) {
+    return {};
+  }
+}
+
+function validGlossaryHash(value) {
+  return typeof value === "string" && /^[0-9a-f]{16,64}$/.test(value);
+}
+
+function validPackKey(value) {
+  return typeof value === "string" && /^[0-9a-f]{16,64}$/.test(value);
+}
+
+function glossaryRecord(value) {
+  if (!value || typeof value !== "object" || typeof value.zh !== "string") return null;
+  return {
+    zh: value.zh,
+    ctx: typeof value.ctx === "string" ? value.ctx : "",
+    packs: value.packs && typeof value.packs === "object" ? value.packs : {},
+    conflict: value.conflict === true,
+  };
+}
+
+async function glossaryLookup(request, env) {
+  if (!env.TRANSLATIONS) return json({ hits: {} });
+  let body;
+  try { body = await request.json(); } catch (_) { return json({ error: "bad json" }, 400); }
+  const items = Array.isArray(body.items) ? body.items.slice(0, GLOSSARY_MAX_ITEMS) : [];
+  const queries = new Map();
+  for (const item of items) {
+    if (!item || !validGlossaryHash(item.gh)) continue;
+    const pk = validPackKey(item.pk) ? item.pk : "";
+    queries.set(item.gh, { pk, ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "" });
+  }
+  const glossary = await readGlossary(env);
+  const hits = {};
+  for (const [gh, query] of queries) {
+    const record = glossaryRecord(glossary[gh]);
+    if (!record || record.conflict || (record.ctx && query.ctx && record.ctx !== query.ctx)) continue;
+    const packCount = Object.keys(record.packs).length;
+    // 只有至少兩個不同整合包確認，才自動採用共享術語；單一來源不夠可靠。
+    if (packCount >= 2) hits[gh] = record.zh;
+  }
+  return json({ hits });
+}
+
+async function glossaryContribute(request, env) {
+  if (!env.TRANSLATIONS) return json({ ok: false, accepted: 0, conflicts: 0 });
+  let body;
+  try { body = await request.json(); } catch (_) { return json({ error: "bad json" }, 400); }
+  const items = Array.isArray(body.items) ? body.items.slice(0, GLOSSARY_MAX_ITEMS) : [];
+  const glossary = await readGlossary(env);
+  let accepted = 0;
+  let conflicts = 0;
+  for (const item of items) {
+    if (!item || !validGlossaryHash(item.gh) || !validPackKey(item.pk)) continue;
+    const zh = typeof item.zh === "string" ? item.zh.trim() : "";
+    const pn = typeof item.pn === "string" ? item.pn.trim().slice(0, 120) : "";
+    if (!zh || zh.length > TM_MAX_ZH_LEN || !pn) continue;
+    const previous = glossaryRecord(glossary[item.gh]);
+    if (!previous) {
+      glossary[item.gh] = { zh, ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "", packs: { [item.pk]: pn }, conflict: false };
+      accepted++;
+      continue;
+    }
+    if (previous.zh !== zh || (previous.ctx && item.ctx && previous.ctx !== item.ctx)) {
+      previous.conflict = true;
+      conflicts++;
+      continue;
+    }
+    if (!previous.packs[item.pk]) {
+      if (Object.keys(previous.packs).length >= GLOSSARY_CAP) continue;
+      previous.packs[item.pk] = pn;
+      accepted++;
+    }
+  }
+  if (accepted || conflicts) {
+    const gz = await gzipBytes(JSON.stringify(glossary));
+    await env.TRANSLATIONS.put(glossaryKey(), gz, { httpMetadata: { contentType: "application/gzip" } });
   }
   return json({ ok: true, accepted, conflicts });
 }
@@ -354,6 +460,7 @@ async function shareUpload(request, env) {
   const maxBytes = Math.min(parseInt(env.SHARE_MAX_BYTES || "104857600", 10) || 104857600, 104857600);
   const declared = parseInt(request.headers.get("content-length") || "0", 10);
   if (type !== "application/zip") return json({ error: "zip content type required" }, 415);
+  if (!Number.isFinite(declared) || declared <= 0) return json({ error: "content length required" }, 411);
   if (declared > maxBytes) return json({ error: "share file too large" }, 413);
 
   const token = randomShareToken();

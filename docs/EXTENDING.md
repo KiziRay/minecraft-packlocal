@@ -112,7 +112,7 @@ pub use my_source::{translate_my_source, MyResult};
 
 - 唯一字串去重再送 AI
 - 大目錄設 depth／2MB 上限（見 text_overlay）
-- AI 上限（如 MAX_AI_UNIQUE）避免一次爆帳
+- AI 內層依 provider 限制分批，來源超過 8,000 個候選字串時再由流程自動續批；預算仍由 provider budget／限制控制
 - **上限被觸發時必須回報剩餘數**（AGENTS.md 硬不變式 12），不可靜默截斷
 
 ## 6. 驗收

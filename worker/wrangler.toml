@@ -43,6 +43,10 @@ bucket_name = "modpack-i18n"
 binding = "SHARES"
 bucket_name = "modpack-i18n-shares"
 
+[[r2_buckets]]
+binding = "TRANSLATIONS"
+bucket_name = "modpack-i18n-translations"
+
 [triggers]
 crons = ["0 * * * *"]
 

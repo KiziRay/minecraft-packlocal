@@ -7,7 +7,7 @@
   <title>模組包翻譯工具｜ZeitFrei</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body>
+<body class="is-loading">
   <div class="app">
     <header class="topbar">
       <a class="workspace-brand" href="#top" aria-label="回到模組包翻譯工具首頁">
@@ -15,7 +15,7 @@
         <span class="brand-copy"><strong>zeitfrei / modpack-i18n</strong><small>DESKTOP TOOL</small></span>
       </a>
       <div class="topbar-actions">
-<kbd class="version-key">1.0.2</kbd>
+        <kbd class="version-key">0.1.0</kbd>
         <button type="button" id="btn-theme" class="text-button theme-button" aria-pressed="true" title="切換到淺色模式"><span id="theme-glyph" aria-hidden="true">◐</span><span id="theme-label">深色</span></button>
         <button type="button" id="btn-check-update" class="text-button update-button"><span>檢查更新</span><span id="update-status" class="update-status" aria-live="polite"></span></button>
         <button type="button" id="btn-scale" class="text-button scale-button" title="Ctrl＋↑／↓或 Ctrl＋滾輪調整介面大小；點擊重設為 100%"><span id="scale-label">介面 100%</span></button>
@@ -25,8 +25,8 @@
 
     <main id="top" class="document">
       <header class="document-head">
-        <div class="markdown-title"><span class="hash-mark">#</span><h1>模組包翻譯工具</h1></div>
-        <p class="document-lead">選好遊戲資料夾，完成後直接開玩。</p>
+        <div class="markdown-title"><h1>模組包翻譯工具</h1></div>
+        <p class="document-lead">翻譯、字體、錯誤分析——選好資料夾就能用。</p>
       </header>
 
       <nav class="service-tabs" aria-label="工具服務" role="tablist">
@@ -50,13 +50,22 @@
             <section class="document-section" aria-labelledby="translation-title">
               <div class="service-intro">
                 <div class="section-heading">
-                  <span class="md-symbol">##</span>
                   <div><h2 id="translation-title">翻譯整合包</h2><p>選遊戲資料夾，工具會掃描、翻譯並直接套用。</p></div>
                 </div>
                 <img class="service-art" src="assets/art/translation-service-illustration.png" alt="" />
               </div>
 
-              <div class="quote-note"><span>&gt;</span><p>翻譯完成會依上方選項決定是否備份，再直接套用到 Minecraft 資料夾。</p></div>
+              <div class="quote-note"><p>翻譯完成會依上方選項決定是否備份，再直接套用到 Minecraft 資料夾。</p></div>
+
+              <div id="translation-helper-panel" class="translation-helper-panel" hidden aria-live="polite">
+                <div class="helper-panel-heading"><span class="helper-panel-mark">+</span><div><strong>任務補充</strong><p id="translation-helper-message">正在確認是否需要遊戲內補充。</p></div></div>
+                <div id="translation-helper-command" class="helper-command" hidden><span>遊戲內指令</span><code id="translation-helper-command-text"></code></div>
+                <div class="helper-panel-actions">
+                  <button type="button" id="btn-helper-prepare" class="small-button" hidden>準備任務補充</button>
+                  <button type="button" id="btn-helper-rescan" class="secondary-button" hidden>我已匯出，重新翻譯</button>
+                  <button type="button" id="btn-helper-cleanup" class="text-button" hidden>清理輔助模組</button>
+                </div>
+              </div>
 
               <div class="field-list">
                 <div class="field-block">
@@ -113,7 +122,34 @@
                 </div>
               </div>
 
-              <div id="translation-options-heading" class="subsection-heading"><span class="md-symbol">###</span><h3>翻譯方式</h3></div>
+              <div id="coverage-tier-block" class="coverage-tier-block">
+                <div class="subsection-heading"><h3>這次要翻多深</h3></div>
+                <p class="field-help">選一個就好，不是同意書。之後還可以用「補翻」繼續加深。</p>
+                <div class="coverage-tier-grid" role="radiogroup" aria-label="完整度">
+                  <label class="coverage-card" for="coverage-quick">
+                    <input type="radio" name="coverage-tier" id="coverage-quick" value="quick" />
+                    <strong>先翻能玩的</strong>
+                    <small>物品、介面、任務主線；較快</small>
+                  </label>
+                  <label class="coverage-card" for="coverage-standard">
+                    <input type="radio" name="coverage-tier" id="coverage-standard" value="standard" checked />
+                    <strong>標準（建議）</strong>
+                    <small>多數可讀文字；時間與完整度平衡</small>
+                  </label>
+                  <label class="coverage-card" for="coverage-max">
+                    <input type="radio" name="coverage-tier" id="coverage-max" value="max" />
+                    <strong>盡量完整</strong>
+                    <small>多花時間深掃；圖內字／程式硬編碼仍可能留下</small>
+                  </label>
+                </div>
+                <label class="option-row compact-option" for="coverage-ack-hard">
+                  <input type="checkbox" id="coverage-ack-hard" checked />
+                  <span class="check-box" aria-hidden="true"></span>
+                  <span><strong>我知道圖片裡的字與程式寫死的英文可能還在</strong><small>勾著就好，不影響開始翻譯。</small></span>
+                </label>
+              </div>
+
+              <div id="translation-options-heading" class="subsection-heading"><h3>翻譯方式</h3></div>
               <div id="translation-options">
               <div class="option-list">
                 <label class="option-row" for="use-ai">
@@ -122,12 +158,35 @@
                 </label>
                 <label class="option-row" for="backup-before-apply">
                   <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
-                  <span><strong>套用前建立備份（建議）</strong><small>勾選會保留被覆蓋的檔案，之後可以還原或刪除備份；取消後會直接套用，不會建立備份。</small></span>
+                  <span><strong>套用前建立備份（建議）</strong><small>勾選會保留被覆蓋的檔案；再次翻譯同一個整合包與位置時，會沿用完整的既有備份，不會重複建立。</small></span>
                 </label>
+                <details id="translation-advanced" class="advanced-details">
+                  <summary>進階：模式、品質與其他</summary>
+                  <div class="advanced-body">
+                <div class="field-block compact-field translation-mode-field">
+                  <label for="translation-mode">翻譯模式</label>
+                  <select id="translation-mode">
+                    <option value="append" selected>接續翻譯（建議）</option>
+                    <option value="skip-if-complete">已達九成的模組略過</option>
+                    <option value="force">重新翻譯缺漏（忽略翻譯記憶）</option>
+                  </select>
+                  <small class="field-status">接續會優先使用已有翻譯；「重新翻譯」只對目前缺漏生效，仍會保護格式符號。</small>
+                </div>
+                <div class="field-block compact-field translation-quality-field">
+                  <label for="translation-quality">翻譯品質</label>
+                  <select id="translation-quality">
+                    <option value="balanced" selected>一般翻譯（建議）</option>
+                    <option value="fast">介面優先（較快）</option>
+                    <option value="thorough">劇情與書本優先（較仔細）</option>
+                  </select>
+                  <small class="field-status">只影響 AI 批次與提示方式；不開 AI 時不會連線。選完整度時會自動建議一組。</small>
+                </div>
                 <label class="option-row" for="minimize-on-close">
                   <input type="checkbox" id="minimize-on-close" checked /><span class="check-box" aria-hidden="true"></span>
                   <span><strong>關閉視窗時縮到背景</strong><small>翻譯繼續進行，不會因為關閉視窗而中斷。</small></span>
                 </label>
+                  </div>
+                </details>
               </div>
 
               <div id="ai-panel" class="ai-panel">
@@ -166,17 +225,37 @@
                   </div>
                 </div>
                 <div id="adv-details" class="advanced-details"><div class="advanced-body">
-                  <div class="field-block"><label for="api-key">自備 API 金鑰</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="只會儲存在本機" /></div>
-                  <div class="field-block"><label for="base-url">API 位置</label><input id="base-url" type="text" autocomplete="off" placeholder="留白使用預設服務" /></div>
+                  <div class="field-block">
+                    <label for="api-provider">服務商預設（不用填網址）</label>
+                    <select id="api-provider">
+                      <option value="deepseek">DeepSeek</option>
+                      <option value="glm">智譜 GLM</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="qwen">阿里雲通義千問</option>
+                      <option value="other">其他 OpenAI 相容服務</option>
+                    </select>
+                    <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商，工具會自動準備連線設定。</small>
+                  </div>
+                  <div class="field-block"><label for="api-key">API Key</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
+                  <small id="api-key-note" class="field-status">Key 只會儲存在本機；已儲存的 Key 會以固定數量的 `#` 顯示。</small>
+                  <div id="custom-endpoint-fields" hidden>
+                    <div class="field-block"><label for="base-url">Base URL</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://example.com/v1" /></div>
+                    <div class="field-block"><label for="api-model">模型名稱</label><input id="api-model" type="text" autocomplete="off" placeholder="例如 model-name" /></div>
+                  </div>
                   <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
                 </div></div>
               </div>
               <details id="reference-details" class="advanced-details" hidden>
                 <summary>參考翻譯（選用）</summary>
                 <div class="advanced-body">
-                  <p>工具會優先套用本機找到的 CTE2 等繁中翻譯；找不到也不影響一般翻譯。</p>
-                  <div class="input-row"><input id="reference-pack" type="text" readonly placeholder="尚未指定參考翻譯資料夾" autocomplete="off" /><button type="button" id="btn-reference-pick" class="small-button">選取</button></div>
+                  <p class="field-help">可選本機 CTE2／繁中包資料夾或 zip，也可使用 CFPA 等公開簡中資源包；工具只填缺並轉台灣用語，不會把參考包上傳到共享 R2。CFPA 多為 CC BY-NC-SA，請自行遵守原授權。</p>
+                  <div class="input-row"><input id="reference-pack" type="text" readonly placeholder="尚未指定參考翻譯資料夾或 zip" autocomplete="off" /><button type="button" id="btn-reference-pick" class="small-button">選資料夾</button><button type="button" id="btn-reference-file" class="small-button">選 zip</button></div>
                   <small id="reference-status" class="field-status">尚未找到參考翻譯。</small>
+                  <label class="option-row compact-option" for="reference-ack-license">
+                    <input type="checkbox" id="reference-ack-license" />
+                    <span class="check-box" aria-hidden="true"></span>
+                    <span><strong>我了解參考包授權由我自行負責</strong><small>未勾選也能翻；有指定參考包時建議勾一下。</small></span>
+                  </label>
                 </div>
               </details>
               </div>
@@ -214,23 +293,33 @@
                 </div>
                 <img class="service-art" src="assets/art/font-service-illustration.png" alt="" />
               </div>
-              <div class="quote-note"><span>&gt;</span><p>選一個你有權使用的 <code>.ttf</code>、<code>.otf</code> 或 <code>.ttc</code>，工具會建立可放進 <code>resourcepacks</code> 的資源包。</p></div>
+              <div class="quote-note"><p>選一個你有權使用的 <code>.ttf</code> 或 <code>.otf</code>（不支援 TTC 合集），工具會建立可放進 <code>resourcepacks</code> 的資源包。</p></div>
 
               <div class="field-grid">
-                <div class="field-block"><label for="font-file">字體檔案</label><p class="field-help">支援 TTF、OTF、TTC。</p><div class="input-row"><input id="font-file" type="text" placeholder="尚未選取字體檔" autocomplete="off" /><button type="button" id="btn-font-pick" class="small-button">選取</button></div></div>
+                <div class="field-block"><label for="font-file">字體檔案</label><p class="field-help">支援 TTF、OTF（請勿使用 TTC）。</p><div class="input-row"><input id="font-file" type="text" placeholder="尚未選取字體檔" autocomplete="off" /><button type="button" id="btn-font-pick" class="small-button">選取</button></div></div>
                 <div class="field-block"><label for="font-output">字體包輸出位置</label><p class="field-help">會建立在這個位置的 <code>翻譯結果/resourcepacks</code>。</p><div class="input-row"><input id="font-output" type="text" placeholder="選取字體包要放在哪裡" autocomplete="off" /><button type="button" id="btn-font-out" class="small-button">選取</button></div></div>
                 <div class="field-block full-field"><label for="font-pack-name">字體資源包名稱</label><input id="font-pack-name" type="text" value="繁體中文遊戲字體" placeholder="輸入資源包名稱" autocomplete="off" /></div>
               </div>
 
-              <div class="subsection-heading"><span class="md-symbol">##</span><h3>字體設定</h3><span class="setting-note">輸出前可隨時重建</span></div>
-              <div class="settings-grid">
-                <label class="range-field" for="font-size"><span><strong>字體大小</strong><small>基準顯示尺寸</small></span><span class="range-value"><output id="font-size-value">11</output> px</span><input id="font-size" type="range" min="8" max="24" step="0.5" value="11" /></label>
-                <label class="range-field" for="font-weight"><span><strong>字重感</strong><small>renderer 層近似調整</small></span><span class="range-value"><output id="font-weight-value">400</output></span><input id="font-weight" type="range" min="100" max="900" step="50" value="400" /></label>
-                <label class="range-field" for="font-shift-x"><span><strong>水平位移</strong><small>左右對齊</small></span><span class="range-value"><output id="font-shift-x-value">0</output></span><input id="font-shift-x" type="range" min="-3" max="3" step="0.1" value="0" /></label>
-                <label class="range-field" for="font-shift-y"><span><strong>垂直位移</strong><small>上下對齊</small></span><span class="range-value"><output id="font-shift-y-value">0.5</output></span><input id="font-shift-y" type="range" min="-3" max="3" step="0.1" value="0.5" /></label>
-                <label class="range-field full-range" for="font-oversample"><span><strong>清晰度</strong><small>oversample 越高，邊緣越平滑，但資源需求也越高</small></span><span class="range-value"><output id="font-oversample-value">4</output>x</span><input id="font-oversample" type="range" min="1" max="8" step="0.5" value="4" /></label>
+              <div id="font-preview" class="font-preview" hidden>
+                <p class="font-preview-label">預覽（近似，遊戲內可能略有差異）</p>
+                <p id="font-preview-sample" class="font-preview-sample">繁體中文 Aa0123 物品名稱樣本</p>
               </div>
 
+              <div class="subsection-heading"><h3>字體設定</h3><span class="setting-note">輸出前可隨時重建</span></div>
+              <div class="settings-grid">
+                <label class="range-field" for="font-size"><span><strong>字體大小</strong><small>基準顯示尺寸</small></span><span class="range-value"><output id="font-size-value">11</output> px</span><input id="font-size" type="range" min="8" max="24" step="0.5" value="11" /></label>
+                <label class="range-field" for="font-weight"><span><strong>略調顯示大小</strong><small>非真字重；要粗細請換字體檔</small></span><span class="range-value"><output id="font-weight-value">400</output></span><input id="font-weight" type="range" min="100" max="900" step="50" value="400" /></label>
+                <label class="range-field" for="font-shift-x"><span><strong>水平位移</strong><small>左右對齊</small></span><span class="range-value"><output id="font-shift-x-value">0</output></span><input id="font-shift-x" type="range" min="-3" max="3" step="0.1" value="0" /></label>
+                <label class="range-field" for="font-shift-y"><span><strong>垂直位移</strong><small>上下對齊</small></span><span class="range-value"><output id="font-shift-y-value">0.5</output></span><input id="font-shift-y" type="range" min="-3" max="3" step="0.1" value="0.5" /></label>
+                <label class="range-field full-range" for="font-oversample"><span><strong>清晰度</strong><small>oversample 越高越平滑，也更吃資源</small></span><span class="range-value"><output id="font-oversample-value">4</output>x</span><input id="font-oversample" type="range" min="1" max="8" step="0.5" value="4" /></label>
+              </div>
+
+              <label class="option-row compact-option" for="font-apply-current">
+                <input type="checkbox" id="font-apply-current" />
+                <span class="check-box" aria-hidden="true"></span>
+                <span><strong>建立後套用到目前整合包 resourcepacks</strong><small>需要先在翻譯頁選好整合包；若 resourcepacks 已有同名包會先備份。</small></span>
+              </label>
               <details class="advanced-details font-details"><summary>進階說明</summary><div class="advanced-copy"><p>字重感是 Minecraft 字體 renderer 的近似調整，不會改寫 TTF/OTF 的原始筆畫。如果要真正變粗或變細，請選用對應字重的字體檔，例如 Regular、Medium 或 Bold。</p><p>建立後會同時寫入 <code>default.json</code> 與 <code>uniform.json</code>，讓一般文字和 Unicode 文字都能使用。</p></div></details>
               <button type="button" id="btn-font-build" class="primary-button">建立字體資源包 <span>↗</span></button>
               <p class="footnote"><span>ⓘ</span>字體檔只會被複製進資源包，不會修改原始字體檔。</p>
@@ -249,8 +338,8 @@
               <div class="quote-note"><span>&gt;</span><p>分析只在本機進行，不會因為看到「翻譯」就把所有問題算在翻譯上。</p></div>
               <div class="field-block">
                 <label for="error-input">錯誤報告</label>
-                <p class="field-help">可貼上 crash report、latest.log，或遊戲顯示的錯誤碼。</p>
-                <textarea id="error-input" rows="14" placeholder="把錯誤文字貼在這裡…"></textarea>
+                <p class="field-help">優先貼完整 crash report；也可以貼 latest.log、debug.log。只貼「退出碼 -1」通常無法找到原因。</p>
+                <textarea id="error-input" rows="16" placeholder="請從 Description、Caused by 或第一個 ERROR 開始貼上…"></textarea>
               </div>
               <div class="action-area">
                 <button type="button" id="btn-diagnose" class="primary-button">開始分析 <span>↗</span></button>
@@ -281,6 +370,19 @@
 
 翻譯過程會顯示在這裡；完成後可以開啟輸出查看結果，翻譯檔已直接套用到遊戲。</pre>
           </section>
+          <section class="status-section metrics-card" aria-labelledby="metrics-title">
+            <div class="status-header"><div><p class="eyebrow">COVERAGE</p><h2 id="metrics-title">完整度／命中</h2></div></div>
+            <p id="metric-summary" class="metric-summary" aria-live="polite">尚未開始</p>
+            <div class="metric-grid" aria-label="補譯命中統計">
+              <div><span>術語表</span><strong id="metric-glossary">0</strong></div>
+              <div><span>TM</span><strong id="metric-tm">0</strong></div>
+              <div><span>共享庫</span><strong id="metric-shared">0</strong></div>
+              <div><span>AI</span><strong id="metric-ai">0</strong></div>
+              <div><span>略過</span><strong id="metric-skipped">0</strong></div>
+              <div><span>待補</span><strong id="metric-pending">—</strong></div>
+            </div>
+            <p class="metric-note">資料來自進度、日誌與完成摘要；完整清單仍以「覆蓋範圍說明.txt」為準。</p>
+          </section>
         </aside>
       </div>
     </main>
@@ -294,17 +396,17 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-states">按鈕何時出現</a><a href="#g-share">分享與參考翻譯</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v1.0.2</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
-          <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔，將簡體中文轉成台灣用語，並找出沒有繁中的英文文字。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>「翻譯結果位置」預設自動建立；想另外保存結果時，勾選選項並輸入或選取資料夾，留白會回到自動位置。</p></li><li><span>3</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在自訂 API 選項出現後直接填入自己的金鑰。</p></li><li><span>4</span><p>先決定是否勾選「套用前建立備份」，翻譯完成後會直接套用到遊戲。</p></li></ol></section>
+          <p class="eyebrow">PLAYER GUIDE / v0.1.0</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>按 Ctrl＋↑／↓，或按住 Ctrl 滾動滑鼠滾輪調整；點右上角的「介面 100%」可重設。</span></div>
+          <section><h2 id="g-translate">翻譯整合包</h2><p>這項服務會讀取模組整合包內的語言檔、FTB 任務、Patchouli 書本、鬆散或 ZIP 資料包、JAR 內書本，以及 KubeJS 明確的顯示 API 字串。簡體中文會轉成台灣用語，沒有繁中的英文才會進入補翻流程。使用 AI 時，工具只會把需要翻譯的文字送出，其餘掃描、分類、格式保護與打包都在本機完成。</p><ol class="guide-steps"><li><span>1</span><p>選取你實際遊玩的整合包資料夾，工具會嘗試偵測 Minecraft 版本。</p></li><li><span>2</span><p>「翻譯結果位置」預設自動建立；想另外保存結果時，勾選選項並輸入或選取資料夾，留白會回到自動位置。</p></li><li><span>3</span><p>選擇翻譯模式與品質：接續適合更新、九成略過適合已翻過的大包、重新翻譯適合更換 AI 譯法；品質可選介面優先、一般或劇情與書本優先。</p></li><li><span>4</span><p>需要補英文時勾選 AI；可使用代管服務，也可以在自訂 API 選擇服務商預設後只填 Key，Key 會以 `#` 顯示。</p></li><li><span>5</span><p>先決定是否勾選「套用前建立備份」，翻譯完成後會直接套用到遊戲；再次翻譯同一個整合包時，工具會先尋找相同位置且內容完整的備份。</p></li></ol><div class="guide-callout"><strong>FTB 任務補充是選用的。</strong><span>只有偵測到 FTB Quests 且有相容版本時才會出現；工具會顯示指令，完成翻譯後自動清理自己下載的輔助模組。</span></div></section>
           <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在翻譯頁手動指定。這會用來產生對應的資源包格式，補翻與修復工作階段也會沿用同一版本。</p></section>
-          <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>貼上閃退報告，分辨翻譯問題與模組／版本問題。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>
-          <section><h2 id="g-font">字體資源包</h2><p>字體資源包是獨立服務，不會翻譯文字。它會把你選的字體檔與 Minecraft 字體設定打包成資源包，協助模組介面與遊戲文字使用你喜歡的字體。</p><ul><li><strong>字體大小：</strong>調整 Minecraft renderer 使用的基準尺寸。</li><li><strong>字重感：</strong>做小幅的 renderer 層近似；不會改寫字體檔的真正筆畫。</li><li><strong>水平／垂直位移：</strong>修正字體在遊戲裡偏左、偏右、偏上或偏下。</li><li><strong>清晰度：</strong>調整 oversample。越高通常越平滑，也可能增加資源需求。</li></ul><div class="guide-callout"><strong>想要真正的粗體？</strong><span>請選用 Regular、Medium、SemiBold 或 Bold 等對應字重的字體檔。工具不會修改或重新繪製字體。</span></div></section>
-          <section><h2 id="g-apply">輸出與套用</h2><p>翻譯完成會直接套用到正確的 Minecraft 資料夾；「套用前建立備份」勾選時，工具會把備份放在「翻譯結果」資料夾。未勾選時不會建立備份，也不能用「還原上一次套用」回復這次操作。分享檔只包含可安裝內容，不會帶出工作路徑、備份或工作階段紀錄。</p><div class="guide-callout guide-callout-warn"><strong>套用前請關閉 Minecraft。</strong><span>你可以在錯誤分析頁還原最近一次備份、刪除全部備份，或回到翻譯頁完整刪除結果資料夾。</span></div></section>
-          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。關閉 AI 仍可以處理既有中文、簡繁轉換與資源包輸出。開發者代管 API 額度有限，使用前必須通過 Discord 會員資格與 Cloudflare 安全驗證；驗證會在服務端再次執行，舊版工具不能略過。你也可以改用自己的金鑰與 API 位置，自訂 API 不需要這些驗證。</p><p>API 金鑰只儲存在本機設定檔，不會寫進翻譯結果或程式預設值。送往 AI 的內容只包含待翻譯字串與必要的通用語境。請自行確認服務條款，不要送出個人資料或私密伺服器資訊。</p></section>
-          <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲出現紅字或閃退怎麼辦？</strong>先停用資源包，確認原本整合包可正常啟動。語言檔工具不會修復缺少模組、版本不相容或世界存檔問題。</p><p><strong>中文字變成方框怎麼辦？</strong>使用字體資源包，選擇支援繁中的字體檔，再到遊戲資源包選單啟用。</p><p><strong>圖片裡的字會翻譯嗎？</strong>不會。本工具目前只處理遊戲文字與相關語言檔。</p><p><strong>翻譯一定完美嗎？</strong>不一定。模組上下文可能不足，請在遊戲裡檢查結果，並用術語表固定重要名稱。</p></section>
+          <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>優先貼完整 crash report，也支援 latest.log／debug.log；顯示證據、可疑模組與下一步。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名，例如物品、怪物或機器名稱。</td></tr></tbody></table></section>
+          <section><h2 id="g-font">字體資源包</h2><p>字體資源包是獨立服務，不會翻譯文字。它會把你選的 TTF／OTF 字體檔與 Minecraft 字體設定打包成資源包，協助模組介面與遊戲文字使用你喜歡的字體。若已在翻譯頁選好整合包，可勾選建立後直接套用到目前實例 resourcepacks；同名資源包會先備份。</p><ul><li><strong>字體大小：</strong>調整 Minecraft renderer 使用的基準尺寸。</li><li><strong>字重感：</strong>做小幅的 renderer 層近似；不會改寫字體檔的真正筆畫。</li><li><strong>水平／垂直位移：</strong>修正字體在遊戲裡偏左、偏右、偏上或偏下。</li><li><strong>清晰度：</strong>調整 oversample。越高通常越平滑，也可能增加資源需求。</li></ul><div class="guide-callout"><strong>想要真正的粗體？</strong><span>請選用 Regular、Medium、SemiBold 或 Bold 等對應字重的字體檔。工具不會修改或重新繪製字體。</span></div></section>
+          <section><h2 id="g-apply">輸出與套用</h2><p>翻譯完成會直接套用到正確的 Minecraft 資料夾；「套用前建立備份」勾選時，工具會把備份放在「翻譯結果」資料夾。再次翻譯同一個整合包與同一個套用位置時，只要既有備份涵蓋這次要覆蓋的檔案，就會直接沿用，不會再複製一份；如果出現新的、尚未備份的目標檔案，工具才會建立新的備份。未勾選時不會建立備份，也不能用「還原上一次套用」回復這次操作。分享檔只包含可安裝內容，不會帶出工作路徑、備份或工作階段紀錄。</p><div class="guide-callout guide-callout-warn"><strong>套用前請關閉 Minecraft。</strong><span>你可以在錯誤分析頁還原最近一次備份、刪除全部備份，或回到翻譯頁完整刪除結果資料夾。</span></div></section>
+          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。關閉 AI 仍可以處理既有中文、簡繁轉換與資源包輸出。開發者代管 API 額度有限，使用前必須通過 Discord 會員資格與 Cloudflare 安全驗證；驗證會在服務端再次執行，舊版工具不能略過。你也可以改用自己的 Key；在自訂 API 選擇服務商預設即可，不需要手動填 Base URL。</p><p>API Key 只儲存在本機設定檔，輸入與已儲存狀態都只顯示固定數量的 `#`，不會寫進翻譯結果或程式預設值。送往 AI 的內容只包含待翻譯字串與必要的通用語境。請自行確認服務條款，不要送出個人資料或私密伺服器資訊。</p></section>
+          <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲出現紅字或閃退怎麼辦？</strong>先到「錯誤分析」貼完整 crash report。只貼退出碼 -1 不夠，請保留 Description、Caused by 與堆疊。工具會把遊戲退出碼和真正錯誤分開顯示。</p><p><strong>工具說證據不足怎麼辦？</strong>重新產生一次錯誤，再同時提供 crash-reports/*.txt、logs/latest.log 和 logs/debug.log。AllTheLeaks、ModernUI、GC 或關閉遊戲的最後幾行通常只是背景訊息，不一定是根因。</p><p><strong>中文字變成方框怎麼辦？</strong>使用字體資源包，選擇支援繁中的字體檔，再到遊戲資源包選單啟用。</p><p><strong>圖片裡的字會翻譯嗎？</strong>不會。本工具目前只處理遊戲文字與相關語言檔。</p><p><strong>翻譯一定完美嗎？</strong>不一定。模組上下文可能不足，請在遊戲裡檢查結果，並用術語表固定重要名稱。</p></section>
           <section><h2 id="g-disclaimer">免責說明</h2><div class="disclaimer"><p>本工具由 ZeitFrei 以方便玩家整理模組包文字為目的提供。翻譯結果可能因模組版本、原文上下文、第三方 AI 服務或字體檔品質而有錯誤、不完整或不符合個人偏好的情況。</p><p>使用者應自行確認模組整合包、字體檔、翻譯內容及第三方服務的授權與使用條款。請不要使用你沒有權利散布的字體或內容。</p><p>本工具不保證遊戲一定能啟動、不保證翻譯完整、不負責模組本身的錯誤、存檔損壞、版本衝突、第三方 API 費用或任何因使用輸出結果造成的直接或間接損失。套用前請備份整合包與存檔。</p></div></section>
-          <section><h2 id="g-states">按鈕何時出現</h2><p>工具會依目前階段隱藏不能用或不需要的按鈕：尚未選實例時只顯示選取資料夾；翻譯進行中只保留停止；完成後才顯示再次複查、分享與開啟輸出。錯誤分析頁的還原與刪除備份只會在選好實例後出現；翻譯頁的「刪除結果」會刪除工具建立的整個「翻譯結果」資料夾。AI 設定只在勾選 AI 時出現，自訂 API 欄位在選擇自訂 API 後會直接展開。</p></section>
-          <section><h2 id="g-share">分享與參考翻譯</h2><p>參考翻譯會優先使用本機找到的 CTE2 等資料，只補缺少的語言鍵，不覆蓋原本已有的繁中。分享不會按一下就上傳：請先檢查遊戲，再勾選兩項確認。分享檔會放到獨立 R2，連結保留 24 小時；分享頁含 cloud.zeitfrei.uk 遊戲下載與 ZeitFrei 工具箱連結，也能被論壇等第三方平台讀取預覽。</p><p>更新或重複翻譯時，工具會先比對本機與匿名社群翻譯記憶。完全相同或只是空白不同的文字可以重用；相似但上下文不一致的文字不會硬套，發現不同譯文會標記衝突。</p></section>
+          <section><h2 id="g-states">按鈕何時出現</h2><p>工具會依目前階段隱藏不能用或不需要的按鈕：尚未選實例時只顯示選取資料夾；翻譯進行中只保留停止；完成後才顯示再次複查、分享與開啟輸出。錯誤分析頁的還原與刪除備份只有在偵測到工具建立的備份時才出現；翻譯頁的「刪除結果」會刪除工具建立的整個「翻譯結果」資料夾。AI 設定只在勾選 AI 時出現，自訂 API 欄位在選擇自訂 API 後會直接展開。</p></section>
+          <section><h2 id="g-share">分享與參考翻譯</h2><p>參考翻譯會優先使用本機找到的 CTE2、CFPA、繁中／簡中資料夾或 zip，只補缺少的語言鍵，不覆蓋原本已有的繁中；簡中參考會轉成台灣用語，且不會上傳到共享 R2。分享不會按一下就上傳：請先檢查遊戲，再勾選兩項確認。分享檔會放到獨立 R2，連結保留 24 小時；分享頁含 cloud.zeitfrei.uk 遊戲下載與 ZeitFrei 工具箱連結，也能被論壇等第三方平台讀取預覽。</p><p>更新或重複翻譯時，工具會先比對本機與匿名社群翻譯記憶。完全相同或只是空白不同的文字可以重用；相似但上下文不一致的文字不會硬套，發現不同譯文會標記衝突。</p></section>
           <p class="guide-footer">zeitfrei / modpack-i18n · 請在使用前閱讀以上說明</p>
         </main>
       </div>

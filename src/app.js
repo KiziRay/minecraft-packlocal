@@ -23,6 +23,156 @@ let aiModeChangePromise = Promise.resolve();
 let translationState = "idle";
 let shareConfirmationOpen = false;
 let shareUploadInFlight = false;
+let apiKeyDraft = "";
+let apiKeySavedMask = "";
+let apiKeyEditing = false;
+let hasApplyBackups = false;
+let backupProbeToken = 0;
+let backupProbeTimer = 0;
+let translationHelperStatus = null;
+let coverageSkippedSeen = new Set();
+let coverageMetrics = {
+  glossary: 0,
+  tm: 0,
+  shared: 0,
+  ai: 0,
+  pending: null,
+  skipped: 0,
+  summary: "尚未開始",
+};
+const STARTUP_SKELETON_MAX_MS = 320;
+const PAGE_SWITCH_SKELETON_MS = 160;
+const CONTENT_FADE_MS = 260;
+let startupContentRevealed = false;
+let pageTransitionToken = 0;
+
+function prefersReducedMotion() {
+  return !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+}
+
+function waitMs(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function waitForStartupSkeleton(tasks) {
+  if (prefersReducedMotion()) return;
+  const guarded = tasks.map((task) => Promise.resolve(task).catch(() => null));
+  await Promise.race([Promise.allSettled(guarded), waitMs(STARTUP_SKELETON_MAX_MS)]);
+}
+
+function revealInitialContent() {
+  if (!document.body || startupContentRevealed) return;
+  startupContentRevealed = true;
+  document.body.classList.remove("is-loading");
+  document.querySelectorAll(".page-panel.is-loading, .status-section.is-loading").forEach((el) => {
+    el.classList.remove("is-loading");
+  });
+  if (prefersReducedMotion()) return;
+  document.body.classList.add("content-fade-in");
+  window.setTimeout(() => {
+    document.body.classList.remove("content-fade-in");
+  }, CONTENT_FADE_MS + 90);
+}
+
+function revealPagePanel(panel, withSkeleton = true) {
+  if (!panel) return;
+  const token = ++pageTransitionToken;
+  document.querySelectorAll(".page-panel.is-loading").forEach((el) => {
+    if (el !== panel) el.classList.remove("is-loading");
+  });
+  panel.classList.remove("content-fade-in");
+  if (prefersReducedMotion()) {
+    panel.classList.remove("is-loading");
+    return;
+  }
+  if (withSkeleton) panel.classList.add("is-loading");
+  window.setTimeout(() => {
+    window.requestAnimationFrame(() => {
+      if (token !== pageTransitionToken || panel.hidden) return;
+      panel.classList.remove("is-loading");
+      panel.classList.add("content-fade-in");
+      window.setTimeout(() => {
+        if (token === pageTransitionToken) panel.classList.remove("content-fade-in");
+      }, CONTENT_FADE_MS + 90);
+    });
+  }, withSkeleton ? PAGE_SWITCH_SKELETON_MS : 0);
+}
+
+function resetCoverageMetrics(summary = "等待翻譯開始") {
+  coverageSkippedSeen = new Set();
+  coverageMetrics = {
+    glossary: 0,
+    tm: 0,
+    shared: 0,
+    ai: 0,
+    pending: null,
+    skipped: 0,
+    summary,
+  };
+  renderCoverageMetrics();
+}
+
+function renderCoverageMetrics() {
+  const setText = (id, value) => {
+    const el = $(id);
+    if (el) el.textContent = String(value);
+  };
+  setText("metric-glossary", coverageMetrics.glossary);
+  setText("metric-tm", coverageMetrics.tm);
+  setText("metric-shared", coverageMetrics.shared);
+  setText("metric-ai", coverageMetrics.ai);
+  setText("metric-skipped", coverageMetrics.skipped);
+  setText("metric-pending", coverageMetrics.pending == null ? "—" : coverageMetrics.pending);
+  setText("metric-summary", coverageMetrics.summary || "等待資料");
+}
+
+function consumeCoverageMessage(message) {
+  const text = String(message || "");
+  if (!text) return;
+  let changed = false;
+  const finalHit = text.match(/補譯\s+(\d+)\s+條（術語表\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)、AI\s+(\d+)）/);
+  if (finalHit) {
+    coverageMetrics.glossary = Math.max(coverageMetrics.glossary, Number(finalHit[2]) || 0);
+    coverageMetrics.shared = Math.max(coverageMetrics.shared, Number(finalHit[3]) || 0);
+    coverageMetrics.tm = Math.max(coverageMetrics.tm, Number(finalHit[4]) || 0);
+    coverageMetrics.ai = Math.max(coverageMetrics.ai, Number(finalHit[5]) || 0);
+    coverageMetrics.summary = `已命中／補譯 ${finalHit[1]} 條`;
+    changed = true;
+  }
+  const freeHit = text.match(/免費命中\s+(\d+)\s+句（術語表\s+(\d+)、翻譯記憶\s+(\d+)）.*?只剩\s+(\d+)\s+句/);
+  if (freeHit) {
+    coverageMetrics.glossary = Math.max(coverageMetrics.glossary, Number(freeHit[2]) || 0);
+    coverageMetrics.tm = Math.max(coverageMetrics.tm, Number(freeHit[3]) || 0);
+    coverageMetrics.pending = Number(freeHit[4]) || coverageMetrics.pending;
+    coverageMetrics.summary = `免費命中 ${freeHit[1]} 句`;
+    changed = true;
+  }
+  const sharedHit = text.match(/社群共享庫命中\s+(\d+)\s+條/);
+  if (sharedHit) {
+    coverageMetrics.shared = Math.max(coverageMetrics.shared, Number(sharedHit[1]) || 0);
+    changed = true;
+  }
+  const aiHit = text.match(/AI\s+(?:新補|新譯|翻譯)\s*(?:約\s*)?(\d+)\s*(?:條|句)/);
+  if (aiHit) {
+    coverageMetrics.ai = Math.max(coverageMetrics.ai, Number(aiHit[1]) || 0);
+    changed = true;
+  }
+  const pendingHit = text.match(/(?:剩餘|仍缺|待補|尚可 AI 補|尚待本機資料或手動翻譯)(?:英文)?(?:約)?\s*(\d+)\s*條/);
+  if (pendingHit) {
+    coverageMetrics.pending = Number(pendingHit[1]) || 0;
+    changed = true;
+  }
+  for (const match of text.matchAll(/完整度略過：([^；\n]+)/g)) {
+    coverageSkippedSeen.add(match[0]);
+    coverageMetrics.skipped = coverageSkippedSeen.size;
+    changed = true;
+  }
+  if (/覆蓋範圍說明|本次來源明細|任務|覆寫|Origins|KubeJS|ZIP 文字/.test(text)) {
+    coverageMetrics.summary = coverageMetrics.summary === "尚未開始" ? "來源統計更新中" : coverageMetrics.summary;
+    changed = true;
+  }
+  if (changed) renderCoverageMetrics();
+}
 
 function clampUiScale(value) {
   const parsed = Number(value);
@@ -123,6 +273,7 @@ function setAutoOutputDir(path) {
     ? "翻譯會在這個位置建立「翻譯結果」；完成後直接套用到整合包資料夾。"
     : "請先選擇整合包資料夾。";
   syncOutputField();
+  scheduleBackupStateRefresh();
 }
 
 function resultWorkDir(outputDir) {
@@ -342,6 +493,16 @@ function formatElapsed(ms) {
   return m + " 分 " + r + " 秒";
 }
 
+function formatProgressEta() {
+  const percent = Number(lastRealPercent) || 0;
+  if (!progressBusy || !progressStartedAt || percent < 3 || percent >= 99) return "";
+  const elapsed = Date.now() - progressStartedAt;
+  if (elapsed < 2500) return "";
+  const remaining = Math.round((elapsed * (100 - percent)) / percent);
+  if (!Number.isFinite(remaining) || remaining <= 0 || remaining > 24 * 60 * 60 * 1000) return "";
+  return " · 預估剩餘 " + formatElapsed(remaining);
+}
+
 function setProgBarWorking(on) {
   const fill = $("prog-fill");
   const bar = fill && fill.parentElement;
@@ -384,10 +545,10 @@ function startProgressHeartbeat() {
     if (msgEl) {
       if (stuckMs > 2000) {
         msgEl.textContent =
-          baseMsg + " · 已進行 " + elapsed + " · 仍在運作，請稍候";
+          baseMsg + " · 已進行 " + elapsed + formatProgressEta() + " · 仍在運作，請稍候";
         setProgBarWorking(true);
       } else {
-        msgEl.textContent = baseMsg + " · 已進行 " + elapsed;
+        msgEl.textContent = baseMsg + " · 已進行 " + elapsed + formatProgressEta();
         setProgBarWorking(false);
       }
     }
@@ -412,11 +573,12 @@ function setProgress(percent, message, opts) {
   $("prog-pct").textContent = Math.floor(showP >= 100 ? 100 : showP) + "%";
   if (message) {
     lastRealMessage = message;
+    consumeCoverageMessage(message);
     const elapsed =
       progressBusy && progressStartedAt
         ? " · 已進行 " + formatElapsed(Date.now() - progressStartedAt)
         : "";
-    $("prog-msg").textContent = message + elapsed;
+    $("prog-msg").textContent = message + elapsed + formatProgressEta();
   }
   updateLinearSteps(p, message, failed);
   setProgBarWorking(false);
@@ -427,34 +589,6 @@ function setProgress(percent, message, opts) {
       lastProgressLogKey = key;
       appendLog(Math.floor(p) + "%  " + message);
     }
-  }
-}
-
-async function onApply() {
-  const instancePath = ($("instance").value || "").trim();
-  const outputDir = selectedOutputDir();
-  if (!instancePath) return log("套用需要「遊戲資料夾」。");
-  if (!outputDir) return log("套用需要「翻譯結果」位置。");
-  setBusy(true);
-  lastProgressLogKey = "";
-  clearLog("套用到遊戲");
-  appendLog("請先完全關閉 Minecraft。", "warn");
-  setProgress(5, "套用中…");
-  try {
-    const result = await invoke("apply_translation_to_game", {
-      instancePath,
-      outputDir,
-      packName: ($("pack-name").value || "").trim() || null,
-      backupBeforeApply: shouldBackupBeforeApply(),
-    });
-    setProgress(100, "套用完成");
-    setLogFinal(result.playerSummary || result.player_summary || JSON.stringify(result, null, 2));
-  } catch (e) {
-    setProgress(0, "套用失敗", { failed: true });
-    appendError("套用失敗");
-    appendError(formatInvokeError(e));
-  } finally {
-    setBusy(false);
   }
 }
 
@@ -485,6 +619,12 @@ function setBusy(busy) {
     "btn-save-adv",
     "use-ai",
     "backup-before-apply",
+    "translation-mode",
+    "translation-quality",
+    "api-provider",
+    "api-key",
+    "base-url",
+    "api-model",
     "choose-output-dir",
     "ai-source-managed",
     "ai-source-custom",
@@ -502,6 +642,7 @@ function setBusy(busy) {
     "btn-font-out",
     "btn-font-build",
     "btn-reference-pick",
+    "btn-reference-file",
     "btn-share-confirm",
     "btn-share-cancel",
     "font-size",
@@ -509,6 +650,7 @@ function setBusy(busy) {
     "font-shift-x",
     "font-shift-y",
     "font-oversample",
+    "font-apply-current",
     "btn-glossary",
     "target-version",
     "tab-translate",
@@ -531,9 +673,11 @@ function setBusy(busy) {
   syncUiState();
 }
 
-/** 分頁：translate | font */
-function showAppPage(page) {
+/** 分頁：translate | font | diagnose */
+function showAppPage(page, opts = {}) {
   const name = page === "font" || page === "diagnose" ? page : "translate";
+  const previous = document.body.dataset.appPage || "translate";
+  const changed = previous !== name;
   const pageTr = $("page-translate");
   const pageFont = $("page-font");
   const pageDiagnose = $("page-diagnose");
@@ -566,6 +710,8 @@ function showAppPage(page) {
   }
   document.body.dataset.appPage = name;
   syncUiState();
+  const activePanel = name === "font" ? pageFont : name === "diagnose" ? pageDiagnose : pageTr;
+  if (changed && !opts.skipTransition) revealPagePanel(activePanel, opts.skeleton !== false);
 }
 
 function setTranslationState(state) {
@@ -590,17 +736,29 @@ function syncUiState() {
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
 
-  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details"]
+  ["field-output", "field-pack-name", "field-version", "translation-options", "translation-options-heading", "reference-details", "coverage-tier-block"]
     .forEach((id) => toggleHidden(id, !hasInstance));
   toggleHidden("btn-run", !hasInstance || progressBusy);
   toggleHidden("btn-supplement", !complete || locked);
   toggleHidden("btn-repair", !failed || locked);
   toggleHidden("btn-glossary", !hasInstance || locked);
   toggleHidden("btn-package", !complete || locked);
-  toggleHidden("btn-open", page === "diagnose" || !(hasOutput && (page === "font" ? !!($("font-output")?.value || "").trim() : true)));
+  const fontOutReady = !!($("font-output")?.value || "").trim();
+  const translateOutReady = hasOutput;
+  const fontApplyCurrent = $("font-apply-current");
+  if (fontApplyCurrent) {
+    fontApplyCurrent.disabled = locked || !hasInstance;
+  }
+  toggleHidden(
+    "btn-open",
+    page === "diagnose" ||
+      (page === "font" ? !fontOutReady : page === "translate" ? !translateOutReady : true)
+  );
   toggleHidden("btn-diagnose-latest", !hasInstance || locked);
-  toggleHidden("btn-restore", !hasInstance || locked);
-  toggleHidden("btn-delete-backups", !hasInstance || locked);
+  toggleHidden("btn-restore", !hasInstance || !hasApplyBackups || locked);
+  toggleHidden("btn-delete-backups", !hasInstance || !hasApplyBackups || locked);
+
+  syncTranslationHelperPanel();
 
   const packageButton = $("btn-package");
   if (packageButton) packageButton.disabled = !complete || locked;
@@ -614,6 +772,132 @@ function syncUiState() {
 
   syncAiPanel(false);
   syncOutputField();
+}
+
+function syncTranslationHelperPanel() {
+  const panel = $("translation-helper-panel");
+  if (!panel) return;
+  const status = translationHelperStatus;
+  const hasInstance = !!($("instance")?.value || "").trim();
+  const needed = !!status?.needed && hasInstance;
+  panel.hidden = !needed;
+  if (!needed) return;
+  const message = $("translation-helper-message");
+  if (message) message.textContent = status.message || "這是選用的任務補充步驟。";
+  const command = $("translation-helper-command");
+  const commandText = $("translation-helper-command-text");
+  const hasCommand = !!status.command && ["installed", "existing"].includes(status.state);
+  if (command) command.hidden = !hasCommand;
+  if (commandText) commandText.textContent = status.command || "";
+  const prepare = $("btn-helper-prepare");
+  if (prepare) {
+    prepare.hidden = status.state !== "available" || progressBusy;
+    prepare.disabled = progressBusy;
+    prepare.textContent = "準備任務補充";
+  }
+  const rescan = $("btn-helper-rescan");
+  if (rescan) {
+    const canRescan = status.supported && ["installed", "existing"].includes(status.state);
+    rescan.hidden = !canRescan || progressBusy;
+    rescan.disabled = progressBusy;
+  }
+  const cleanup = $("btn-helper-cleanup");
+  if (cleanup) {
+    cleanup.hidden = !status.installedByTool || progressBusy;
+    cleanup.disabled = progressBusy;
+  }
+}
+
+async function refreshTranslationHelper() {
+  const instancePath = ($("instance")?.value || "").trim();
+  if (!instancePath) {
+    translationHelperStatus = null;
+    syncUiState();
+    return;
+  }
+  try {
+    translationHelperStatus = await invoke("inspect_translation_helper_cmd", {
+      instancePath,
+      outputDir: selectedOutputDir() || null,
+    });
+  } catch (_) {
+    translationHelperStatus = null;
+  }
+  syncUiState();
+}
+
+async function prepareTranslationHelper() {
+  const instancePath = ($("instance")?.value || "").trim();
+  const outputDir = selectedOutputDir();
+  if (!instancePath || !outputDir) return log("請先選擇遊戲資料夾，讓工具知道要把狀態放在哪裡。");
+  if (progressBusy) return;
+  try {
+    const result = await invoke("prepare_translation_helper_cmd", { instancePath, outputDir });
+    translationHelperStatus = result;
+    appendLog(result.message || "任務補充已準備好。", "info");
+    if (result.command) appendLog("進入遊戲後執行：" + result.command, "info");
+  } catch (e) {
+    appendLog("任務補充已跳過：" + formatInvokeError(e), "warn");
+    await refreshTranslationHelper();
+  }
+  syncUiState();
+}
+
+async function rescanAfterTranslationHelper() {
+  if (
+    !translationHelperStatus ||
+    !translationHelperStatus.supported ||
+    !["installed", "existing"].includes(translationHelperStatus.state)
+  ) return;
+  appendLog("開始重新掃描剛剛匯出的任務文字。", "info");
+  await onRun();
+}
+
+async function cleanupPreparedTranslationHelper() {
+  const instancePath = ($("instance")?.value || "").trim();
+  const outputDir = selectedOutputDir();
+  if (!instancePath || !outputDir) return;
+  try {
+    const result = await invoke("cleanup_translation_helper_cmd", { instancePath, outputDir });
+    if (result.changed) {
+      appendLog(result.message || "已清理暫時輔助模組。", "info");
+      translationHelperStatus = { ...result, needed: false, supported: false, state: "cleaned" };
+    }
+  } catch (e) {
+    appendLog("翻譯已完成，但輔助模組尚未刪除；請關閉遊戲後再試：" + formatInvokeError(e), "warn");
+  }
+  syncUiState();
+}
+
+async function cleanupTranslationHelperFromPanel() {
+  await cleanupPreparedTranslationHelper();
+  await refreshTranslationHelper();
+}
+
+function scheduleBackupStateRefresh() {
+  if (backupProbeTimer) window.clearTimeout(backupProbeTimer);
+  backupProbeTimer = window.setTimeout(() => {
+    backupProbeTimer = 0;
+    refreshBackupState();
+  }, 180);
+}
+
+async function refreshBackupState() {
+  const instancePath = ($("instance")?.value || "").trim();
+  const outputDir = selectedOutputDir() || null;
+  const token = ++backupProbeToken;
+  if (!instancePath) {
+    hasApplyBackups = false;
+    syncUiState();
+    return;
+  }
+  try {
+    const found = await invoke("has_apply_backups_cmd", { instancePath, outputDir });
+    if (token === backupProbeToken) hasApplyBackups = !!found;
+  } catch (_) {
+    if (token === backupProbeToken) hasApplyBackups = false;
+  }
+  if (token === backupProbeToken) syncUiState();
 }
 
 async function pickDir(title) {
@@ -665,8 +949,11 @@ async function uploadSharePackage() {
     if (!auth || !(auth.loggedIn || auth.logged_in) || !(auth.inGuild || auth.in_guild)) {
       return log("分享前請先登入 Discord 並加入 ZeitFrei 官方伺服器。");
     }
-    const turnstile = await invoke("turnstile_status");
-    if (!turnstile || !(turnstile.verified)) {
+    const ai = await invoke("ai_status");
+    const turnstileRequired = ai?.turnstileRequired ?? ai?.turnstile_required;
+    const turnstileVerified = !!(ai && (ai.turnstileVerified || ai.turnstile_verified));
+    // 代管模式且 Worker 強制 Turnstile 時才擋；自訂 API 不走此閘門。
+    if ((ai?.aiMode === "managed" || ai?.ai_mode === "managed") && turnstileRequired !== false && !turnstileVerified) {
       if (!(await beginTurnstileVerification())) return;
     }
     const name = ($("pack-name").value || "模組包翻譯分享").trim();
@@ -729,6 +1016,9 @@ async function refreshAiStatus() {
       (s.serviceAvailable ?? s.service_available) !== false
     );
     const managedTurnstileReady = !!(s && (s.turnstileVerified || s.turnstile_verified));
+    const managedTurnstileRequired = !(
+      s && (s.turnstileRequired === false || s.turnstile_required === false)
+    );
     syncAiModeUi(mode);
     statusEl.textContent = ready
       ? usingOwnKey
@@ -770,6 +1060,8 @@ async function refreshAiStatus() {
       if (turnstileTitle) {
         turnstileTitle.textContent = turnstileVerified
           ? "Cloudflare 安全驗證完成"
+          : !managedTurnstileRequired
+            ? "Cloudflare 安全驗證（目前不需要）"
           : identityReady
             ? "Cloudflare 尚未驗證"
             : "Cloudflare 等待 Discord 驗證";
@@ -777,12 +1069,15 @@ async function refreshAiStatus() {
       if (turnstileNote) {
         turnstileNote.textContent = turnstileVerified
           ? "短效憑證只保留在本次開啟的工具記憶體中。"
+          : !managedTurnstileRequired
+            ? "目前服務端未要求這項驗證。"
           : identityReady
             ? "完成後即可使用開發者提供的翻譯額度。"
             : "先完成 Discord 登入與伺服器資格確認。";
       }
       if ($("btn-turnstile-verify")) {
-        $("btn-turnstile-verify").hidden = !identityReady || turnstileVerified;
+        $("btn-turnstile-verify").hidden =
+          !identityReady || turnstileVerified || !managedTurnstileRequired;
       }
       if (noteEl) {
         noteEl.textContent = ready
@@ -805,12 +1100,116 @@ async function refreshAiStatus() {
 async function refreshApiSettings() {
   try {
     const s = await invoke("get_api_settings");
+    initApiKeyMask();
+    setApiKeyMask(String(s.keyMasked || s.key_masked || ""));
     syncAiModeUi(String(s.aiMode || s.ai_mode || "managed"));
-    // 不在介面顯示具體服務商網址
+    syncCustomProviderUi(String(s.provider || "deepseek"));
     const bu = (s.baseUrl || s.base_url || "").trim();
-    $("base-url").value = /deepseek/i.test(bu) ? "" : bu;
+    const model = (s.model || "").trim();
+    if ($("base-url")) $("base-url").value = bu;
+    if ($("api-model")) $("api-model").value = model;
   } catch (e) {
     /* AI 狀態由 refreshAiStatus 顯示；設定讀取失敗不阻擋本機翻譯。 */
+  }
+}
+
+function renderApiKeyMask() {
+  const input = $("api-key");
+  if (!input) return;
+  input.value = apiKeyEditing
+    ? "#".repeat(Math.min(apiKeyDraft.length, 128))
+    : apiKeySavedMask;
+}
+
+function setApiKeyMask(mask) {
+  apiKeyDraft = "";
+  apiKeySavedMask = mask ? "########" : "";
+  apiKeyEditing = false;
+  renderApiKeyMask();
+}
+
+function replaceApiKeySelection(text) {
+  const input = $("api-key");
+  if (!input) return;
+  const start = Math.max(0, Math.min(apiKeyDraft.length, input.selectionStart ?? apiKeyDraft.length));
+  const end = Math.max(start, Math.min(apiKeyDraft.length, input.selectionEnd ?? start));
+  apiKeyDraft = apiKeyDraft.slice(0, start) + text + apiKeyDraft.slice(end);
+  renderApiKeyMask();
+  const cursor = start + text.length;
+  input.focus();
+  input.setSelectionRange(cursor, cursor);
+}
+
+function initApiKeyMask() {
+  const input = $("api-key");
+  if (!input || input.dataset.maskReady === "true") return;
+  input.dataset.maskReady = "true";
+  input.addEventListener("focus", () => {
+    apiKeyEditing = true;
+    renderApiKeyMask();
+    input.setSelectionRange(apiKeyDraft.length, apiKeyDraft.length);
+  });
+  input.addEventListener("blur", () => {
+    if (!apiKeyDraft) {
+      apiKeyEditing = false;
+      renderApiKeyMask();
+    }
+  });
+  input.addEventListener("beforeinput", (event) => {
+    if (!apiKeyEditing) return;
+    const type = event.inputType || "";
+    if (type === "insertText" || type === "insertCompositionText" || type === "insertFromDrop") {
+      event.preventDefault();
+      replaceApiKeySelection(event.data || "");
+    } else if (type === "insertFromPaste" && event.data != null) {
+      event.preventDefault();
+      replaceApiKeySelection(event.data);
+    } else if (type === "deleteContentBackward" || type === "deleteContentForward" || type === "deleteByCut") {
+      event.preventDefault();
+      const inputEl = $("api-key");
+      const start = inputEl?.selectionStart ?? apiKeyDraft.length;
+      const end = inputEl?.selectionEnd ?? start;
+      if (start !== end) {
+        replaceApiKeySelection("");
+      } else if (type === "deleteContentBackward" && start > 0) {
+        inputEl.setSelectionRange(start - 1, start);
+        replaceApiKeySelection("");
+      } else if (type === "deleteContentForward" && start < apiKeyDraft.length) {
+        inputEl.setSelectionRange(start, start + 1);
+        replaceApiKeySelection("");
+      }
+    }
+  });
+  input.addEventListener("paste", (event) => {
+    event.preventDefault();
+    replaceApiKeySelection(event.clipboardData?.getData("text") || "");
+  });
+  input.addEventListener("drop", (event) => event.preventDefault());
+}
+
+function syncCustomProviderUi(provider) {
+  const supported = ["deepseek", "glm", "openai", "qwen", "other"];
+  const normalized = supported.includes(provider) ? provider : "deepseek";
+  const select = $("api-provider");
+  if (select) select.value = normalized;
+  const isOther = normalized === "other";
+  const fields = $("custom-endpoint-fields");
+  if (fields) fields.hidden = !isOther;
+  const base = $("base-url");
+  const model = $("api-model");
+  if (base) base.disabled = !isOther;
+  if (model) model.disabled = !isOther;
+  const note = $("api-provider-note");
+  if (note) {
+    note.textContent = isOther
+      ? "請再填寫 Base URL 與模型名稱；一般使用者不需要改這些設定。"
+      : normalized === "glm"
+        ? "只要填 API Key，工具會自動使用智譜 GLM 的官方設定。"
+        : normalized === "openai"
+          ? "只要填 API Key，工具會自動使用 OpenAI 的官方設定。"
+          : normalized === "qwen"
+            ? "只要填 API Key，工具會自動使用通義千問的官方設定。"
+            : "只要填 API Key，工具會自動使用 DeepSeek 的官方設定。";
   }
 }
 
@@ -839,7 +1238,10 @@ async function ensureAiReadyForAction() {
     const inGuild = !!(status && (status.inGuild || status.in_guild));
     const serviceAvailable = status && (status.serviceAvailable ?? status.service_available) !== false;
     const turnstileVerified = !!(status && (status.turnstileVerified || status.turnstile_verified));
-    if (loggedIn && inGuild && serviceAvailable && !turnstileVerified) {
+    const turnstileRequired = !(
+      status && (status.turnstileRequired === false || status.turnstile_required === false)
+    );
+    if (loggedIn && inGuild && serviceAvailable && turnstileRequired && !turnstileVerified) {
       if (await beginTurnstileVerification()) {
         status = await refreshAiStatus();
         return !!(status && status.ready !== false);
@@ -998,8 +1400,10 @@ async function refreshReferencePack() {
 async function onSaveAdv() {
   try {
     await invoke("save_api_settings_cmd", {
-      apiKey: ($("api-key").value || "").trim(),
+      apiKey: apiKeyDraft.trim(),
       baseUrl: ($("base-url").value || "").trim(),
+      provider: ($("api-provider").value || "deepseek").trim(),
+      model: ($("api-model").value || "").trim(),
     });
     $("api-key").value = ""; // 輸入框清空，畫面上不留金鑰
     await refreshApiSettings();
@@ -1031,6 +1435,7 @@ async function onRun() {
   setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始翻譯");
+  resetCoverageMetrics("翻譯統計蒐集中");
   if ($("btn-package")) $("btn-package").disabled = true;
   appendLog(
     shouldBackupBeforeApply()
@@ -1048,15 +1453,20 @@ async function onRun() {
       backupBeforeApply: shouldBackupBeforeApply(),
       referencePack: (($('reference-pack')?.value || "").trim() || null),
       targetVersion: targetVersion || null,
+      translationMode: ($("translation-mode")?.value || "append"),
+      translationQuality: ($("translation-quality")?.value || "balanced"),
+      coverageTier: (document.querySelector('input[name="coverage-tier"]:checked')?.value || "standard"),
     });
     setProgress(100, "全部完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
     if (result.minemenuMsg || result.minemenu_msg) {
       msg += "\n\n" + (result.minemenuMsg || result.minemenu_msg);
     }
+    consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
     appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「翻譯完成後分享」。");
+    await cleanupPreparedTranslationHelper();
   } catch (e) {
     setTranslationState("failed");
     handleRunFailure(e, "翻譯失敗");
@@ -1065,6 +1475,7 @@ async function onRun() {
     }
   } finally {
     setBusy(false);
+    refreshBackupState();
   }
 }
 
@@ -1109,6 +1520,7 @@ async function onRepair() {
     handleRunFailure(e, "修復失敗");
   } finally {
     setBusy(false);
+    refreshBackupState();
   }
 }
 
@@ -1143,6 +1555,7 @@ async function onSupplement() {
   setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始再補一些");
+  resetCoverageMetrics("補翻統計蒐集中");
   setProgress(3, "準備中…");
 
   try {
@@ -1153,14 +1566,17 @@ async function onSupplement() {
     });
     setProgress(100, "補譯完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
+    consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
     appendLog("複查完成，結果已重新套用到遊戲。", "info");
+    await cleanupPreparedTranslationHelper();
   } catch (e) {
     setTranslationState("failed");
     handleRunFailure(e, "再補一些失敗");
   } finally {
     setBusy(false);
+    refreshBackupState();
   }
 }
 
@@ -1199,16 +1615,50 @@ function showDiagnosis(result) {
   if (!box) return;
   const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
   const missing = Array.isArray(result?.missing) ? result.missing : [];
+  const suspectedMods = Array.isArray(result?.suspectedMods)
+    ? result.suspectedMods
+    : Array.isArray(result?.suspected_mods)
+      ? result.suspected_mods
+      : [];
+  const nextSteps = Array.isArray(result?.nextSteps)
+    ? result.nextSteps
+    : Array.isArray(result?.next_steps)
+      ? result.next_steps
+      : [];
+  const confidence = result?.confidence || "low";
+  const confidenceLabel = { high: "高", medium: "中", low: "低" }[confidence] || confidence;
+  const verdictLabel = {
+    missing_mod: "缺少模組或前置",
+    runtime: "Java／JVM／顯示環境",
+    mod_loading: "模組載入或版本相容性",
+    world_content: "世界內容更新或建立世界",
+    maybe_our_files: "可能是翻譯輸出",
+    content_missing: "內容或註冊資料缺失",
+    content_data: "資料檔載入失敗",
+    unknown: "證據不足",
+    no_logs: "沒有可分析記錄",
+  }[result?.verdict] || result?.verdict || "未分類";
+  const summary = String(result?.summary || "沒有足夠資料").replace(/\*\*/g, "");
+  const gameExitCode = result?.gameExitCode ?? result?.game_exit_code;
+  const source = result?.source || "";
   box.textContent = [
-    `判定：${result?.summary || "沒有足夠資料"}`,
+    `判定：${verdictLabel}\n${summary}`,
+    `證據強度：${confidenceLabel}（這是規則命中的程度，不是保證）`,
     result?.errorCode || result?.error_code ? `分析代碼：${result.errorCode || result.error_code}` : "",
+    gameExitCode ? `遊戲退出碼：${gameExitCode}（退出碼通常不是根因）` : "",
     result?.primaryError || result?.primary_error ? `最接近的錯誤：${result.primaryError || result.primary_error}` : "",
     missing.length ? `可能缺少：${missing.join(", ")}` : "",
+    suspectedMods.length ? `可疑模組或模組檔：${suspectedMods.join(", ")}` : "",
     evidence.length ? `找到的線索：\n${evidence.join("\n")}` : "",
+    nextSteps.length ? `建議下一步：\n${nextSteps.map((step, index) => `${index + 1}. ${step}`).join("\n")}` : "",
     result?.translationRelated || result?.translation_related
-      ? "這次結果可能和翻譯檔有關，建議先停用剛建立的資源包再重試。"
-      : "目前沒有證據顯示是翻譯造成的。",
+      ? "翻譯關聯：記錄有直接指向翻譯輸出的證據。請先關遊戲，再用「還原上一次套用」後重試。"
+      : "翻譯關聯：目前沒有直接證據顯示是翻譯造成的。",
+    source ? `讀取來源：${source}` : "",
   ].filter(Boolean).join("\n\n");
+  if ((result?.translationRelated || result?.translation_related) && hasApplyBackups) {
+    appendLog("可直接按「還原上一次套用」排除翻譯輸出。", "warn");
+  }
 }
 
 async function diagnosePastedText() {
@@ -1238,27 +1688,73 @@ async function loadUiPrefs() {
   }
 }
 
+function wireCoverageTier() {
+  const applyQualityHint = () => {
+    const tier = document.querySelector('input[name="coverage-tier"]:checked')?.value || "standard";
+    const quality = $("translation-quality");
+    if (!quality) return;
+    if (tier === "quick") quality.value = "fast";
+    else if (tier === "max") quality.value = "thorough";
+    else quality.value = "balanced";
+  };
+  document.querySelectorAll('input[name="coverage-tier"]').forEach((el) => {
+    el.addEventListener("change", applyQualityHint);
+  });
+}
+
+let fontPreviewUrl = null;
+async function updateFontPreview(path) {
+  const panel = $("font-preview");
+  const sample = $("font-preview-sample");
+  if (!panel || !sample || !path) return;
+  try {
+    if (fontPreviewUrl) URL.revokeObjectURL(fontPreviewUrl);
+    // Tauri 本機路徑無法直接 FontFace；用 CSS 近似 size／shift，並標示路徑已選。
+    panel.hidden = false;
+    const size = Number($("font-size")?.value || 11);
+    const shiftY = Number($("font-shift-y")?.value || 0.5);
+    sample.style.fontSize = `${Math.max(14, size * 1.6)}px`;
+    sample.style.transform = `translateY(${shiftY}px)`;
+    sample.title = path;
+  } catch (_) {
+    panel.hidden = true;
+  }
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
+  const startupRevealFallback = window.setTimeout(revealInitialContent, 900);
   initTheme();
   initUiScale();
   loadBackupPreference();
   syncAiPanel(false);
-  await refreshApiSettings();
-  refreshAiStatus();
-  loadUiPrefs();
+  const apiSettingsTask = refreshApiSettings();
+  const startupTasks = [
+    apiSettingsTask,
+    apiSettingsTask.catch(() => null).then(() => refreshAiStatus()),
+    loadUiPrefs(),
+    refreshBackupState(),
+  ];
   setProgress(0, "尚未開始");
-  showAppPage("translate");
+  resetCoverageMetrics("尚未開始");
+  showAppPage("translate", { skipTransition: true });
   setTranslationState("idle");
+  wireCoverageTier();
+  await waitForStartupSkeleton(startupTasks);
+  window.clearTimeout(startupRevealFallback);
+  revealInitialContent();
   ["instance", "output", "font-output"].forEach((id) => {
     const input = $(id);
     if (!input) return;
     input.addEventListener("input", () => {
+      hasApplyBackups = false;
       if (id === "instance" && !input.value.trim()) {
         setTranslationState("idle");
       } else {
         if (id === "output" && customOutputEnabled()) input.dataset.customPath = input.value.trim();
         syncUiState();
+        scheduleBackupStateRefresh();
       }
+      scheduleBackupStateRefresh();
     });
   });
   if ($("choose-output-dir")) {
@@ -1276,6 +1772,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (autoPath) input.value = autoPath;
       }
       syncUiState();
+      scheduleBackupStateRefresh();
     });
   }
   ["font-size", "font-weight", "font-shift-x", "font-shift-y", "font-oversample"].forEach((id) => {
@@ -1327,6 +1824,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       const level = (p.level || p.Level || "info").toLowerCase();
       const message = p.message || p.Message || "";
       if (!message) return;
+      consumeCoverageMessage(message);
       if (level === "error") appendError(message);
       else if (level === "warn") appendLog(message, "warn");
       else appendLog(message, "info");
@@ -1356,6 +1854,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   $("use-ai").onchange = () => syncUiState();
+  if ($("api-provider")) {
+    $("api-provider").onchange = () => syncCustomProviderUi($("api-provider").value);
+  }
   document.querySelectorAll('input[name="ai-source"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       if (radio.checked) aiModeChangePromise = changeAiMode(radio.value);
@@ -1456,6 +1957,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-glossary")) $("btn-glossary").onclick = onOpenGlossary;
   if ($("btn-supplement")) $("btn-supplement").onclick = onSupplement;
   if ($("btn-repair")) $("btn-repair").onclick = onRepair;
+  if ($("btn-helper-prepare")) $("btn-helper-prepare").onclick = prepareTranslationHelper;
+  if ($("btn-helper-rescan")) $("btn-helper-rescan").onclick = rescanAfterTranslationHelper;
+  if ($("btn-helper-cleanup")) $("btn-helper-cleanup").onclick = cleanupTranslationHelperFromPanel;
   function openGuideOverlay() {
     const ov = $("guide-overlay");
     if (!ov) return;
@@ -1529,10 +2033,13 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (!dialog.open) throw new Error("無法開啟檔案選擇");
         const f = await dialog.open({
           multiple: false,
-          filters: [{ name: "字體", extensions: ["ttf", "otf", "ttc"] }],
-          title: "選擇你喜歡的字體檔",
+          filters: [{ name: "字體", extensions: ["ttf", "otf"] }],
+          title: "選擇你喜歡的字體檔（TTF／OTF）",
         });
-        if (typeof f === "string") $("font-file").value = f;
+        if (typeof f === "string") {
+          $("font-file").value = f;
+          updateFontPreview(f);
+        }
       } catch (e) {
         log(String(e));
       }
@@ -1572,8 +2079,24 @@ window.addEventListener("DOMContentLoaded", async () => {
             oversample: Number($('font-oversample')?.value || 4),
           },
         });
-        setProgress(100, "字體包完成");
-        setLogFinal(r.playerSummary || r.player_summary || JSON.stringify(r, null, 2));
+        let finalMessage = r.playerSummary || r.player_summary || JSON.stringify(r, null, 2);
+        const packPath = r.packPath || r.pack_path || "";
+        const shouldApplyFont = !!$("font-apply-current")?.checked;
+        const instancePath = ($("instance")?.value || "").trim();
+        if (shouldApplyFont) {
+          if (!instancePath) {
+            appendLog("未選整合包，字體包已建立但未套用。", "warn");
+          } else if (packPath) {
+            setProgress(70, "正在套用字體包到目前實例…");
+            const applied = await invoke("apply_font_pack_to_current_instance", {
+              instancePath,
+              fontPackPath: packPath,
+            });
+            finalMessage += "\n\n" + (applied.playerSummary || applied.player_summary || JSON.stringify(applied, null, 2));
+          }
+        }
+        setProgress(100, shouldApplyFont && instancePath ? "字體包完成並已套用" : "字體包完成");
+        setLogFinal(finalMessage);
       } catch (e) {
         setProgress(0, "失敗", { failed: true });
         appendLog("建立字體包失敗：");
@@ -1591,6 +2114,27 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (selected) {
           $("reference-pack").value = selected;
           if ($("reference-status")) $("reference-status").textContent = "已指定參考翻譯，開始翻譯時會優先套用。";
+          syncUiState();
+        }
+      } catch (e) {
+        log(String(e));
+      }
+    };
+  }
+  if ($("btn-reference-file")) {
+    $("btn-reference-file").onclick = async () => {
+      try {
+        if (!dialog.open) throw new Error("無法開啟檔案選擇");
+        const selected = await dialog.open({
+          multiple: false,
+          filters: [{ name: "參考翻譯包", extensions: ["zip", "jar"] }],
+          title: "選取參考翻譯 zip",
+        });
+        if (typeof selected === "string") {
+          $("reference-pack").value = selected;
+          if ($("reference-status")) {
+            $("reference-status").textContent = "已指定參考翻譯 zip；工具只填缺並轉台灣用語，不會上傳參考包。";
+          }
           syncUiState();
         }
       } catch (e) {
@@ -1630,6 +2174,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           }
         }
         syncUiState();
+        await refreshTranslationHelper();
       }
     } catch (e) {
       log(String(e));
@@ -1642,6 +2187,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         $("output").value = p;
         $("output").dataset.customPath = p;
         syncUiState();
+        scheduleBackupStateRefresh();
+        await refreshTranslationHelper();
       }
     } catch (e) {
       log(String(e));
@@ -1689,15 +2236,31 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("btn-restore").onclick = async () => {
       const instancePath = ($("instance").value || "").trim();
       if (!instancePath) return log("請先選擇遊戲資料夾。");
-      if (!window.confirm("這會還原上一次套用前的檔案，確定要繼續嗎？")) return;
+      if (!window.confirm("請先關閉 Minecraft。這會回到此備份對應的套用前狀態（若多次套用曾重用同一備份，可能跨過好幾次）。確定繼續？")) return;
       try {
         const result = await invoke("restore_last_apply_cmd", {
           instancePath,
           outputDir: selectedOutputDir() || null,
         });
-        appendLog(result.playerSummary || result.player_summary || "已還原上一次套用。", "warn");
+        const summary = result.playerSummary || result.player_summary || "已還原上一次套用。";
+        const warnings = result.warnings || [];
+        appendLog(summary, "warn");
+        if (warnings.length) appendLog("還原警告：\n" + warnings.join("\n"), "warn");
+        const box = $("diagnose-result");
+        if (box) {
+          box.hidden = false;
+          box.textContent = [summary, warnings.length ? "警告：\n" + warnings.join("\n") : ""]
+            .filter(Boolean)
+            .join("\n\n");
+        }
+        await refreshBackupState();
       } catch (e) {
         appendError("還原失敗：" + formatInvokeError(e));
+        const box = $("diagnose-result");
+        if (box) {
+          box.hidden = false;
+          box.textContent = "還原失敗：" + formatInvokeError(e);
+        }
       }
     };
   }
@@ -1721,7 +2284,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           result.playerSummary || result.player_summary || "備份刪除完成。",
           result.failed?.length ? "warn" : "info"
         );
-        syncUiState();
+        await refreshBackupState();
       } catch (e) {
         appendError("刪除備份失敗");
         appendError(formatInvokeError(e));
@@ -1743,6 +2306,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           input.dataset.customPath = "";
           input.value = "";
         }
+        hasApplyBackups = false;
         syncUiState();
       } catch (e) {
         appendError("刪除翻譯結果失敗");

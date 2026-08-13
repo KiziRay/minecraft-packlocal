@@ -72,10 +72,6 @@ fn load_ref_dir(root: &Path) -> Result<(LangMap, usize), String> {
         if name != "zh_tw.json" && name != "zh_cn.json" {
             continue;
         }
-        // prefer only zh_tw for reference pack; also allow zh_cn as weaker fill later
-        if name != "zh_tw.json" {
-            continue;
-        }
         let Some(ns) = ns_from_lang_path(p, root) else {
             continue;
         };
@@ -87,11 +83,18 @@ fn load_ref_dir(root: &Path) -> Result<(LangMap, usize), String> {
             continue;
         }
         files += 1;
-        zh.entry(ns).or_default().extend(map);
+        let slot = zh.entry(ns).or_default();
+        if name == "zh_tw.json" {
+            slot.extend(map);
+        } else {
+            for (key, value) in map {
+                slot.entry(key).or_insert(value);
+            }
+        }
     }
     let keys: usize = zh.values().map(|m| m.len()).sum();
     if keys == 0 {
-        return Err("參考包裡找不到 zh_tw.json。".into());
+        return Err("參考包裡找不到 zh_tw.json 或 zh_cn.json。".into());
     }
     Ok((zh, files))
 }
@@ -112,7 +115,7 @@ fn load_ref_zip(path: &Path) -> Result<(LangMap, usize), String> {
         }
         let name = name_raw.replace('\\', "/");
         let lower = name.to_ascii_lowercase();
-        if !lower.ends_with("zh_tw.json") {
+        if !lower.ends_with("zh_tw.json") && !lower.ends_with("zh_cn.json") {
             continue;
         }
         if !lower.contains("/lang/") {
@@ -144,11 +147,18 @@ fn load_ref_zip(path: &Path) -> Result<(LangMap, usize), String> {
             continue;
         }
         files += 1;
-        zh.entry(ns).or_default().extend(map);
+        let slot = zh.entry(ns).or_default();
+        if lower.ends_with("zh_tw.json") {
+            slot.extend(map);
+        } else {
+            for (key, value) in map {
+                slot.entry(key).or_insert(value);
+            }
+        }
     }
     let keys: usize = zh.values().map(|m| m.len()).sum();
     if keys == 0 {
-        return Err("參考 zip 裡找不到 zh_tw.json。".into());
+        return Err("參考 zip 裡找不到 zh_tw.json 或 zh_cn.json。".into());
     }
     Ok((zh, files))
 }
@@ -205,8 +215,18 @@ pub fn discover_default_reference() -> Option<PathBuf> {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let lower = name.to_ascii_lowercase();
             let looks_like_reference = lower.contains("cte2")
+                || lower.contains("cfpa")
+                || lower.contains("zh_tw")
+                || lower.contains("zh_cn")
+                || lower.contains("resourcepack")
+                || lower.contains("resource-pack")
+                || lower.contains("chinese")
                 || name.contains("繁體")
+                || name.contains("繁中")
+                || name.contains("漢化")
+                || name.contains("汉化")
                 || name.contains("翻譯")
+                || name.contains("翻译")
                 || name.contains("僅翻譯");
             if !looks_like_reference {
                 continue;
@@ -249,7 +269,37 @@ fn has_reference_lang(root: &Path) -> bool {
                 && entry
                     .file_name()
                     .to_str()
-                    .map(|name| name.eq_ignore_ascii_case("zh_tw.json"))
+                    .map(|name| {
+                        name.eq_ignore_ascii_case("zh_tw.json")
+                            || name.eq_ignore_ascii_case("zh_cn.json")
+                    })
                     .unwrap_or(false)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zh_cn_reference_fills_missing_without_overwriting_zh_tw() {
+        let root = std::env::temp_dir().join(format!("merge_ref_cfpa_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lang = root.join("assets/example/lang");
+        std::fs::create_dir_all(&lang).unwrap();
+        std::fs::write(
+            lang.join("zh_cn.json"),
+            r#"{"item.example.a":"简中 A","item.example.b":"简中 B"}"#,
+        )
+        .unwrap();
+        std::fs::write(lang.join("zh_tw.json"), r#"{"item.example.a":"繁中 A"}"#).unwrap();
+
+        let (reference, files) = load_reference_zh_tw(&root).unwrap();
+        assert_eq!(files, 2);
+        let namespace = reference.get("example").unwrap();
+        assert_eq!(namespace.get("item.example.a").unwrap(), "繁中 A");
+        assert_eq!(namespace.get("item.example.b").unwrap(), "简中 B");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -1,11 +1,10 @@
 //! 檢查更新（通知＋驗證＋安裝）。
 //!
-//! 本專案是 NSIS 安裝版，不直接改寫執行中的 exe。流程採用 ZeitFrei-Tool 的可靠性原則，
-//! 但把「自行替換 exe」改成由 Tauri 產生的官方 NSIS 安裝程式處理：
+//! 本專案只發佈免安裝 EXE，不直接改寫正在執行的 exe。流程採用 ZeitFrei-Tool 的可靠性原則：
 //!   1. 打 Worker `/api/desktop/latest` 拿最新版本
 //!   2. 比版本，較新才提示
-//!   3. 防連點，下載官方 NSIS 到暫存，強制驗 SHA-256、檔案大小與 PE 標頭
-//!   4. Windows 以 `/S /R` 靜默安裝並重開；脫離父行程失敗時退回一般安裝程式
+//!   3. 防連點，下載官方免安裝 EXE 到暫存，強制驗 SHA-256、檔案大小與 PE 標頭
+//!   4. Windows 由脫離父行程的背景工作等待舊程式結束，再替換同一路徑並重新開啟
 //!
 //! 更新端點與下載連結都非機密，比對邏輯全在本地。
 
@@ -166,7 +165,7 @@ pub struct DownloadResult {
     pub launched: bool,
     /// true＝已排程替換免安裝 EXE 並要求完成後重開。
     pub automatic: bool,
-    /// true＝安裝程式已脫離目前行程，前端收到回應後可關閉舊程式。
+    /// true＝背景更新工作已脫離目前行程，前端收到回應後可關閉舊程式。
     pub should_exit: bool,
     pub message: String,
 }
@@ -229,7 +228,7 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
         message: if automatic {
             "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。".into()
         } else {
-            format!("已驗證並開啟安裝程式：{}\n請依畫面完成更新。", dest.display())
+            format!("已驗證並開啟免安裝更新檔：{}\n若工具沒有自動替換，請關閉目前工具後手動開啟新版。", dest.display())
         },
     })
 }
@@ -264,7 +263,7 @@ fn validate_update_bytes(bytes: &[u8]) -> Result<(), String> {
         return Err("下載的更新 EXE 大小不合理，已停止更新。".into());
     }
     if !bytes.starts_with(b"MZ") {
-        return Err("下載內容不是 Windows 安裝程式，已停止更新。".into());
+        return Err("下載內容不是有效的 Windows EXE，已停止更新。".into());
     }
     Ok(())
 }

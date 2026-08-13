@@ -30,6 +30,25 @@ pub struct TranslateSession {
     /// 使用者指定的目標 MC 版本（補翻／修復重建 pack.mcmeta 時沿用）。舊檔沒有 → None。
     #[serde(default)]
     pub target_version: Option<String>,
+    #[serde(default = "default_translation_mode")]
+    pub translation_mode: String,
+    #[serde(default = "default_translation_quality")]
+    pub translation_quality: String,
+    /// 完整度授權（quick／standard／max）；舊工作階段缺欄位時視為 standard。
+    #[serde(default = "default_coverage_tier")]
+    pub coverage_tier: String,
+}
+
+fn default_translation_mode() -> String {
+    "append".into()
+}
+
+fn default_translation_quality() -> String {
+    "balanced".into()
+}
+
+fn default_coverage_tier() -> String {
+    "standard".into()
 }
 
 /// 可能存放工作階段的目錄（翻譯結果／舊版相容）

@@ -7,8 +7,8 @@
 //!
 //! 存放：`%APPDATA%\modpack-i18n-tool\tm.json`
 //!
-//! 設計取捨：鍵只用英文原文，不含語境。同一句英文在 Minecraft 模組圈幾乎都是同一個意思，
-//! 換取的是簡單與高命中率。語境資訊仍會送進 AI prompt，只是不進記憶庫的鍵。
+//! 設計取捨：沒有上下文提示的短字串沿用英文原文鍵；有物品名／按鈕／描述等上下文提示時，
+//! 會把上下文一起放進鍵，避免同一句英文在不同位置誤套用。舊版無上下文條目仍可讀取。
 
 use std::collections::HashMap;
 use std::fs;
@@ -26,6 +26,7 @@ pub struct Tm {
     entries: HashMap<String, String>,
     /// 本次新增的條目數
     added: usize,
+    rejected: usize,
     /// 本次命中的條目數
     hits: usize,
     full: bool,
@@ -35,6 +36,7 @@ pub struct Tm {
 pub struct TmStats {
     pub hits: usize,
     pub added: usize,
+    pub rejected: usize,
     pub total: usize,
     pub full: bool,
 }
@@ -58,6 +60,7 @@ impl Tm {
         Tm {
             entries,
             added: 0,
+            rejected: 0,
             hits: 0,
             full: false,
         }
@@ -65,7 +68,13 @@ impl Tm {
 
     /// 查詢並計入命中統計。
     pub fn get(&mut self, source: &str) -> Option<String> {
-        let hit = self.entries.get(source.trim())?.clone();
+        self.get_with_context(source, None)
+    }
+
+    /// 依原文與可選上下文查詢；有上下文時不會誤用無關語境的同句翻譯。
+    pub fn get_with_context(&mut self, source: &str, context: Option<&str>) -> Option<String> {
+        let key = storage_key(source, context);
+        let hit = self.entries.get(&key)?.clone();
         // 記憶庫是舊資料：仍要確認佔位符對得上目前這條原文
         if !placeholder::is_compatible(source, &hit) {
             return None;
@@ -76,6 +85,15 @@ impl Tm {
 
     /// 寫入一條已驗證的譯文。
     pub fn insert(&mut self, source: &str, translated: &str) {
+        self.insert_with_context(source, translated, None);
+    }
+
+    pub fn insert_with_context(
+        &mut self,
+        source: &str,
+        translated: &str,
+        context: Option<&str>,
+    ) {
         let s = source.trim();
         let t = translated.trim();
         if s.is_empty() || t.is_empty() || s == t {
@@ -84,14 +102,53 @@ impl Tm {
         if s.len() > MAX_SOURCE_LEN {
             return;
         }
-        if self.entries.contains_key(s) {
+        if !placeholder::is_compatible(s, t) {
+            self.rejected += 1;
+            return;
+        }
+        let key = storage_key(s, context);
+        if self.entries.contains_key(&key) {
             return;
         }
         if self.entries.len() >= MAX_ENTRIES {
             self.full = true;
             return;
         }
-        self.entries.insert(s.to_string(), t.to_string());
+        self.entries.insert(key, t.to_string());
+        self.added += 1;
+    }
+
+    /// Force 模式使用：同一原文以新的安全譯文取代舊記憶。
+    pub fn upsert(&mut self, source: &str, translated: &str) {
+        self.upsert_with_context(source, translated, None);
+    }
+
+    pub fn upsert_with_context(
+        &mut self,
+        source: &str,
+        translated: &str,
+        context: Option<&str>,
+    ) {
+        let s = source.trim();
+        let t = translated.trim();
+        if s.is_empty()
+            || t.is_empty()
+            || s == t
+            || s.len() > MAX_SOURCE_LEN
+            || !placeholder::is_compatible(s, t)
+        {
+            self.rejected += 1;
+            return;
+        }
+        let key = storage_key(s, context);
+        if self.entries.get(&key).is_some_and(|old| old == t) {
+            return;
+        }
+        if self.entries.len() >= MAX_ENTRIES && !self.entries.contains_key(&key) {
+            self.full = true;
+            return;
+        }
+        self.entries.insert(key, t.to_string());
         self.added += 1;
     }
 
@@ -99,6 +156,7 @@ impl Tm {
         TmStats {
             hits: self.hits,
             added: self.added,
+            rejected: self.rejected,
             total: self.entries.len(),
             full: self.full,
         }
@@ -126,7 +184,7 @@ impl Tm {
 
     pub fn note(&self) -> String {
         let s = self.stats();
-        if s.hits == 0 && s.added == 0 {
+        if s.hits == 0 && s.added == 0 && s.rejected == 0 {
             return "翻譯記憶：本次未使用".into();
         }
         let mut n = format!(
@@ -136,7 +194,17 @@ impl Tm {
         if s.full {
             n.push_str("；已達上限，新條目未收錄");
         }
+        if s.rejected > 0 {
+            n.push_str(&format!("；{} 條格式不安全未寫入", s.rejected));
+        }
         n
+    }
+}
+
+fn storage_key(source: &str, context: Option<&str>) -> String {
+    match context.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => format!("{}\u{0}{}", source.trim(), value),
+        None => source.trim().to_string(),
     }
 }
 
@@ -185,6 +253,7 @@ mod tests {
         // 舊記憶沒有佔位符，但現在這條原文有 → 不可重用，否則遊戲會格式錯誤
         tm.insert("Deals %s damage", "造成傷害");
         assert!(tm.get("Deals %s damage").is_none());
+        assert_eq!(tm.stats().rejected, 1);
     }
 
     #[test]
@@ -211,6 +280,30 @@ mod tests {
         tm.insert("Sword", "刀");
         assert_eq!(tm.get("Sword").as_deref(), Some("劍"));
         assert_eq!(tm.stats().added, 1);
+    }
+
+    #[test]
+    fn force_upsert_replaces_a_safe_old_entry() {
+        let mut tm = blank();
+        tm.insert("Sword", "舊譯");
+        tm.upsert("Sword", "新譯");
+        assert_eq!(tm.get("Sword").as_deref(), Some("新譯"));
+    }
+
+    #[test]
+    fn scoped_entries_do_not_cross_contexts() {
+        let mut tm = blank();
+        tm.insert_with_context("Open", "開啟", Some("按鈕"));
+        tm.insert_with_context("Open", "開啟中", Some("狀態"));
+        assert_eq!(
+            tm.get_with_context("Open", Some("按鈕")).as_deref(),
+            Some("開啟")
+        );
+        assert_eq!(
+            tm.get_with_context("Open", Some("狀態")).as_deref(),
+            Some("開啟中")
+        );
+        assert!(tm.get_with_context("Open", Some("物品名")).is_none());
     }
 
     #[test]

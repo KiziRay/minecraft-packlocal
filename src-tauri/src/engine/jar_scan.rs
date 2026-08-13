@@ -2,7 +2,7 @@
 //! 來源：mods jar、資源包、KubeJS、config 內 lang、常見設定亂碼處理前置資料。
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use zip::ZipArchive;
 use super::cancel;
 use super::convert::{apply_phrase_dict, convert_s2tw_batch, strip_of_suffix_zhi};
 use super::security::{check_jar_size, is_safe_zip_entry_name, MAX_ZIP_ENTRY_BYTES};
+use super::scan_cache::ScanCache;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +27,7 @@ pub struct ScanReport {
     pub keys_need_ai: usize,
     pub keys_from_zh_tw: usize,
     pub keys_from_zh_cn: usize,
+    pub scan_cache_hits: usize,
     pub errors: Vec<String>,
 }
 
@@ -67,6 +69,7 @@ where
     let mut rps = 0usize;
     let mut loose = 0usize;
     let mut errors = Vec::new();
+    let mut scan_cache = ScanCache::load();
 
     // ─── 1) mods jar / zip（平行掃描；含 Essential 等雙 jar，只讀 lang 不拆包）───
     on_progress(6, "本地整理：列出模組檔…");
@@ -77,11 +80,13 @@ where
         &format!("本地整理：讀模組語言（共 {} 個）…", jar_paths.len()),
     );
     if !jar_paths.is_empty() {
-        let n_workers = thread::available_parallelism()
+        let available = thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(8)
-            .clamp(8, 16)
-            .min(jar_paths.len());
+            .unwrap_or(8);
+        let configured = std::env::var("MODPACK_I18N_JAR_WORKERS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let n_workers = worker_count(jar_paths.len(), available, configured);
         let chunk_size = (jar_paths.len() + n_workers - 1) / n_workers;
         let mut handles = Vec::with_capacity(n_workers);
         for chunk in jar_paths.chunks(chunk_size) {
@@ -197,13 +202,17 @@ where
         ("global_packs", 14),
         ("paxi", 12),
         ("data", 10),
+        // FTB Quest Localizer 等遊戲內輔助模組的匯出語言檔。
+        ("FTBLang", 12),
+        // 部分任務匯出工具使用這個資料夾名稱。
+        ("exported", 12),
     ];
     for (sub, depth) in loose_roots {
         let root = mc.join(sub);
         if !root.is_dir() {
             continue;
         }
-        match harvest_loose_lang_tree(&root, &mut raw, *depth, &mut errors) {
+        match harvest_loose_lang_tree(&root, &mut raw, *depth, &mut errors, &mut scan_cache) {
             Ok(n) => {
                 loose += n;
                 if n > 0 {
@@ -215,6 +224,38 @@ where
             }
             Err(e) => errors.push(format!("{sub}: {e}")),
         }
+    }
+
+    // FTB Quest Localizer 的 FTBLang 會放在「實例根目錄」，不一定在
+    // instance/minecraft/。把實例本身與上一層也列入，但只掃任務匯出資料夾，
+    // 避免把啟動器的其他資料夾整棵掃進來。
+    let mut helper_roots = Vec::new();
+    for base in [instance_or_mc, instance_or_mc.parent().unwrap_or(instance_or_mc)] {
+        for sub in ["FTBLang", "ftblang", "exported"] {
+            let root = base.join(sub);
+            if root.is_dir() {
+                helper_roots.push(root);
+            }
+        }
+    }
+    let mut seen_helper_roots = HashSet::new();
+    for root in helper_roots {
+        let key = root.to_string_lossy().to_ascii_lowercase();
+        if !seen_helper_roots.insert(key) {
+            continue;
+        }
+        match harvest_loose_lang_tree(&root, &mut raw, 12, &mut errors, &mut scan_cache) {
+            Ok(n) => loose += n,
+            Err(e) => errors.push(format!("{}: {e}", root.display())),
+        }
+    }
+
+    let cache_hits = scan_cache.hits();
+    if let Err(error) = scan_cache.save() {
+        errors.push(format!("掃描快取未能保存（不影響本次翻譯）：{error}"));
+    }
+    if cache_hits > 0 {
+        on_progress(34, &format!("本地整理：重用 {} 個未變語言檔快取", cache_hits));
     }
 
     cancel::check()?;
@@ -345,9 +386,15 @@ where
         keys_need_ai,
         keys_from_zh_tw: from_tw,
         keys_from_zh_cn: from_cn,
+        scan_cache_hits: cache_hits,
         errors,
     };
     Ok((zh, en_only, report))
+}
+
+fn worker_count(jar_count: usize, available: usize, configured: Option<usize>) -> usize {
+    let requested = configured.unwrap_or_else(|| available.clamp(8, 16));
+    requested.clamp(1, 16).min(jar_count.max(1))
 }
 
 fn list_archive_files(root: &Path, max_depth: usize) -> Vec<PathBuf> {
@@ -425,7 +472,8 @@ fn harvest_folder_pack(
         return harvest_assets_tree(&assets, raw, 6, errors);
     }
     // 少數包根目錄直接是 assets
-    harvest_loose_lang_tree(pack_root, raw, 6, errors)
+    let mut cache = ScanCache::default();
+    harvest_loose_lang_tree(pack_root, raw, 6, errors, &mut cache)
 }
 
 fn harvest_assets_tree(
@@ -451,11 +499,25 @@ fn harvest_assets_tree(
     Ok(count)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::worker_count;
+
+    #[test]
+    fn worker_count_honors_safe_override_and_caps_to_input() {
+        assert_eq!(worker_count(3, 16, Some(1)), 1);
+        assert_eq!(worker_count(3, 16, Some(99)), 3);
+        assert_eq!(worker_count(20, 4, None), 8);
+        assert_eq!(worker_count(0, 4, Some(0)), 1);
+    }
+}
+
 fn harvest_loose_lang_tree(
     root: &Path,
     raw: &mut RawLang,
     max_depth: usize,
     errors: &mut Vec<String>,
+    cache: &mut ScanCache,
 ) -> Result<usize, String> {
     let mut count = 0usize;
     for entry in WalkDir::new(root)
@@ -478,7 +540,23 @@ fn harvest_loose_lang_tree(
         {
             continue;
         }
-        if try_ingest_lang_file(path, raw, errors) {
+        if let Some(cached) = cache.get(path) {
+            raw.entry(cached.namespace)
+                .or_default()
+                .entry(cached.locale)
+                .or_default()
+                .extend(cached.entries);
+            count += 1;
+            continue;
+        }
+        let mut parsed = RawLang::new();
+        if try_ingest_lang_file(path, &mut parsed, errors) {
+            for (namespace, locales) in &parsed {
+                for (locale, entries) in locales {
+                    cache.put(path, namespace.clone(), locale.clone(), entries.clone());
+                }
+            }
+            merge_raw_lang(raw, parsed);
             count += 1;
         }
     }

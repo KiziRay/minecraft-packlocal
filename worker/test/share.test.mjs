@@ -22,6 +22,15 @@ test("分享下載會檢查期限並讓過期物件失效", () => {
   assert.match(download, /cache-control/);
 });
 
+test("分享上傳要求有效 Content-Length，避免繞過大小限制", () => {
+  const start = source.indexOf("async function shareUpload");
+  const end = source.indexOf("async function shareDownload", start);
+  const upload = source.slice(start, end);
+  assert.match(upload, /content-length/);
+  assert.match(upload, /content length required/);
+  assert.match(upload, /declared > maxBytes/);
+});
+
 test("分享連結先顯示可嵌入的介紹頁，下載需明確指定", () => {
   const start = source.indexOf("async function shareDownload");
   const end = source.indexOf("function randomShareToken", start);
@@ -38,6 +47,18 @@ test("共享翻譯記憶保留上下文並標記衝突，不覆蓋舊譯文", ()
   assert.match(source, /function tmMerge/);
   assert.match(source, /conflict: true/);
   assert.match(source, /ctx/);
+});
+
+test("共享翻譯資料使用獨立 TRANSLATIONS bucket", () => {
+  assert.match(source, /env\.TRANSLATIONS/);
+  assert.match(source, /glossary\/v1\/global\.json\.gz/);
+  assert.match(source, /function glossaryLookup/);
+  assert.match(source, /function glossaryContribute/);
+});
+
+test("共享術語不同譯文會標記衝突並停止套用", () => {
+  assert.match(source, /previous\.conflict = true/);
+  assert.match(source, /record\.conflict/);
 });
 
 test("強制 Turnstile 設定不完整時不會退化成只檢查 Discord", () => {

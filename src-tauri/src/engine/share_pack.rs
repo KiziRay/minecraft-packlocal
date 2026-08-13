@@ -1,9 +1,9 @@
-//! 把「翻譯結果」工作目錄打包成單一 zip，讓使用者可以手動把整包翻譯檔分享給別人。
+//! 把「翻譯結果」工作目錄打包成單一 zip，供 R2 分享服務產生短期下載連結。
 //!
 //! 這是「勾選『建立打包檔案』」才會用到的路徑：預設的一鍵流程是直接覆蓋安裝進遊戲、
 //! 不留資料夾；只有想分享時才打包成一個可命名的檔。
 //!
-//! （上傳 R2 + 產生分享短連結為後續版本；本版先做本機打包成檔。）
+//! 本機只建立暫存 ZIP；實際上傳由 `share_upload` 使用獨立 SHARES R2 完成。
 
 use std::fs::File;
 use std::io::Write;
@@ -78,13 +78,12 @@ fn is_shareable_path(root: &Path, path: &Path) -> bool {
         return false;
     };
     match first {
-        "resourcepacks" | "patchouli_books" | "kubejs" | "minemenu" | "datapacks"
+        "resourcepacks" | "resourcepacks-extra" | "patchouli_books" | "kubejs" | "minemenu" | "datapacks"
         | "jar-translated"
         | "defaultconfigs" | "global_packs" | "paxi" | "data" => true,
-        "config" => matches!(
-            components.next().and_then(|part| part.as_os_str().to_str()),
-            Some("ftbquests" | "openloader" | "fancymenu")
-        ),
+        // work/config 只會放掃描後有翻譯變更的檔案；允許所有子目錄，
+        // 讓未預先列入清單的模組設定型文字也能被直接套用／分享。
+        "config" => components.next().is_some(),
         _ => false,
     }
 }
@@ -109,6 +108,10 @@ mod tests {
         fs::create_dir_all(&jars).unwrap();
         fs::write(rp.join("pack.zip"), b"dummy-pack").unwrap();
         fs::write(jars.join("example.jar"), b"translated-jar").unwrap();
+        fs::create_dir_all(work.join("resourcepacks-extra")).unwrap();
+        fs::write(work.join("resourcepacks-extra/translated.zip"), b"overlay-pack").unwrap();
+        fs::create_dir_all(work.join("config/starterkit")).unwrap();
+        fs::write(work.join("config/starterkit/description.txt"), "翻譯內容").unwrap();
         fs::write(work.join("覆蓋範圍說明.txt"), "coverage").unwrap();
 
         let dest = root.join("out");
@@ -122,7 +125,9 @@ mod tests {
             .map(|i| ar.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(names.iter().any(|n| n.contains("resourcepacks/pack.zip")), "{names:?}");
+        assert!(names.iter().any(|n| n.contains("resourcepacks-extra/translated.zip")), "{names:?}");
         assert!(names.iter().any(|n| n.contains("jar-translated/example.jar")), "{names:?}");
+        assert!(names.iter().any(|n| n.contains("config/starterkit/description.txt")), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("覆蓋範圍說明.txt")), "{names:?}");
         let _ = fs::remove_dir_all(&root);
     }

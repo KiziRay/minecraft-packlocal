@@ -8,7 +8,7 @@
 - 不宣稱 100% 漢化
 - **免安裝任何額外東西**（簡繁轉換內建於執行檔）
 
-目前版本：**1.0.2**（以 `src-tauri/Cargo.toml` 為準）
+目前版本：**0.1.0**（以 src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json 三處同步為準）
 
 開發者代管 AI 會先檢查 Discord 官方伺服器資格，再透過 Cloudflare Turnstile 完成安全驗證；自訂 API 不需要這些驗證。
 
@@ -58,6 +58,7 @@
 |------|------|------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 開發 | 架構、模組、資料流 |
 | [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | 開發 | 環境、建置、除錯、設定路徑 |
+| [docs/AI-HANDOFF.md](./docs/AI-HANDOFF.md) | Claude／Gemini 等 AI | 必讀順序、硬規則、目前流程與交付驗證 |
 | [docs/LOCALIZE-202608.md](./docs/LOCALIZE-202608.md) | 開發 | **202608**：最快且盡完整本地化、缺漏／優化 backlog、波次 |
 | [docs/SEARCH-MAP.md](./docs/SEARCH-MAP.md) | 開發 | 多根搜尋地圖（手翻同路徑） |
 | [docs/API-COMMANDS.md](./docs/API-COMMANDS.md) | 前後端 | Tauri command 契約 |
@@ -97,7 +98,7 @@ Tauri 2 + Rust + 靜態前端（`src/index.html` + `app.js` + `styles.css`，`fr
 
 模組／地圖著作權屬原作者。本工具依現況提供，不保證完整或正確。完整支援範圍與免責條款見 [`docs/支援範圍與免責聲明.md`](./docs/支援範圍與免責聲明.md)，使用說明見 [`docs/USER-GUIDE.md`](./docs/USER-GUIDE.md)。
 
-本專案的原始程式碼與 ZeitFrei 自有專案素材採用 [PolyForm Noncommercial 1.0.0](./LICENSE)。玩家可以個人或其他非商業目的使用、修改與分享，但不得直接或間接用於商業產品、付費服務、商業散布或轉授權；需要商業使用請先取得書面同意。第三方程式、資料與素材維持原本授權，請查看 [`NOTICE.md`](./NOTICE.md)。
+本專案的原始程式碼與 ZeitFrei 自有專案素材採用 [PolyForm Noncommercial License 1.0.0](./LICENSE)，並以 [NOTICE.md](./NOTICE.md) 補充必要聲明。玩家可以個人使用、研究、修改與非商業分享；商業使用、付費散布、併入付費服務或產品需另行取得書面授權。
 
 公開原始碼不代表提供檔案安全或正確性保證。使用下載的執行檔或資源前，請自行確認來源、檔案完整性與使用環境。
 

@@ -3,9 +3,47 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 /// 固定結果資料夾名稱
 pub const RESULT_DIR_NAME: &str = "翻譯結果";
+
+/// 清掉翻譯中斷後留下的暫存，不碰玩家的翻譯結果與備份。
+pub fn cleanup_transient_work(work_root: &Path) -> Result<(), String> {
+    for name in [
+        ".archive-overlay-stage",
+        ".jar-display-stage",
+        ".jar-patchouli-stage",
+        ".jar-patchouli-translated",
+    ] {
+        let path = work_root.join(name);
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|e| format!("無法清理暫存 {}：{e}", path.display()))?;
+        }
+    }
+    for root_name in ["jar-translated", "resourcepacks-extra"] {
+        let root = work_root.join(root_name);
+        if !root.is_dir() {
+            continue;
+        }
+        let temporary_files = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+            })
+            .map(|entry| entry.into_path())
+            .collect::<Vec<_>>();
+        for path in temporary_files {
+            fs::remove_file(&path).map_err(|e| format!("無法清理暫存 {}：{e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
 
 /// 完整路徑組合都先算好，呼叫端取用哪幾個由流程決定（未取用的仍保留供診斷）。
 #[allow(dead_code)]
@@ -38,6 +76,7 @@ pub fn ensure_result_layout(user_output: &Path) -> Result<ResultLayout, String> 
 
     let work_root = resolve_work_root(user_output);
     fs::create_dir_all(&work_root).map_err(|e| format!("無法建立「{RESULT_DIR_NAME}」：{e}"))?;
+    cleanup_transient_work(&work_root)?;
 
     let resourcepacks = work_root.join("resourcepacks");
     let config = work_root.join("config");
@@ -83,11 +122,14 @@ fn write_readme(layout: &ResultLayout) -> Result<(), String> {
 \n\
 目錄結構：\n\
   {RESULT_DIR_NAME}/\n\
-    resourcepacks/     ← 把這裡的 .zip 複製到遊戲 resourcepacks 並啟用\n\
-    config/ftbquests/  ← 任務／劇情：依備份選項覆蓋到遊戲 config\\ftbquests\n\
+    resourcepacks/     ← 翻譯完成會直接套用；需要手動時才複製到遊戲 resourcepacks\n\
+    resourcepacks-extra/ ← ZIP 資料包／資源包翻譯副本（工具套用時一起複製）\n\
+    config/ftbquests/  ← 任務／劇情：完成時依備份選項覆蓋到遊戲 config\\ftbquests\n\
     config/openloader/ ← 文字覆寫（若有）\n\
+    config/starterkit/、armorsets/、minecolonies/ 等 ← 顯示型設定文字（若有）\n\
     patchouli_books/   ← 書本（若有）\n\
-    kubejs/            ← 語言覆寫（若有）\n\
+    kubejs/            ← 語言覆寫與安全白名單腳本字串（若有）\n\
+    data/               ← JAR 內 Patchouli 書本覆寫（若有）\n\
     jar-translated/    ← 翻譯後 JAR 副本（套用時依備份選項放入 mods）\n\
     minemenu/          ← 若有快捷選單修正檔\n\
     翻譯工作階段.json  ← 補翻／修復用，勿亂刪\n\
@@ -95,7 +137,7 @@ fn write_readme(layout: &ResultLayout) -> Result<(), String> {
 \n\
 建議流程：\n\
 1. 關閉遊戲\n\
-2. 用工具「一鍵套用到遊戲」（可選擇是否備份）或手動複製\n\
+2. 工具完成時會依選項備份並直接套用；只有手動處理時才複製\n\
 3. 開遊戲 → 語言繁中（台灣）→ 啟用資源包\n\
 \n\
 工作根目錄：\n{}\n",
@@ -120,6 +162,12 @@ pub struct CoverageStats {
     pub ref_note: String,
     pub pack_path: String,
     pub pack_format: u32,
+    pub source_notes: Vec<String>,
+    pub unsupported: Vec<String>,
+    pub glossary_hits: usize,
+    pub tm_hits: usize,
+    pub shared_hits: usize,
+    pub coverage_tier: String,
 }
 
 pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Result<PathBuf, String> {
@@ -144,6 +192,24 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
     } else {
         "4. 不用線上服務做分類找檔；掃描與分類都在本機完成\n"
     };
+    let source_lines = if stats.source_notes.is_empty() {
+        "• 本次沒有額外來源統計。\n".to_string()
+    } else {
+        stats
+            .source_notes
+            .iter()
+            .map(|line| format!("• {line}\n"))
+            .collect::<String>()
+    };
+    let unsupported_lines = if stats.unsupported.is_empty() {
+        "• 本次沒有記錄到額外略過原因。\n".to_string()
+    } else {
+        stats
+            .unsupported
+            .iter()
+            .map(|line| format!("• {line}\n"))
+            .collect::<String>()
+    };
     let body = format!(
         "【覆蓋範圍說明 — 請先讀】\n\
 （依全球 Minecraft／整合包玩家社群常見期望撰寫；本工具不宣稱 100% 漢化）\n\
@@ -152,6 +218,8 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 • 中文鍵約 {} 條{}\n\
 • 仍待補英文約 {} 條（語言檔層級粗估完成度約 {:.1}%）\n\
 • 掃過模組 jar 約 {} 個；翻譯副本重建 {} 個、寫入 {} 個語言檔、{} 個失敗\n\
+• 完整度授權：{}\n\
+• 補譯命中：術語表 {}／翻譯記憶 {}／共享庫 {}\n\
 • 資源包：{}\n\
 • pack_format：{}（不相容時遊戲會提示，可回報版本）\n\
 • 參考包：{}\n\
@@ -161,20 +229,26 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 1. mods／資源包／KubeJS 等語言檔 → 產出 zh_tw 資源包 zip\n\
 2. 簡中 → 台灣繁體（OpenCC s2twp，本機）\n\
 {}\
-4. FTB Quests 任務文字（輸出到 config/ftbquests，需套用才進遊戲）\n\
-5. 文字覆寫：patchouli_books／openloader／kubejs 等（需套用才進遊戲）\n\
+4. FTB Quests 任務文字（輸出到 config/ftbquests，完成時直接套用）\n\
+5. 文字覆寫：patchouli_books／openloader／kubejs／顯示型 config 等（完成時直接套用）\n\
 6. 任務／書本系統：Better Questing／HQM／Heracles／Modonomicon（顯示欄位，best-effort）\n\
 7. Origins／Apoli 能力名稱與說明（路徑感知，不動識別字）\n\
 8. JAR 原檔只讀；翻譯副本是否在套用前備份同名 mods 檔，由玩家選項決定\n\
 \n\
+═══ 本次來源明細 ═══\n\
+{}\
+\n\
 ═══ 通常蓋不到／仍可能英文（誠實列出）═══\n\
 1. 圖片上的字（紅線，本工具不處理圖片）\n\
-2. 寫死在 Java 程式碼／KubeJS 腳本裡的字串（不解析程式碼）\n\
-3. GuideME 的 Markdown 書本、被壓成 .zip 的資料包（本版尚未支援，未來可加）\n\
+2. 寫死在 Java 程式碼／KubeJS 任意腳本邏輯裡的字串（不解析程式碼；僅處理明確白名單的顯示 API）\n\
+3. 特殊或動態生成的 Markdown 結構仍可能需要手動檢查；一般文字 ZIP 已會安全重建\n\
 4. 基岩版（Bedrock）整合包（格式不同，不支援）\n\
 5. 未掃到的特殊格式、動態生成文字\n\
 6. 世界閃退、缺模組、結構包問題（與翻譯無關，本工具不修）\n\
 7. 機翻腔、專有名詞不一致（社群包也會寫「不保證完美」）\n\
+\n\
+本次略過／需要人工檢查：\n\
+{}\
 \n\
 ═══ 不該做的事（本工具紅線）═══\n\
 1. 不直接改 mods/*.jar 原檔；只建立翻譯副本並在套用時替換\n\
@@ -184,7 +258,7 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 5. 不把簡中當繁中交差\n\
 \n\
 ═══ 建議你怎麼用 ═══\n\
-1. 關遊戲 → 工具「一鍵套用到遊戲」或手動複製 zip／任務\n\
+1. 關遊戲 → 等工具完成直接套用；若要手動安裝再複製 zip／任務\n\
 2. 語言選繁體中文（台灣）並啟用資源包\n\
 3. 不滿意用備份還原；可「只補缺漏」續跑\n\
 \n\
@@ -197,6 +271,14 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
         stats.jars_rewritten,
         stats.jar_lang_files,
         stats.jar_errors,
+        if stats.coverage_tier.is_empty() {
+            "standard"
+        } else {
+            stats.coverage_tier.as_str()
+        },
+        stats.glossary_hits,
+        stats.tm_hits,
+        stats.shared_hits,
         stats.pack_path,
         stats.pack_format,
         if stats.ref_note.is_empty() {
@@ -211,6 +293,8 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
         },
         reference_summary,
         ai_rule,
+        source_lines,
+        unsupported_lines,
         layout.work_root.display()
     );
     fs::write(&path, body).map_err(|e| e.to_string())?;
@@ -304,6 +388,12 @@ mod tests {
                 ref_note: "未找到參考包。".into(),
                 pack_path: "pack.zip".into(),
                 pack_format: 15,
+                source_notes: Vec::new(),
+                unsupported: Vec::new(),
+                glossary_hits: 0,
+                tm_hits: 0,
+                shared_hits: 0,
+                coverage_tier: "standard".into(),
             },
         )
         .unwrap();

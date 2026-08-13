@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings;
+use super::deepseek::translate_plain_strings_with_scope;
+use super::placeholder::{self, GuardStats};
+use super::translation_scope::TranslationScope;
 
 /// 逐項統計。目前彙整成 `note` 給玩家看，其餘欄位保留供排查回報用。
 #[allow(dead_code)]
@@ -28,6 +30,7 @@ pub fn translate_ftbquests<F>(
     minecraft_dir: &Path,
     output_dir: &Path,
     use_ai: bool,
+    scope: Option<&TranslationScope>,
     mut on_progress: F,
 ) -> Result<QuestTranslateResult, String>
 where
@@ -118,10 +121,11 @@ where
 
     // 翻譯表
     let mut map: HashMap<String, String> = HashMap::new();
+    let mut guard = GuardStats::default();
     if use_ai {
         on_progress(30, "任務：呼叫 AI 翻譯任務／劇情文字…");
         let app_prog = &mut on_progress;
-        let translated = translate_plain_strings(&all_strings, |pct, msg| {
+        let translated = translate_plain_strings_with_scope(&all_strings, scope, |pct, msg| {
             let mapped = 30 + (pct as u16 * 50 / 100) as u8;
             app_prog(mapped.min(80), msg);
         })?;
@@ -129,7 +133,9 @@ where
             if let Some(zh) = translated.get(i) {
                 let t = zh.trim();
                 if !t.is_empty() {
-                    map.insert(en.clone(), t.to_string());
+                    if let Some(safe) = placeholder::guard(en, t, &mut guard) {
+                        map.insert(en.clone(), safe);
+                    }
                 }
             }
         }
@@ -141,7 +147,9 @@ where
             if looks_chinese(s) {
                 if let Some(c) = converted.get(i) {
                     if c != s {
-                        map.insert(s.clone(), c.clone());
+                        if let Some(safe) = placeholder::guard(s, c, &mut guard) {
+                            map.insert(s.clone(), safe);
+                        }
                     }
                 }
             }
@@ -198,11 +206,9 @@ where
         &readme,
         format!(
             "【FTB Quests 任務／劇情翻譯】\n\
-1. 關閉遊戲。\n\
-2. 備份遊戲裡的 config\\ftbquests。\n\
-3. 把本工具輸出目錄下的 config\\ftbquests 整份複製覆蓋到遊戲：\n\
-   <實例>\\minecraft\\config\\ftbquests\n\
-4. 開遊戲檢查任務書。\n\
+1. 翻譯完成前請關閉遊戲。\n\
+2. 工具完成時會依你的備份選項，直接把 config\\ftbquests 套用到正確的遊戲資料夾。\n\
+3. 開遊戲檢查任務書；若仍有英文，回工具按「再補一些」。\n\
 \n\
 統計：掃描 {} 檔、唯一字串 {}、套用約 {} 處、寫出 {} 檔。\n\
 輸出：{}\n",
@@ -223,7 +229,7 @@ where
         files_written: written,
         output_dir: dest_root.display().to_string(),
         note: format!(
-            "任務／劇情已處理：唯一 {} 條 → 寫出 {} 個 snbt。請把輸出的 config\\ftbquests 覆蓋進遊戲。",
+            "任務／劇情已處理：唯一 {} 條 → 寫出 {} 個 snbt。流程完成時會依備份選項直接套用到遊戲。",
             map.len(),
             written
         ),

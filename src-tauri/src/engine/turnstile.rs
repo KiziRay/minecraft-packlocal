@@ -39,6 +39,39 @@ pub struct TurnstileStatus {
     pub message: String,
 }
 
+/// 讀取 Worker 的公開健康狀態，確認目前線上版本是否真的強制 Turnstile。
+///
+/// 不能只看本機是否有憑證：Worker 可以在部署後切換強制模式，
+/// 而且舊版桌面程式曾把「未設定金鑰」的相容行為誤套到已啟用的服務上。
+pub fn managed_turnstile_required() -> Result<bool, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("無法建立安全驗證狀態連線：{error}"))?;
+    let response = client
+        .get(format!("{}/health", MANAGED_BASE_URL.trim_end_matches('/')))
+        .send()
+        .map_err(|error| format!("無法確認安全驗證服務狀態：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "安全驗證服務狀態回應錯誤：HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let value = response
+        .json::<Value>()
+        .map_err(|error| format!("安全驗證服務回應格式錯誤：{error}"))?;
+    turnstile_required_from_health(&value)
+        .ok_or_else(|| "安全驗證服務缺少必要的狀態欄位。".into())
+}
+
+fn turnstile_required_from_health(value: &Value) -> Option<bool> {
+    let ready = value.get("turnstileReady")?.as_bool()?;
+    let enforced = value.pointer("/turnstile/enforced")?.as_bool()?;
+    Some(ready && enforced)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StartResponse {
@@ -312,7 +345,8 @@ fn epoch_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_challenge_url, valid_proof_shape};
+    use super::{turnstile_required_from_health, valid_challenge_url, valid_proof_shape};
+    use serde_json::json;
 
     #[test]
     fn accepts_only_managed_worker_challenge_url() {
@@ -331,5 +365,24 @@ mod tests {
         assert!(!valid_proof_shape("abc.def"));
         assert!(!valid_proof_shape("abcdefghijklmnop.qrstuvwxy z012345"));
         assert!(!valid_proof_shape("abcdefghijklmnop.qrstuvwxyz01234+"));
+    }
+
+    #[test]
+    fn health_status_distinguishes_enforced_turnstile() {
+        assert_eq!(
+            turnstile_required_from_health(&json!({
+                "turnstileReady": true,
+                "turnstile": { "enforced": true }
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            turnstile_required_from_health(&json!({
+                "turnstileReady": true,
+                "turnstile": { "enforced": false }
+            })),
+            Some(false)
+        );
+        assert_eq!(turnstile_required_from_health(&json!({})), None);
     }
 }

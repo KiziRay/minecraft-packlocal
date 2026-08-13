@@ -1,6 +1,12 @@
 # 變更紀錄
 
-## 本回合整理（尚未發布版本）
+## 0.1.0 — 2026-08-14（台北）— 重新公開發佈
+
+- **公開樹重置**：以目前本機可發佈工作區重新建立遠端 main 歷史，清除舊 Releases 與 release tags 後重新發佈。
+- **授權確認**：根目錄 LICENSE 使用 PolyForm Noncommercial License 1.0.0，並以 NOTICE.md 標明第三方素材與非商業限制。
+- **版本同步**：package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json 與 UI 顯示同步為 0.1.0。
+
+## 本回合整理（已納入 0.1.0）
 
 - **開發規格 LOCALIZE-202608**：新增 `docs/LOCALIZE-202608.md`（目標最快且盡完整本地化；缺漏／全球開源可優化技術／速度與完整度 backlog／W0–W6 波次）。`DEVELOPMENT.md`、`COMMUNITY.md`、`EXTENDING.md`、`SEARCH-MAP.md` 已互鏈。
 - UI 改成依流程狀態顯示：未選實例時收起輸出與 AI，翻譯中收起複查／分享，完成後才開放分享。
@@ -11,8 +17,33 @@
 - 結果位置改名為「翻譯結果位置」：可維持自動位置，也可在翻譯前指定資料夾；勾選但留白會回到自動位置。移除多餘的「實際套用位置」區塊。
 - 套用備份改放在 `翻譯結果/` 內，新增「刪除結果」可完整清理結果與備份；未啟用 AI 時，輸出的覆蓋說明不再寫入 AI 相關文字。
 - 自訂 API 選取後直接顯示設定欄位；資源包名稱固定使用目前偵測到的整合包名稱與資源包版本，翻譯中不可修改。
+- **錯誤分析改為證據判讀**：讀取 crash report 開頭與結尾，並合併最新 crash report、latest.log、debug.log 與 hs_err_pid 記錄。
+- **增加錯誤分類**：補上 Java／JVM／記憶體／顯示環境、Mixin／模組載入、資料檔、註冊表與退出碼判讀；未知時不再直接把翻譯列為可能原因。
+- **分析結果更完整**：顯示證據強度、最接近錯誤、可疑模組、遊戲退出碼、證據來源與可執行的下一步。
+- **LOCALIZE-202608 完整度實作**：新增 `<item:…>`／`#mod:tag` 等格式護盾與 TM 寫入守衛；新增 Append／Skip-if-complete／Force、fast／balanced／thorough 品質選擇。
+- **擴充翻譯來源**：支援 ZIP datapack／resourcepack 文字安全重建、KubeJS `Text.of`／`Component.literal`／`text.literal` 顯示字串、JAR 內 `data/*/patchouli_books`、GuideME／自訂 Markdown 可讀行；所有來源仍不改原始 JAR／ZIP。
+- **完整翻譯優先**：覆寫、Origins、任務／書本與 KubeJS 來源超過 8,000 條時會自動分批，不再把後半段留到下一次；設定／手冊／ZIP／JAR 顯示型 `.properties` 也會嘗試翻譯。
+- **JAR 顯示文字複查**：新增 `engine/jar_display.rs`，會把 JAR 內可辨識的 JSON／Markdown／properties 玩家文字接入翻譯流程，建立 `jar-translated` 副本；class 只留線索，不改程式碼。
+- **JAR 路徑與重名修正**：同名 JAR 會依完整路徑分開暫存，並保留先前語言檔翻譯副本，避免顯示文字複查把前一步結果覆蓋回原文。
+- **硬碟占用整理**：放寬文字掃描檔案與深度上限；翻譯中斷時清理 ZIP／JAR 暫存，掃描快取會移除不存在路徑並限制約 8 MiB。一般掃描不需要 GPU。
+- **覆蓋報告加強**：`覆蓋範圍說明.txt` 新增本次來源明細與略過／錯誤原因；輸出區分 `resourcepacks-extra`、`data` 與工作檔，方便判斷是哪一類文字沒有翻到。
 
 格式：版本 — 日期（台北）— 摘要。
+
+## 未發布修正
+
+- **離線完整度加速**：未勾 AI 時，FTB Quests、文字覆寫、ZIP 文字、Origins、任務／書本與 KubeJS 顯示字串會最多 3 路並行整理；勾 AI 時維持序列，避免多來源同時打翻譯服務。各來源錯誤會進 UI 與 `翻譯錯誤日誌.txt`，不會 panic 中斷。
+- **字體包可直接套用**：字體資源包建立後可勾選套用到目前整合包 `resourcepacks`；若已有同名資源包會先建立 `字體套用備份_*`。
+- **右欄命中儀表**：進度欄新增 glossary／TM／共享庫／AI／略過／待補摘要，資料來自進度、日誌與完成摘要；完整細節仍寫入 `覆蓋範圍說明.txt`。
+- **參考翻譯加強**：手動參考包支援資料夾與 zip；自動搜尋納入 CFPA、zh_cn／zh_tw、漢化／翻譯等常見命名。參考包只填缺，`zh_cn` 會作為弱來源並在合併後轉台灣用語，不上傳到共享 R2。
+- **0.1.0 三服務優化**：完整度授權（先翻能玩的／標準／盡量完整）、分享 Turnstile 改讀 `ai_status`、字體包 pack_format／拒 TTC／副檔名修正、診斷舊 crash 時間窗與翻譯證據提前、還原 `mc_dir` 校驗與失敗可見、覆蓋報告命中統計、深色工房 UI（完整度三卡、進階摺疊）。
+- **分享 Turnstile**：分享上傳改讀 `ai_status.turnstileVerified`，不再呼叫未註冊的 `turnstile_status` command。
+- **AGENTS 對齊**：版本敘述改以三處版本檔為準；雲端導航含分享／共享 TM；更新器敘述對齊免安裝 EXE 驗證後替換。
+- **開發文件整理**：重寫 `docs/DEVELOPMENT.md` 作為目前技術總覽，新增 `docs/AI-HANDOFF.md` 給其他 AI 使用，補上 FTB 任務輔助模組、Cloudflare 資料隔離、路徑規則、UI 狀態、驗證命令與已知限制；README 文件地圖與架構圖同步更新。
+- **FTB 任務補充改成選用流程**：只有偵測到 FTB Quests 且版本／載入器相容時才顯示；可一鍵準備相容的任務匯出模組、照畫面指令匯出後重新翻譯。工具自己下載的輔助模組會在翻譯完成後自動清理，使用者原本安裝的模組不會被刪除；不相容或下載失敗會直接跳過，不阻擋主流程。
+- **自訂 API 服務商預設**：自訂 API 改為服務商預設接入；目前內建 DeepSeek、智譜 GLM、OpenAI 與通義千問，使用者只需選服務商並填 API Key，不必輸入 Base URL。Key 在介面固定以 `#` 顯示；未內建的 OpenAI 相容服務仍可手動填 Base URL／模型，並修正 GLM 的 `/chat/completions` 端點路徑。
+- **修復代管 AI 驗證狀態不同步**：工具現在會讀取 Worker `/health` 判斷 Turnstile 是否強制；已啟用時，AI 狀態會要求本機短效憑證，翻譯引擎也不再用空白憑證送出請求，避免翻譯到一半反覆收到 HTTP 428。
+- **重複翻譯不重複備份**：再次套用同一個整合包時，工具會檢查實例路徑、套用目標與既有備份清單；備份完整就沿用原備份，只有發現新的尚未備份目標時才建立新的備份。日誌與 `ApplyResult` 會分別顯示「沿用既有備份」或「新建備份」。
 
 ## 1.0.2 — 2026-08-10（台北）
 
@@ -29,10 +60,10 @@
 - **手翻同路徑・多根搜尋**：`jar_scan` 鬆散 lang 擴到 defaultconfigs／datapacks／global_packs／paxi／data，config 加深以涵蓋 openloader 巢狀；`text_overlay` 多根掃資料包，路徑提示＋內容嗅探收入 `loc_name`／`effect_tip` 等，gameplay JSON 只翻顯示欄位白名單（不碰 id）；Origins／任務書同源加 openloader／global_packs。規格見 `docs/SEARCH-MAP.md`。
 - **直接覆蓋安裝、不建資料夾**：選到有效遊戲實例時，翻譯中繼檔預設放工具自管的暫存區（`%APPDATA%\modpack-i18n-tool\work`，`managed_output_base` 命令），不再在你的資料夾另建「翻譯結果」；「套用到遊戲」直接覆蓋安裝（先備份、可一鍵還原）。想要看得到的輸出仍可按「使用啟動器建議的位置」。
 - **打包成分享檔（新增 `engine/share_pack.rs`）**：勾「也建立可分享的打包檔」或按「打包成分享檔」，把整包翻譯結果壓成單一 zip 供手動分享（`create_share_package` 命令，附 3 個單元測試）。**上傳雲端拿分享短連結為後續版本**（自建在本專案 Worker）。
-- **Turnstile 改為選用**：保留 GPT 的 Turnstile（協定驗證、Discord 會員閘）程式，但**只有服務端設好 `TURNSTILE_*` 金鑰才強制**；未設定時不擋，代管 AI 維持「Discord 登入即可」，避免沒金鑰時把免費翻譯整個弄壞（`authorizeManagedAi` 條件化、client proof 選用、`ai_status` 不再要求 Turnstile）。
+- **Turnstile 依服務端設定決定**：只有 Worker 設好 `TURNSTILE_*` 金鑰並啟用強制模式時才要求安全驗證；未啟用時保留「Discord 登入即可」的相容行為。
 - **支持開發按鈕**：移到主畫面操作區的醒目位置，並可重複出現（操作區＋頁尾）。
 - **詳細使用說明**：新增 `docs/詳細使用說明.md`（實例是什麼、各啟動器資料夾在哪、該選哪個、如何安裝與分享）。
-- 版本 1.0.2；`cargo test` 125 綠、`cargo check` 0 warning。
+- 版本 0.1.0；發佈前驗證以本回合命令輸出為準。
 
 ## 1.0.1 — 2026-08-10（台北）
 
@@ -53,7 +84,9 @@
 - **公開發佈**：GitHub `KiziRay/minecraft-packlocal`（PolyForm Noncommercial 1.0.0）；Release 附安裝版／免安裝版與 `SHA256SUMS.txt`。
 - 以下項目隨本版一併發佈：
 - **社群共享翻譯記憶**（`engine/shared_tm.rs` + Worker `/tm/lookup`、`/tm/contribute`）：
-  **隱藏、預設開、零設定**。翻譯時先查社群共享庫，命中就免送 AI；AI 新產出的譯文匿名回饋。
+  **隱藏、預設開、零設定**。翻譯時先查社群共享庫，命中就免送 AI；通過格式檢查的譯文匿名回饋。
+  - 新增共享術語表（`engine/shared_glossary.rs` + Worker `/glossary/lookup`、`/glossary/contribute`），依整合包名稱分類；相同譯文去重，不同譯文標記衝突。
+  - TM 與術語資料改放獨立 Cloudflare R2 `TRANSLATIONS`，不與更新檔或一日分享檔混用。
   - **以 `(模組, lang key, 原文雜湊)` 為單位**——跨整合包安全：任何含同模組同版本的包都能重用，
     上下文由 lang key 保證、版本由原文雜湊保證；共享來的一樣過佔位符守衛才採用。
   - 只送字串（原文＋譯文＋雜湊），**無任何個資、路徑、身分**；存開發者 R2（依模組分片）。

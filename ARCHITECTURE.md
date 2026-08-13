@@ -23,7 +23,7 @@
    engine/out_layout   engine/secrets      engine/security
    engine/minemenu     engine/font_pack    engine/glossary
    engine/placeholder  engine/tm           engine/cancel
-   engine/updater      engine/share_upload
+   engine/updater      engine/share_upload  engine/translation_helper
 ```
 
 ## 1b. 雲端（Cloudflare Worker）
@@ -70,15 +70,19 @@ instance (mods/…)
     ├─ translate_ftbquests ──► 翻譯結果/config/ftbquests
     │
     ├─ translate_text_overlays ──► patchouli / openloader / …
+    │     （use_ai=false 時額外來源最多 3 路並行；use_ai=true 維持序列）
     │
     ├─ jar_docs（只讀 JAR 文件與 class 文字線索）
+    ├─ inspect／prepare／cleanup_translation_helper（FTB 任務補充，選用）
     ├─ apply_to_instance（備份後直接套用、啟用資源包，含翻譯 JAR）
     └─ write_coverage_report + 錯誤日誌 + session 更新
 ```
 
+字體資源包是獨立服務：`font_pack` 先建立 `翻譯結果/resourcepacks/<字體包>/`，若前端勾選套用，`apply_font_pack_to_current_instance` 只複製到目前實例 `resourcepacks`，同名先備份；不修改原始字體檔。
+
 資源包名稱和工具版本分開：`pack_version` 讀取 CurseForge `manifest.json`、Modrinth `modrinth.index.json` 等文件；名稱格式為「模組包翻譯工具+月日+整合包版本」，找不到版本時使用 `R1`。同一工作區可以反覆複查，`TranslateSession.review_pass` 記錄複查次數。
 
-分享檔只取可安裝內容，經 `/api/share/upload` 上傳到獨立的 Cloudflare R2 `SHARES` bucket。更新用免安裝 EXE／翻譯記憶仍使用 `DOWNLOADS`，兩者不共用資料路徑。Worker 每次下載都檢查 24 小時期限，排程只負責清理過期物件。
+分享檔只取可安裝內容，經 `/api/share/upload` 上傳到獨立的 Cloudflare R2 `SHARES` bucket。更新 EXE 使用 `DOWNLOADS`；共享 TM 與共享術語使用獨立的 `TRANSLATIONS` bucket，三者不共用資料路徑。Worker 每次下載都檢查 24 小時期限，排程只負責清理過期物件。
 
 **原則**：
 1. 本地全部整理完才 AI；AI 只收字串。
@@ -110,8 +114,10 @@ instance (mods/…)
 | `Placeholders` | `placeholder.rs` | positional／keyed／soft 三類佔位符 |
 | `GuardStats` | `placeholder.rs` | 檢查／修復／退回計數 |
 | `Glossary` | `glossary.rs` | 術語表（內建 + 使用者覆寫） |
-| `Tm` | `tm.rs` | 翻譯記憶 |
+| `Tm` | `tm.rs` | 本機翻譯記憶 |
+| `TranslationScope` | `translation_scope.rs` | 整合包名稱分類與穩定識別 |
 | `AiFillReport` | `deepseek.rs` | 三層命中數與退回數 |
+| `TranslationHelperStatus` | `translation_helper.rs` | FTB 任務補充的相容性、安裝與清理狀態 |
 
 ## 4. 前端事件
 
@@ -149,7 +155,7 @@ modpack-i18n-tool/
   src/                 前端（tauri frontendDist）
   src-tauri/
     src/lib.rs         command + 管線
-    src/engine/        純邏輯模組
+    src/engine/        純邏輯模組（含選用的 translation_helper）
     tauri.conf.json    產品名、版本、bundle
   docs/                開發與產品文件
   AGENTS.md            維修硬規則
@@ -160,10 +166,10 @@ modpack-i18n-tool/
 
 - `lib.rs` 管線偏長，可日後拆 `pipeline.rs`。
 - `en_only` 命名仍沿用，語意已是「待譯非繁中來源」。
-- `datapacks` 的 zip 本體未展開掃（只掃目錄內檔）。
+- ZIP datapack／resourcepack 已有安全重建流程；特殊結構、超限檔案與不在顯示欄白名單的內容仍會跳過並記錄。
 - KubeJS **腳本內硬字串**未完整 AST 抽取（僅 lang 路徑 + overlay 規則）。
-- 尚未支援的任務／書本系統：Better Questing、HQM、Modonomicon、Paxi
-  （FTB Quests 與 Patchouli 已支援）。
+- Better Questing、HQM、Heracles、Modonomicon 已有顯示欄位處理；Paxi 與特殊任務 schema 仍可能需要人工補充。
+- FTB 任務遊戲內匯出是選用橋接；只在相容版本顯示輔助模組，不相容時不阻擋主翻譯流程。
 - 翻譯記憶以英文原文為鍵，不含語境；同一句英文在不同語境會共用譯文。
   語境只影響送給 AI 的 prompt。這是為了命中率的刻意取捨。
 - 取消只在階段邊界與批次邊界生效；單一 AI 批次（最多 140 句）需等它結束。

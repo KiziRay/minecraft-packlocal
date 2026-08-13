@@ -20,13 +20,16 @@ use super::discord_auth::managed_ai_session_cookie;
 use super::glossary::{self, Glossary};
 use super::jar_scan::LangMap;
 use super::placeholder::{self, GuardStats};
-use super::secrets::resolve_ai_config;
+use super::secrets::{api_chat_completions_url, resolve_ai_config};
 use super::shared_tm;
+use super::shared_glossary;
 use super::tm::Tm;
-use super::turnstile::{managed_ai_turnstile_proof, MANAGED_AI_PROTOCOL};
+use super::translation_scope::TranslationScope;
+use super::turnstile::{
+    managed_ai_turnstile_proof, managed_turnstile_required, MANAGED_AI_PROTOCOL,
+};
+use super::translation_mode::TranslationQuality;
 
-/// 每批條數（去重後的「唯一英文」）
-const BATCH: usize = 140;
 const RETRY_BATCH: usize = 50;
 /// 使用者自備金鑰時的並行批次數（自己的額度自己用，可衝滿）
 const PARALLEL: usize = 16;
@@ -118,6 +121,19 @@ fn looks_like_quota_or_auth_error(msg: &str) -> bool {
         || m.contains("免費翻譯")
 }
 
+fn is_turnstile_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("turnstile")
+        || m.contains("cloudflare")
+        || m.contains("安全驗證")
+        || m.contains("verification required")
+        || m.contains("428")
+}
+
+fn turnstile_reauth_message() -> String {
+    "Cloudflare 安全驗證已過期或無效，請回到 AI 區塊重新驗證後再試。".into()
+}
+
 // ═══ 語境判斷 ═════════════════════════════════════════════════
 
 /// 由 lang key 推測語境，讓 AI 知道這是物品名還是整句提示。
@@ -163,10 +179,56 @@ fn kind_of_segment(seg: &str) -> Option<&'static str> {
 ///
 /// `use_ai == false` 時仍會跑術語表與翻譯記憶（兩者都不需要網路），
 /// 只是不呼叫 AI。沒有金鑰的玩家因此還是拿得到官方譯名與先前翻過的內容。
+#[allow(dead_code)]
 pub fn fill_missing_with_ai<F>(
     zh: &mut LangMap,
     en_only: &LangMap,
     use_ai: bool,
+    on_progress: F,
+) -> Result<AiFillReport, String>
+where
+    F: FnMut(u8, &str),
+{
+    fill_missing_with_mode(
+        zh,
+        en_only,
+        use_ai,
+        false,
+        TranslationQuality::Balanced,
+        None,
+        on_progress,
+    )
+}
+
+pub fn fill_missing_with_ai_with_scope<F>(
+    zh: &mut LangMap,
+    en_only: &LangMap,
+    use_ai: bool,
+    scope: Option<&TranslationScope>,
+    on_progress: F,
+) -> Result<AiFillReport, String>
+where
+    F: FnMut(u8, &str),
+{
+    fill_missing_with_mode(
+        zh,
+        en_only,
+        use_ai,
+        false,
+        TranslationQuality::Balanced,
+        scope,
+        on_progress,
+    )
+}
+
+/// 與一般補翻相同，但 Force 模式會略過本機翻譯記憶，避免重跑時一直沿用舊機翻。
+pub fn fill_missing_with_mode<F>(
+    zh: &mut LangMap,
+    en_only: &LangMap,
+    use_ai: bool,
+    force_refresh: bool,
+    quality: TranslationQuality,
+    scope: Option<&TranslationScope>,
     mut on_progress: F,
 ) -> Result<AiFillReport, String>
 where
@@ -189,6 +251,7 @@ where
                 key: k.clone(),
                 source: en.clone(),
                 context: context_hint(k).map(str::to_owned),
+                scope: scope.cloned(),
             });
         }
     }
@@ -204,7 +267,11 @@ where
     // ── 社群共享翻譯記憶（keyed：模組·key·原文）：先撈，命中就免送 AI ──
     // 隱藏、預設開；查不到／服務未就緒都靜默略過。以 (ns,key,srcHash) 為單位，跨整合包安全。
     on_progress(43, "查詢社群共享翻譯（不需你設定）…");
-    let shared = shared_tm::lookup(&jobs);
+    let shared = if force_refresh {
+        HashMap::new()
+    } else {
+        shared_tm::lookup(&jobs)
+    };
     let mut shared_done: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if !shared.is_empty() {
         for (i, job) in jobs.iter().enumerate() {
@@ -250,7 +317,17 @@ where
     }
 
     if !unique.is_empty() {
-        let resolved = resolve_unique(&unique, &ctx, use_ai, 44, 44, &mut on_progress)?;
+        let resolved = resolve_unique(
+            &unique,
+            &ctx,
+            use_ai,
+            !force_refresh,
+            quality,
+            44,
+            44,
+            scope,
+            &mut on_progress,
+        )?;
         // 併入子報告的計數
         let sub = &resolved.report;
         report.glossary_hits += sub.glossary_hits;
@@ -260,7 +337,8 @@ where
         report.notes.extend(sub.notes.clone());
 
         // 寫回語言表 + 蒐集「這次新由 AI 產出的」以貢獻給社群
-        let mut to_share: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+        let mut to_share: Vec<shared_tm::SharedTmEntry> = Vec::new();
+        let mut glossary_share: Vec<shared_glossary::SharedGlossaryEntry> = Vec::new();
         for &i in &remaining {
             let Some(&uid) = job_uid.get(&i) else {
                 continue;
@@ -271,14 +349,25 @@ where
                     .or_default()
                     .insert(job.key.clone(), text.clone());
                 report.filled += 1;
-                if resolved.ai_uids.contains(&uid) {
-                    to_share.push((
-                        job.namespace.clone(),
-                        job.key.clone(),
-                        job.source.clone(),
-                        text.clone(),
-                        job.context.clone(),
-                    ));
+                if job.scope.is_some() {
+                    to_share.push(shared_tm::SharedTmEntry {
+                        namespace: job.namespace.clone(),
+                        key: job.key.clone(),
+                        source: job.source.clone(),
+                        translated: text.clone(),
+                        context: job.context.clone(),
+                        scope: job.scope.clone(),
+                    });
+                    if let (Some(scope), Some(context)) = (job.scope.clone(), job.context.clone()) {
+                        if is_shared_term_candidate(&job.source, Some(&context)) {
+                            glossary_share.push(shared_glossary::SharedGlossaryEntry {
+                                source: job.source.clone(),
+                                translated: text.clone(),
+                                context: Some(context),
+                                scope,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -286,15 +375,38 @@ where
         if !to_share.is_empty() {
             shared_tm::contribute(&to_share);
         }
+        if !glossary_share.is_empty() {
+            shared_glossary::contribute(&glossary_share);
+        }
     }
 
     on_progress(90, &report.note());
     Ok(report)
 }
 
+fn is_shared_term_candidate(source: &str, context: Option<&str>) -> bool {
+    let trimmed = source.trim();
+    context.is_some()
+        && !trimmed.is_empty()
+        && trimmed.len() <= 120
+        && !trimmed.contains(['\n', '\r'])
+}
+
 /// 翻譯任意字串列表（任務書／書本／覆寫文字用），回傳與輸入等長（缺則空字串）。
+#[allow(dead_code)]
 pub fn translate_plain_strings<F>(
     texts: &[String],
+    on_progress: F,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(u8, &str),
+{
+    translate_plain_strings_with_scope(texts, None, on_progress)
+}
+
+pub fn translate_plain_strings_with_scope<F>(
+    texts: &[String],
+    scope: Option<&TranslationScope>,
     mut on_progress: F,
 ) -> Result<Vec<String>, String>
 where
@@ -319,7 +431,17 @@ where
     }
     let ctx = vec![None; unique.len()];
 
-    let resolved = resolve_unique(&unique, &ctx, true, 0, 99, &mut on_progress)?;
+    let resolved = resolve_unique(
+        &unique,
+        &ctx,
+        true,
+        true,
+        TranslationQuality::Balanced,
+        0,
+        99,
+        scope,
+        &mut on_progress,
+    )?;
 
     Ok(idx_uid
         .into_iter()
@@ -332,8 +454,6 @@ where
 struct Resolved {
     translations: HashMap<usize, String>,
     report: AiFillReport,
-    /// 這些 uid 的譯文是「本次新由 AI 產出」（用來只回饋新內容給社群，不重傳術語表/記憶）。
-    ai_uids: std::collections::HashSet<usize>,
 }
 
 /// 術語表 → 翻譯記憶 → AI，三層依序解決 `unique` 裡的每一條。
@@ -343,8 +463,11 @@ fn resolve_unique(
     unique: &[String],
     ctx: &[Option<&'static str>],
     use_ai: bool,
+    reuse_tm: bool,
+    quality: TranslationQuality,
     base_pct: u8,
     span_pct: u8,
+    scope: Option<&TranslationScope>,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<Resolved, String> {
     cancel::check()?;
@@ -360,7 +483,43 @@ fn resolve_unique(
     let mut translations: HashMap<usize, String> = HashMap::new();
     let mut report = AiFillReport::default();
     let mut guard = GuardStats::default();
-    let mut ai_uids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let shared_jobs: Vec<shared_tm::SharedTmJob> = unique
+        .iter()
+        .enumerate()
+        .map(|(uid, source)| shared_tm::SharedTmJob {
+            namespace: "__shared_text".into(),
+            key: ctx
+                .get(uid)
+                .copied()
+                .flatten()
+                .unwrap_or("一般文字")
+                .into(),
+            source: source.clone(),
+            context: ctx.get(uid).copied().flatten().map(str::to_owned),
+            scope: scope.cloned(),
+        })
+        .collect();
+    let shared_hits = if reuse_tm {
+        super::shared_tm::lookup(&shared_jobs)
+    } else {
+        HashMap::new()
+    };
+
+    let glossary_jobs: Vec<shared_glossary::SharedGlossaryJob> = unique
+        .iter()
+        .enumerate()
+        .map(|(uid, source)| shared_glossary::SharedGlossaryJob {
+            source: source.clone(),
+            context: ctx.get(uid).copied().flatten().map(str::to_owned),
+            scope: scope.cloned(),
+        })
+        .collect();
+    let shared_glossary_hits = if reuse_tm {
+        shared_glossary::lookup(&glossary_jobs)
+    } else {
+        HashMap::new()
+    };
 
     // ── 第 1、2 層：查表，完全不用網路 ──
     let mut need_ai: Vec<(usize, String)> = Vec::new();
@@ -370,15 +529,36 @@ fn resolve_unique(
             report.glossary_hits += 1;
             continue;
         }
-        if let Some(zh) = tm.get(src) {
-            translations.insert(uid, zh);
-            report.tm_hits += 1;
-            continue;
+        if let Some(candidate) = shared_glossary_hits.get(&uid) {
+            if let Some(safe) = placeholder::guard(src, candidate, &mut guard) {
+                translations.insert(uid, safe);
+                report.shared_hits += 1;
+                continue;
+            }
+        }
+        let context = ctx.get(uid).copied().flatten();
+        if reuse_tm {
+            let tm_hit = match context {
+                Some(value) => tm.get_with_context(src, Some(value)),
+                None => tm.get(src),
+            };
+            if let Some(zh) = tm_hit {
+                translations.insert(uid, zh);
+                report.tm_hits += 1;
+                continue;
+            }
+        }
+        if let Some(zh) = shared_hits.get(&uid) {
+            if let Some(safe) = placeholder::guard(src, zh, &mut guard) {
+                translations.insert(uid, safe);
+                report.shared_hits += 1;
+                continue;
+            }
         }
         need_ai.push((uid, src.clone()));
     }
 
-    let pre = report.glossary_hits + report.tm_hits;
+    let pre = report.glossary_hits + report.shared_hits + report.tm_hits;
     if pre > 0 {
         on_progress(
             base_pct,
@@ -393,11 +573,11 @@ fn resolve_unique(
     }
 
     if need_ai.is_empty() {
+        contribute_generic_shared(unique, ctx, &translations, scope);
         report.notes.push(tm.note());
         return Ok(Resolved {
             translations,
             report,
-            ai_uids,
         });
     }
 
@@ -415,10 +595,10 @@ fn resolve_unique(
             .notes
             .push(format!("未使用 AI，{} 句維持原文", need_ai.len()));
         report.notes.push(tm.note());
+        contribute_generic_shared(unique, ctx, &translations, scope);
         return Ok(Resolved {
             translations,
             report,
-            ai_uids,
         });
     }
 
@@ -446,6 +626,7 @@ fn resolve_unique(
         &masked_need_ai,
         &gloss,
         ctx,
+        quality,
         base_pct,
         span_pct,
         on_progress,
@@ -461,10 +642,22 @@ fn resolve_unique(
         let candidate = placeholder::unmask(masked_out, tokens);
         match placeholder::guard(src, &candidate, &mut guard) {
             Some(safe) => {
-                tm.insert(src, &safe);
+                let context = ctx.get(*uid).copied().flatten();
+                if reuse_tm {
+                    if let Some(value) = context {
+                        tm.insert_with_context(src, &safe, Some(value));
+                    } else {
+                        tm.insert(src, &safe);
+                    }
+                } else {
+                    if let Some(value) = context {
+                        tm.upsert_with_context(src, &safe, Some(value));
+                    } else {
+                        tm.upsert(src, &safe);
+                    }
+                }
                 translations.insert(*uid, safe);
                 report.ai_translated += 1;
-                ai_uids.insert(*uid);
             }
             None => {
                 // 退回原文：語言表維持英文，遊戲不會壞
@@ -481,11 +674,44 @@ fn resolve_unique(
         report.notes.push(guard.note());
     }
 
+    contribute_generic_shared(unique, ctx, &translations, scope);
+
     Ok(Resolved {
         translations,
         report,
-        ai_uids,
     })
+}
+
+fn contribute_generic_shared(
+    unique: &[String],
+    ctx: &[Option<&'static str>],
+    translations: &HashMap<usize, String>,
+    scope: Option<&TranslationScope>,
+) {
+    let Some(scope) = scope.cloned() else {
+        return;
+    };
+    let entries: Vec<shared_tm::SharedTmEntry> = unique
+        .iter()
+        .enumerate()
+        .filter_map(|(uid, source)| {
+            let translated = translations.get(&uid)?.clone();
+            Some(shared_tm::SharedTmEntry {
+                namespace: "__shared_text".into(),
+                key: ctx
+                    .get(uid)
+                    .copied()
+                    .flatten()
+                    .unwrap_or("一般文字")
+                    .into(),
+                source: source.clone(),
+                translated,
+                context: ctx.get(uid).copied().flatten().map(str::to_owned),
+                scope: Some(scope.clone()),
+            })
+        })
+        .collect();
+    shared_tm::contribute(&entries);
 }
 
 // ═══ 連線 ═════════════════════════════════════════════════════
@@ -508,11 +734,15 @@ impl Engine {
         // AI 來源由使用者明確選擇；自訂模式缺金鑰時直接回報，代管模式再驗 Discord。
         let cfg = resolve_ai_config()?;
         let (managed_session, managed_turnstile) = if cfg.managed {
+            let turnstile_required = managed_turnstile_required()?;
             (
                 managed_ai_session_cookie()?,
-                // Turnstile 為選用：拿不到通行憑證也照樣走（Worker 端未設定金鑰就不強制），
-                // 才不會在還沒設定 Turnstile 時把代管翻譯整個擋掉。
-                managed_ai_turnstile_proof().unwrap_or_default(),
+                if turnstile_required {
+                    managed_ai_turnstile_proof()
+                        .map_err(|_| "Cloudflare 安全驗證已過期，請回到工具重新驗證。".to_string())?
+                } else {
+                    String::new()
+                },
             )
         } else {
             (String::new(), String::new())
@@ -540,10 +770,7 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         Ok(Engine {
             client: Arc::new(client),
-            url: Arc::new(format!(
-                "{}/v1/chat/completions",
-                cfg.base_url.trim_end_matches('/')
-            )),
+            url: Arc::new(api_chat_completions_url(&cfg.base_url)),
             api_key: Arc::new(cfg.api_key),
             model: Arc::new(cfg.model),
             managed_session: Arc::new(managed_session),
@@ -566,11 +793,15 @@ fn run_batches(
     items: &[(usize, String)],
     gloss: &Glossary,
     ctx: &[Option<&'static str>],
+    quality: TranslationQuality,
     base_pct: u8,
     span_pct: u8,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<HashMap<usize, String>, String> {
-    let chunks: Vec<Vec<(usize, String)>> = items.chunks(BATCH).map(|c| c.to_vec()).collect();
+    let chunks: Vec<Vec<(usize, String)>> = items
+        .chunks(quality.batch_size())
+        .map(|c| c.to_vec())
+        .collect();
     let total_batches = chunks.len().max(1);
     let total_unique = items.len();
 
@@ -610,6 +841,7 @@ fn run_batches(
             let managed_session = Arc::clone(&engine.managed_session);
             let managed_turnstile = Arc::clone(&engine.managed_turnstile);
             let managed = engine.managed;
+            let quality = quality;
             let translations = Arc::clone(&translations);
             let items: Vec<(usize, String)> = chunk.clone();
             let hints = gloss.hints_for(&chunk.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>());
@@ -637,6 +869,7 @@ fn run_batches(
                         slice,
                         slice_ctx,
                         &hints,
+                        quality,
                     )?;
                     let mut n = 0usize;
                     if let Ok(mut tr) = translations.lock() {
@@ -745,6 +978,9 @@ fn run_batches(
                 &format!("AI 這一輪沒有新譯文（連續 {} 次）…", empty_rounds),
             );
             let err_peek = errors.lock().map(|e| e.clone()).unwrap_or_default();
+            if err_peek.iter().any(|e| is_turnstile_error(e)) {
+                return Err(turnstile_reauth_message());
+            }
             let quota_hit = err_peek.iter().any(|e| looks_like_quota_or_auth_error(e));
             if empty_rounds >= EMPTY_ROUNDS_ABORT || quota_hit {
                 let detail = err_peek
@@ -768,6 +1004,9 @@ fn run_batches(
             .first()
             .cloned()
             .unwrap_or_else(|| "全部請求都沒有回應".into());
+        if is_turnstile_error(&detail) {
+            return Err(turnstile_reauth_message());
+        }
         return Err(ai_quota_support_message(&detail));
     }
     if !err_list.is_empty() {
@@ -808,6 +1047,7 @@ fn build_user_prompt(
     chunk: &[(usize, String)],
     contexts: &[Option<&'static str>],
     hints: &[(String, String)],
+    quality: TranslationQuality,
 ) -> String {
     let items: Vec<Value> = chunk
         .iter()
@@ -828,6 +1068,11 @@ fn build_user_prompt(
     p.push_str("2. 保留原文開頭與結尾的空白。\n");
     p.push_str("3. c 是語境。物品名／方塊名／生物名要像「名稱」，簡短不成句。\n");
     p.push_str("4. 已經是中文的照原樣輸出；純代號、路徑、id 照原樣輸出。\n");
+    p.push_str(match quality {
+        TranslationQuality::Fast => "5. 這是介面快速軌：句子簡潔，保留原意與語氣即可。\n",
+        TranslationQuality::Balanced => "5. 兼顧介面長度與語意，使用自然的台灣玩家用語。\n",
+        TranslationQuality::Thorough => "5. 這是劇情／書本仔細軌：完整保留語意、語氣、段落與上下文，不要省略資訊。\n",
+    });
     if !hints.is_empty() {
         p.push_str("5. 這些詞用固定譯名：");
         let joined: Vec<String> = hints.iter().map(|(en, zh)| format!("{en}={zh}")).collect();
@@ -851,13 +1096,14 @@ fn translate_chunk(
     chunk: &[(usize, String)],
     contexts: &[Option<&'static str>],
     hints: &[(String, String)],
+    quality: TranslationQuality,
 ) -> Result<HashMap<usize, String>, String> {
     let body = json!({
         "model": model,
         "temperature": 0.1,
         "messages": [
             {"role": "system", "content": "你是 Minecraft 模組的繁體中文（台灣）在地化譯者。只輸出合法 JSON 陣列，無其他文字。"},
-            {"role": "user", "content": build_user_prompt(chunk, contexts, hints)}
+            {"role": "user", "content": build_user_prompt(chunk, contexts, hints, quality)}
         ]
     });
 
@@ -1083,7 +1329,7 @@ fn probe_ai_ready(
         }
     }
 
-    let url = format!("{base}/v1/chat/completions");
+    let url = api_chat_completions_url(base);
     let probe = vec![(0usize, "OK".to_string())];
     match translate_chunk(
         &client,
@@ -1096,6 +1342,7 @@ fn probe_ai_ready(
         &probe,
         &[None],
         &[],
+        TranslationQuality::Balanced,
     ) {
         Ok(m) if !m.is_empty() => Ok(()),
         Ok(_) if cancel::is_cancelled() => Ok(()),
@@ -1228,7 +1475,12 @@ mod tests {
     fn prompt_carries_context_and_glossary_hints() {
         let chunk = vec![(0usize, "Creeper".to_string())];
         let hints = vec![("Creeper".to_string(), "苦力怕".to_string())];
-        let p = build_user_prompt(&chunk, &[Some("生物名")], &hints);
+        let p = build_user_prompt(
+            &chunk,
+            &[Some("生物名")],
+            &hints,
+            TranslationQuality::Balanced,
+        );
         assert!(p.contains("Creeper=苦力怕"));
         assert!(p.contains("生物名"));
         assert!(p.contains("{0}"), "必須明確要求保留遮罩後的佔位符");
@@ -1248,5 +1500,13 @@ mod tests {
         let msg = ai_quota_support_message("deepseek-chat 402 Insufficient Balance");
         assert!(!msg.to_lowercase().contains("deepseek"));
         assert!(msg.contains("AI 服務"));
+    }
+
+    #[test]
+    fn turnstile_failure_is_not_classified_as_quota_failure() {
+        assert!(is_turnstile_error("第 1 批失敗：Cloudflare 安全驗證已過期"));
+        assert!(is_turnstile_error("HTTP 428 verification required"));
+        assert!(!is_turnstile_error("帳號餘額不足"));
+        assert!(turnstile_reauth_message().contains("重新驗證"));
     }
 }

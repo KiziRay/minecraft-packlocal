@@ -47,6 +47,9 @@ pub fn extract_jar_documentation(
     }
 
     let out = work_root.join("jar-documentation");
+    if out.exists() {
+        fs::remove_dir_all(&out).map_err(|e| format!("清理舊的 JAR 文件複查失敗：{e}"))?;
+    }
     fs::create_dir_all(&out).map_err(|e| format!("建立 JAR 文件複查目錄失敗：{e}"))?;
     let mut report = JarDocumentationReport::default();
     for entry in WalkDir::new(&mods).max_depth(1).into_iter().filter_map(Result::ok) {

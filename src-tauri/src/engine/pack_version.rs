@@ -17,6 +17,8 @@ use super::security::sanitize_folder_name;
 pub struct PackVersionInfo {
     pub version: String,
     pub pack_name: String,
+    /// 整合包本身的名稱；與輸出的翻譯資源包名稱分開。
+    pub modpack_name: String,
     pub source: String,
     pub metadata_path: Option<String>,
 }
@@ -24,7 +26,19 @@ pub struct PackVersionInfo {
 pub fn detect_pack_version(instance_or_minecraft: &Path) -> PackVersionInfo {
     let mc = resolve_minecraft_dir(instance_or_minecraft)
         .unwrap_or_else(|_| instance_or_minecraft.to_path_buf());
-    let root = mc.parent().unwrap_or(&mc);
+    // 使用者可能選實例根目錄，也可能直接選 minecraft；分類名稱要取
+    // 實際選取的實例名稱，不能在暫存／共用父目錄名稱上分類。
+    let selected_name = instance_or_minecraft
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let selected_direct_minecraft = selected_name.eq_ignore_ascii_case("minecraft")
+        || selected_name.eq_ignore_ascii_case(".minecraft");
+    let root = if selected_direct_minecraft {
+        mc.parent().unwrap_or(&mc)
+    } else {
+        instance_or_minecraft
+    };
 
     let candidates = [
         (root.join("manifest.json"), "CurseForge manifest"),
@@ -42,6 +56,7 @@ pub fn detect_pack_version(instance_or_minecraft: &Path) -> PackVersionInfo {
             return PackVersionInfo {
                 version: safe_version(&version),
                 pack_name: String::new(),
+                modpack_name: read_pack_name(&path).unwrap_or_else(|| fallback_pack_name(root)),
                 source: source.to_string(),
                 metadata_path: Some(path.display().to_string()),
             };
@@ -51,6 +66,7 @@ pub fn detect_pack_version(instance_or_minecraft: &Path) -> PackVersionInfo {
     PackVersionInfo {
         version: "R1".to_string(),
         pack_name: String::new(),
+        modpack_name: fallback_pack_name(root),
         source: "首次翻譯（找不到整合包版本檔）".to_string(),
         metadata_path: None,
     }
@@ -87,6 +103,46 @@ fn read_version(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn read_pack_name(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&text).ok()?;
+    for key in ["name", "displayName", "display_name", "title"] {
+        if let Some(value) = json.get(key).and_then(Value::as_str) {
+            if is_useful_name(value) {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    for parent_key in ["pack", "metadata", "project"] {
+        if let Some(parent) = json.get(parent_key) {
+            for key in ["name", "displayName", "display_name", "title"] {
+                if let Some(value) = parent.get(key).and_then(Value::as_str) {
+                    if is_useful_name(value) {
+                        return Some(value.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fallback_pack_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未命名整合包")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn is_useful_name(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 160 && !value.contains(['\r', '\n', '\0'])
 }
 
 fn is_useful_version(value: &str) -> bool {
@@ -160,6 +216,7 @@ mod tests {
         .unwrap();
         let info = detect_pack_version(&root);
         assert_eq!(info.version, "2.4.1");
+        assert_eq!(info.modpack_name, "Example");
         assert!(!info.version.contains("1.0.2"));
         let _ = fs::remove_dir_all(&root);
     }
@@ -171,6 +228,7 @@ mod tests {
         fs::create_dir_all(root.join("minecraft")).unwrap();
         let info = detect_pack_version(&root);
         assert_eq!(info.version, "R1");
+        assert_eq!(info.modpack_name, root.file_name().unwrap().to_string_lossy());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -183,6 +241,16 @@ mod tests {
         let (name, _) = build_pack_name(&root);
         assert!(name.starts_with("模組包翻譯工具+"));
         assert!(name.ends_with("+release-7"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn direct_minecraft_selection_uses_instance_name_for_fallback() {
+        let root = temp_root("direct-minecraft");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("minecraft").join("mods")).unwrap();
+        let info = detect_pack_version(&root.join("minecraft"));
+        assert_eq!(info.modpack_name, root.file_name().unwrap().to_string_lossy());
         let _ = fs::remove_dir_all(&root);
     }
 }
