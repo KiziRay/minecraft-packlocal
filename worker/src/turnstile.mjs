@@ -21,6 +21,26 @@ export function turnstileConfigured(env) {
   return status.siteKey && status.siteSecret && status.proofSecret;
 }
 
+/** 回傳尚未就緒的 env 名稱（僅名稱，不含值）。 */
+export function turnstileMissingNames(env) {
+  const status = turnstileStatus(env);
+  const missing = [];
+  if (!status.siteKey) missing.push("TURNSTILE_SITE_KEY");
+  if (!status.siteSecret) missing.push("TURNSTILE_SECRET_KEY");
+  if (!status.proofSecret) missing.push("TURNSTILE_PROOF_SECRET");
+  return missing;
+}
+
+function turnstileUnavailableMessage(env) {
+  const missing = turnstileMissingNames(env);
+  if (!missing.length) {
+    return "安全驗證尚未完成服務端設定。請管理員檢查 Turnstile 設定後重新部署，使用者可改用自訂 API。";
+  }
+  return `Worker 缺少 ${missing.join("／")}。請管理員用 wrangler.toml [vars]（SITE_KEY）或 wrangler secret put（SECRET／PROOF）設定後確認 /health，使用者可改用自訂 API。`;
+}
+
+export { turnstileUnavailableMessage };
+
 // Safe diagnostics only: never expose secret values or their lengths.
 export function turnstileStatus(env) {
   return {
@@ -53,7 +73,7 @@ export function isAllowedLoopbackCallback(value) {
 
 export async function startTurnstile(request, env, userId) {
   if (!turnstileConfigured(env)) {
-    return apiError("安全驗證尚未完成服務端設定", "turnstile_unavailable", 503);
+    return apiError(turnstileUnavailableMessage(env), "turnstile_unavailable", 503);
   }
 
   let body;
@@ -89,7 +109,11 @@ export async function startTurnstile(request, env, userId) {
 
 export async function renderTurnstile(request, env) {
   if (!turnstileConfigured(env)) {
-    return htmlPage("安全驗證暫時無法使用", "服務端尚未完成設定，請稍後再試。", 503);
+    return htmlPage(
+      "安全驗證尚未完成服務端設定",
+      turnstileUnavailableMessage(env),
+      503
+    );
   }
   const state = clean(new URL(request.url).searchParams.get("state"));
   const payload = await verifySignedPayload(state, env.TURNSTILE_PROOF_SECRET, "challenge");
@@ -123,7 +147,11 @@ export async function renderTurnstile(request, env) {
 
 export async function completeTurnstile(request, env) {
   if (!turnstileConfigured(env)) {
-    return htmlPage("安全驗證暫時無法使用", "服務端尚未完成設定，請稍後再試。", 503);
+    return htmlPage(
+      "安全驗證尚未完成服務端設定",
+      turnstileUnavailableMessage(env),
+      503
+    );
   }
 
   let form;
@@ -134,38 +162,47 @@ export async function completeTurnstile(request, env) {
   }
   const state = clean(form.get("state"));
   const token = clean(form.get("cf-turnstile-response"));
+  const secret = clean(env.TURNSTILE_SECRET_KEY);
   const payload = await verifySignedPayload(state, env.TURNSTILE_PROOF_SECRET, "challenge");
-  if (!validChallengePayload(payload) || token.length < 1 || token.length > 2048) {
-    return htmlPage("驗證未完成", "請回到翻譯工具重新驗證。", 400);
+  if (!validChallengePayload(payload)) {
+    return htmlPage("驗證未完成", "挑戰狀態無效或已過期。請回到翻譯工具重新驗證。", 400);
+  }
+  if (!secret) {
+    return htmlPage(
+      "安全驗證尚未完成服務端設定",
+      "Worker 缺少 TURNSTILE_SECRET_KEY。請管理員用 wrangler secret put 設定後再試。",
+      503
+    );
+  }
+  if (token.length < 1) {
+    return htmlPage(
+      "缺少驗證 token",
+      "請先在頁面完成 Cloudflare 勾選，再按「完成並回到工具」。",
+      400
+    );
+  }
+  if (token.length > 2048) {
+    return htmlPage("驗證 token 異常", "token 長度超過上限。請回到翻譯工具重新驗證。", 400);
   }
 
-  const verifyBody = new FormData();
-  verifyBody.set("secret", clean(env.TURNSTILE_SECRET_KEY));
-  verifyBody.set("response", token);
-  verifyBody.set("idempotency_key", crypto.randomUUID());
+  // Official Siteverify accepts application/x-www-form-urlencoded or JSON (not multipart).
+  const params = new URLSearchParams();
+  params.set("secret", secret);
+  params.set("response", token);
+  params.set("idempotency_key", crypto.randomUUID());
   const remoteIp = clean(request.headers.get("CF-Connecting-IP"));
-  if (remoteIp) verifyBody.set("remoteip", remoteIp);
+  if (remoteIp) params.set("remoteip", remoteIp);
 
-  let outcome;
-  try {
-    const response = await fetch(SITEVERIFY_URL, {
-      method: "POST",
-      body: verifyBody,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!response.ok) throw new Error("siteverify unavailable");
-    outcome = await response.json();
-  } catch (_) {
-    return htmlPage("驗證服務暫時無法使用", "請稍後回到翻譯工具重新驗證。", 503);
+  const siteverify = await callSiteverify(params);
+  if (!siteverify.ok) {
+    return htmlPage(siteverify.title, siteverify.message, siteverify.status);
   }
+  const outcome = siteverify.outcome;
 
   const expectedHostname = clean(env.TURNSTILE_HOSTNAME) || new URL(request.url).hostname;
-  if (
-    outcome.success !== true ||
-    outcome.action !== TURNSTILE_ACTION ||
-    outcome.hostname !== expectedHostname
-  ) {
-    return htmlPage("安全驗證失敗", "驗證已過期或無效，請回到翻譯工具重試。", 403);
+  const failure = describeSiteverifyFailure(outcome, expectedHostname);
+  if (failure) {
+    return htmlPage(failure.title, failure.message, 403);
   }
 
   const now = epochSeconds();
@@ -260,6 +297,201 @@ function callbackPage(callback, proof, expiresAt) {
       "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*; base-uri 'none'; frame-ancestors 'none'`,
     },
   });
+}
+
+/**
+ * Siteverify 上游呼叫。
+ * Cloudflare 對 invalid-input-secret 等業務失敗常回 HTTP 400 + JSON；
+ * 必須先解析 body，不可只看 status 就當傳輸異常。
+ */
+export async function callSiteverify(verifyBody, fetchImpl = fetch) {
+  const prepared = prepareSiteverifyRequest(verifyBody);
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      status: prepared.status,
+      title: prepared.title,
+      message: prepared.message,
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetchImpl(SITEVERIFY_URL, {
+      method: "POST",
+      headers: prepared.headers,
+      body: prepared.body,
+      signal: controller.signal,
+    });
+    const rawText = await safeReadText(response);
+    const outcome = tryParseSiteverifyJson(rawText);
+    // Business failures (invalid secret/token) often arrive as HTTP 400 + JSON.
+    if (outcome && typeof outcome === "object" && ("success" in outcome || "error-codes" in outcome)) {
+      return { ok: true, outcome, httpStatus: response.status };
+    }
+    const snippet = truncateUpstreamBody(rawText);
+    return {
+      ok: false,
+      status: 502,
+      title: "Cloudflare Siteverify 回應異常",
+      message: snippet
+        ? `上游 HTTP ${response.status}，body：${snippet}。請管理員檢查 Turnstile Secret／sitekey 是否成對，或稍後重試。`
+        : `上游 HTTP ${response.status} 且無可用 JSON。請稍後重試；若持續失敗，請管理員檢查 Turnstile Secret 與網路。`,
+    };
+  } catch (error) {
+    const aborted =
+      error &&
+      (error.name === "AbortError" || /aborted|timeout/i.test(String(error.message || error)));
+    return {
+      ok: false,
+      status: 503,
+      title: aborted ? "Cloudflare Siteverify 逾時" : "無法連線 Cloudflare Siteverify",
+      message: aborted
+        ? "驗證上游超過 8 秒未回應。請檢查網路後回到翻譯工具重試，或改用自訂 API。"
+        : "Worker 連不上 challenges.cloudflare.com。請檢查網路／防火牆後重試，或改用自訂 API。",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Build urlencoded Siteverify body; reject empty secret/response before upstream call. */
+export function prepareSiteverifyRequest(input) {
+  let secret = "";
+  let responseToken = "";
+  let remoteip = "";
+  let idempotencyKey = "";
+
+  if (input instanceof URLSearchParams) {
+    secret = clean(input.get("secret"));
+    responseToken = clean(input.get("response"));
+    remoteip = clean(input.get("remoteip"));
+    idempotencyKey = clean(input.get("idempotency_key"));
+  } else if (input && typeof input === "object" && typeof input.get === "function") {
+    // FormData or similar — normalize to urlencoded (officially supported).
+    secret = clean(input.get("secret"));
+    responseToken = clean(input.get("response"));
+    remoteip = clean(input.get("remoteip"));
+    idempotencyKey = clean(input.get("idempotency_key"));
+  } else if (input && typeof input === "object") {
+    secret = clean(input.secret);
+    responseToken = clean(input.response);
+    remoteip = clean(input.remoteip);
+    idempotencyKey = clean(input.idempotency_key);
+  }
+
+  if (!secret) {
+    return {
+      ok: false,
+      status: 503,
+      title: "缺少 Site Secret",
+      message: "TURNSTILE_SECRET_KEY 為空，未呼叫上游。請管理員用 wrangler secret put TURNSTILE_SECRET_KEY 設定。",
+    };
+  }
+  if (!responseToken) {
+    return {
+      ok: false,
+      status: 400,
+      title: "缺少驗證 token",
+      message: "cf-turnstile-response 為空，未呼叫上游。請先完成頁面勾選再送出。",
+    };
+  }
+
+  const params = new URLSearchParams();
+  params.set("secret", secret);
+  params.set("response", responseToken);
+  if (remoteip) params.set("remoteip", remoteip);
+  if (idempotencyKey) params.set("idempotency_key", idempotencyKey);
+
+  return {
+    ok: true,
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  };
+}
+
+async function safeReadText(response) {
+  try {
+    return await response.text();
+  } catch (_) {
+    return "";
+  }
+}
+
+function tryParseSiteverifyJson(rawText) {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Truncate upstream body for error pages; never include request secret. */
+export function truncateUpstreamBody(rawText, maxLen = 240) {
+  const text = String(rawText || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  // Defense in depth: scrub accidental secret-looking query fragments.
+  const scrubbed = text.replace(/secret=[^&\s"]+/gi, "secret=[redacted]");
+  return scrubbed.length <= maxLen ? scrubbed : `${scrubbed.slice(0, maxLen)}…`;
+}
+
+/** 將 Siteverify 失敗轉成可行動中文（不含密鑰）。 */
+export function describeSiteverifyFailure(outcome, expectedHostname) {
+  if (!outcome || typeof outcome !== "object") {
+    return {
+      title: "安全驗證回應無效",
+      message: "上游未回傳可用結果。請回到翻譯工具重新驗證。",
+    };
+  }
+  if (outcome.success === true) {
+    if (outcome.action !== TURNSTILE_ACTION) {
+      return {
+        title: "安全驗證 action 不符",
+        message: `預期 action「${TURNSTILE_ACTION}」，實際「${String(outcome.action || "")}」。請管理員確認 Turnstile widget 設定。`,
+      };
+    }
+    if (outcome.hostname !== expectedHostname) {
+      return {
+        title: "安全驗證網域不符",
+        message: `預期 hostname「${expectedHostname}」，實際「${String(outcome.hostname || "")}」。請把 Turnstile widget 允許網域設為 Worker 網域。`,
+      };
+    }
+    return null;
+  }
+  const codes = Array.isArray(outcome["error-codes"])
+    ? outcome["error-codes"].map((code) => String(code)).filter(Boolean)
+    : [];
+  const detail = codes.length ? codes.map(describeTurnstileErrorCode).join("；") : "未提供 error-codes";
+  return {
+    title: "安全驗證未通過",
+    message: `${detail}。請回到翻譯工具重新驗證；若顯示金鑰／網域錯誤，請管理員檢查 Cloudflare Turnstile 設定。`,
+  };
+}
+
+function describeTurnstileErrorCode(code) {
+  switch (code) {
+    case "missing-input-secret":
+      return "缺少 Site Secret（missing-input-secret）";
+    case "invalid-input-secret":
+      return "Site Secret 無效或與 Site Key 不成對（invalid-input-secret）";
+    case "missing-input-response":
+      return "缺少驗證 token（missing-input-response）";
+    case "invalid-input-response":
+      return "驗證 token 無效或已用過（invalid-input-response）";
+    case "timeout-or-duplicate":
+      return "驗證 token 逾時或重複送出（timeout-or-duplicate）";
+    case "bad-request":
+      return "Siteverify 請求格式錯誤（bad-request）";
+    case "internal-error":
+      return "Cloudflare 內部錯誤（internal-error）";
+    default:
+      return code;
+  }
 }
 
 function htmlPage(title, message, status) {

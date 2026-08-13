@@ -42,8 +42,6 @@ let coverageMetrics = {
   skipped: 0,
   summary: "尚未開始",
 };
-const STARTUP_SKELETON_MAX_MS = 320;
-const PAGE_SWITCH_SKELETON_MS = 160;
 const CONTENT_FADE_MS = 260;
 let startupContentRevealed = false;
 let pageTransitionToken = 0;
@@ -52,23 +50,25 @@ function prefersReducedMotion() {
   return !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
 }
 
-function waitMs(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-async function waitForStartupSkeleton(tasks) {
-  if (prefersReducedMotion()) return;
-  const guarded = tasks.map((task) => Promise.resolve(task).catch(() => null));
-  await Promise.race([Promise.allSettled(guarded), waitMs(STARTUP_SKELETON_MAX_MS)]);
+/** 強制卸除啟動骨架／is-loading，避免永遠蓋住可點元件。 */
+function forceRevealUi() {
+  try {
+    const body = document.body;
+    if (!body) return;
+    body.classList.remove("is-loading");
+    body.querySelectorAll(".is-loading").forEach((el) => el.classList.remove("is-loading"));
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 function revealInitialContent() {
-  if (!document.body || startupContentRevealed) return;
+  if (!document.body || startupContentRevealed) {
+    forceRevealUi();
+    return;
+  }
   startupContentRevealed = true;
-  document.body.classList.remove("is-loading");
-  document.querySelectorAll(".page-panel.is-loading, .status-section.is-loading").forEach((el) => {
-    el.classList.remove("is-loading");
-  });
+  forceRevealUi();
   if (prefersReducedMotion()) return;
   document.body.classList.add("content-fade-in");
   window.setTimeout(() => {
@@ -76,29 +76,28 @@ function revealInitialContent() {
   }, CONTENT_FADE_MS + 90);
 }
 
-function revealPagePanel(panel, withSkeleton = true) {
+function revealPagePanel(panel) {
   if (!panel) return;
   const token = ++pageTransitionToken;
   document.querySelectorAll(".page-panel.is-loading").forEach((el) => {
-    if (el !== panel) el.classList.remove("is-loading");
+    el.classList.remove("is-loading");
   });
+  panel.classList.remove("is-loading");
   panel.classList.remove("content-fade-in");
-  if (prefersReducedMotion()) {
-    panel.classList.remove("is-loading");
-    return;
-  }
-  if (withSkeleton) panel.classList.add("is-loading");
+  if (prefersReducedMotion()) return;
+  panel.classList.add("content-fade-in");
   window.setTimeout(() => {
-    window.requestAnimationFrame(() => {
-      if (token !== pageTransitionToken || panel.hidden) return;
-      panel.classList.remove("is-loading");
-      panel.classList.add("content-fade-in");
-      window.setTimeout(() => {
-        if (token === pageTransitionToken) panel.classList.remove("content-fade-in");
-      }, CONTENT_FADE_MS + 90);
-    });
-  }, withSkeleton ? PAGE_SWITCH_SKELETON_MS : 0);
+    if (token === pageTransitionToken) panel.classList.remove("content-fade-in");
+  }, CONTENT_FADE_MS + 90);
 }
+
+// 腳本一載入就掛 fallback：即使 DOMContentLoaded 中途拋錯，2s 內也必須露出 UI
+(function bootRevealGuard() {
+  const run = () => forceRevealUi();
+  if (document.body) run();
+  document.addEventListener("DOMContentLoaded", run);
+  window.setTimeout(run, 2000);
+})();
 
 function resetCoverageMetrics(summary = "等待翻譯開始") {
   coverageSkippedSeen = new Set();
@@ -749,7 +748,7 @@ function showAppPage(page, opts = {}) {
   syncStatusRail(name);
   syncUiState();
   const activePanel = name === "font" ? pageFont : name === "diagnose" ? pageDiagnose : pageTr;
-  if (changed && !opts.skipTransition) revealPagePanel(activePanel, opts.skeleton !== false);
+  if (changed && !opts.skipTransition) revealPagePanel(activePanel);
 }
 
 function syncStatusRail(page) {
@@ -846,29 +845,8 @@ function wireShellChrome() {
     setOverflowMenuOpen(false);
   });
 
-  // WebView2：擋空白處文字選取／拖曳，不可攔截 button/a/input 的 click
-  const selectionSafeTarget = (t) =>
-    !!(t && t.closest && t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true']"));
-  const interactiveTarget = (t) =>
-    !!(t && t.closest && t.closest("button, a, label, summary, input, textarea, select, option"));
-  document.addEventListener(
-    "selectstart",
-    (ev) => {
-      if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
-      ev.preventDefault();
-    },
-    true
-  );
-  document.addEventListener("dragstart", (ev) => {
-    if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
-    ev.preventDefault();
-  });
-  document.addEventListener("dblclick", (ev) => {
-    if (selectionSafeTarget(ev.target) || interactiveTarget(ev.target)) return;
-    const sel = window.getSelection?.();
-    if (sel && sel.rangeCount) sel.removeAllRanges();
-    // 不 preventDefault click 路徑；只清掉可能蓋住畫面的選取範圍
-  });
+  // 0.2.4：移除 0.2.2/0.2.3 的 selectstart／dblclick／drag 攔截實驗（曾與骨架蓋層疊加導致無法點）
+  // 選取防護只留 CSS user-select；不以 JS 攔事件。
 }
 
 function syncUiState() {
@@ -1242,7 +1220,7 @@ async function refreshAiStatus() {
         turnstileTitle.textContent = turnstileVerified
           ? "Cloudflare 安全驗證完成"
           : !turnstileServiceReady
-            ? "Cloudflare 服務狀態異常"
+            ? "Cloudflare 服務端設定未完成"
           : !managedTurnstileRequired
             ? "Cloudflare 安全驗證（目前不需要）"
           : identityReady
@@ -1255,7 +1233,7 @@ async function refreshAiStatus() {
           : !turnstileServiceReady
             ? turnstileHealthError || message || "無法讀取 Worker／health；請檢查網路後重試。"
           : !managedTurnstileRequired
-            ? "目前服務端未要求這項驗證。"
+            ? "服務端未強制這項驗證（TURNSTILE_ENFORCED≠1），可直接使用代管翻譯。"
           : identityReady
             ? "完成後即可使用開發者提供的翻譯額度。"
             : "先完成 Discord 登入與伺服器資格確認。";
@@ -1277,9 +1255,13 @@ async function refreshAiStatus() {
     return s;
   } catch (e) {
     latestAiStatus = null;
-    statusEl.textContent = "AI：狀態暫時無法確認";
+    const detail = formatInvokeError(e);
+    statusEl.textContent = "AI：狀態確認失敗";
     if (statusRow) statusRow.dataset.state = "error";
-    if (noteEl) noteEl.textContent = "不影響本機簡繁轉換；需要 AI 補翻時請稍後再確認。";
+    if (noteEl) {
+      noteEl.textContent =
+        "無法讀取 AI 狀態：" + detail + "（本機簡繁轉換仍可用；需要 AI 時請檢查網路／Worker 後重試）";
+    }
     return null;
   }
 }
@@ -1996,107 +1978,48 @@ async function updateFontPreview(path) {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  const startupRevealFallback = window.setTimeout(revealInitialContent, 900);
-  initTheme();
-  initUiScale();
-  loadBackupPreference();
-  syncAiPanel(false);
-  const apiSettingsTask = refreshApiSettings();
-  const startupTasks = [
-    apiSettingsTask,
-    apiSettingsTask.catch(() => null).then(() => refreshAiStatus()),
-    loadUiPrefs(),
-    refreshBackupState(),
-  ];
-  setProgress(0, "尚未開始");
-  resetCoverageMetrics("尚未開始");
-  showAppPage("translate", { skipTransition: true });
-  setTranslationState("idle");
-  wireCoverageTier();
-  // 殼層與頂欄必須在任何 await 之前接線，避免 listen／啟動任務卡住時整頁不能點
-  wireShellChrome();
-  if ($("tab-translate")) $("tab-translate").onclick = () => showAppPage("translate");
-  if ($("tab-font")) $("tab-font").onclick = () => showAppPage("font");
-  if ($("tab-diagnose")) $("tab-diagnose").onclick = () => showAppPage("diagnose");
-  if ($("btn-theme")) {
-    $("btn-theme").onclick = () => {
-      const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
-      applyTheme(current === "dark" ? "light" : "dark");
-    };
-  }
-  if ($("btn-scale")) $("btn-scale").onclick = () => applyUiScale(1);
-  if ($("btn-quit")) {
-    $("btn-quit").onclick = async () => {
-      try {
-        await invoke("quit_app");
-      } catch (e) {
-        window.close();
-      }
-    };
-  }
-  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
-    if (el.dataset.wired === "1") return;
-    el.dataset.wired = "1";
-    el.addEventListener("click", async () => {
-      const url = el.getAttribute("data-url");
-      if (!url) return;
-      try {
-        await openExternalUrl(url);
-      } catch (e) {
-        appendLog("無法開啟連結：" + String(e), "warn");
-      }
-    });
-  });
-  if ($("btn-clear-log")) {
-    $("btn-clear-log").onclick = () => {
-      clearLog("日誌已清除");
-      const el = $("log");
-      if (el) el.classList.add("log-empty");
-    };
-  }
-  if ($("btn-inst")) {
-    $("btn-inst").onclick = async () => {
-      try {
-        const p = await pickDir("選擇遊戲／整合包資料夾");
-        if (p) {
-          $("instance").value = p;
-          const ok = await validateSelectedInstance(p);
-          setTranslationState(ok ? "ready" : "idle");
-          await detectVersionForInstance(p, false);
-          await refreshPackTranslationName(p);
-          await refreshReferencePack();
-          $("output").value = "";
-          $("output").dataset.autoPath = "";
-          $("output").dataset.customPath = "";
-          if (!($("output").value || "").trim()) {
-            try {
-              const base =
-                (await invoke("managed_output_for_instance", { instancePath: p }).catch(() => null)) ||
-                (await invoke("managed_output_base").catch(() => null)) ||
-                (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null)) ||
-                (await invoke("suggest_resourcepacks_dir", { instancePath: p }));
-              if (base) {
-                setAutoOutputDir(base);
-                appendLog(
-                  "翻譯結果位置已準備好：\n" + base +
-                    "\n翻譯完成會直接套用到整合包資料夾。"
-                );
-              }
-            } catch (_) {
-              /* 略 */
-            }
-          }
-          syncUiState();
-          await refreshTranslationHelper();
-        }
-      } catch (e) {
-        log(String(e));
-      }
-    };
-  }
-  await waitForStartupSkeleton(startupTasks);
-  window.clearTimeout(startupRevealFallback);
+  // 0.2.4：先露出 UI、再綁全部按鈕；任何 await／錯誤都不可擋住接線
   revealInitialContent();
+  const startupRevealFallback = window.setTimeout(() => {
+    forceRevealUi();
+    revealInitialContent();
+  }, 2000);
+
+  let apiSettingsTask = Promise.resolve();
+  try {
+    initTheme();
+    initUiScale();
+    loadBackupPreference();
+    syncAiPanel(false);
+    apiSettingsTask = refreshApiSettings().catch((e) => {
+      try {
+        appendLog("啟動時讀取 API 設定失敗：" + String(e), "warn");
+      } catch (_) {
+        /* ignore */
+      }
+      return null;
+    });
+    // 背景任務：不 await，避免卡住按鈕接線
+    apiSettingsTask.then(() => refreshAiStatus().catch(() => null));
+    loadUiPrefs().catch(() => null);
+    refreshBackupState().catch(() => null);
+    setProgress(0, "尚未開始");
+    resetCoverageMetrics("尚未開始");
+    showAppPage("translate", { skipTransition: true });
+    setTranslationState("idle");
+    wireCoverageTiers();
+    wireShellChrome();
+  } catch (e) {
+    forceRevealUi();
+    try {
+      console.error("[boot]", e);
+      appendLog("啟動初始化失敗（介面仍可操作）：" + String(e), "warn");
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  // —— 以下全部為同步接線（不可插入 await）——
   syncUiState();
   ["instance", "output", "font-output"].forEach((id) => {
     const input = $(id);
@@ -2735,7 +2658,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   }
 
-  // 後端事件通道放在所有按鈕接線之後，避免 listen 卡住時整頁失效
+  // 全部按鈕已接線；再掛後端事件（可 await，失敗不影響已綁定的 UI）
+  window.clearTimeout(startupRevealFallback);
+  forceRevealUi();
+  revealInitialContent();
+
   try {
     await listen("translate-progress", (ev) => {
       const p = (ev && ev.payload) || {};

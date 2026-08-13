@@ -1,5 +1,43 @@
 # 變更紀錄
 
+## 0.2.6 — 2026-08-14（台北）— 代管 AI 503 不再誤報「維護中」
+
+- **根因（實測）**：`/health` `hasKey:true`，但 `turnstileReady:false`（`TURNSTILE_SECRET_KEY` 名稱存在、值為空／空白 → `siteSecret:false`）。`TURNSTILE_ENFORCED=1` 時 Worker 回 **503 + `turnstile_unavailable`**；exe 卻把代管模式**所有** 503 顯示成「免費翻譯暫時無法使用（服務端維護中）」。
+- **修復（exe）**：依 JSON `error.type` 分流——`server_not_ready` 才稱維護；`turnstile_unavailable`／`auth_unavailable` 顯示真實原因。
+- **修復（Worker）**：代管閘門缺 Turnstile 設定時回中文缺項說明（仍為 `turnstile_unavailable`／503）。
+- **管理員**：對與 `TURNSTILE_SITE_KEY` 成對的 widget 重跑 `wrangler secret put TURNSTILE_SECRET_KEY`（非空），直到 `/health` `turnstileReady=true`。DeepSeek key 已就緒，無需重設。
+- 版本同步：三處＋UI／說明／Worker → **0.2.6**。
+
+## 0.2.5.2 — 2026-08-14（台北）— Turnstile：缺 Secret 誤顯示「不需要」
+
+- **線上實測**：`secret list` 有 `TURNSTILE_SECRET_KEY` 名稱，但 `/health` 仍 `siteSecret:false`、`turnstileMissing:["TURNSTILE_SECRET_KEY"]`、`turnstileReady:false`（值為空／空白時 `Boolean(clean())` 為 false）。`SITE_KEY`（vars）與 `PROOF_SECRET` 已齊；`enforced=true`。
+- **文案矛盾根因**：桌面 `turnstile_required_from_health` 把 `ready=false && enforced=true` 算成 `Ok(false)`（「不需要」），UI 才顯示「目前不需要／服務端未要求」。
+- **修復**：enforced 但未就緒 → `Err`（服務端設定未完成，並列缺項名稱）；Worker 503／health 明示缺哪個 env；「目前不需要」僅在 `enforced=false`。
+- **管理員下一步**：對與 `TURNSTILE_SITE_KEY` 成對的 widget 重跑 `wrangler secret put TURNSTILE_SECRET_KEY`（非空值），直到 `/health` `turnstileReady=true`。
+
+## 0.2.5.1 — 2026-08-14（台北）— Worker：Siteverify HTTP 400 誤判（hotfix）
+
+- **根因（實測）**：Cloudflare Siteverify 對 `invalid-input-secret` 等業務失敗常回 **HTTP 400 + JSON**；Worker 只看 `response.ok` 就當成「上游異常」，從不解析 `error-codes`。
+- **修復（Worker only）**：先讀 body 再判斷；有 `success`／`error-codes` 就走既有失敗文案；空 secret／token 不打上游；改送 `application/x-www-form-urlencoded`；非 JSON 時附截斷 body（遮罩 `secret=`）。
+- **不需升 exe**：錯誤頁由 Worker HTML 顯示；桌面仍為 0.2.5。
+- 若錯誤變 `invalid-input-secret`：請管理員重設與 sitekey 成對的 `TURNSTILE_SECRET_KEY`（`wrangler secret put`）。
+
+## 0.2.5 — 2026-08-14（台北）— 驗證錯誤不再誤報「暫時無法使用」
+
+- **唯一來源（證據）**：瀏覽器頁標題「驗證服務暫時無法使用」只出現在 `worker/src/turnstile.mjs` Siteverify `catch`；設定缺失則為「安全驗證暫時無法使用」。
+- **根因**：Siteverify 逾時／HTTP／JSON／金鑰／網域失敗全被吞成同一句「暫時無法使用」，無法對症。
+- **修復（Worker）**：改 `AbortController`；區分逾時、上游 HTTP、JSON、error-codes、action／hostname 不符；設定缺失改明示缺 secret。
+- **修復（exe）**：`ai_status` catch 顯示真實錯誤；Discord 登入／會員查詢失敗帶 HTTP／連線細節，不再寫「暫時無法使用」。
+- Worker `/health` 實測：`ok`、`turnstileReady=true`、secrets 齊、`enforced=true`。
+- 版本同步：三處＋UI／說明／Worker → **0.2.5**。
+
+## 0.2.4 — 2026-08-14（台北）— P0：UI 全黑／按鈕全死
+
+- **根因（證據）**：`DOMContentLoaded` 呼叫 `wireCoverageTier()`（少一個 `s`），函式實為 `wireCoverageTiers` → 啟動中途 `ReferenceError`，後續全部 `onclick` 接線與 `revealInitialContent` 主路徑都不執行。
+- **蓋層**：`body.is-loading` + `.main-stage > * { opacity: 0 }`／`.service-tabs > * { opacity: 0 }` 使標題列下幾乎全黑；骨架 `::before` 雖 `pointer-events: none`，但內容不可見且接線失敗 →「全黑＋全不能點」。
+- **修復**：更正呼叫名；廢除啟動 `is-loading` 骨架（HTML 不再掛 class；CSS 不再把子項藏成 opacity 0）；腳本載入即 `forceRevealUi`＋2s fallback；所有按鈕同步接線完成後才 `await listen`；移除 0.2.2/0.2.3 的 `selectstart`／`dblclick`／`dragstart` 實驗攔截；裝飾層強制 `pointer-events: none`，互動元件 `pointer-events: auto`。
+- 版本同步：三處＋UI／說明／Worker → **0.2.4**。
+
 ## 0.2.3 — 2026-08-14（台北）— 修復點擊失效＋條件顯示
 
 - **P0 點擊**：啟動時殼層／頂欄／瀏覽鈕在任何 `await listen` 之前接線；骨架與氣氛層強制 `pointer-events: none`；雙擊防選取改為精準 `selectstart`（不擋 button／a／input click）。

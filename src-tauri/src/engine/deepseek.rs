@@ -134,6 +134,64 @@ fn turnstile_reauth_message() -> String {
     "Cloudflare 安全驗證已過期或無效，請回到 AI 區塊重新驗證後再試。".into()
 }
 
+/// 從 Worker／上游 JSON 取出 `error.type`（僅診斷用，不含金鑰）。
+fn extract_proxy_error_type(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    v.get("error")
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 代管／自訂 AI 的 HTTP 錯誤 → 玩家可行動文案。503 不得一律稱「維護中」。
+fn map_chat_http_error(code: u16, body: &str, managed: bool) -> Option<String> {
+    let err_type = extract_proxy_error_type(body);
+    let type_ref = err_type.as_deref();
+    match code {
+        503 if type_ref == Some("server_not_ready")
+            || (!managed && body.contains("server_not_ready")) =>
+        {
+            Some(
+                "免費翻譯暫時無法使用（服務端維護中）。你可以自行填入 AI 金鑰，或稍後再試"
+                    .into(),
+            )
+        }
+        503 if type_ref == Some("turnstile_unavailable")
+            || body.contains("turnstile_unavailable")
+            || body.contains("Turnstile is not configured") =>
+        {
+            Some(
+                "安全驗證尚未完成服務端設定（Turnstile Secret 未就緒）。請管理員用 wrangler secret put TURNSTILE_SECRET_KEY 後確認 /health turnstileReady=true，或改用自訂 API。"
+                    .into(),
+            )
+        }
+        503 if type_ref == Some("auth_unavailable") || body.contains("auth_unavailable") => {
+            Some("Discord 登入／會員驗證暫時無法連線，請稍後再試；或改用自訂 API。".into())
+        }
+        503 if managed => {
+            let snippet = sanitize_provider_name(&body.chars().take(160).collect::<String>());
+            if snippet.trim().is_empty() {
+                Some("代管 AI 暫時無法使用（503）。請稍後再試，或改用自訂 API。".into())
+            } else {
+                Some(format!("代管 AI 暫時無法使用（503）：{snippet}"))
+            }
+        }
+        429 if managed => Some("免費翻譯的當日額度已用完".into()),
+        426 if managed => {
+            Some("這個版本已不能使用開發者代管 AI，請更新工具後再試。".into())
+        }
+        428 if managed => {
+            Some("Cloudflare 安全驗證已過期，請回到工具重新驗證。".into())
+        }
+        401 if managed => Some("使用開發者代管 AI 前，請先登入 Discord。".into()),
+        403 if managed => {
+            Some("使用開發者代管 AI 前，請先加入 ZeitFrei 官方 Discord 伺服器。".into())
+        }
+        _ => None,
+    }
+}
+
 // ═══ 語境判斷 ═════════════════════════════════════════════════
 
 /// 由 lang key 推測語境，讓 AI 知道這是物品名還是整句提示。
@@ -1140,56 +1198,34 @@ fn translate_chunk(
 
         let status = resp.status();
         let code = status.as_u16();
-        if code == 503 {
-            // 代管 Worker 尚未設定 DeepSeek secret（開發者端）。對玩家而言是「免費翻譯暫停」。
-            let t = resp.text().unwrap_or_default();
-            if managed || t.contains("server_not_ready") {
-                return Err(
-                    "免費翻譯暫時無法使用（服務端維護中）。你可以自行填入 AI 金鑰，或稍後再試"
-                        .into(),
-                );
-            }
-            last_err = "服務暫時無法使用（503），稍後再試".into();
-            thread::sleep(Duration::from_millis(600 + attempt as u64 * 600));
-            continue;
-        }
-        if code == 429 {
-            // 代管模式的 429＝當日免費額度用完，直接導向贊助提示。
-            if managed {
-                return Err("免費翻譯的當日額度已用完".into());
-            }
-            last_err = "請求太頻繁，稍後再試".into();
-            thread::sleep(Duration::from_millis(800 + attempt as u64 * 1200));
-            continue;
-        }
-        if code == 426 && managed {
-            return Err("這個版本已不能使用開發者代管 AI，請更新工具後再試。".into());
-        }
-        if code == 428 && managed {
-            return Err("Cloudflare 安全驗證已過期，請回到工具重新驗證。".into());
-        }
-        if code == 401 && managed {
-            return Err("使用開發者代管 AI 前，請先登入 Discord。".into());
-        }
-        if code == 403 && managed {
-            return Err("使用開發者代管 AI 前，請先加入 ZeitFrei 官方 Discord 伺服器。".into());
-        }
-        if code == 401 || code == 403 {
-            let t = resp.text().unwrap_or_default();
-            return Err(format!(
-                "金鑰無效或無權限：{}",
-                sanitize_provider_name(&t.chars().take(120).collect::<String>())
-            ));
-        }
-        if code == 402 {
-            let t = resp.text().unwrap_or_default();
-            return Err(format!(
-                "帳號餘額不足：{}",
-                sanitize_provider_name(&t.chars().take(120).collect::<String>())
-            ));
-        }
+        // 非 2xx 先讀 body，依 error.type 分流（Turnstile／auth 的 503 不得誤報「維護中」）。
         if !status.is_success() {
             let t = resp.text().unwrap_or_default();
+            if let Some(mapped) = map_chat_http_error(code, &t, managed) {
+                return Err(mapped);
+            }
+            if code == 503 {
+                last_err = "服務暫時無法使用（503），稍後再試".into();
+                thread::sleep(Duration::from_millis(600 + attempt as u64 * 600));
+                continue;
+            }
+            if code == 429 {
+                last_err = "請求太頻繁，稍後再試".into();
+                thread::sleep(Duration::from_millis(800 + attempt as u64 * 1200));
+                continue;
+            }
+            if code == 401 || code == 403 {
+                return Err(format!(
+                    "金鑰無效或無權限：{}",
+                    sanitize_provider_name(&t.chars().take(120).collect::<String>())
+                ));
+            }
+            if code == 402 {
+                return Err(format!(
+                    "帳號餘額不足：{}",
+                    sanitize_provider_name(&t.chars().take(120).collect::<String>())
+                ));
+            }
             let snippet = sanitize_provider_name(&t.chars().take(200).collect::<String>());
             if looks_like_quota_or_auth_error(&snippet) || looks_like_quota_or_auth_error(&t) {
                 return Err(format!("可能額度不足或金鑰問題（{code}）：{snippet}"));
@@ -1508,5 +1544,34 @@ mod tests {
         assert!(is_turnstile_error("HTTP 428 verification required"));
         assert!(!is_turnstile_error("帳號餘額不足"));
         assert!(turnstile_reauth_message().contains("重新驗證"));
+    }
+
+    #[test]
+    fn managed_503_turnstile_is_not_labeled_maintenance() {
+        let body = r#"{"error":{"message":"Cloudflare Turnstile is not configured","type":"turnstile_unavailable"}}"#;
+        let msg = map_chat_http_error(503, body, true).expect("mapped");
+        assert!(msg.contains("Turnstile") || msg.contains("安全驗證"));
+        assert!(!msg.contains("維護中"));
+        assert_eq!(
+            extract_proxy_error_type(body).as_deref(),
+            Some("turnstile_unavailable")
+        );
+    }
+
+    #[test]
+    fn managed_503_missing_key_is_maintenance() {
+        let body =
+            r#"{"error":{"message":"managed translation not configured","type":"server_not_ready"}}"#;
+        let msg = map_chat_http_error(503, body, true).expect("mapped");
+        assert!(msg.contains("維護中"));
+    }
+
+    #[test]
+    fn managed_503_auth_unavailable_is_explicit() {
+        let body =
+            r#"{"error":{"message":"login verification unavailable","type":"auth_unavailable"}}"#;
+        let msg = map_chat_http_error(503, body, true).expect("mapped");
+        assert!(msg.contains("Discord"));
+        assert!(!msg.contains("維護中"));
     }
 }

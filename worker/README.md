@@ -88,6 +88,8 @@ Set-Location -LiteralPath 'C:\Users\jolin\Downloads\zeitfreigame\modpack-i18n-to
 npx wrangler secret put TURNSTILE_SECRET_KEY
 ```
 
+貼上 Cloudflare Dashboard → Turnstile → 該 widget（Site Key 須與 `wrangler.toml` 的 `TURNSTILE_SITE_KEY` 相同）的 **Secret Key**，勿加引號或空白。Siteverify 對錯誤 secret 會回 HTTP 400 + `invalid-input-secret`；這是業務失敗，不是網路全斷。
+
 ## 改版發佈（實際流程）
 
 ```powershell

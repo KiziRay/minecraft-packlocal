@@ -17,7 +17,9 @@ import {
   renderTurnstile,
   startTurnstile,
   turnstileConfigured,
+  turnstileMissingNames,
   turnstileStatus,
+  turnstileUnavailableMessage,
   verifyTurnstileAccess,
 } from "./turnstile.mjs";
 
@@ -82,13 +84,16 @@ export default {
     // 健康檢查
     if (url.pathname === "/" || url.pathname === "/health") {
       // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）——設好 secret 後可用來自我驗證
+      const turnstile = turnstileStatus(env);
       return json({
         ok: true,
         service: "modpack-i18n",
         version: env.LATEST_VERSION,
         hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
         turnstileReady: turnstileConfigured(env),
-        turnstile: turnstileStatus(env),
+        turnstile,
+        // 僅缺項名稱，不含值；方便管理員對照 secret list／vars。
+        turnstileMissing: turnstileMissingNames(env),
       });
     }
 
@@ -704,7 +709,7 @@ async function authorizeManagedAi(request, env) {
       response: json(
         {
           error: {
-            message: "Cloudflare Turnstile is not configured",
+            message: turnstileUnavailableMessage(env),
             type: "turnstile_unavailable",
           },
         },

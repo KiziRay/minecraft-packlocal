@@ -137,8 +137,21 @@ pub fn check_discord_auth_status() -> DiscordAuthStatus {
                 return DiscordAuthStatus::unavailable("登入服務回應格式異常，請稍後再試。", true)
             }
         },
-        Ok(_) => return DiscordAuthStatus::unavailable("登入服務暫時無法使用。", true),
-        Err(_) => return DiscordAuthStatus::unavailable("目前連不上登入服務，請稍後再試。", true),
+        Ok(response) => {
+            return DiscordAuthStatus::unavailable(
+                &format!(
+                    "登入服務回應錯誤（HTTP {}）。請檢查網路或稍後再試。",
+                    response.status().as_u16()
+                ),
+                true,
+            )
+        }
+        Err(error) => {
+            return DiscordAuthStatus::unavailable(
+                &format!("目前連不上登入服務：{error}"),
+                true,
+            )
+        }
     };
 
     let user_id = account
@@ -159,9 +172,20 @@ pub fn check_discord_auth_status() -> DiscordAuthStatus {
             Ok(value) => value,
             Err(_) => return DiscordAuthStatus::unavailable("伺服器會員驗證回應異常。", true),
         },
-        Ok(_) => return DiscordAuthStatus::unavailable("伺服器會員驗證暫時無法使用。", true),
-        Err(_) => {
-            return DiscordAuthStatus::unavailable("目前無法確認 Discord 伺服器會員狀態。", true)
+        Ok(response) => {
+            return DiscordAuthStatus::unavailable(
+                &format!(
+                    "伺服器會員驗證回應錯誤（HTTP {}）。請稍後再試。",
+                    response.status().as_u16()
+                ),
+                true,
+            )
+        }
+        Err(error) => {
+            return DiscordAuthStatus::unavailable(
+                &format!("目前無法確認 Discord 伺服器會員狀態：{error}"),
+                true,
+            )
         }
     };
 

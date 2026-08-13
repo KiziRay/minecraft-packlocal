@@ -97,9 +97,17 @@ button, a, label, summary, .service-tab, .promo-card {
   -webkit-user-select: none;
   user-select: none;
   -webkit-user-drag: none;
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
 }
 button, input, select, textarea, summary { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
+input, select, textarea, .input-row, .path-block, .topbar, .footer {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
 a { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
   outline: 2px solid var(--accent);
@@ -140,7 +148,7 @@ code {
   position: fixed;
   inset: 0;
   z-index: 0;
-  pointer-events: none;
+  pointer-events: none !important;
   background:
     radial-gradient(ellipse 70% 50% at 50% -10%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 60%),
     radial-gradient(ellipse 40% 40% at 100% 100%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 55%),
@@ -150,7 +158,7 @@ code {
   content: "";
   position: absolute;
   inset: 0;
-  pointer-events: none;
+  pointer-events: none !important;
   opacity: 0.22;
   background: url("assets/atmosphere-banner.png") center / cover no-repeat;
   mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 70%);
@@ -1085,27 +1093,14 @@ textarea {
 #more-options[hidden],
 #btn-more-options[hidden] { display: none !important; }
 
-/* —— Loading / fade —— */
-body.is-loading .main-stage > *,
-body.is-loading .side-block > *,
-body.is-loading .service-tabs > * { opacity: 0; }
-body.is-loading .main-stage,
-body.is-loading .side-block,
-body.is-loading .service-tabs {
-  position: relative;
-  min-height: 40px;
-}
+/* —— Loading / fade ——
+   0.2.4：廢除 body.is-loading 對 .main-stage／.service-tabs 子項 opacity:0
+   （曾因 JS 中途 ReferenceError 永遠不卸除 → 全黑＋看似點不到） */
 body.is-loading .main-stage::before,
 body.is-loading .side-block::before,
 body.is-loading .service-tabs::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-  border-radius: var(--radius-sm);
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--line) 45%, transparent), transparent);
-  animation: skeleton-sweep 1.1s linear infinite;
+  display: none !important;
+  pointer-events: none !important;
 }
 
 /* 未通過實例檢查：收斂為「選資料夾」引導 */
@@ -1133,12 +1128,8 @@ body[data-instance-ready="0"][data-app-page="translate"] .path-gate-hint {
   line-height: 1.5;
   background: color-mix(in srgb, var(--panel) 70%, transparent);
 }
-@keyframes skeleton-sweep {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(100%); }
-}
 @keyframes content-fade-in {
-  from { opacity: 0; transform: translateY(4px); }
+  from { opacity: 0.92; transform: translateY(2px); }
   to { opacity: 1; transform: translateY(0); }
 }
 body.content-fade-in .main-stage > *,

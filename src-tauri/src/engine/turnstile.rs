@@ -63,13 +63,50 @@ pub fn managed_turnstile_required() -> Result<bool, String> {
         .json::<Value>()
         .map_err(|error| format!("安全驗證服務回應格式錯誤：{error}"))?;
     turnstile_required_from_health(&value)
-        .ok_or_else(|| "安全驗證服務缺少必要的狀態欄位。".into())
 }
 
-fn turnstile_required_from_health(value: &Value) -> Option<bool> {
-    let ready = value.get("turnstileReady")?.as_bool()?;
-    let enforced = value.pointer("/turnstile/enforced")?.as_bool()?;
-    Some(ready && enforced)
+/// 從 `/health` 判定代管 AI 是否強制 Turnstile。
+/// - `Ok(true)`：已就緒且 enforced
+/// - `Ok(false)`：服務端明確不強制（enforced=false）
+/// - `Err`：無法讀狀態，或 enforced 但尚未就緒（缺 Site Key／Secret／Proof）
+fn turnstile_required_from_health(value: &Value) -> Result<bool, String> {
+    let ready = value
+        .get("turnstileReady")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "安全驗證服務缺少必要的狀態欄位。".to_string())?;
+    let enforced = value
+        .pointer("/turnstile/enforced")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "安全驗證服務缺少必要的狀態欄位。".to_string())?;
+
+    if enforced && !ready {
+        let mut missing = Vec::new();
+        let flag = |key: &str| {
+            value
+                .pointer(&format!("/turnstile/{key}"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        };
+        if !flag("siteKey") {
+            missing.push("TURNSTILE_SITE_KEY（vars）");
+        }
+        if !flag("siteSecret") {
+            missing.push("TURNSTILE_SECRET_KEY（secret）");
+        }
+        if !flag("proofSecret") {
+            missing.push("TURNSTILE_PROOF_SECRET（secret，≥32 字元）");
+        }
+        let detail = if missing.is_empty() {
+            "強制驗證已開但尚未就緒".to_string()
+        } else {
+            format!("缺少 {}", missing.join("／"))
+        };
+        return Err(format!(
+            "安全驗證尚未完成服務端設定 — {detail}。請管理員用 wrangler secret put 補齊後確認 /health turnstileReady=true，或改用自訂 API。"
+        ));
+    }
+
+    Ok(ready && enforced)
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,15 +428,35 @@ mod tests {
                 "turnstileReady": true,
                 "turnstile": { "enforced": true }
             })),
-            Some(true)
+            Ok(true)
         );
         assert_eq!(
             turnstile_required_from_health(&json!({
                 "turnstileReady": true,
                 "turnstile": { "enforced": false }
             })),
-            Some(false)
+            Ok(false)
         );
-        assert_eq!(turnstile_required_from_health(&json!({})), None);
+        assert_eq!(
+            turnstile_required_from_health(&json!({
+                "turnstileReady": false,
+                "turnstile": { "enforced": false }
+            })),
+            Ok(false)
+        );
+        let misconfigured = turnstile_required_from_health(&json!({
+            "turnstileReady": false,
+            "turnstile": {
+                "siteKey": true,
+                "siteSecret": false,
+                "proofSecret": true,
+                "enforced": true
+            }
+        }));
+        assert!(misconfigured.is_err());
+        let err = misconfigured.unwrap_err();
+        assert!(err.contains("TURNSTILE_SECRET_KEY"));
+        assert!(!err.contains("目前不需要"));
+        assert!(turnstile_required_from_health(&json!({})).is_err());
     }
 }
