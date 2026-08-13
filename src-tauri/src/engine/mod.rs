@@ -12,6 +12,7 @@ mod ftbquests;
 mod glossary;
 mod glossary_modpack;
 mod hashutil;
+mod instance_validate;
 mod jar_scan;
 mod jar_docs;
 mod jar_display;
@@ -67,6 +68,7 @@ pub use font_pack::{
 };
 pub use ftbquests::translate_ftbquests;
 pub use glossary::{ensure_user_glossary_template, load_phrase_dict, user_glossary_path};
+pub use instance_validate::{validate_instance_path, InstanceValidation};
 pub use jar_scan::{resolve_minecraft_dir, scan_instance, LangMap, ScanReport};
 pub use jar_docs::{extract_jar_documentation, JarDocumentationReport};
 pub use jar_display::translate_jar_display_texts;

@@ -23,15 +23,15 @@
   --overlay: rgba(8, 10, 14, 0.62);
   --shadow: rgba(0, 0, 0, 0.28);
   --ui-scale: 1;
-  --pad: clamp(10px, 2.2vw, 28px);
-  --gap: clamp(12px, 2vw, 24px);
+  --pad: clamp(12px, 1.6vw, 24px);
+  --gap: clamp(12px, 1.5vw, 20px);
   --radius: 14px;
   --radius-sm: 10px;
-  /* fluid shell: grows with window, still caps CTA density on ultrawide */
-  --content-max: min(1120px, 100%);
-  --dock-width: clamp(240px, 28vw, 340px);
-  --stage-max: min(52ch, 100%);
-  --cta-max: min(360px, 100%);
+  /* 放大吃滿可用寬；僅以 padding 留邊，不再中央固定窄卡 */
+  --content-max: 100%;
+  --dock-width: clamp(260px, 26vw, 380px);
+  --stage-max: min(72ch, 100%);
+  --cta-max: min(420px, 100%);
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
   --font-ui: "Outfit", "Noto Sans TC", "Segoe UI Variable", "Microsoft JhengHei UI", sans-serif;
   --font-body: "Noto Sans TC", "Segoe UI Variable", "Microsoft JhengHei UI", sans-serif;
@@ -83,6 +83,12 @@ body {
   isolation: isolate;
   color: var(--ink);
   background: var(--paper);
+  -webkit-user-select: none;
+  user-select: none;
+}
+input, textarea, select, pre.log, .log, code, [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
 }
 button, input, select, textarea, summary { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
@@ -328,9 +334,10 @@ h1 {
   padding: clamp(10px, 1.8vh, 20px) 0 clamp(8px, 1.2vh, 14px);
 }
 .workspace-frame {
-  width: min(100%, var(--content-max));
-  margin: 0 auto;
+  width: 100%;
+  margin: 0;
   min-height: 0;
+  flex: 1;
 }
 .content-column { min-width: 0; }
 .page-panel[hidden] { display: none !important; }
@@ -365,101 +372,49 @@ body[data-app-page="diagnose"] .workspace-frame {
   line-height: 1.55;
 }
 
-/* —— Coverage —— */
-.coverage-tier-block { margin: 0 0 18px; }
-.coverage-tier-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: clamp(8px, 1.2vw, 12px);
-}
-.coverage-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-height: 0;
-  padding: clamp(10px, 1.4vh, 14px) clamp(10px, 1.2vw, 12px) clamp(10px, 1.2vh, 12px);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--canvas);
-  cursor: pointer;
-  transition: border-color 160ms var(--ease), background 160ms var(--ease), transform 160ms var(--ease);
-}
-.coverage-card:hover {
-  border-color: var(--line-strong);
-  transform: translateY(-1px);
-}
-.coverage-card input { position: absolute; opacity: 0; pointer-events: none; }
-.coverage-check {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: transparent;
-  border: 1px solid var(--line-strong);
-}
-.coverage-card:has(input:checked) {
-  border-color: color-mix(in srgb, var(--accent) 65%, var(--line));
-  background: color-mix(in srgb, var(--accent-soft) 55%, var(--canvas));
-}
-.coverage-card:has(input:checked) .coverage-check {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.coverage-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  margin-bottom: 2px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 600;
-}
-.coverage-card:has(input:checked) .coverage-icon {
-  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
-  color: var(--ink);
-}
-.coverage-card strong {
-  font-family: var(--font-ui);
-  font-size: 15px;
-  letter-spacing: -0.02em;
-}
-.coverage-card small {
-  color: var(--faint);
-  font-size: 12px;
-  line-height: 1.4;
-  flex: 1 1 auto;
-}
-.coverage-range {
-  display: inline-flex;
-  align-self: flex-start;
-  margin-top: 2px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.coverage-honest {
-  margin: 10px 0 0;
+/* —— Honest note / AI home / legacy coverage —— */
+.inline-honest {
+  margin: 0 0 14px;
   color: var(--faint);
   font-size: 12px;
   line-height: 1.45;
 }
-.coverage-honest strong { color: var(--muted); font-weight: 600; }
-.coverage-ack { margin-top: 8px; }
+.path-validate[data-state="ok"] { color: var(--ok); }
+.path-validate[data-state="error"] { color: var(--danger); }
+.path-validate[data-state="idle"] { color: var(--faint); }
+
+.ai-home-panel {
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--panel) 88%, var(--canvas));
+}
+.ai-home-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.ai-home-head .options-group-title { margin: 0; }
+.ai-toggle-row { margin: 0; }
+.ai-source-inline {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.ai-auth-fold { margin-top: 8px; }
+.run-status-head { margin-bottom: 8px; }
+
+.coverage-tier-block { display: none !important; }
+.coverage-honest {
+  margin: 0;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.45;
+}
 
 /* —— Fields / actions —— */
 .path-block { margin: 0 0 16px; }

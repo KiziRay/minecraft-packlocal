@@ -26,7 +26,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | targetVersion | string \| null | **使用者指定的 MC 版本**（如 `1.20.1`、`26.2`）；`null`＝自動偵測 |
 | translationMode | string | `append`（預設）、`skip-if-complete`、`force`；Force 忽略共享／本機翻譯記憶，但保留術語表與格式護盾 |
 | translationQuality | string | `fast`、`balanced`（預設）、`thorough`；調整 AI 批次大小與提示，不做 API 分流 |
-| coverageTier | string | `quick`、`standard`、`max`；決定額外來源掃描深度 |
+| coverageTier | string | 固定傳 `max`（完整挑戰）；後端忽略其他值 |
 
 回傳 `OneClickResult`（camelCase）：`report`, `packPath`, `workRoot`, `namespaces`, `filesWritten`, `keysTotal`, `aiFilled`, `jarTranslation`, `minemenuMsg`, `playerSummary`。`jarTranslation` 會列出掃描、重建、寫入語言檔與略過錯誤。工作區另可能有 `data/`（JAR 內 Patchouli）、`resourcepacks-extra/`（ZIP 內翻譯副本）與 KubeJS 安全白名單輸出。
 
@@ -157,7 +157,8 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | `save_api_settings_cmd` | apiKey, provider, baseUrl, model | string（金鑰空＝保留；內建服務商只需 provider＋Key） |
 | `set_ai_mode_cmd` | aiMode：`managed`／`custom` | string |
 | `has_api_key` | — | bool；只代表是否已儲存自訂 API 金鑰 |
-| `ai_status` | — | 見下方；代管模式會讀取 Worker 是否強制 Turnstile，並檢查 Discord 與本機短效憑證 |
+| `ai_status` | — | 見下方；代管模式會讀取 Worker 是否強制 Turnstile，並檢查 Discord 與本機短效憑證；`serviceAvailable` 只反映 Discord，Turnstile health 另有 `turnstileServiceReady`／`turnstileHealthError` |
+| `validate_instance_cmd` | `instancePath` | 實例門檻：mods＋模組檔＋config／options／resourcepacks／啟動器特徵 |
 | `get_api_settings` | — | `{ provider, model, baseUrl, hasKey, keyMasked, aiMode }`；provider 可為 `deepseek`、`glm`、`openai`、`qwen`、`other` |
 | `discord_login` | — | `{ ok, user? , error? }`；開啟既有桌面 OAuth 流程 |
 | `cancel_discord_login_cmd` | — | bool |

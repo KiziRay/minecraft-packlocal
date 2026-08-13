@@ -48,7 +48,7 @@ fn default_translation_quality() -> String {
 }
 
 fn default_coverage_tier() -> String {
-    "standard".into()
+    "max".into()
 }
 
 /// 可能存放工作階段的目錄（翻譯結果／舊版相容）

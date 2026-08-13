@@ -26,10 +26,12 @@ pub struct CoverageSourceFlags {
 
 impl CoverageTier {
     pub fn parse(value: Option<&str>) -> Self {
-        match value.unwrap_or("standard").trim().to_ascii_lowercase().as_str() {
+        // 0.2.2 起主路徑固定完整挑戰；舊值仍可解析，未指定則 max。
+        match value.unwrap_or("max").trim().to_ascii_lowercase().as_str() {
             "quick" | "fast" | "light" | "先翻能玩的" => Self::Quick,
-            "max" | "full" | "thorough" | "盡量完整" => Self::Max,
-            _ => Self::Standard,
+            "standard" | "normal" | "標準" => Self::Standard,
+            "max" | "full" | "thorough" | "盡量完整" | "完整挑戰" => Self::Max,
+            _ => Self::Max,
         }
     }
 
@@ -123,8 +125,9 @@ mod tests {
     #[test]
     fn parse_tiers() {
         assert_eq!(CoverageTier::parse(Some("quick")), CoverageTier::Quick);
+        assert_eq!(CoverageTier::parse(Some("standard")), CoverageTier::Standard);
         assert_eq!(CoverageTier::parse(Some("max")), CoverageTier::Max);
-        assert_eq!(CoverageTier::parse(None), CoverageTier::Standard);
+        assert_eq!(CoverageTier::parse(None), CoverageTier::Max);
     }
 
     #[test]

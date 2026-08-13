@@ -31,6 +31,7 @@ let hasApplyBackups = false;
 let backupProbeToken = 0;
 let backupProbeTimer = 0;
 let translationHelperStatus = null;
+let instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
 let coverageSkippedSeen = new Set();
 let coverageMetrics = {
   glossary: 0,
@@ -844,6 +845,20 @@ function wireShellChrome() {
     }
     setOverflowMenuOpen(false);
   });
+
+  // WebView2：雙擊空白常觸發全選／拖曳選取導致介面卡住
+  document.addEventListener("dragstart", (ev) => {
+    const t = ev.target;
+    if (t && (t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true']"))) return;
+    ev.preventDefault();
+  });
+  document.addEventListener("dblclick", (ev) => {
+    const t = ev.target;
+    if (t && (t.closest("input, textarea, select, pre.log, .log, code, [contenteditable='true'], button, a, label, summary"))) return;
+    const sel = window.getSelection?.();
+    if (sel && sel.rangeCount) sel.removeAllRanges();
+    ev.preventDefault();
+  });
 }
 
 function syncUiState() {
@@ -858,12 +873,17 @@ function syncUiState() {
   const moreBtn = $("btn-more-options");
   if (moreBtn) moreBtn.hidden = hideMore;
   if (hideMore) closeMoreDrawer();
-  ["field-output", "pack-version-group", "translation-method-group", "ai-options-group", "reference-details"]
+  ["field-output", "pack-version-group", "translation-method-group", "reference-details"]
     .forEach((id) => toggleHidden(id, !hasInstance));
   const runBtn = $("btn-run");
   if (runBtn) {
     runBtn.hidden = progressBusy;
-    runBtn.disabled = !hasInstance || progressBusy;
+    runBtn.disabled = !hasInstance || !instanceValidation.ok || progressBusy;
+    runBtn.title = !hasInstance
+      ? "請先選擇遊戲資料夾"
+      : !instanceValidation.ok
+        ? instanceValidation.reason || "實例檢查未通過"
+        : "";
   }
   toggleHidden("btn-supplement", !complete || locked);
   toggleHidden("btn-repair", !failed || locked);
@@ -1099,15 +1119,15 @@ async function uploadSharePackage() {
 
 function syncAiPanel(refreshStatus = true) {
   const panel = $("ai-panel");
-  const group = $("ai-options-group");
-  const enabled = !!$("use-ai")?.checked && !!($("instance")?.value || "").trim();
+  const enabled = !!$("use-ai")?.checked;
   if (panel) {
     panel.hidden = !enabled;
     panel.setAttribute("aria-hidden", enabled ? "false" : "true");
   }
+  const group = $("ai-options-group");
   if (group) {
-    group.hidden = !enabled;
-    group.setAttribute("aria-hidden", enabled ? "false" : "true");
+    group.hidden = false;
+    group.setAttribute("aria-hidden", "false");
   }
   if (enabled && refreshStatus) refreshAiStatus();
 }
@@ -1164,6 +1184,12 @@ async function refreshAiStatus() {
       const loggedIn = !!(s && (s.loggedIn || s.logged_in));
       const inGuild = !!(s && (s.inGuild || s.in_guild));
       const serviceAvailable = s && (s.serviceAvailable ?? s.service_available) !== false;
+      const turnstileServiceReady = !(
+        s && (s.turnstileServiceReady === false || s.turnstile_service_ready === false)
+      );
+      const turnstileHealthError = String(
+        (s && (s.turnstileHealthError || s.turnstile_health_error)) || ""
+      ).trim();
       const turnstileVerified = !!(s && (s.turnstileVerified || s.turnstile_verified));
       const identityReady = loggedIn && inGuild && serviceAvailable;
       const displayName = String((s && (s.displayName || s.display_name)) || "").trim();
@@ -1175,12 +1201,16 @@ async function refreshAiStatus() {
           : !loggedIn
             ? "Discord 尚未登入"
             : !serviceAvailable
-              ? "Discord 驗證服務暫時無法使用"
+              ? "Discord 登入服務連線失敗"
               : !inGuild
                 ? "尚未加入官方伺服器"
                 : "Discord 尚未驗證";
       }
-      if (authNote) authNote.textContent = message || "登入 Discord 並加入官方伺服器後即可使用。";
+      if (authNote) {
+        authNote.textContent = !serviceAvailable
+          ? message || "請檢查網路後按「重新檢查」。"
+          : message || "登入 Discord 並加入官方伺服器後即可使用。";
+      }
       if ($("btn-discord-login")) $("btn-discord-login").hidden = loggedIn;
       if ($("btn-discord-logout")) $("btn-discord-logout").hidden = !loggedIn;
       if ($("btn-discord-join")) $("btn-discord-join").hidden = inGuild;
@@ -1189,6 +1219,8 @@ async function refreshAiStatus() {
       if (turnstileTitle) {
         turnstileTitle.textContent = turnstileVerified
           ? "Cloudflare 安全驗證完成"
+          : !turnstileServiceReady
+            ? "Cloudflare 服務狀態異常"
           : !managedTurnstileRequired
             ? "Cloudflare 安全驗證（目前不需要）"
           : identityReady
@@ -1198,6 +1230,8 @@ async function refreshAiStatus() {
       if (turnstileNote) {
         turnstileNote.textContent = turnstileVerified
           ? "短效憑證只保留在本次開啟的工具記憶體中。"
+          : !turnstileServiceReady
+            ? turnstileHealthError || message || "無法讀取 Worker／health；請檢查網路後重試。"
           : !managedTurnstileRequired
             ? "目前服務端未要求這項驗證。"
           : identityReady
@@ -1206,11 +1240,13 @@ async function refreshAiStatus() {
       }
       if ($("btn-turnstile-verify")) {
         $("btn-turnstile-verify").hidden =
-          !identityReady || turnstileVerified || !managedTurnstileRequired;
+          !identityReady || turnstileVerified || !managedTurnstileRequired || !turnstileServiceReady;
       }
       if (noteEl) {
         noteEl.textContent = ready
           ? "Discord 資格與安全憑證會在每次代管翻譯時再次確認。"
+          : !turnstileServiceReady
+            ? turnstileHealthError || message || "安全驗證服務狀態異常。"
           : message || "請先登入 Discord 並加入 ZeitFrei 官方伺服器。";
       }
     } else if (noteEl) {
@@ -1363,6 +1399,7 @@ async function ensureAiReadyForAction() {
     $("api-key")?.focus();
   } else {
     $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if ($("ai-auth-details")) $("ai-auth-details").open = true;
     const loggedIn = !!(status && (status.loggedIn || status.logged_in));
     const inGuild = !!(status && (status.inGuild || status.in_guild));
     const serviceAvailable = status && (status.serviceAvailable ?? status.service_available) !== false;
@@ -1485,10 +1522,42 @@ async function detectVersionForInstance(instancePath, silent) {
 async function refreshInstanceTarget(instancePath) {
   try {
     const target = await invoke("check_install_target", { instancePath });
-    const mcDir = target && (target.mcDir || target.mc_dir);
     if (!target || target.ok === false) return false;
     return true;
   } catch (_) {
+    return false;
+  }
+}
+
+function setInstanceValidateStatus(ok, reason, state) {
+  const el = $("instance-validate-status");
+  if (!el) return;
+  el.textContent = reason || "";
+  el.dataset.state = state || (ok ? "ok" : reason ? "error" : "idle");
+}
+
+async function validateSelectedInstance(path) {
+  const instancePath = String(path || "").trim();
+  if (!instancePath) {
+    instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
+    setInstanceValidateStatus(false, instanceValidation.reason, "idle");
+    syncUiState();
+    return false;
+  }
+  try {
+    const result = await invoke("validate_instance_cmd", { instancePath });
+    const ok = !!(result && result.ok);
+    const reason = String((result && result.reason) || "").trim() || (ok ? "實例可用。" : "實例檢查未通過。");
+    const hints = Array.isArray(result?.hints) ? result.hints.filter(Boolean) : [];
+    instanceValidation = { ok, reason, hints };
+    const detail = hints.length ? `${reason} ${hints[0]}` : reason;
+    setInstanceValidateStatus(ok, detail, ok ? "ok" : "error");
+    syncUiState();
+    return ok;
+  } catch (e) {
+    instanceValidation = { ok: false, reason: formatInvokeError(e) };
+    setInstanceValidateStatus(false, instanceValidation.reason, "error");
+    syncUiState();
     return false;
   }
 }
@@ -1509,20 +1578,15 @@ async function refreshPackTranslationName(instancePath) {
 }
 
 async function refreshReferencePack() {
-  const input = $("reference-pack");
   const status = $("reference-status");
-  if (!input || (input.value || "").trim()) return input?.value || "";
-  try {
-    const found = await invoke("get_default_reference_pack");
-    if (found) {
-      input.value = found;
-      if (status) status.textContent = "已找到本機參考翻譯，翻譯時會優先套用。";
-      return found;
-    }
-  } catch (_) {
-    /* 參考翻譯是選用功能，找不到時仍可繼續。 */
+  const input = $("reference-pack");
+  if (input && (input.value || "").trim()) {
+    if (status) status.textContent = "已指定參考翻譯；翻譯時會優先填缺。";
+    return input.value;
   }
-  if (status) status.textContent = "未找到參考翻譯；你仍可直接開始，或手動選取資料夾。";
+  if (status) {
+    status.textContent = "尚未指定參考翻譯；可手動選本機繁中／社群漢化資料夾或 zip，或略過。";
+  }
   return "";
 }
 
@@ -1547,6 +1611,9 @@ async function onRun() {
   const instancePath = ($("instance").value || "").trim();
   let outputDir = selectedOutputDir();
   if (!instancePath) return log("請先選擇「遊戲資料夾」。");
+  if (!(await validateSelectedInstance(instancePath))) {
+    return log(instanceValidation.reason || "實例檢查未通過，無法開始翻譯。");
+  }
   if (!outputDir) {
     outputDir = (await invoke("managed_output_base").catch(() => "")) || "";
     if (outputDir) setAutoOutputDir(outputDir);
@@ -1583,8 +1650,8 @@ async function onRun() {
       referencePack: (($('reference-pack')?.value || "").trim() || null),
       targetVersion: targetVersion || null,
       translationMode: ($("translation-mode")?.value || "append"),
-      translationQuality: ($("translation-quality")?.value || "balanced"),
-      coverageTier: (document.querySelector('input[name="coverage-tier"]:checked')?.value || "standard"),
+      translationQuality: ($("translation-quality")?.value || "thorough"),
+      coverageTier: "max",
     });
     setProgress(100, "全部完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
@@ -1831,35 +1898,8 @@ async function loadUiPrefs() {
 
 const COVERAGE_ACK_STORAGE_KEY = "modpack-i18n-coverage-ack-hard";
 
-function wireCoverageTier() {
-  const applyQualityHint = () => {
-    const tier = document.querySelector('input[name="coverage-tier"]:checked')?.value || "standard";
-    const quality = $("translation-quality");
-    if (!quality) return;
-    if (tier === "quick") quality.value = "fast";
-    else if (tier === "max") quality.value = "thorough";
-    else quality.value = "balanced";
-  };
-  document.querySelectorAll('input[name="coverage-tier"]').forEach((el) => {
-    el.addEventListener("change", applyQualityHint);
-  });
-  const ack = $("coverage-ack-hard");
-  if (ack) {
-    try {
-      const saved = localStorage.getItem(COVERAGE_ACK_STORAGE_KEY);
-      if (saved === "0") ack.checked = false;
-      else if (saved === "1") ack.checked = true;
-    } catch (_) {
-      /* ignore */
-    }
-    ack.addEventListener("change", () => {
-      try {
-        localStorage.setItem(COVERAGE_ACK_STORAGE_KEY, ack.checked ? "1" : "0");
-      } catch (_) {
-        /* ignore */
-      }
-    });
-  }
+function wireCoverageTiers() {
+  /* 0.2.2：完整度三選已移除；固定 max，此函式保留空殼以免舊呼叫炸掉。 */
 }
 
 let fontPreviewUrl = null;
@@ -1960,9 +2000,17 @@ window.addEventListener("DOMContentLoaded", async () => {
     input.addEventListener("input", () => {
       hasApplyBackups = false;
       if (id === "instance" && !input.value.trim()) {
+        instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
+        setInstanceValidateStatus(false, instanceValidation.reason, "idle");
         setTranslationState("idle");
       } else {
         if (id === "output" && customOutputEnabled()) input.dataset.customPath = input.value.trim();
+        if (id === "instance") {
+          window.clearTimeout(input._validateTimer);
+          input._validateTimer = window.setTimeout(() => {
+            validateSelectedInstance(input.value.trim());
+          }, 400);
+        }
         syncUiState();
         scheduleBackupStateRefresh();
       }
@@ -2410,7 +2458,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       const p = await pickDir("選擇遊戲／整合包資料夾");
       if (p) {
         $("instance").value = p;
-        setTranslationState("ready");
+        const ok = await validateSelectedInstance(p);
+        setTranslationState(ok ? "ready" : "idle");
         await detectVersionForInstance(p, false);
         await refreshPackTranslationName(p);
         await refreshReferencePack();

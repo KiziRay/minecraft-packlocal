@@ -197,16 +197,33 @@ pub fn verify_turnstile_blocking(app: AppHandle) -> Value {
         Err(_) => return json!({ "ok": false, "error": "目前連不上安全驗證服務。" }),
     };
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        let mut detail = String::new();
+        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+            detail = value
+                .get("error")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+        if detail.is_empty() {
+            detail = body.chars().take(160).collect();
+        }
         return json!({
             "ok": false,
-            "error": if response.status().as_u16() == 426 {
-                "安全驗證協定已更新，請先更新工具。"
-            } else if response.status().as_u16() == 401 {
-                "Discord 登入已過期，請重新登入。"
-            } else if response.status().as_u16() == 403 {
-                "請先加入 ZeitFrei 官方 Discord 伺服器。"
+            "error": if status == 426 {
+                "安全驗證協定已更新，請先更新工具。".to_string()
+            } else if status == 401 {
+                "Discord 登入已過期，請重新登入。".to_string()
+            } else if status == 403 {
+                "請先加入 ZeitFrei 官方 Discord 伺服器。".to_string()
+            } else if !detail.is_empty() {
+                format!("安全驗證失敗（HTTP {status}）：{detail}")
             } else {
-                "安全驗證服務暫時無法使用。"
+                format!("安全驗證服務回應錯誤（HTTP {status}）。")
             }
         });
     }

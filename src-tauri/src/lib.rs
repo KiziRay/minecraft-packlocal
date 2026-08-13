@@ -30,12 +30,12 @@ use engine::{
     translate_quests_books, translate_text_overlays,
     managed_turnstile_required,
     turnstile_status, mode_note, skip_complete_namespaces, TranslationMode, TranslationQuality,
-    user_glossary_path, validate_open_url, verify_turnstile_blocking, write_coverage_report,
+    user_glossary_path, validate_instance_path, validate_open_url, verify_turnstile_blocking, write_coverage_report,
     write_gap_summary_file,
     map_stage_progress, CoverageSourceFlags, CoverageTier,
     ApiSettingsPublic, ApplyResult, BuildOptions, PackVersionInfo,
     CoverageStats, DiscordAuthStatus, FontPackApplyResult, FontPackOptions, FontPackResult,
-    JarDocumentationReport, JarTranslationReport,
+    InstanceValidation, JarDocumentationReport, JarTranslationReport,
     LangMap, LaunchDiagnosis, ShareUploadResult,
     DeleteBackupResult, RestoreResult, ScanReport, TranslateSession, UpdateCheck, CANCEL_MESSAGE, DISCORD_INVITE_URL,
     MIN_FREE_BYTES, RESULT_DIR_NAME, SESSION_FILE,
@@ -727,9 +727,18 @@ fn run_one_click(
 ) -> Result<OneClickResult, String> {
     emit_progress(app, 2, "準備中（此階段不呼叫 AI）…");
     let mode = TranslationMode::parse(translation_mode.as_deref());
-    let tier = CoverageTier::parse(coverage_tier.as_deref());
+    // 主路徑固定完整挑戰；舊 UI 若仍傳 quick／standard 僅記一筆日誌。
+    let requested = CoverageTier::parse(coverage_tier.as_deref());
+    let tier = CoverageTier::Max;
     let sources: CoverageSourceFlags = tier.sources();
     emit_log(app, "info", &tier.note());
+    if requested != CoverageTier::Max {
+        emit_log(
+            app,
+            "info",
+            &format!("已忽略舊完整度選項「{}」，固定使用盡量完整。", requested.label()),
+        );
+    }
     let quality = if translation_quality
         .as_deref()
         .map(|s| s.trim().is_empty())
@@ -739,6 +748,19 @@ fn run_one_click(
     } else {
         TranslationQuality::parse(translation_quality.as_deref())
     };
+    let validation = validate_instance_path(&instance);
+    if !validation.ok {
+        let detail = if validation.hints.is_empty() {
+            validation.reason.clone()
+        } else {
+            format!(
+                "{}（{}）",
+                validation.reason,
+                validation.hints.join("；")
+            )
+        };
+        return Err(detail);
+    }
     emit_log(app, "info", &format!("{}", mode_note(mode, 0)));
     emit_log(app, "info", &format!("翻譯品質：{}", quality.label()));
     let mut skipped_by_tier: Vec<String> = Vec::new();
@@ -849,9 +871,9 @@ fn run_one_click(
         }
     } else {
         ref_note = if use_ai {
-            "未找到參考包。建議選 CTE2 TW 全翻 zip，本機合併可大幅減少 AI 用量。".into()
+            "未找到參考包。可選本機繁中／社群漢化包或 zip，本機合併可大幅減少 AI 用量。".into()
         } else {
-            "未找到參考包。建議選 CTE2 TW 全翻 zip，本機合併可補上更多內容。".into()
+            "未找到參考包。可選本機繁中／社群漢化包或 zip，本機合併可補上更多內容。".into()
         };
         emit_progress(app, 42, &ref_note);
     }
@@ -1385,8 +1407,9 @@ fn run_supplement(
     let (mut session, session_file) = load_session(&out).or_else(|_| load_session(&work))?;
     let mode = TranslationMode::parse(Some(&session.translation_mode));
     let quality = TranslationQuality::parse(Some(&session.translation_quality));
-    let tier = CoverageTier::parse(Some(session.coverage_tier.as_str()));
+    let tier = CoverageTier::Max;
     let sources: CoverageSourceFlags = tier.sources();
+    session.coverage_tier = tier.value().into();
     emit_log(app, "info", &mode_note(mode, 0));
     emit_log(app, "info", &format!("翻譯品質：{}", quality.label()));
     emit_log(app, "info", &tier.note());
@@ -2335,6 +2358,13 @@ fn check_install_target(instance_path: String) -> serde_json::Value {
     }
 }
 
+/// 嚴格驗證實例是否可開始翻譯（mods＋實例特徵）；選路徑與一鍵入口共用。
+#[tauri::command]
+fn validate_instance_cmd(instance_path: String) -> Result<InstanceValidation, String> {
+    let path = normalize_user_path(&instance_path)?;
+    Ok(validate_instance_path(&path))
+}
+
 /// 把「翻譯結果」打包成單一 zip，供使用者手動分享整包翻譯檔。
 /// 只有勾「建立打包檔案」才會用到；預設一鍵流程是直接覆蓋安裝進遊戲、不打包。
 /// `work_root`＝翻譯結果資料夾（通常是工作階段的 output_dir）。
@@ -2594,12 +2624,17 @@ async fn ai_status() -> serde_json::Value {
     let turnstile_required = turnstile_requirement.as_ref().ok().copied().unwrap_or(true);
     let identity_ready = logged_in && in_guild && service_available;
     let turnstile_service_ready = turnstile_requirement.is_ok();
+    let turnstile_health_error = turnstile_requirement.as_ref().err().cloned();
     let ready = managed_ai_available()
         && identity_ready
         && turnstile_service_ready
         && (!turnstile_required || turnstile.verified);
-    let status_message = if !turnstile_service_ready {
-        "目前無法確認 Cloudflare 安全驗證服務狀態，請稍後再試。".to_string()
+    let status_message = if !service_available {
+        message
+    } else if !turnstile_service_ready {
+        turnstile_health_error
+            .clone()
+            .unwrap_or_else(|| "目前無法確認 Cloudflare 安全驗證服務狀態。".into())
     } else if identity_ready && turnstile_required && !turnstile.verified {
         turnstile.message.clone()
     } else if identity_ready {
@@ -2614,10 +2649,12 @@ async fn ai_status() -> serde_json::Value {
         "managedFree": true,
         "loggedIn": logged_in,
         "inGuild": in_guild,
-        "serviceAvailable": service_available && turnstile_service_ready,
+        "serviceAvailable": service_available,
         "turnstileRequired": turnstile_required,
         "turnstileVerified": turnstile.verified,
         "turnstileExpiresAt": turnstile.expires_at,
+        "turnstileServiceReady": turnstile_service_ready,
+        "turnstileHealthError": turnstile_health_error,
         "inviteUrl": DISCORD_INVITE_URL,
         "displayName": status.as_ref().map(|s| s.nickname.clone()).unwrap_or_default(),
         "message": status_message
@@ -2851,6 +2888,7 @@ pub fn run() {
         managed_output_for_instance,
         delete_result_folder_cmd,
             check_install_target,
+            validate_instance_cmd,
             create_font_pack,
             apply_font_pack_to_current_instance,
             save_api_key,
