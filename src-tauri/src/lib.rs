@@ -31,6 +31,7 @@ use engine::{
     managed_turnstile_required,
     turnstile_status, mode_note, skip_complete_namespaces, TranslationMode, TranslationQuality,
     user_glossary_path, validate_open_url, verify_turnstile_blocking, write_coverage_report,
+    write_gap_summary_file,
     map_stage_progress, CoverageSourceFlags, CoverageTier,
     ApiSettingsPublic, ApplyResult, BuildOptions, PackVersionInfo,
     CoverageStats, DiscordAuthStatus, FontPackApplyResult, FontPackOptions, FontPackResult,
@@ -1147,6 +1148,16 @@ fn run_one_click(
 
     let pending = remaining_pending(&en_only, &zh);
     let pending_count = count_map(&pending);
+    if sources.write_gap_summary {
+        match write_gap_summary_file(&work, &pending, 120) {
+            Ok(p) => emit_log(
+                app,
+                "info",
+                &format!("已寫待補缺口摘要（樣本）：{}", p.display()),
+            ),
+            Err(e) => emit_warn(app, &format!("待補缺口摘要寫入失敗：{e}")),
+        }
+    }
     let _ = save_session(
         &work,
         &TranslateSession {
@@ -1688,6 +1699,16 @@ fn run_supplement(
 
     let still = remaining_pending(&session.pending_en, &zh);
     let still_n = count_map(&still);
+    if sources.write_gap_summary {
+        match write_gap_summary_file(&work, &still, 120) {
+            Ok(p) => emit_log(
+                app,
+                "info",
+                &format!("已寫待補缺口摘要（樣本）：{}", p.display()),
+            ),
+            Err(e) => emit_warn(app, &format!("待補缺口摘要寫入失敗：{e}")),
+        }
+    }
     session.pending_en = still;
     session.pending_count = still_n;
     session.keys_zh = built.keys_total;

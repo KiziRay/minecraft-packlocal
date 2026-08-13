@@ -15,12 +15,12 @@ pub struct CoverageSourceFlags {
     pub ftbquests: bool,
     pub quests_books: bool,
     pub text_overlay: bool,
-    pub text_overlay_deep: bool,
     pub archive_overlay: bool,
     pub jar_patchouli: bool,
     pub jar_display: bool,
     pub origins: bool,
     pub script_literals: bool,
+    /// Max 档：額外寫出「待補缺口摘要.txt」（樣本鍵清單，非完整五層盤點）。
     pub write_gap_summary: bool,
 }
 
@@ -64,7 +64,6 @@ impl CoverageTier {
                 ftbquests: true,
                 quests_books: true,
                 text_overlay: true,
-                text_overlay_deep: false,
                 archive_overlay: false,
                 jar_patchouli: false,
                 jar_display: false,
@@ -77,7 +76,6 @@ impl CoverageTier {
                 ftbquests: true,
                 quests_books: true,
                 text_overlay: true,
-                text_overlay_deep: true,
                 archive_overlay: true,
                 jar_patchouli: true,
                 jar_display: true,
@@ -90,7 +88,6 @@ impl CoverageTier {
                 ftbquests: true,
                 quests_books: true,
                 text_overlay: true,
-                text_overlay_deep: true,
                 archive_overlay: true,
                 jar_patchouli: true,
                 jar_display: true,
@@ -103,9 +100,9 @@ impl CoverageTier {
 
     pub fn note(self) -> String {
         match self {
-            Self::Quick => "完整度：先翻能玩的（物品／介面／任務主線；略過 ZIP／JAR 顯示／腳本深掃）。".into(),
-            Self::Standard => "完整度：標準（多數可讀文字來源）。".into(),
-            Self::Max => "完整度：盡量完整（深掃＋缺口摘要；圖內字與程式硬編碼仍可能留下）。".into(),
+            Self::Quick => "完整度：先翻能玩的（物品／介面／任務主線；略過 ZIP／JAR 顯示／腳本來源）。".into(),
+            Self::Standard => "完整度：標準（多數可讀文字來源；預設一般 AI 品質）。".into(),
+            Self::Max => "完整度：盡量完整（來源同標準、預設較仔細品質；另寫待補缺口摘要；圖內字與程式硬編碼仍可能留下）。".into(),
         }
     }
 }
@@ -137,6 +134,17 @@ mod tests {
         assert!(!s.archive_overlay);
         assert!(!s.jar_display);
         assert!(!s.script_literals);
+        assert!(!s.write_gap_summary);
+    }
+
+    #[test]
+    fn max_writes_gap_summary_only() {
+        let std = CoverageTier::Standard.sources();
+        let max = CoverageTier::Max.sources();
+        assert_eq!(std.archive_overlay, max.archive_overlay);
+        assert_eq!(std.jar_display, max.jar_display);
+        assert!(!std.write_gap_summary);
+        assert!(max.write_gap_summary);
     }
 
     #[test]

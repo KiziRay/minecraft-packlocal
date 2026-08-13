@@ -113,6 +113,15 @@ function resetCoverageMetrics(summary = "等待翻譯開始") {
   renderCoverageMetrics();
 }
 
+function formatCount(n) {
+  const num = Number(n) || 0;
+  try {
+    return num.toLocaleString("zh-TW");
+  } catch (_) {
+    return String(num);
+  }
+}
+
 function renderCoverageMetrics() {
   const setText = (id, value) => {
     const el = $(id);
@@ -125,6 +134,22 @@ function renderCoverageMetrics() {
   setText("metric-skipped", coverageMetrics.skipped);
   setText("metric-pending", coverageMetrics.pending == null ? "—" : coverageMetrics.pending);
   setText("metric-summary", coverageMetrics.summary || "等待資料");
+  const translated =
+    (Number(coverageMetrics.glossary) || 0) +
+    (Number(coverageMetrics.tm) || 0) +
+    (Number(coverageMetrics.shared) || 0) +
+    (Number(coverageMetrics.ai) || 0);
+  const countEl = $("prog-count");
+  if (countEl) {
+    if (coverageMetrics.pending != null) {
+      const total = translated + (Number(coverageMetrics.pending) || 0);
+      countEl.textContent = `已翻譯 ${formatCount(translated)} / ${formatCount(total)} 條目`;
+    } else if (translated > 0) {
+      countEl.textContent = `已翻譯 ${formatCount(translated)} 條目`;
+    } else {
+      countEl.textContent = coverageMetrics.summary || "尚未開始";
+    }
+  }
 }
 
 function consumeCoverageMessage(message) {
@@ -428,24 +453,28 @@ function formatInvokeError(e) {
   }
 }
 
-/** Linear 步驟：依百分比與訊息對應 */
-const STEP_ORDER = ["prep", "scan", "polish", "ai", "pack", "done"];
+/** mockup 四步：準備 → 掃描 → 翻譯 → 完成（polish/ai/pack 併入 translate） */
+const STEP_ORDER = ["prep", "scan", "translate", "done"];
 
 function stepFromProgress(percent, message) {
   const p = Number(percent) || 0;
   const m = String(message || "");
   if (p <= 0) return null;
-  if (p >= 100 || /全部完成|補翻完成|字體包完成/.test(m)) return "done";
+  if (p >= 100 || /全部完成|補翻完成|字體包完成|已套用/.test(m)) return "done";
   if (/失敗|錯誤/.test(m) && p === 0) return "error";
-  if (/字體/.test(m)) return p >= 90 ? "pack" : "prep";
+  if (/字體/.test(m)) return p >= 90 ? "done" : "prep";
   if (p < 6 || /準備中|啟動|讀取上次|工作階段/.test(m)) return "prep";
-  // 本地蒐集／整理（進度文案會帶「本地」）
-  if (p < 41 || /本地整理|本地蒐集|讀模組|資源包|KubeJS|OpenCC|詞典|合併/.test(m)) {
-    if (p >= 33 || /合併|OpenCC|詞典|快捷選單|整理完成/.test(m)) return "polish";
+  if (p < 33 || /本地蒐集|讀模組|掃描|資源包|KubeJS/.test(m)) {
+    if (
+      p >= 33 ||
+      /本地整理|合併|OpenCC|詞典|快捷選單|整理完成|純 AI|AI 階段|AI 翻譯|補約|缺漏|打包|套用/.test(m)
+    ) {
+      return "translate";
+    }
     return "scan";
   }
-  if (p < 90 || /純 AI|AI 階段|AI 翻譯|補約|缺漏/.test(m)) return "ai";
-  return "pack";
+  if (p < 100) return "translate";
+  return "done";
 }
 
 function updateLinearSteps(percent, message, failed) {
@@ -763,11 +792,9 @@ function syncUiState() {
   if (fontApplyCurrent) {
     fontApplyCurrent.disabled = locked || !hasInstance;
   }
-  toggleHidden(
-    "btn-open",
-    page === "diagnose" ||
-      (page === "font" ? !fontOutReady : page === "translate" ? !translateOutReady : true)
-  );
+  toggleHidden("btn-open", page !== "translate" || !translateOutReady);
+  toggleHidden("btn-open-report", page !== "translate" || !translateOutReady);
+  toggleHidden("btn-open-font", page !== "font" || !fontOutReady);
   toggleHidden("btn-diagnose-latest", !hasInstance || locked);
   toggleHidden("btn-restore", !hasInstance || !hasApplyBackups || locked);
   toggleHidden("btn-delete-backups", !hasInstance || !hasApplyBackups || locked);
@@ -1714,6 +1741,8 @@ async function loadUiPrefs() {
   }
 }
 
+const COVERAGE_ACK_STORAGE_KEY = "modpack-i18n-coverage-ack-hard";
+
 function wireCoverageTier() {
   const applyQualityHint = () => {
     const tier = document.querySelector('input[name="coverage-tier"]:checked')?.value || "standard";
@@ -1726,6 +1755,23 @@ function wireCoverageTier() {
   document.querySelectorAll('input[name="coverage-tier"]').forEach((el) => {
     el.addEventListener("change", applyQualityHint);
   });
+  const ack = $("coverage-ack-hard");
+  if (ack) {
+    try {
+      const saved = localStorage.getItem(COVERAGE_ACK_STORAGE_KEY);
+      if (saved === "0") ack.checked = false;
+      else if (saved === "1") ack.checked = true;
+    } catch (_) {
+      /* ignore */
+    }
+    ack.addEventListener("change", () => {
+      try {
+        localStorage.setItem(COVERAGE_ACK_STORAGE_KEY, ack.checked ? "1" : "0");
+      } catch (_) {
+        /* ignore */
+      }
+    });
+  }
 }
 
 let fontPreviewUrl = null;
@@ -2441,12 +2487,11 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
-  $("btn-open").onclick = async () => {
-    const outputInput = document.body.dataset.appPage === "font" ? $("font-output") : $("output");
+  async function openResultFolder(fromFont) {
+    const outputInput = fromFont ? $("font-output") : $("output");
     const outputDir = (outputInput?.value || "").trim();
     if (!outputDir) return log("還沒選結果位置。");
     try {
-      // 優先開「翻譯結果」
       const work = resultWorkDir(outputDir);
       try {
         await invoke("open_path", { path: work });
@@ -2456,7 +2501,36 @@ window.addEventListener("DOMContentLoaded", async () => {
     } catch (e) {
       log(String(e));
     }
-  };
+  }
+  $("btn-open").onclick = () => openResultFolder(false);
+  if ($("btn-open-font")) $("btn-open-font").onclick = () => openResultFolder(true);
+
+  if ($("btn-clear-log")) {
+    $("btn-clear-log").onclick = () => {
+      clearLog("日誌已清除");
+      const el = $("log");
+      if (el) el.classList.add("log-empty");
+    };
+  }
+
+  if ($("btn-open-report")) {
+    $("btn-open-report").onclick = async () => {
+      const outputDir = ($("output")?.value || "").trim();
+      if (!outputDir) return log("還沒選結果位置。");
+      const work = resultWorkDir(outputDir);
+      const report = work + "\\覆蓋範圍說明.txt";
+      try {
+        await invoke("open_path", { path: report });
+      } catch (_) {
+        try {
+          await invoke("open_path", { path: work });
+          appendLog("尚未找到覆蓋範圍說明.txt，已改開輸出資料夾。", "warn");
+        } catch (e) {
+          log(String(e));
+        }
+      }
+    };
+  }
 
 });
 

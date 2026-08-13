@@ -80,6 +80,7 @@ pub use minemenu::fix_minemenu_unicode_escapes;
 pub use origins::translate_origins;
 pub use out_layout::{
     cleanup_transient_work, ensure_result_layout, suggest_output_base, write_coverage_report,
+    write_gap_summary_file,
     CoverageStats, RESULT_DIR_NAME,
 };
 pub use pack_version::{build_pack_name, PackVersionInfo};

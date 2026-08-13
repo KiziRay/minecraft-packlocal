@@ -170,6 +170,53 @@ pub struct CoverageStats {
     pub coverage_tier: String,
 }
 
+/// Max 档待補樣本：列出部分仍缺譯的 `namespace:key`（上限 sample_limit），不是完整盤點。
+pub fn write_gap_summary_file(
+    work_root: &Path,
+    pending: &crate::engine::jar_scan::LangMap,
+    sample_limit: usize,
+) -> Result<PathBuf, String> {
+    let path = work_root.join("待補缺口摘要.txt");
+    let mut total = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut namespaces: Vec<_> = pending.keys().cloned().collect();
+    namespaces.sort();
+    for ns in namespaces {
+        let Some(map) = pending.get(&ns) else { continue };
+        let mut keys: Vec<_> = map.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            total += 1;
+            if lines.len() < sample_limit {
+                lines.push(format!("{ns}:{key}"));
+            }
+        }
+    }
+    let shown = lines.len();
+    let more = total.saturating_sub(shown);
+    let mut body = String::from(
+        "【待補缺口摘要】\n\
+（Max 完整度選項產出；只列語言表層級仍缺譯的樣本鍵，不是完整五層盤點，也不代表遊戲內一定看得到這些字。）\n\n",
+    );
+    body.push_str(&format!("仍待補（粗估）：{total} 條\n"));
+    body.push_str(&format!("本檔列出：{shown} 條"));
+    if more > 0 {
+        body.push_str(&format!("（另有約 {more} 條未列出）"));
+    }
+    body.push_str("\n\n");
+    if lines.is_empty() {
+        body.push_str("目前沒有待補英文鍵，或待補已清空。\n");
+    } else {
+        body.push_str("樣本：\n");
+        for line in lines {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Result<PathBuf, String> {
     let path = layout.work_root.join("覆蓋範圍說明.txt");
     let covered_pct = if stats.keys_zh + stats.keys_pending > 0 {
@@ -358,7 +405,25 @@ pub fn suggest_output_base(instance_path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
+
+    #[test]
+    fn gap_summary_lists_sample_keys() {
+        let root = std::env::temp_dir().join(format!("gap_summary_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut pending = HashMap::new();
+        let mut map = HashMap::new();
+        map.insert("item.a".into(), "A".into());
+        map.insert("item.b".into(), "B".into());
+        pending.insert("demo".into(), map);
+        let path = write_gap_summary_file(&root, &pending, 10).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("demo:item.a"), "{body}");
+        assert!(body.contains("仍待補（粗估）：2"), "{body}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn coverage_report_omits_ai_when_disabled() {
