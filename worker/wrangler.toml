@@ -5,21 +5,20 @@ compatibility_date = "2026-08-01"
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "0.2.6"
+LATEST_VERSION = "0.3.0"
 # 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.2.6-windows-x64.exe"
-RELEASE_NOTES = "0.2.6：代管 AI 的 503 依錯誤類型顯示（Turnstile 未就緒／Discord 驗證／真缺金鑰），不再一律誤報「服務端維護中」。"
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.3.0-windows-x64.exe"
+RELEASE_NOTES = "0.3.0：代管 AI 改僅 Discord 門檻（移除多餘 Turnstile）；搜尋工作圖、寫入探針、主流程殼對齊。"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-chat"
 
-# 開發者代管 AI 的桌面授權。v3 要求 Discord + Cloudflare Turnstile 短效憑證；
-# 舊版沒有完整標頭，會由 Worker 回 426 拒絕。
+# 開發者代管 AI 的桌面授權。v3 協定標頭仍要；門檻改為 Discord 會員（Turnstile 已停用）。
 AUTH_BASE_URL = "https://cloud.zeitfrei.uk"
 MANAGED_AI_PROTOCOL = "3"
 TURNSTILE_SITE_KEY = "0x4AAAAAAELdGLixrUpLNaxf"
 TURNSTILE_HOSTNAME = "modpack-i18n.jolin34563.workers.dev"
-TURNSTILE_ENFORCED = "1"
+TURNSTILE_ENFORCED = "0"
 
 # 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
 # 超過就回 429，客戶端顯示贊助提示。
@@ -28,7 +27,7 @@ DAILY_TOKEN_BUDGET = "20000000"
 PER_USER_DAILY_TOKEN_BUDGET = "1000000"
 
 # 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
-UPDATE_SHA256 = "7769e3d1c4346e5be94a5fdd9aaa62188a1ddb174daabdf0155d73d3ae6f18c2"
+UPDATE_SHA256 = "7684df70ed142b39bdb214e726fde28a078cc0dd556184b62b85ff46a6fea3b7"
 
 # 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
 SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"

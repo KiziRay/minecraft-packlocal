@@ -2,7 +2,7 @@
 
 Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 
-目前設定以工具 1.0.2 為目標。Turnstile／協定 v3 必須和支援它的桌面版一起使用；舊版會收到 426，不會繞過 Discord 會員與安全驗證。
+目前設定以工具 **0.3.0** 為目標。代管 AI 門檻為 **Discord 會員**（Turnstile 已停用）；協定 v3 標頭仍要，舊版會收到 426。
 
 ## 端點
 
@@ -13,14 +13,14 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 | POST | `/api/turnstile/start` | 驗證 Discord 後簽發五分鐘挑戰網址 |
 | GET | `/turnstile` | 顯示 Cloudflare Turnstile widget |
 | POST | `/api/turnstile/verify` | 呼叫 Siteverify，成功後回傳短效 HMAC 憑證到本機 callback |
-| POST | `/v1/chat/completions` | AI 代理：驗證 Discord 與 Turnstile 憑證後轉發上游 |
+| POST | `/v1/chat/completions` | AI 代理：驗證 Discord 後轉發上游 |
 | POST | `/tm/lookup` | 社群共享翻譯記憶查詢（精確鍵＋帶語境的跨模組候選） |
 | POST | `/tm/contribute` | 貢獻翻譯；存獨立 `TRANSLATIONS` R2 的 `tm/v1/<ns>.json.gz` 與 `tm/v2/global.json.gz` |
 | POST | `/glossary/lookup` | 查詢已確認、無衝突的共享術語 |
 | POST | `/glossary/contribute` | 貢獻依整合包分類的術語；重複去除、衝突停用 |
 | POST | `/api/share/upload` | 登入並通過安全驗證後，上傳可安裝翻譯 ZIP 到獨立 `SHARES` bucket |
 | GET/HEAD | `/s/<token>` | 下載 24 小時有效的分享檔；過期立即回 404 |
-| GET | `/health` | 健康檢查（`hasKey`、`turnstileReady`） |
+| GET | `/health` | 健康檢查（`hasKey`、`authGate`；Turnstile 欄位僅相容） |
 
 共享翻譯記憶：依模組分片存獨立 `TRANSLATIONS` R2（`tm/v1/<namespace>.json.gz`），每筆資料包含譯文、語境、整合包分類與衝突標記；另有
 `tm/v2/global.json.gz` 提供安全的跨模組候選。精確 keyhash＝`sha256(ns\0key\0正規化原文)[:24]`，
@@ -46,16 +46,15 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 
 ## 代管 AI 授權
 
-開發者代管 API 只提供給已登入 Discord、仍在 ZeitFrei 官方伺服器，且完成 Cloudflare Turnstile 的玩家。桌面端送出以下標頭：
+開發者代管 API 只提供給已登入 Discord、仍在 ZeitFrei 官方伺服器的玩家。桌面端送出以下標頭：
 
 - `X-Zeitfrei-AI-Protocol: 3`
 - `X-Zeitfrei-Client-Version: <桌面版版本>`
 - `X-Zeitfrei-Session: <桌面登入 session>`
-- `X-Zeitfrei-Turnstile: <短效 HMAC 憑證>`
 
-Worker 會先向 `cloud.zeitfrei.uk/api/check-upload` 驗證 session，再查 Discord `member-tier`。通過後桌面端才能申請 Turnstile 挑戰；原始 Turnstile token 由 Worker 呼叫 Siteverify，成功後簽發綁定 Discord user id、兩小時有效的 HMAC 憑證。缺少新版協定、登入資格或憑證都會拒絕，因此只修改舊版 UI 無法繞過限制。
+Worker 會先向 `cloud.zeitfrei.uk/api/check-upload` 驗證 session，再查 Discord `member-tier`。缺少協定標頭或登入資格會拒絕。Turnstile 路由仍保留於程式碼，但預設不再強制。
 
-桌面登入沿用既有的 `/api/desktop-auth` 與 `127.0.0.1:19420..19430/callback`；Turnstile 使用 `127.0.0.1:19431..19440/turnstile-callback`，不需要修改 Discord Developer Portal 或機器人。完成程式更新後仍需手動重新部署本 Worker，線上限制才會生效。
+桌面登入沿用既有的 `/api/desktop-auth` 與 `127.0.0.1:19420..19430/callback`。完成程式更新後仍需手動重新部署本 Worker，線上限制才會生效。
 
 ## 上線前必要設定
 
@@ -73,22 +72,15 @@ npx wrangler r2 bucket create modpack-i18n-shares
 ```powershell
 Set-Location -LiteralPath '<專案根目錄>\worker'
 npx wrangler secret put DEEPSEEK_KEY
-npx wrangler secret put TURNSTILE_SECRET_KEY
-npx wrangler secret put TURNSTILE_PROOF_SECRET
+# 以下僅在你仍要啟用 Turnstile 時才需要：
+# npx wrangler secret put TURNSTILE_SECRET_KEY
+# npx wrangler secret put TURNSTILE_PROOF_SECRET
 ```
 
-- `TURNSTILE_SECRET_KEY`：Cloudflare widget 的 Site Secret。
-- `TURNSTILE_PROOF_SECRET`：至少 32 字元的獨立隨機值，用來簽挑戰狀態與短效憑證，不可與 Site Secret 共用。
-- 公開的 Site Key 放在 `wrangler.toml`；widget hostname 必須限制為 `modpack-i18n.jolin34563.workers.dev`。
+- 0.3.0 起預設 `TURNSTILE_ENFORCED=0`，代管閘門不依賴 Turnstile Secret。
+- 若日後重新強制 Turnstile：公開的 Site Key 放在 `wrangler.toml`；widget hostname 必須限制為 `modpack-i18n.jolin34563.workers.dev`。
 
-任何 Secret 缺少時採拒絕存取。Secret 更新會直接套用；程式碼與 `[vars]` 變更仍需執行 `npx wrangler deploy`。若只要補 Site Secret，正確指令是：
-
-```powershell
-Set-Location -LiteralPath 'C:\Users\jolin\Downloads\zeitfreigame\modpack-i18n-tool\worker'
-npx wrangler secret put TURNSTILE_SECRET_KEY
-```
-
-貼上 Cloudflare Dashboard → Turnstile → 該 widget（Site Key 須與 `wrangler.toml` 的 `TURNSTILE_SITE_KEY` 相同）的 **Secret Key**，勿加引號或空白。Siteverify 對錯誤 secret 會回 HTTP 400 + `invalid-input-secret`；這是業務失敗，不是網路全斷。
+`DEEPSEEK_KEY` 缺少時代管 AI 不可用。Secret 更新會直接套用；程式碼與 `[vars]` 變更仍需執行 `npx wrangler deploy`。
 
 ## 改版發佈（實際流程）
 
@@ -103,8 +95,8 @@ certutil -hashfile "src-tauri/target/release/Minecraft 模組整合包翻譯工�
 
 # 3. 切到 worker 後上傳到 R2（一定要 --remote，否則只進本地模擬）
 Set-Location -LiteralPath '<專案根目錄>\worker'
-npx wrangler r2 object put "modpack-i18n/minecraftpacklocal-1.0.2-portable.exe" `
---file "../src-tauri/target/release/Minecraft 模組整合包翻譯工具.exe" `
+npx wrangler r2 object put "modpack-i18n/minecraft-packlocal-v0.3.0-windows-x64.exe" `
+  --file "../.upload/minecraft-packlocal-v0.3.0-windows-x64.exe" `
   --content-type "application/octet-stream" --remote
 ```
 
@@ -112,9 +104,9 @@ npx wrangler r2 object put "modpack-i18n/minecraftpacklocal-1.0.2-portable.exe" 
 
 ```toml
 [vars]
-LATEST_VERSION   = "1.0.2"
-DOWNLOAD_URL     = "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.2-portable.exe"
-UPDATE_SHA256    = "145489079e07fdbb0064e93e80af190ae445af0581128c3d209fc6ccd1d37c63"
+LATEST_VERSION   = "0.3.0"
+DOWNLOAD_URL     = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.3.0-windows-x64.exe"
+UPDATE_SHA256    = "<certutil 算出的 sha256>"
 ```
 
 客戶端按下「檢查更新」後，會抓到免安裝 EXE、驗證 SHA-256，完成替換後自動重開；自動下載失敗時仍可改用瀏覽器下載。

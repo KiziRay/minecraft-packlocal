@@ -25,9 +25,7 @@ use super::shared_tm;
 use super::shared_glossary;
 use super::tm::Tm;
 use super::translation_scope::TranslationScope;
-use super::turnstile::{
-    managed_ai_turnstile_proof, managed_turnstile_required, MANAGED_AI_PROTOCOL,
-};
+use super::turnstile::MANAGED_AI_PROTOCOL;
 use super::translation_mode::TranslationQuality;
 
 const RETRY_BATCH: usize = 50;
@@ -121,17 +119,19 @@ fn looks_like_quota_or_auth_error(msg: &str) -> bool {
         || m.contains("免費翻譯")
 }
 
-fn is_turnstile_error(msg: &str) -> bool {
+fn is_auth_relogin_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("turnstile")
         || m.contains("cloudflare")
         || m.contains("安全驗證")
         || m.contains("verification required")
         || m.contains("428")
+        || m.contains("login_required")
+        || m.contains("login expired")
 }
 
-fn turnstile_reauth_message() -> String {
-    "Cloudflare 安全驗證已過期或無效，請回到 AI 區塊重新驗證後再試。".into()
+fn auth_relogin_message() -> String {
+    "Discord 登入已失效或需重新確認會員資格，請回到工具重新登入後再試。".into()
 }
 
 /// 從 Worker／上游 JSON 取出 `error.type`（僅診斷用，不含金鑰）。
@@ -161,8 +161,9 @@ fn map_chat_http_error(code: u16, body: &str, managed: bool) -> Option<String> {
             || body.contains("turnstile_unavailable")
             || body.contains("Turnstile is not configured") =>
         {
+            // 舊 Worker 若仍回此型別：引導改 Discord／自訂 API，不要求玩家處理 Secret。
             Some(
-                "安全驗證尚未完成服務端設定（Turnstile Secret 未就緒）。請管理員用 wrangler secret put TURNSTILE_SECRET_KEY 後確認 /health turnstileReady=true，或改用自訂 API。"
+                "雲端翻譯閘門設定異常。請確認已登入 Discord 並加入官方伺服器；若仍失敗可改用自訂 API，或稍後再試。"
                     .into(),
             )
         }
@@ -782,8 +783,6 @@ struct Engine {
     model: Arc<String>,
     /// 只在代管模式使用；送往自家 Worker，由 Worker 驗證登入與伺服器會員身分。
     managed_session: Arc<String>,
-    /// Cloudflare Siteverify 通過後由 Worker 簽發；只存在記憶體，且綁定 Discord 使用者。
-    managed_turnstile: Arc<String>,
     managed: bool,
 }
 
@@ -791,19 +790,10 @@ impl Engine {
     fn connect() -> Result<Self, String> {
         // AI 來源由使用者明確選擇；自訂模式缺金鑰時直接回報，代管模式再驗 Discord。
         let cfg = resolve_ai_config()?;
-        let (managed_session, managed_turnstile) = if cfg.managed {
-            let turnstile_required = managed_turnstile_required()?;
-            (
-                managed_ai_session_cookie()?,
-                if turnstile_required {
-                    managed_ai_turnstile_proof()
-                        .map_err(|_| "Cloudflare 安全驗證已過期，請回到工具重新驗證。".to_string())?
-                } else {
-                    String::new()
-                },
-            )
+        let managed_session = if cfg.managed {
+            managed_ai_session_cookie()?
         } else {
-            (String::new(), String::new())
+            String::new()
         };
 
         if let Err(probe) = probe_ai_ready(
@@ -812,7 +802,6 @@ impl Engine {
             &cfg.model,
             cfg.managed,
             &managed_session,
-            &managed_turnstile,
         ) {
             return Err(if cfg.managed {
                 probe
@@ -832,7 +821,6 @@ impl Engine {
             api_key: Arc::new(cfg.api_key),
             model: Arc::new(cfg.model),
             managed_session: Arc::new(managed_session),
-            managed_turnstile: Arc::new(managed_turnstile),
             managed: cfg.managed,
         })
     }
@@ -897,7 +885,6 @@ fn run_batches(
             let api_key = Arc::clone(&engine.api_key);
             let model = Arc::clone(&engine.model);
             let managed_session = Arc::clone(&engine.managed_session);
-            let managed_turnstile = Arc::clone(&engine.managed_turnstile);
             let managed = engine.managed;
             let quality = quality;
             let translations = Arc::clone(&translations);
@@ -923,7 +910,6 @@ fn run_batches(
                         &model,
                         managed,
                         &managed_session,
-                        &managed_turnstile,
                         slice,
                         slice_ctx,
                         &hints,
@@ -1036,8 +1022,8 @@ fn run_batches(
                 &format!("AI 這一輪沒有新譯文（連續 {} 次）…", empty_rounds),
             );
             let err_peek = errors.lock().map(|e| e.clone()).unwrap_or_default();
-            if err_peek.iter().any(|e| is_turnstile_error(e)) {
-                return Err(turnstile_reauth_message());
+            if err_peek.iter().any(|e| is_auth_relogin_error(e)) {
+                return Err(auth_relogin_message());
             }
             let quota_hit = err_peek.iter().any(|e| looks_like_quota_or_auth_error(e));
             if empty_rounds >= EMPTY_ROUNDS_ABORT || quota_hit {
@@ -1062,8 +1048,8 @@ fn run_batches(
             .first()
             .cloned()
             .unwrap_or_else(|| "全部請求都沒有回應".into());
-        if is_turnstile_error(&detail) {
-            return Err(turnstile_reauth_message());
+        if is_auth_relogin_error(&detail) {
+            return Err(auth_relogin_message());
         }
         return Err(ai_quota_support_message(&detail));
     }
@@ -1150,7 +1136,6 @@ fn translate_chunk(
     model: &str,
     managed: bool,
     managed_session: &str,
-    managed_turnstile: &str,
     chunk: &[(usize, String)],
     contexts: &[Option<&'static str>],
     hints: &[(String, String)],
@@ -1179,8 +1164,7 @@ fn translate_chunk(
             req = req
                 .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
                 .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Zeitfrei-Session", managed_session)
-                .header("X-Zeitfrei-Turnstile", managed_turnstile);
+                .header("X-Zeitfrei-Session", managed_session);
         } else if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -1332,7 +1316,6 @@ fn probe_ai_ready(
     model: &str,
     managed: bool,
     managed_session: &str,
-    managed_turnstile: &str,
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(25))
@@ -1374,7 +1357,6 @@ fn probe_ai_ready(
         model,
         managed,
         managed_session,
-        managed_turnstile,
         &probe,
         &[None],
         &[],
@@ -1539,18 +1521,18 @@ mod tests {
     }
 
     #[test]
-    fn turnstile_failure_is_not_classified_as_quota_failure() {
-        assert!(is_turnstile_error("第 1 批失敗：Cloudflare 安全驗證已過期"));
-        assert!(is_turnstile_error("HTTP 428 verification required"));
-        assert!(!is_turnstile_error("帳號餘額不足"));
-        assert!(turnstile_reauth_message().contains("重新驗證"));
+    fn auth_failure_is_not_classified_as_quota_failure() {
+        assert!(is_auth_relogin_error("第 1 批失敗：Cloudflare 安全驗證已過期"));
+        assert!(is_auth_relogin_error("HTTP 428 verification required"));
+        assert!(!is_auth_relogin_error("帳號餘額不足"));
+        assert!(auth_relogin_message().contains("Discord"));
     }
 
     #[test]
-    fn managed_503_turnstile_is_not_labeled_maintenance() {
+    fn managed_503_legacy_turnstile_is_not_labeled_maintenance() {
         let body = r#"{"error":{"message":"Cloudflare Turnstile is not configured","type":"turnstile_unavailable"}}"#;
         let msg = map_chat_http_error(503, body, true).expect("mapped");
-        assert!(msg.contains("Turnstile") || msg.contains("安全驗證"));
+        assert!(msg.contains("Discord") || msg.contains("自訂 API"));
         assert!(!msg.contains("維護中"));
         assert_eq!(
             extract_proxy_error_type(body).as_deref(),

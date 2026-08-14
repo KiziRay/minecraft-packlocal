@@ -33,6 +33,7 @@ mod share_pack;
 mod share_upload;
 mod security;
 mod scan_cache;
+mod search_system;
 mod session;
 mod shared_tm;
 mod shared_glossary;
@@ -61,7 +62,7 @@ pub use discord_auth::{
     cancel_discord_login, check_discord_auth_status, login_discord_blocking, logout_discord,
     DiscordAuthStatus, DISCORD_INVITE_URL,
 };
-pub use disk::{ensure_space, MIN_FREE_BYTES};
+pub use disk::{ensure_ready_to_write, ensure_space, probe_apply_targets, MIN_FREE_BYTES};
 pub use font_pack::{
     apply_font_pack_to_instance, build_font_pack_str_with_options, FontPackApplyResult,
     FontPackOptions, FontPackResult,
@@ -96,6 +97,7 @@ pub use secrets::{
     save_api_settings_with_provider, set_ai_mode, set_minimize_on_close, ApiSettingsPublic,
 };
 pub use script_literals::translate_kubejs_literals;
+pub use search_system::{run_search_pipeline, write_search_artifacts};
 pub use security::{
     is_probably_network_path, normalize_user_path, validate_open_url,
 };
@@ -110,9 +112,7 @@ pub use translation_mode::{
     mode_note, skip_complete_namespaces, TranslationMode, TranslationQuality,
 };
 pub use turnstile::{
-    cancel_turnstile_verification, clear_turnstile_proof, managed_turnstile_required,
-    turnstile_status,
-    verify_turnstile_blocking,
+    cancel_turnstile_verification, clear_turnstile_proof, verify_turnstile_blocking,
 };
 pub use translation_scope::TranslationScope;
 pub use translation_helper::{

@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::discord_auth::managed_ai_session_cookie;
 use super::secrets::MANAGED_BASE_URL;
 use super::share_pack::package_translation;
-use super::turnstile::{managed_ai_turnstile_proof, MANAGED_AI_PROTOCOL};
+use super::turnstile::MANAGED_AI_PROTOCOL;
 
 const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 
@@ -21,7 +21,6 @@ pub struct ShareUploadResult {
 
 pub fn upload_share_package(work_root: &Path, name: &str) -> Result<ShareUploadResult, String> {
     let session = managed_ai_session_cookie()?;
-    let proof = managed_ai_turnstile_proof()?;
     let temp_root = std::env::temp_dir().join(format!(
         "modpack-i18n-share-{}-{}",
         std::process::id(),
@@ -49,7 +48,6 @@ pub fn upload_share_package(work_root: &Path, name: &str) -> Result<ShareUploadR
             .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
             .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
             .header("X-Zeitfrei-Session", session)
-            .header("X-Zeitfrei-Turnstile", proof)
             .header("X-Zeitfrei-Pack-Name", encode_header_value(name))
             .body(bytes)
             .send()
@@ -58,7 +56,7 @@ pub fn upload_share_package(work_root: &Path, name: &str) -> Result<ShareUploadR
         if !status.is_success() {
             return Err(match status.as_u16() {
                 401 => "分享前請先登入 Discord。".to_string(),
-                403 => "分享前請加入 ZeitFrei Discord 伺服器並完成安全驗證。".to_string(),
+                403 => "分享前請加入 ZeitFrei Discord 伺服器。".to_string(),
                 413 => "分享檔太大。".to_string(),
                 429 => "今天的分享次數已達上限，請明天再試。".to_string(),
                 _ => format!("分享服務回應錯誤（HTTP {status}）。"),

@@ -33,7 +33,7 @@
           </button>
           <div id="overflow-menu" class="overflow-menu" role="menu" hidden>
             <div class="overflow-meta">
-                  <kbd class="version-key">v0.2.6</kbd>
+                  <kbd class="version-key">v0.3.0</kbd>
               <span class="overflow-meta-note">自適應布局</span>
             </div>
             <button type="button" id="btn-theme" class="overflow-item" role="menuitem" aria-pressed="true" title="切換淺色／深色">
@@ -91,7 +91,7 @@
                     <div class="ai-source-picker ai-source-inline" role="radiogroup" aria-label="AI 來源">
                       <label class="ai-source-option" for="ai-source-managed">
                         <input type="radio" id="ai-source-managed" name="ai-source" value="managed" checked />
-                        <span><strong>開發者 API</strong><small>需 Discord 與安全驗證</small></span>
+                        <span><strong>免費代管</strong><small>需登入 Discord 並加入官方伺服器</small></span>
                       </label>
                       <label class="ai-source-option" for="ai-source-custom">
                         <input type="radio" id="ai-source-custom" name="ai-source" value="custom" />
@@ -120,17 +120,6 @@
                             <p>瀏覽器沒有自動開啟時，可複製這個登入網址。</p>
                             <div class="input-row"><input id="discord-login-url" type="text" readonly value="正在準備登入網址" /><button type="button" id="btn-copy-login-url" class="small-button">複製</button></div>
                             <div class="login-fallback-actions"><button type="button" id="btn-open-login-url" class="text-button">重新開啟</button><button type="button" id="btn-cancel-login" class="text-button">取消登入</button></div>
-                          </div>
-                          <div class="turnstile-auth-row managed-auth-compact">
-                            <div class="auth-status-line">
-                              <strong id="turnstile-auth-title">Cloudflare 尚未驗證</strong>
-                              <p id="turnstile-auth-note">Discord 確認後，再完成一次安全驗證。</p>
-                            </div>
-                            <div class="managed-auth-actions">
-                              <button type="button" id="btn-turnstile-verify" class="small-button" hidden>完成安全驗證</button>
-                              <button type="button" id="btn-turnstile-open" class="text-button" hidden>重新開啟驗證頁</button>
-                              <button type="button" id="btn-turnstile-cancel" class="text-button" hidden>取消驗證</button>
-                            </div>
                           </div>
                         </div>
                         <div id="adv-details" class="advanced-details"><div class="advanced-body">
@@ -271,10 +260,10 @@
                 <strong id="prog-pct" class="prog-pct">0%</strong>
               </div>
               <ol class="linear-steps" id="linear-steps" aria-label="翻譯流程">
-                <li class="lin-step" data-step="prep"><span class="step-index" aria-hidden="true">1</span><span class="step-copy"><strong>準備</strong><small>環境與資料</small></span></li>
-                <li class="lin-step" data-step="scan"><span class="step-index" aria-hidden="true">2</span><span class="step-copy"><strong>掃描</strong><small>模組資源</small></span></li>
-                <li class="lin-step" data-step="translate"><span class="step-index" aria-hidden="true">3</span><span class="step-copy"><strong>翻譯</strong><small>轉換與覆寫</small></span></li>
-                <li class="lin-step" data-step="done"><span class="step-index" aria-hidden="true">4</span><span class="step-copy"><strong>完成</strong><small>寫入結果</small></span></li>
+                <li class="lin-step" data-step="prep"><span class="step-index" aria-hidden="true">1</span><span class="step-copy"><strong>檢查</strong><small>資料夾與空間</small></span></li>
+                <li class="lin-step" data-step="scan"><span class="step-index" aria-hidden="true">2</span><span class="step-copy"><strong>搜尋</strong><small>整理全文案</small></span></li>
+                <li class="lin-step" data-step="translate"><span class="step-index" aria-hidden="true">3</span><span class="step-copy"><strong>翻譯</strong><small>缺漏與更新</small></span></li>
+                <li class="lin-step" data-step="done"><span class="step-index" aria-hidden="true">4</span><span class="step-copy"><strong>套用</strong><small>備份並寫入</small></span></li>
               </ol>
               <div class="prog-bar"><div id="prog-fill" class="prog-fill"></div></div>
               <p id="prog-count" class="prog-count" aria-live="polite">尚未開始</p>
@@ -420,6 +409,14 @@
           <details id="translation-advanced" class="advanced-details nested-fold">
             <summary>進階：模式、品質與其他</summary>
             <div class="advanced-body">
+              <div class="callout-note advanced-consent-note">
+                <p>進階解包可找出更多文字，但只寫入工具副本，不會改原本的模組檔。未勾選時維持安全模式。</p>
+              </div>
+              <label class="option-row" for="advanced-unpack-consent">
+                <input type="checkbox" id="advanced-unpack-consent" />
+                <span class="check-box" aria-hidden="true"></span>
+                <span><strong>我同意啟用進階解包</strong><small>搜尋時一併納入進階來源；產物寫在翻譯結果，可還原。</small></span>
+              </label>
               <div class="more-options-inline">
                 <div class="field-block compact-field translation-mode-field">
                   <label for="translation-mode">翻譯模式</label>
@@ -470,13 +467,13 @@
       <div class="guide-body">
         <aside class="guide-toc" aria-label="使用說明目錄"><p>ON THIS PAGE</p><a href="#g-what">工具做什麼</a><a href="#g-translate">翻譯整合包</a><a href="#g-font">字體資源包</a><a href="#g-apply">輸出與套用</a><a href="#g-ai">AI、金鑰與隱私</a><a href="#g-trouble">常見問題</a><a href="#g-states">按鈕何時出現</a><a href="#g-share">分享與參考翻譯</a><a href="#g-disclaimer">免責說明</a></aside>
         <main class="guide-content">
-          <p class="eyebrow">PLAYER GUIDE / v0.2.6</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解 jar、JSON 或資源包格式，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>視窗可自由縮放，布局會依寬高重排並盡量吃滿可用空間。也可按 Ctrl＋↑／↓ 或 Ctrl＋滾輪調介面縮放；在「⋯」選單可重設 100%。</span></div>
+          <p class="eyebrow">PLAYER GUIDE / v0.3.0</p><h1 id="g-what">模組包翻譯工具</h1><p class="guide-lead">給普通玩家使用的繁體中文工具。你不需要理解技術細節，只要照著頁面上的步驟操作。</p><div class="guide-callout guide-callout-tip"><strong>介面太小或太大？</strong><span>視窗可自由縮放，布局會依寬高重排並盡量吃滿可用空間。也可按 Ctrl＋↑／↓ 或 Ctrl＋滾輪調介面縮放；在「⋯」選單可重設 100%。</span></div>
           <section><h2 id="g-translate">翻譯整合包</h2><p>頂欄切到「翻譯」。先選遊戲資料夾並通過檢查後，才會顯示 AI、開始翻譯與右側步驟／日誌。進階設定在「更多選項」。不會宣稱 100%。</p><ol class="guide-steps"><li><span>1</span><p>選取整合包／遊戲實例資料夾（需通過實例檢查）。</p></li><li><span>2</span><p>需要時在主頁設定 AI；更多選項可調結果位置與參考翻譯。</p></li><li><span>3</span><p>按「開始翻譯」；進度與日誌在右側執行面板。</p></li></ol></section>
           <section><h2>Minecraft 版本</h2><p>工具會從遊戲實例設定自動偵測版本，也可以在更多選項手動指定。</p></section>
           <section><h2>按鈕對照</h2><table class="guide-table"><tbody><tr><th>開始翻譯</th><td>第一次建立完整翻譯結果。</td></tr><tr><th>補翻工作階段</th><td>上次中斷、或新增文字後只補還沒完成的部分。</td></tr><tr><th>翻譯完成後分享</th><td>只分享可安裝檔，建立 24 小時有效的短連結。</td></tr><tr><th>錯誤分析</th><td>優先貼完整 crash report。</td></tr><tr><th>術語表</th><td>指定模組專有名詞的固定譯名。</td></tr></tbody></table></section>
           <section><h2 id="g-font">字體資源包</h2><p>頂欄切到「字體」。獨立服務，不會翻譯文字。支援 TTF／OTF，拒 TTC。</p></section>
           <section><h2 id="g-apply">輸出與套用</h2><p>翻譯完成會直接套用；勾選備份時放在「翻譯結果」。套用前請關閉 Minecraft。</p></section>
-          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。代管 API 需 Discord 與 Cloudflare 驗證；也可自備 Key。Key 只存本機。</p></section>
+          <section><h2 id="g-ai">AI、金鑰與隱私</h2><p>AI 是選用功能。免費代管需登入 Discord 並加入官方伺服器；也可自備金鑰。金鑰只存本機。圖片上的字不處理。</p></section>
           <section><h2 id="g-trouble">常見問題</h2><p><strong>遊戲紅字或閃退？</strong>到「診斷」貼完整 crash report。</p><p><strong>圖片裡的字會翻嗎？</strong>不會。</p></section>
           <section><h2 id="g-disclaimer">免責說明</h2><div class="disclaimer"><p>本工具由 ZeitFrei 提供。翻譯結果可能不完整；請自行確認授權與備份存檔。</p></div></section>
           <section><h2 id="g-states">按鈕何時出現</h2><p>未通過實例檢查前，主區只留選資料夾；AI、開始翻譯、右側步驟／日誌都隱藏。通過後才展開。「支持開發」在頁尾。翻譯進行中只保留停止。</p></section>

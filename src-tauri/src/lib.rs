@@ -10,7 +10,7 @@ use engine::{
     clear_turnstile_proof, classify_diagnosis, convert_langmap_s2tw, converter_name, count_map,
     detect_minecraft_version, detect_pack_format, diagnose_launch, discover_default_reference,
     try_download_cfpa_pack,
-    cleanup_transient_work, ensure_result_layout, ensure_space, ensure_user_glossary_template,
+    cleanup_transient_work, ensure_result_layout, ensure_ready_to_write, ensure_space, ensure_user_glossary_template,
     extract_jar_documentation,
     rewrite_translated_jars, translate_jar_display_texts, translate_jar_patchouli,
     fill_missing_with_mode,
@@ -21,15 +21,16 @@ use engine::{
     package_translation,
     upload_share_package,
     pack_format_for_version,
+    probe_apply_targets,
     remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir, restore_last_apply_in,
     delete_apply_backups_in, has_apply_backups_in,
     save_api_settings, save_api_settings_with_provider, save_session,
     scan_instance, set_ai_mode,
+    run_search_pipeline, write_search_artifacts,
     set_minimize_on_close, subtract_covered, suggest_output_base, translate_ftbquests,
     translate_archive_overlays, translate_kubejs_literals, translate_origins,
     translate_quests_books, translate_text_overlays,
-    managed_turnstile_required,
-    turnstile_status, mode_note, skip_complete_namespaces, TranslationMode, TranslationQuality,
+    mode_note, skip_complete_namespaces, TranslationMode, TranslationQuality,
     user_glossary_path, validate_instance_path, validate_open_url, verify_turnstile_blocking, write_coverage_report,
     write_gap_summary_file,
     map_stage_progress, CoverageSourceFlags, CoverageTier,
@@ -474,6 +475,7 @@ async fn one_click_translate(
     translation_mode: Option<String>,
     translation_quality: Option<String>,
     coverage_tier: Option<String>,
+    advanced_unpack: Option<bool>,
 ) -> Result<OneClickResult, String> {
     let instance = match normalize_path_strict(&instance_path) {
         Ok(p) => p,
@@ -505,6 +507,7 @@ async fn one_click_translate(
     let target_version = target_version
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let advanced_unpack = advanced_unpack.unwrap_or(false);
 
     reset_cancel();
     let app2 = app.clone();
@@ -521,6 +524,7 @@ async fn one_click_translate(
             translation_mode,
             translation_quality,
             coverage_tier,
+            advanced_unpack,
         )
     })
     .await
@@ -724,8 +728,9 @@ fn run_one_click(
     translation_mode: Option<String>,
     translation_quality: Option<String>,
     coverage_tier: Option<String>,
+    advanced_unpack: bool,
 ) -> Result<OneClickResult, String> {
-    emit_progress(app, 2, "準備中（此階段不呼叫 AI）…");
+    emit_progress(app, 2, "檢查資料夾…");
     let mode = TranslationMode::parse(translation_mode.as_deref());
     // 主路徑固定完整挑戰；舊 UI 若仍傳 quick／standard 僅記一筆日誌。
     let requested = CoverageTier::parse(coverage_tier.as_deref());
@@ -763,6 +768,13 @@ fn run_one_click(
     }
     emit_log(app, "info", &format!("{}", mode_note(mode, 0)));
     emit_log(app, "info", &format!("翻譯品質：{}", quality.label()));
+    if advanced_unpack {
+        emit_log(
+            app,
+            "info",
+            "已同意進階模式：搜尋會一併納入進階來源（只寫副本，不改原模組檔）。",
+        );
+    }
     let mut skipped_by_tier: Vec<String> = Vec::new();
     if !instance.exists() {
         return Err("找不到這個資料夾，請重新選擇或檢查路徑是否正確（可用空白字元）。".into());
@@ -781,8 +793,8 @@ fn run_one_click(
             &format!("想固定某些譯名可編輯：{}", p.display()),
         );
     }
-    // 空間不足先擋，避免寫到一半失敗留半成品
-    ensure_space(&out, MIN_FREE_BYTES)?;
+    // 階 3：空間＋寫入權限探針；失敗不開搜尋
+    ensure_ready_to_write(&out, MIN_FREE_BYTES)?;
     // 使用者只選根目錄；工具建立 翻譯結果/ 與子目錄
     let layout = ensure_result_layout(&out)?;
     let work = layout.work_root.clone();
@@ -809,6 +821,33 @@ fn run_one_click(
     );
 
     let dict = load_phrase_dict(None);
+
+    // ═══ 階 4：搜尋系統（分析＋理解＋整合→工作圖；進階同意則含進階來源）═══
+    {
+        let app_search = app.clone();
+        let graph = run_search_pipeline(&instance, advanced_unpack, &mut |pct, msg| {
+            emit_progress(&app_search, pct, msg);
+        })?;
+        write_search_artifacts(&work, &graph)?;
+        emit_log(app, "info", &graph.player_summary);
+        if graph.split_polysemy_count > 0 {
+            emit_log(
+                app,
+                "info",
+                &format!(
+                    "相同用語但意思不同，已分開處理：{} 組。",
+                    graph.split_polysemy_count
+                ),
+            );
+        }
+        if graph.aligned_count > 0 {
+            emit_log(
+                app,
+                "info",
+                &format!("多處出現的同一用語已統一：{} 組。", graph.aligned_count),
+            );
+        }
+    }
 
     // ═══ 階段 A：本機掃模組／資源包語言（不 AI）═══
     let app_scan = app.clone();
@@ -1251,6 +1290,8 @@ fn run_one_click(
         "翻譯檔已建立，不建立備份，直接套用到遊戲資料夾…"
     };
     emit_progress(app, map_stage_progress(97, 3, 0), apply_progress);
+    emit_log(app, "info", "套用前再確認寫入權限；若遊戲開著請先關閉。");
+    probe_apply_targets(&instance)?;
     let applied = apply_to_instance(&instance, &work, Some(&pack_name), backup_before_apply)?;
     emit_log(
         app,
@@ -2585,7 +2626,7 @@ fn has_api_key() -> bool {
 }
 
 /// 給 UI 顯示 AI 來源狀態。
-/// 自訂 API 只檢查本機是否有金鑰；代管 AI 需要 Discord 會員資格與 Turnstile 短效憑證。
+/// 自訂 API 只檢查本機是否有金鑰；代管 AI 需要 Discord 會員資格（不再要求 Turnstile）。
 #[tauri::command]
 async fn ai_status() -> serde_json::Value {
     let settings = get_api_settings_public();
@@ -2619,26 +2660,12 @@ async fn ai_status() -> serde_json::Value {
         .as_ref()
         .map(|s| s.message.clone())
         .unwrap_or_else(|| "目前無法確認 Discord 登入狀態。".into());
-    let turnstile = turnstile_status();
-    let turnstile_requirement = managed_turnstile_required();
-    let turnstile_required = turnstile_requirement.as_ref().ok().copied().unwrap_or(true);
     let identity_ready = logged_in && in_guild && service_available;
-    let turnstile_service_ready = turnstile_requirement.is_ok();
-    let turnstile_health_error = turnstile_requirement.as_ref().err().cloned();
-    let ready = managed_ai_available()
-        && identity_ready
-        && turnstile_service_ready
-        && (!turnstile_required || turnstile.verified);
+    let ready = managed_ai_available() && identity_ready;
     let status_message = if !service_available {
         message
-    } else if !turnstile_service_ready {
-        turnstile_health_error
-            .clone()
-            .unwrap_or_else(|| "目前無法確認 Cloudflare 安全驗證服務狀態。".into())
-    } else if identity_ready && turnstile_required && !turnstile.verified {
-        turnstile.message.clone()
     } else if identity_ready {
-        "開發者提供的翻譯已可使用。".to_string()
+        "免費代管翻譯已可使用。".to_string()
     } else {
         message
     };
@@ -2650,11 +2677,11 @@ async fn ai_status() -> serde_json::Value {
         "loggedIn": logged_in,
         "inGuild": in_guild,
         "serviceAvailable": service_available,
-        "turnstileRequired": turnstile_required,
-        "turnstileVerified": turnstile.verified,
-        "turnstileExpiresAt": turnstile.expires_at,
-        "turnstileServiceReady": turnstile_service_ready,
-        "turnstileHealthError": turnstile_health_error,
+        "turnstileRequired": false,
+        "turnstileVerified": true,
+        "turnstileExpiresAt": 0,
+        "turnstileServiceReady": true,
+        "turnstileHealthError": null,
         "inviteUrl": DISCORD_INVITE_URL,
         "displayName": status.as_ref().map(|s| s.nickname.clone()).unwrap_or_default(),
         "message": status_message

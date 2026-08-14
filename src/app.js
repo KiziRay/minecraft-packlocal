@@ -1098,12 +1098,7 @@ async function uploadSharePackage() {
       return log("分享前請先登入 Discord 並加入 ZeitFrei 官方伺服器。");
     }
     const ai = await invoke("ai_status");
-    const turnstileRequired = ai?.turnstileRequired ?? ai?.turnstile_required;
-    const turnstileVerified = !!(ai && (ai.turnstileVerified || ai.turnstile_verified));
-    // 代管模式且 Worker 強制 Turnstile 時才擋；自訂 API 不走此閘門。
-    if ((ai?.aiMode === "managed" || ai?.ai_mode === "managed") && turnstileRequired !== false && !turnstileVerified) {
-      if (!(await beginTurnstileVerification())) return;
-    }
+    void ai;
     const name = ($("pack-name").value || "模組包翻譯分享").trim();
     appendLog("正在整理可安裝檔案並上傳…");
     const result = await invoke("upload_share_package_cmd", { workRoot: work, name });
@@ -1164,34 +1159,20 @@ async function refreshAiStatus() {
       (s.inGuild || s.in_guild) &&
       (s.serviceAvailable ?? s.service_available) !== false
     );
-    const managedTurnstileReady = !!(s && (s.turnstileVerified || s.turnstile_verified));
-    const managedTurnstileRequired = !(
-      s && (s.turnstileRequired === false || s.turnstile_required === false)
-    );
     syncAiModeUi(mode);
     statusEl.textContent = ready
       ? usingOwnKey
         ? "AI：自訂 API 可用"
-        : "AI：開發者 API 可用"
+        : "AI：免費代管可用"
       : mode === "custom"
         ? "AI：請先設定自訂 API"
-        : managedIdentityReady && !managedTurnstileReady
-          ? "AI：請完成安全驗證"
-          : "AI：尚未完成 Discord 驗證";
+        : "AI：尚未完成 Discord 驗證";
     if (statusRow) statusRow.dataset.state = ready ? (usingOwnKey ? "own" : "managed") : "error";
 
     if (mode === "managed") {
       const loggedIn = !!(s && (s.loggedIn || s.logged_in));
       const inGuild = !!(s && (s.inGuild || s.in_guild));
       const serviceAvailable = s && (s.serviceAvailable ?? s.service_available) !== false;
-      const turnstileServiceReady = !(
-        s && (s.turnstileServiceReady === false || s.turnstile_service_ready === false)
-      );
-      const turnstileHealthError = String(
-        (s && (s.turnstileHealthError || s.turnstile_health_error)) || ""
-      ).trim();
-      const turnstileVerified = !!(s && (s.turnstileVerified || s.turnstile_verified));
-      const identityReady = loggedIn && inGuild && serviceAvailable;
       const displayName = String((s && (s.displayName || s.display_name)) || "").trim();
       const title = $("discord-auth-title");
       const authNote = $("discord-auth-note");
@@ -1214,41 +1195,12 @@ async function refreshAiStatus() {
       if ($("btn-discord-login")) $("btn-discord-login").hidden = loggedIn;
       if ($("btn-discord-logout")) $("btn-discord-logout").hidden = !loggedIn;
       if ($("btn-discord-join")) $("btn-discord-join").hidden = inGuild;
-      const turnstileTitle = $("turnstile-auth-title");
-      const turnstileNote = $("turnstile-auth-note");
-      if (turnstileTitle) {
-        turnstileTitle.textContent = turnstileVerified
-          ? "Cloudflare 安全驗證完成"
-          : !turnstileServiceReady
-            ? "Cloudflare 服務端設定未完成"
-          : !managedTurnstileRequired
-            ? "Cloudflare 安全驗證（目前不需要）"
-          : identityReady
-            ? "Cloudflare 尚未驗證"
-            : "Cloudflare 等待 Discord 驗證";
-      }
-      if (turnstileNote) {
-        turnstileNote.textContent = turnstileVerified
-          ? "短效憑證只保留在本次開啟的工具記憶體中。"
-          : !turnstileServiceReady
-            ? turnstileHealthError || message || "無法讀取 Worker／health；請檢查網路後重試。"
-          : !managedTurnstileRequired
-            ? "服務端未強制這項驗證（TURNSTILE_ENFORCED≠1），可直接使用代管翻譯。"
-          : identityReady
-            ? "完成後即可使用開發者提供的翻譯額度。"
-            : "先完成 Discord 登入與伺服器資格確認。";
-      }
-      if ($("btn-turnstile-verify")) {
-        $("btn-turnstile-verify").hidden =
-          !identityReady || turnstileVerified || !managedTurnstileRequired || !turnstileServiceReady;
-      }
       if (noteEl) {
         noteEl.textContent = ready
-          ? "Discord 資格與安全憑證會在每次代管翻譯時再次確認。"
-          : !turnstileServiceReady
-            ? turnstileHealthError || message || "安全驗證服務狀態異常。"
+          ? "Discord 會員資格會在每次免費代管翻譯時再次確認。"
           : message || "請先登入 Discord 並加入 ZeitFrei 官方伺服器。";
       }
+      void managedIdentityReady;
     } else if (noteEl) {
       noteEl.textContent = message || "使用自己的金鑰與額度，不需要 Discord 驗證。";
     }
@@ -1404,19 +1356,6 @@ async function ensureAiReadyForAction() {
   } else {
     $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     if ($("ai-auth-details")) $("ai-auth-details").open = true;
-    const loggedIn = !!(status && (status.loggedIn || status.logged_in));
-    const inGuild = !!(status && (status.inGuild || status.in_guild));
-    const serviceAvailable = status && (status.serviceAvailable ?? status.service_available) !== false;
-    const turnstileVerified = !!(status && (status.turnstileVerified || status.turnstile_verified));
-    const turnstileRequired = !(
-      status && (status.turnstileRequired === false || status.turnstile_required === false)
-    );
-    if (loggedIn && inGuild && serviceAvailable && turnstileRequired && !turnstileVerified) {
-      if (await beginTurnstileVerification()) {
-        status = await refreshAiStatus();
-        return !!(status && status.ready !== false);
-      }
-    }
   }
   return false;
 }
@@ -1656,6 +1595,7 @@ async function onRun() {
       translationMode: ($("translation-mode")?.value || "append"),
       translationQuality: ($("translation-quality")?.value || "thorough"),
       coverageTier: "max",
+      advancedUnpack: !!$("advanced-unpack-consent")?.checked,
     });
     setProgress(100, "全部完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);

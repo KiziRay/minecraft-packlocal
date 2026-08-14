@@ -27,11 +27,27 @@ dist-ssr
 .claudecode/
 AGENTS.md
 CLAUDE.md
+ARCHITECTURE.md
 # 完整內部開發文件（僅本機保留，不公開）
 開發文件.md
+docs/DEVELOPMENT*
+docs/AI-HANDOFF*
+docs/SEARCH-MAP*
+docs/LOCALIZE*
+docs/AUDIT*
+docs/EXTENDING*
+docs/HARDENING*
+docs/API-COMMANDS*
+docs/COMMUNITY.md
+.cursor/
+*.plan.md
 
 # 本機舊版執行檔；正式版本請用 GitHub Release 管理
 *.exe
+.upload/
+dist-release/
+SHA256SUMS
+SHA256SUMS.txt
 
 # 舊版未使用 Icon；公開 repository 只保留目前採用的原始美術資產
 src/assets/zeitfrei-modpack-icon.png

@@ -1,5 +1,16 @@
 # 變更紀錄
 
+## 0.3.0 — 2026-08-15（台北）— 主流程搜尋／探針／去 Turnstile
+
+- **P0**：代管 AI／分享改**僅 Discord 門檻**；移除多餘 Turnstile 強制（Worker `authorizeManagedAi`＋桌面憑證流程）。舊 Worker 若仍回 `turnstile_unavailable` 會顯示可行動白話，不誤報「維護中」。
+- **P1／P6**：開工前 `ensure_ready_to_write`（空間＋寫入探針）；失敗不進入搜尋。
+- **P3**：新增搜尋系統（掃描→分析→理解→整合）→`上下文工作圖.json`／`搜尋盤點說明.txt`；進階同意時搜尋即含進階來源（裁定 A）。
+- **P7**：步驟文案對齊主流程；進階解包同意牆進「更多選項」；玩家向文案（免費代管／禁開發黑話）。
+- **P8**：說明頁強調圖片字不處理。
+- **公開庫**：`.gitignore` 白名單強化（工程長文／計畫不上傳）。
+- 版本同步：三處＋UI／Worker → **0.3.0**。
+- **運維**：已 `wrangler deploy`；`/health` `authGate=discord`、`turnstile.enforced=false`；R2 已上 `minecraft-packlocal-v0.3.0-windows-x64.exe`，`UPDATE_SHA256` 已同步。
+
 ## 0.2.6 — 2026-08-14（台北）— 代管 AI 503 不再誤報「維護中」
 
 - **根因（實測）**：`/health` `hasKey:true`，但 `turnstileReady:false`（`TURNSTILE_SECRET_KEY` 名稱存在、值為空／空白 → `siteSecret:false`）。`TURNSTILE_ENFORCED=1` 時 Worker 回 **503 + `turnstile_unavailable`**；exe 卻把代管模式**所有** 503 顯示成「免費翻譯暫時無法使用（服務端維護中）」。

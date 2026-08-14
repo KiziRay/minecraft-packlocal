@@ -61,10 +61,11 @@ test("共享術語不同譯文會標記衝突並停止套用", () => {
   assert.match(source, /record\.conflict/);
 });
 
-test("強制 Turnstile 設定不完整時不會退化成只檢查 Discord", () => {
+test("代管閘門改為僅 Discord（不再強制 Turnstile）", () => {
   const start = source.indexOf("async function authorizeManagedAi");
   const end = source.indexOf("async function authorizeManagedIdentity", start);
   const auth = source.slice(start, end);
-  assert.match(auth, /turnstileEnforced && !turnstileConfigured\(env\)/);
-  assert.match(auth, /type: "turnstile_unavailable"/);
+  assert.match(auth, /authorizeManagedIdentity/);
+  assert.doesNotMatch(auth, /turnstileEnforced/);
+  assert.doesNotMatch(auth, /verifyTurnstileAccess/);
 });

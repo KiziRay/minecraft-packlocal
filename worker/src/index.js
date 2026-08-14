@@ -19,8 +19,6 @@ import {
   turnstileConfigured,
   turnstileMissingNames,
   turnstileStatus,
-  turnstileUnavailableMessage,
-  verifyTurnstileAccess,
 } from "./turnstile.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -83,16 +81,17 @@ export default {
 
     // 健康檢查
     if (url.pathname === "/" || url.pathname === "/health") {
-      // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）——設好 secret 後可用來自我驗證
+      // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）
+      // turnstile*：保留欄位供舊版相容；P0 起代管閘門不再依賴 Turnstile。
       const turnstile = turnstileStatus(env);
       return json({
         ok: true,
         service: "modpack-i18n",
         version: env.LATEST_VERSION,
         hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
+        authGate: "discord",
         turnstileReady: turnstileConfigured(env),
-        turnstile,
-        // 僅缺項名稱，不含值；方便管理員對照 secret list／vars。
+        turnstile: { ...turnstile, enforced: false },
         turnstileMissing: turnstileMissingNames(env),
       });
     }
@@ -697,45 +696,8 @@ async function proxyChat(request, env) {
 }
 
 async function authorizeManagedAi(request, env) {
-  const identity = await authorizeManagedIdentity(request, env);
-  if (!identity.ok) return identity;
-
-  // 代管 AI 與分享檔共用 Discord 會員及 Turnstile 閘門；舊版缺少新標頭時會先被拒絕。
-  // 強制模式下，設定不完整也必須拒絕，不能退化成只檢查 Discord。
-  const turnstileEnforced = String(env.TURNSTILE_ENFORCED || "") === "1";
-  if (turnstileEnforced && !turnstileConfigured(env)) {
-    return {
-      ok: false,
-      response: json(
-        {
-          error: {
-            message: turnstileUnavailableMessage(env),
-            type: "turnstile_unavailable",
-          },
-        },
-        503
-      ),
-    };
-  }
-  if (turnstileEnforced) {
-    const proof = String(request.headers.get("x-zeitfrei-turnstile") || "").trim();
-    const checked = await verifyTurnstileAccess(proof, env, identity.userId);
-    if (!checked.ok) {
-      return {
-        ok: false,
-        response: json(
-          {
-            error: {
-              message: "Cloudflare Turnstile verification required",
-              type: checked.type,
-            },
-          },
-          checked.type === "turnstile_unavailable" ? 503 : 428
-        ),
-      };
-    }
-  }
-  return identity;
+  // P0：Turnstile 整體多餘 → 僅 Discord 會員門檻；真人驗證不再擋代管 AI／分享。
+  return authorizeManagedIdentity(request, env);
 }
 
 async function authorizeManagedIdentity(request, env) {
