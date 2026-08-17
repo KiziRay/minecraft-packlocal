@@ -1,0 +1,66 @@
+name = "modpack-i18n"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
+# 客戶端打 /api/desktop/latest 比對版本。
+[vars]
+LATEST_VERSION = "1.0.0"
+# 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
+# SHA 等產 MCPL-1.0.0.exe 並上傳 R2 後再填 UPDATE_SHA256。
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.0.exe"
+RELEASE_NOTES = "1.0.0：模組共享庫、診斷回報、正式版更新檔名 MCPL。"
+# 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
+UPSTREAM_BASE = "https://api.deepseek.com"
+UPSTREAM_MODEL = "deepseek-v4-flash"
+
+# 開發者代管 AI 的桌面授權。v3 協定標頭仍要；門檻改為 Discord 會員（Turnstile 已停用）。
+AUTH_BASE_URL = "https://cloud.zeitfrei.uk"
+MANAGED_AI_PROTOCOL = "3"
+TURNSTILE_SITE_KEY = "0x4AAAAAAELdGLixrUpLNaxf"
+TURNSTILE_HOSTNAME = "modpack-i18n.jolin34563.workers.dev"
+TURNSTILE_ENFORCED = "0"
+
+# 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
+# 超過就回 429，客戶端顯示贊助提示。
+DAILY_TOKEN_BUDGET = "20000000"
+# 單一 Discord 帳號每日上限；啟用 USAGE KV 後生效。
+PER_USER_DAILY_TOKEN_BUDGET = "1000000"
+
+# 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
+UPDATE_SHA256 = "2e3062e959016e6ecd40c30da3c4c92c5438ae79705941a79dba8b0f679d6549"
+
+# 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
+SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"
+SHARE_MAX_BYTES = "4294967296"
+# 分享次數（有 USAGE KV 才生效）：每人每日 3 次、同時未過期 2 個、未完成 MPU 1 小時後刪。
+SHARE_DAILY_LIMIT = "3"
+SHARE_ACTIVE_LIMIT = "2"
+SHARE_MPU_STALE_SECONDS = "3600"
+
+# 免安裝 EXE 存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
+[[r2_buckets]]
+binding = "DOWNLOADS"
+bucket_name = "modpack-i18n"
+
+[[r2_buckets]]
+binding = "SHARES"
+bucket_name = "modpack-i18n-shares"
+
+[[r2_buckets]]
+binding = "TRANSLATIONS"
+bucket_name = "modpack-i18n-translations"
+
+[triggers]
+crons = ["0 * * * *"]
+
+# 每日用量／分享短碼／診斷回報配額（KV）。
+# 建立：npx wrangler kv namespace create USAGE --config worker/wrangler.toml
+[[kv_namespaces]]
+binding = "USAGE"
+id = "9418f0bb99d94270a43c703a241ee227"
+
+# DEEPSEEK_KEY 用 secret 設定，不進版控：
+#   npx wrangler secret put DEEPSEEK_KEY
+# DISCORD_REPORT_WEBHOOK 只放 secret，永不寫入本檔或 git。
+# TURNSTILE_SECRET_KEY、TURNSTILE_PROOF_SECRET 也只能用 secret 設定，不能寫入本檔。
