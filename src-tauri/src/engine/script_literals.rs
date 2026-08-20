@@ -14,6 +14,7 @@ use super::cancel;
 use super::convert::convert_s2tw_batch;
 use super::deepseek::fill_missing_with_ai_with_scope;
 use super::jar_scan::LangMap;
+use super::mech_tokens::is_resource_path_token;
 use super::translation_scope::TranslationScope;
 
 const MAX_SCRIPT_BYTES: u64 = 8 * 1024 * 1024;
@@ -79,10 +80,11 @@ where
         return Ok(report);
     }
 
+    let kube_ns = super::shared_identity::pack_namespace(scope);
     let mut pending = LangMap::new();
     for (index, text) in unique.iter().enumerate() {
         pending
-            .entry("__kubejs_script_literals".into())
+            .entry(kube_ns.clone())
             .or_default()
             .insert(index.to_string(), text.clone());
     }
@@ -93,7 +95,7 @@ where
     })?;
     // fill_missing 只會新增非中文／可翻譯內容；中文與 glossary 命中也照樣可用。
     let mut map = HashMap::new();
-    if let Some(entries) = translated.get("__kubejs_script_literals") {
+    if let Some(entries) = translated.get(&kube_ns) {
         for (index, source) in unique.iter().enumerate() {
             if let Some(value) = entries.get(&index.to_string()) {
                 if value.trim() != source.trim() && !value.trim().is_empty() {
@@ -111,6 +113,9 @@ where
                 map.insert(key.clone(), value);
             }
         }
+    }
+    if !map.is_empty() {
+        let _ = super::shared_tm::contribute_plain_pairs(&map, &HashMap::new(), "overlay", scope);
     }
 
     for (path, raw, literals) in payloads {
@@ -199,6 +204,7 @@ fn should_translate(text: &str) -> bool {
         && t.chars().any(|c| c.is_alphabetic())
         && !t.contains("minecraft:")
         && !t.contains("#forge:")
+        && !is_resource_path_token(t)
 }
 
 fn decode_literal(token: &str) -> Option<String> {
@@ -238,6 +244,7 @@ mod tests {
     fn only_explicit_display_calls_are_candidates() {
         assert!(should_translate("Hello world"));
         assert!(!should_translate("minecraft:stone"));
+        assert!(!should_translate("root.txt"));
         assert_eq!(decode_literal(r#""hello\nworld""#).as_deref(), Some("hello\nworld"));
         assert_eq!(encode_like("'x'", "你好"), "'你好'");
     }

@@ -40,14 +40,6 @@ impl TranslationQuality {
             Self::Thorough => "劇情與書本優先（較仔細）",
         }
     }
-
-    pub fn batch_size(self) -> usize {
-        match self {
-            Self::Fast => 180,
-            Self::Balanced => 140,
-            Self::Thorough => 70,
-        }
-    }
 }
 
 impl TranslationMode {
@@ -76,20 +68,52 @@ impl TranslationMode {
     }
 }
 
-/// Skip90 只略過「目前已中文／待補」達門檻的命名空間；未達門檻的照常處理。
-/// 回傳被略過的 key 數，呼叫端必須寫進工作階段／報告，不能靜默丟掉。
+/// Skip90：以「台灣可玩來源」的有效中文比例計，港繁 hint 不灌水。
+#[allow(dead_code)]
 pub fn skip_complete_namespaces(
     zh: &LangMap,
     en_only: &mut LangMap,
     threshold_percent: usize,
 ) -> usize {
+    skip_complete_namespaces_with_provenance(zh, None, en_only, threshold_percent)
+}
+
+pub fn skip_complete_namespaces_with_provenance(
+    zh: &LangMap,
+    provenance: Option<&super::lang_provenance::ProvenanceMap>,
+    en_only: &mut LangMap,
+    threshold_percent: usize,
+) -> usize {
+    use super::lang_provenance::{get_source, LangSource};
+    use super::translation_quality::is_usable_zh;
     let mut skipped = 0usize;
     let namespaces = en_only.keys().cloned().collect::<Vec<_>>();
+    let threshold = (threshold_percent as f32) / 100.0;
     for namespace in namespaces {
         let pending = en_only.get(&namespace).map(|m| m.len()).unwrap_or(0);
-        let translated = zh.get(&namespace).map(|m| m.len()).unwrap_or(0);
-        let total = translated.saturating_add(pending);
-        if total == 0 || translated.saturating_mul(100) < total.saturating_mul(threshold_percent) {
+        let Some(zh_map) = zh.get(&namespace) else {
+            continue;
+        };
+        let usable = zh_map
+            .iter()
+            .filter(|(k, v)| {
+                let src = provenance
+                    .and_then(|p| get_source(p, &namespace, k))
+                    .unwrap_or(LangSource::Tw);
+                src.is_tw_playable() && is_usable_zh("", v)
+            })
+            .count();
+        let total = usable.saturating_add(pending);
+        if total == 0 {
+            continue;
+        }
+        let coverage = usable as f32 / total as f32;
+        let quality = if zh_map.is_empty() {
+            0.0
+        } else {
+            usable as f32 / zh_map.len() as f32
+        };
+        if quality < threshold || coverage < threshold {
             continue;
         }
         skipped += pending;
@@ -106,7 +130,7 @@ pub fn mode_note(mode: TranslationMode, skipped: usize) -> String {
             "模式：{}；本次略過 {} 條已達完成門檻的缺漏。",
             mode.label(), skipped
         ),
-        TranslationMode::Force => "模式：重新翻譯缺漏；本次不使用既有翻譯記憶，但仍會套用術語表與格式護盾。".into(),
+        TranslationMode::Force => "模式：重新翻譯缺漏；本次略過本機／共享翻譯記憶，會多花 AI 用量；仍套用術語表與格式護盾。".into(),
     }
 }
 

@@ -11,27 +11,59 @@ const $ = (id) => document.getElementById(id);
 
 const THEME_STORAGE_KEY = "modpack-i18n-theme";
 const UI_SCALE_STORAGE_KEY = "modpack-i18n-ui-scale";
+const UI_AUTOSCALE_STORAGE_KEY = "modpack-i18n-ui-autoscale";
+const ONBOARDING_STORAGE_KEY = "modpack-i18n-onboarding-seen-v1.0.0";
 const BACKUP_STORAGE_KEY = "modpack-i18n-backup-before-apply";
 const FONT_PREFS_STORAGE_KEY = "modpack-i18n-font-prefs";
-const UI_SCALE_MIN = 1;
+const UI_SCALE_MIN = 0.9;
+const UI_SCALE_AUTO_MIN = 1.0;
 const UI_SCALE_MAX = 1.5;
 const UI_SCALE_STEP = 0.05;
+const GP_REWARD_STORAGE_KEY = "modpack-i18n-gp-reward-v1";
+const USAGE_FEEDBACK_CLIENT_ID_KEY = "modpack-i18n-usage-feedback-client-id-v1";
+const USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY = "modpack-i18n-usage-feedback-last-submit-at-v1";
+const USAGE_FEEDBACK_LAST_NUDGE_AT_KEY = "modpack-i18n-usage-feedback-last-nudge-at-v1";
+const SFX_VOLUME_STORAGE_KEY = "modpack-i18n-sfx-volume-v1";
+const SFX_MUTED_STORAGE_KEY = "modpack-i18n-sfx-muted-v1";
 let uiScale = 1;
+let uiAutoScale = true;
+let lastAutoAvailWidth = 0;
 let latestAiStatus = null;
 let discordLoginUrl = "";
 let turnstileUrl = "";
 let aiModeChangePromise = Promise.resolve();
 let translationState = "idle";
+let managedAiPaused = false;
+let managedAiCurrentError = null;
+let gpRewardInFlight = false;
+let gpRewardTimerId = 0;
+let pendingUsageFeedbackNudge = false;
+let usageFeedbackDelayTimerId = 0;
+let feedbackStep = 1;
 let shareConfirmationOpen = false;
 let shareUploadInFlight = false;
+let lastShareUrl = "";
+let lastShareInstancePath = "";
+let hasShareableFiles = false;
+let shareableProbeToken = 0;
+let sfxVolume = 0.55;
+let sfxMuted = false;
+let sfxAudioCtx = null;
+let sfxLastPlayAt = 0;
+let sfxLastErrorAt = 0;
+let sfxLastSuccessAt = 0;
 let apiKeyDraft = "";
 let apiKeySavedMask = "";
 let apiKeyEditing = false;
 let hasApplyBackups = false;
+let lastDiagnosisResult = null;
 let backupProbeToken = 0;
 let backupProbeTimer = 0;
 let translationHelperStatus = null;
 let instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
+/** 偵測到 Minecraft＜1.13 時為 true，禁用開始翻譯 */
+let versionBlocked = false;
+let versionBlockReason = "";
 let coverageSkippedSeen = new Set();
 let coverageMetrics = {
   glossary: 0,
@@ -40,14 +72,76 @@ let coverageMetrics = {
   ai: 0,
   pending: null,
   skipped: 0,
+  batchDone: null,
+  batchTotal: null,
+  batchRetry: null,
+  batchRetryBatches: null,
+  batchFail: null,
+  cacheHitTokens: null,
+  cacheMissTokens: null,
+  completionTokens: null,
+  cacheHitPercent: null,
   summary: "尚未開始",
 };
+/** 主譯結算後鎖定命中明細，忽略隊列／後期免費命中覆寫 */
+let coverageSettlementLocked = false;
 const CONTENT_FADE_MS = 260;
 let startupContentRevealed = false;
 let pageTransitionToken = 0;
+let lastProgressPayload = null;
+let lastActiveStepKey = null;
+let lastActiveStepTotal = null;
+let pendingProgressPayload = null;
+let pendingLogRender = false;
+let uiFlushTimer = 0;
+let uiFlushRaf = 0;
+let lastUiFlushAt = 0;
+const UI_FLUSH_MS = 100;
 
 function prefersReducedMotion() {
   return !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+}
+
+/** 與後端 is_supported_minecraft_version 對齊：≥1.13 或年份版 ≥26 */
+function parseMcVersionParts(version) {
+  const cleaned = String(version || "")
+    .trim()
+    .match(/^[\d.]+/);
+  if (!cleaned) return null;
+  const parts = cleaned[0]
+    .split(".")
+    .filter(Boolean)
+    .map((p) => Number(p))
+    .filter((n) => Number.isFinite(n));
+  return parts.length >= 2 ? parts : null;
+}
+
+function isSupportedMinecraftVersion(version) {
+  const parts = parseMcVersionParts(version);
+  if (!parts) return false;
+  if (parts[0] >= 26) return true;
+  if (parts[0] !== 1) return false;
+  if (parts[1] > 13) return true;
+  if (parts[1] < 13) return false;
+  return true; // 1.13 / 1.13.x
+}
+
+function unsupportedVersionMessage(version) {
+  return (
+    "本工具僅支援 Minecraft 1.13 以上（含年份版 26.x），偵測到 " +
+    version +
+    "，無法翻譯。"
+  );
+}
+
+function clearVersionBlock() {
+  versionBlocked = false;
+  versionBlockReason = "";
+}
+
+function setVersionBlock(reason) {
+  versionBlocked = true;
+  versionBlockReason = reason || "Minecraft 版本過舊，無法翻譯。";
 }
 
 /** 強制卸除啟動骨架／is-loading，避免永遠蓋住可點元件。 */
@@ -101,6 +195,7 @@ function revealPagePanel(panel) {
 
 function resetCoverageMetrics(summary = "等待翻譯開始") {
   coverageSkippedSeen = new Set();
+  coverageSettlementLocked = false;
   coverageMetrics = {
     glossary: 0,
     tm: 0,
@@ -108,6 +203,15 @@ function resetCoverageMetrics(summary = "等待翻譯開始") {
     ai: 0,
     pending: null,
     skipped: 0,
+    batchDone: null,
+    batchTotal: null,
+    batchRetry: null,
+    batchRetryBatches: null,
+    batchFail: null,
+    cacheHitTokens: null,
+    cacheMissTokens: null,
+    completionTokens: null,
+    cacheHitPercent: null,
     summary,
   };
   renderCoverageMetrics();
@@ -133,12 +237,44 @@ function renderCoverageMetrics() {
   setText("metric-ai", coverageMetrics.ai);
   setText("metric-skipped", coverageMetrics.skipped);
   setText("metric-pending", coverageMetrics.pending == null ? "—" : coverageMetrics.pending);
-  setText("metric-summary", coverageMetrics.summary || "等待資料");
+  const batchText =
+    coverageMetrics.batchDone != null && coverageMetrics.batchTotal != null
+      ? `${formatCount(coverageMetrics.batchDone)} / ${formatCount(coverageMetrics.batchTotal)}${
+          coverageMetrics.batchRetry != null || coverageMetrics.batchFail != null
+            ? ` (+${formatCount(coverageMetrics.batchRetry || 0)} retry / ${formatCount(coverageMetrics.batchFail || 0)} fail)`
+            : ""
+        }`
+      : "—";
+  setText("metric-batches", batchText);
+  setText(
+    "metric-cache-rate",
+    coverageMetrics.cacheHitPercent == null ? "—" : `${coverageMetrics.cacheHitPercent}%`
+  );
+  setText(
+    "metric-token-hit",
+    coverageMetrics.cacheHitTokens == null ? "—" : formatCount(coverageMetrics.cacheHitTokens)
+  );
+  setText(
+    "metric-token-miss",
+    coverageMetrics.cacheMissTokens == null ? "—" : formatCount(coverageMetrics.cacheMissTokens)
+  );
+  setText(
+    "metric-token-out",
+    coverageMetrics.completionTokens == null ? "—" : formatCount(coverageMetrics.completionTokens)
+  );
   const translated =
     (Number(coverageMetrics.glossary) || 0) +
     (Number(coverageMetrics.tm) || 0) +
     (Number(coverageMetrics.shared) || 0) +
     (Number(coverageMetrics.ai) || 0);
+  // 摘要一律以四格加總為準（含 finalHit lock 後 aiHit 再更新），pending 另顯示於待補格
+  if (translated > 0) {
+    const summary = `已命中／補譯 ${translated} 條`;
+    coverageMetrics.summary = summary;
+    setText("metric-summary", summary);
+  } else {
+    setText("metric-summary", coverageMetrics.summary || "等待資料");
+  }
   const countEl = $("prog-count");
   if (countEl) {
     if (coverageMetrics.pending != null) {
@@ -152,10 +288,25 @@ function renderCoverageMetrics() {
   }
 }
 
+function appendCoverageCompletionTip() {
+  const note = "若遊戲仍英文，查看報告港繁／待譯欄。";
+  if (coverageMetrics.summary && !coverageMetrics.summary.includes("港繁")) {
+    coverageMetrics.summary += ` · ${note}`;
+  }
+  const noteEl = document.querySelector(".metric-note");
+  if (noteEl && !noteEl.textContent.includes("港繁")) {
+    noteEl.textContent = `${noteEl.textContent.replace(/\s*$/, "")} ${note}`;
+  }
+}
+
 function consumeCoverageMessage(message) {
   const text = String(message || "");
   if (!text) return;
   let changed = false;
+  // 忽略「AI 翻譯 N 句（已扣掉…）」隊列文案，避免覆寫主結算
+  if (/AI 翻譯\s+\d+\s+句（已扣掉/.test(text)) {
+    return;
+  }
   const finalHit = text.match(/補譯\s+(\d+)\s+條（術語表\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)、AI\s+(\d+)）/);
   if (finalHit) {
     coverageMetrics.glossary = Math.max(coverageMetrics.glossary, Number(finalHit[2]) || 0);
@@ -163,24 +314,58 @@ function consumeCoverageMessage(message) {
     coverageMetrics.tm = Math.max(coverageMetrics.tm, Number(finalHit[4]) || 0);
     coverageMetrics.ai = Math.max(coverageMetrics.ai, Number(finalHit[5]) || 0);
     coverageMetrics.summary = `已命中／補譯 ${finalHit[1]} 條`;
+    coverageSettlementLocked = true;
+    appendCoverageCompletionTip();
     changed = true;
   }
-  const freeHit = text.match(/免費命中\s+(\d+)\s+句（術語表\s+(\d+)、翻譯記憶\s+(\d+)）.*?只剩\s+(\d+)\s+句/);
-  if (freeHit) {
+  const freeHit = text.match(
+    /免費命中\s+(\d+)\s+句（術語表\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)）.*?只剩\s+(\d+)\s+句/
+  );
+  if (freeHit && !coverageSettlementLocked) {
     coverageMetrics.glossary = Math.max(coverageMetrics.glossary, Number(freeHit[2]) || 0);
-    coverageMetrics.tm = Math.max(coverageMetrics.tm, Number(freeHit[3]) || 0);
-    coverageMetrics.pending = Number(freeHit[4]) || coverageMetrics.pending;
+    coverageMetrics.shared = Math.max(coverageMetrics.shared, Number(freeHit[3]) || 0);
+    coverageMetrics.tm = Math.max(coverageMetrics.tm, Number(freeHit[4]) || 0);
+    coverageMetrics.pending = Number(freeHit[5]) || coverageMetrics.pending;
     coverageMetrics.summary = `免費命中 ${freeHit[1]} 句`;
     changed = true;
   }
   const sharedHit = text.match(/社群共享庫命中\s+(\d+)\s+條/);
-  if (sharedHit) {
+  if (sharedHit && !coverageSettlementLocked) {
     coverageMetrics.shared = Math.max(coverageMetrics.shared, Number(sharedHit[1]) || 0);
     changed = true;
   }
-  const aiHit = text.match(/AI\s+(?:新補|新譯|翻譯)\s*(?:約\s*)?(\d+)\s*(?:條|句)/);
+  const aiHit = text.match(/AI\s+(?:新補|新譯)\s*(?:約\s*)?(\d+)\s*(?:條|句)/);
   if (aiHit) {
     coverageMetrics.ai = Math.max(coverageMetrics.ai, Number(aiHit[1]) || 0);
+    changed = true;
+  }
+  const batchHit = text.match(/(\d+)\s*[／/]\s*(\d+)\s*批/);
+  if (batchHit) {
+    coverageMetrics.batchDone = Number(batchHit[1]) || coverageMetrics.batchDone;
+    coverageMetrics.batchTotal = Number(batchHit[2]) || coverageMetrics.batchTotal;
+    changed = true;
+  }
+  const retryFailHit =
+    text.match(/重試\s+(\d+)（(\d+)\s*批）\s*·\s*批失敗\s+(\d+)/) ||
+    text.match(/重試\s+(\d+)（(\d+)\s*批）\s*·\s*失敗\s+(\d+)/);
+  if (retryFailHit) {
+    coverageMetrics.batchRetry = Number(retryFailHit[1]) || coverageMetrics.batchRetry;
+    coverageMetrics.batchRetryBatches =
+      Number(retryFailHit[2]) || coverageMetrics.batchRetryBatches;
+    coverageMetrics.batchFail = Number(retryFailHit[3]) || coverageMetrics.batchFail;
+    changed = true;
+  }
+  const tokenHit =
+    text.match(/token\s+命中\s+(\d+)／未命中\s+(\d+)／輸出\s+(\d+)/) ||
+    text.match(/AI token：快取命中\s+(\d+)、未命中\s+(\d+)、輸出\s+(\d+)/);
+  if (tokenHit) {
+    const hit = Number(tokenHit[1]) || 0;
+    const miss = Number(tokenHit[2]) || 0;
+    coverageMetrics.cacheHitTokens = hit;
+    coverageMetrics.cacheMissTokens = miss;
+    coverageMetrics.completionTokens = Number(tokenHit[3]) || coverageMetrics.completionTokens;
+    const total = hit + miss;
+    if (total > 0) coverageMetrics.cacheHitPercent = Math.floor((hit * 100) / total);
     changed = true;
   }
   const pendingHit = text.match(/(?:剩餘|仍缺|待補|尚可 AI 補|尚待本機資料或手動翻譯)(?:英文)?(?:約)?\s*(\d+)\s*條/);
@@ -206,17 +391,44 @@ function clampUiScale(value) {
   return Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, Math.round(parsed * 100) / 100));
 }
 
-function applyUiScale(value, save = true) {
+function clampAutoUiScale(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_AUTO_MIN, Math.round(parsed * 100) / 100));
+}
+
+function computeAutoScale() {
+  const w = (window.screen && screen.availWidth) || 1920;
+  let pct = 100;
+  if (w <= 1920) pct = 100;
+  else if (w <= 2304) pct = 110;
+  else if (w <= 2560) pct = 120;
+  else if (w <= 3200) pct = 130;
+  else pct = 140;
+  return clampAutoUiScale(pct / 100);
+}
+
+function isUiAutoScaleOn() {
+  return uiAutoScale !== false;
+}
+
+function applyUiScale(value, save = true, opts = {}) {
+  const fromAuto = !!opts.fromAuto;
   uiScale = clampUiScale(value);
   document.documentElement.style.setProperty("--ui-scale", String(uiScale));
   const label = $("scale-label");
   const button = $("btn-scale");
   const percent = Math.round(uiScale * 100);
-  if (label) label.textContent = `介面 ${percent}%`;
-  if (button) {
-    button.title = `Ctrl＋↑／↓或 Ctrl＋滾輪調整介面大小；點擊重設為 100%（目前 ${percent}%）`;
+  if (label) {
+    label.textContent = fromAuto || isUiAutoScaleOn() ? `介面 ${percent}%（自動）` : `介面 ${percent}%`;
   }
-  if (save) {
+  if (button) {
+    button.title = isUiAutoScaleOn()
+      ? "已開啟自動依螢幕調整；關閉後可用 Ctrl＋↑／↓或滾輪手動調整"
+      : `Ctrl＋↑／↓或 Ctrl＋滾輪調整介面大小；點擊重設為 100%（目前 ${percent}%）`;
+    button.disabled = isUiAutoScaleOn();
+  }
+  if (save && !fromAuto) {
     try {
       localStorage.setItem(UI_SCALE_STORAGE_KEY, String(uiScale));
     } catch (_) {
@@ -225,18 +437,417 @@ function applyUiScale(value, save = true) {
   }
 }
 
-function initUiScale() {
-  let saved = 1;
-  try {
-    saved = clampUiScale(localStorage.getItem(UI_SCALE_STORAGE_KEY) || 1);
-  } catch (_) {
-    /* 使用預設比例 */
+function applyAutoScale() {
+  const w = (window.screen && screen.availWidth) || 1920;
+  lastAutoAvailWidth = w;
+  applyUiScale(computeAutoScale(), false, { fromAuto: true });
+}
+
+function setUiAutoScale(on, persist = true) {
+  uiAutoScale = !!on;
+  const box = $("ui-autoscale");
+  if (box) box.checked = uiAutoScale;
+  if (persist) {
+    try {
+      localStorage.setItem(UI_AUTOSCALE_STORAGE_KEY, uiAutoScale ? "1" : "0");
+    } catch (_) {
+      /* ignore */
+    }
   }
-  applyUiScale(saved, false);
+  if (uiAutoScale) applyAutoScale();
+  else {
+    let saved = 1;
+    try {
+      saved = clampUiScale(localStorage.getItem(UI_SCALE_STORAGE_KEY) || 1);
+    } catch (_) {
+      /* default */
+    }
+    applyUiScale(saved, false);
+  }
+}
+
+function initUiScale() {
+  let auto = true;
+  try {
+    const raw = localStorage.getItem(UI_AUTOSCALE_STORAGE_KEY);
+    if (raw === "0") auto = false;
+    if (raw === "1") auto = true;
+  } catch (_) {
+    /* default on */
+  }
+  uiAutoScale = auto;
+  const box = $("ui-autoscale");
+  if (box) box.checked = auto;
+  if (auto) applyAutoScale();
+  else {
+    let saved = 1;
+    try {
+      saved = clampUiScale(localStorage.getItem(UI_SCALE_STORAGE_KEY) || 1);
+    } catch (_) {
+      /* 使用預設比例 */
+    }
+    applyUiScale(saved, false);
+  }
+  window.setInterval(() => {
+    if (!isUiAutoScaleOn()) return;
+    const w = (window.screen && screen.availWidth) || 1920;
+    if (w !== lastAutoAvailWidth) applyAutoScale();
+  }, 1500);
 }
 
 function adjustUiScale(delta) {
+  if (isUiAutoScaleOn()) {
+    zoomAutoHint();
+    return;
+  }
   applyUiScale(uiScale + delta);
+}
+
+let _mouseXY = { x: 24, y: 72 };
+let _zoomHintTimer = null;
+
+window.addEventListener(
+  "pointermove",
+  (ev) => {
+    _mouseXY.x = ev.clientX;
+    _mouseXY.y = ev.clientY;
+  },
+  { passive: true, capture: true }
+);
+
+function placeNearCursor(el, x, y, gap = 14) {
+  if (!el) return;
+  el.style.visibility = "hidden";
+  el.style.left = "0px";
+  el.style.top = "0px";
+  const rect = el.getBoundingClientRect();
+  const vw = window.innerWidth || 800;
+  const vh = window.innerHeight || 600;
+  let left = x + gap;
+  let top = y + gap;
+  if (left + rect.width > vw - 8) left = Math.max(8, x - rect.width - gap);
+  if (top + rect.height > vh - 8) top = Math.max(8, y - rect.height - gap);
+  el.style.left = `${Math.round(left)}px`;
+  el.style.top = `${Math.round(top)}px`;
+  el.style.visibility = "";
+}
+
+function zoomAutoHint() {
+  let el = document.getElementById("zoom-hint");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "zoom-hint";
+    el.className = "zoom-hint";
+    el.setAttribute("role", "status");
+    document.body.appendChild(el);
+  }
+  el.textContent = "介面縮放已鎖定（自動縮放開啟中；可到 ⋯ 設定關閉後再手動調整）";
+  el.classList.add("show");
+  placeNearCursor(el, _mouseXY.x, _mouseXY.y, 14);
+  if (_zoomHintTimer) clearTimeout(_zoomHintTimer);
+  _zoomHintTimer = setTimeout(() => {
+    el.classList.remove("show");
+  }, 1400);
+}
+
+const ONBOARD_STEPS = [
+  {
+    selector: ".service-tabs",
+    title: "三個服務分頁",
+    body: "頂部分頁可切換「翻譯」「字體」「診斷」。一般先留在翻譯頁；出問題再開診斷。",
+  },
+  {
+    selector: ".path-block",
+    title: "先選遊戲資料夾",
+    body: "選取 Minecraft 實例資料夾並通過檢查後，才會顯示 AI、開始翻譯與右側步驟／日誌。",
+  },
+  {
+    selector: "#ai-options-group",
+    fallback: "#path-gate-hint",
+    title: "AI 輔助（可選）",
+    body: "免費代管需 Discord；額度用盡或自訂失敗時，推薦改用自訂 API 的 DeepSeek（便宜划算），到 platform.deepseek.com 申請金鑰。也可關閉 AI 只做本機整理。",
+  },
+  {
+    selector: "#btn-run",
+    fallback: "#path-gate-hint",
+    title: "開始翻譯",
+    body: "通過資料夾檢查後按「開始翻譯」。完成會盡量自動套用；不會宣稱 100%。忙碌時「停止」與「更多選項」同排。",
+  },
+  {
+    selector: "#tab-diagnose",
+    fallback: ".service-tabs",
+    title: "錯誤分析",
+    body: "可貼 crash／log，或選整合包資料夾做記錄＋mods 交叉驗證。每次只給一個主因與下一步。",
+  },
+  {
+    selector: "#tab-font",
+    fallback: ".service-tabs",
+    title: "字體資源包",
+    body: "把 .ttf／.otf 打成資源包，可選套用到目前實例。與翻譯無關，中文變□多半是字體問題。",
+  },
+  {
+    selector: "#btn-overflow",
+    title: "⋯ 設定",
+    body: "右上角 ⋯＝設定：外觀、自動縮放、檢查更新、完整使用說明，以及重播本引導都在這裡。",
+  },
+];
+
+let onboardIndex = 0;
+let onboardActive = false;
+
+function hasSeenOnboarding() {
+  try {
+    return localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function markOnboardingSeen() {
+  try {
+    localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function resolveOnboardTarget(step) {
+  if (!step) return null;
+  let el = document.querySelector(step.selector);
+  if (el) {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    const visible =
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      rect.width > 0 &&
+      rect.height > 0;
+    if (visible) return el;
+  }
+  if (step.fallback) return document.querySelector(step.fallback);
+  return el;
+}
+
+function layoutOnboarding() {
+  if (!onboardActive) return;
+  const step = ONBOARD_STEPS[onboardIndex];
+  const root = $("onboard-root");
+  const hole = $("onboard-hole");
+  const bubble = $("onboard-bubble");
+  const meta = $("onboard-meta");
+  const title = $("onboard-title");
+  const body = $("onboard-body");
+  const prev = $("onboard-prev");
+  const next = $("onboard-next");
+  if (!root || !bubble || !step) return;
+
+  if (meta) meta.textContent = `${onboardIndex + 1} / ${ONBOARD_STEPS.length}`;
+  if (title) title.textContent = step.title;
+  if (body) body.textContent = step.body;
+  if (prev) prev.disabled = onboardIndex <= 0;
+  if (next) next.textContent = onboardIndex >= ONBOARD_STEPS.length - 1 ? "完成" : "下一步";
+
+  const target = resolveOnboardTarget(step);
+  const pad = 8;
+  const vw = window.innerWidth || 800;
+  const vh = window.innerHeight || 600;
+  let holeRect = { left: vw * 0.2, top: vh * 0.2, width: vw * 0.6, height: 80 };
+  if (target) {
+    const r = target.getBoundingClientRect();
+    holeRect = {
+      left: Math.max(8, r.left - pad),
+      top: Math.max(8, r.top - pad),
+      width: Math.min(vw - 16, r.width + pad * 2),
+      height: Math.min(vh - 16, r.height + pad * 2),
+    };
+  }
+  if (hole) {
+    hole.hidden = false;
+    hole.style.left = `${Math.round(holeRect.left)}px`;
+    hole.style.top = `${Math.round(holeRect.top)}px`;
+    hole.style.width = `${Math.round(holeRect.width)}px`;
+    hole.style.height = `${Math.round(holeRect.height)}px`;
+  }
+
+  bubble.style.visibility = "hidden";
+  bubble.style.left = "0px";
+  bubble.style.top = "0px";
+  const b = bubble.getBoundingClientRect();
+  let left = holeRect.left;
+  let top = holeRect.top + holeRect.height + 12;
+  if (top + b.height > vh - 12) top = Math.max(12, holeRect.top - b.height - 12);
+  if (left + b.width > vw - 12) left = Math.max(12, vw - b.width - 12);
+  if (left < 12) left = 12;
+  if (top < 12) top = 12;
+  bubble.style.left = `${Math.round(left)}px`;
+  bubble.style.top = `${Math.round(top)}px`;
+  bubble.style.visibility = "";
+}
+
+function stopOnboarding(markSeen) {
+  onboardActive = false;
+  const root = $("onboard-root");
+  if (root) {
+    root.hidden = true;
+    root.classList.remove("is-active");
+    root.setAttribute("aria-hidden", "true");
+  }
+  if (markSeen) markOnboardingSeen();
+  window.removeEventListener("resize", layoutOnboarding);
+}
+
+function startOnboarding(opts = {}) {
+  const force = !!opts.force;
+  if (!force && hasSeenOnboarding()) return;
+  const root = $("onboard-root");
+  if (!root) return;
+  closeGuideOverlaySafe();
+  onboardIndex = 0;
+  onboardActive = true;
+  root.hidden = false;
+  root.classList.add("is-active");
+  root.setAttribute("aria-hidden", "false");
+  layoutOnboarding();
+  window.addEventListener("resize", layoutOnboarding);
+}
+
+function closeGuideOverlaySafe() {
+  const ov = $("guide-overlay");
+  if (!ov) return;
+  ov.hidden = true;
+  ov.setAttribute("aria-hidden", "true");
+}
+
+function getCurrentTauriWindow() {
+  try {
+    const api = (TAURI && TAURI.window) || (window.__TAURI__ && window.__TAURI__.window);
+    if (!api) return null;
+    if (typeof api.getCurrentWindow === "function") return api.getCurrentWindow();
+    if (typeof api.getCurrent === "function") return api.getCurrent();
+    return api.appWindow || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function initWinbarChrome() {
+  const bar = document.querySelector(".winbar");
+  if (!bar || bar.dataset.chromeBound === "1") return;
+  bar.dataset.chromeBound = "1";
+
+  const minBtn = $("btn-win-min");
+  const maxBtn = $("btn-win-max");
+  const closeBtn = $("btn-win-close");
+  if (minBtn) {
+    minBtn.onclick = () => {
+      const w = getCurrentTauriWindow();
+      if (w && w.minimize) w.minimize().catch(() => {});
+    };
+  }
+  async function syncMaxIcon() {
+    const w = getCurrentTauriWindow();
+    if (!w || !maxBtn || !w.isMaximized) return;
+    try {
+      const m = await w.isMaximized();
+      maxBtn.textContent = m ? "❐" : "□";
+      maxBtn.title = m ? "還原" : "最大化";
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (maxBtn) {
+    maxBtn.onclick = () => {
+      const w = getCurrentTauriWindow();
+      if (w && w.toggleMaximize) {
+        w.toggleMaximize().catch(() => {});
+        setTimeout(syncMaxIcon, 140);
+      }
+    };
+  }
+  if (closeBtn) {
+    closeBtn.onclick = () => {
+      if (managedAiPaused) {
+        const ok = window.confirm("代管 AI 暫停中，確定要關閉工具嗎？");
+        if (!ok) return;
+      }
+      const w = getCurrentTauriWindow();
+      if (w && w.close) w.close().catch(() => {});
+    };
+  }
+
+  let dragTimer = null;
+  let dragArmed = false;
+  const noDrag = (t) =>
+    t && t.closest && t.closest("button,a,input,select,textarea,[contenteditable],.wb-btn,.winbar-nodrag,.overflow-wrap");
+  const cancelDrag = () => {
+    if (dragTimer) {
+      clearTimeout(dragTimer);
+      dragTimer = null;
+    }
+  };
+  bar.addEventListener(
+    "mousedown",
+    (e) => {
+      if (e.button !== 0 || noDrag(e.target)) return;
+      if (e.detail >= 2) {
+        cancelDrag();
+        dragArmed = false;
+        return;
+      }
+      cancelDrag();
+      dragArmed = true;
+      const w = getCurrentTauriWindow();
+      if (!w || !w.startDragging) return;
+      dragTimer = setTimeout(() => {
+        dragTimer = null;
+        if (!dragArmed) return;
+        try {
+          w.startDragging();
+        } catch (_) {
+          /* ignore */
+        }
+      }, 140);
+    },
+    true
+  );
+  window.addEventListener(
+    "mouseup",
+    () => {
+      dragArmed = false;
+      cancelDrag();
+    },
+    true
+  );
+  bar.addEventListener(
+    "dblclick",
+    (e) => {
+      dragArmed = false;
+      cancelDrag();
+      if (noDrag(e.target)) return;
+      e.preventDefault();
+      const w = getCurrentTauriWindow();
+      if (w && w.toggleMaximize) {
+        w.toggleMaximize().catch(() => {});
+        setTimeout(syncMaxIcon, 140);
+      }
+    },
+    true
+  );
+
+  document.querySelectorAll(".rsz[data-resize]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => {
+      const dir = el.getAttribute("data-resize");
+      const w = getCurrentTauriWindow();
+      if (!w || !w.startResizeDragging || !dir) return;
+      try {
+        e.preventDefault();
+      } catch (_) {
+        /* ignore */
+      }
+      w.startResizeDragging(dir).catch(() => {});
+    });
+  });
+  syncMaxIcon();
 }
 
 function shouldBackupBeforeApply() {
@@ -300,11 +911,29 @@ function setAutoOutputDir(path) {
     : "請先選擇整合包資料夾。";
   syncOutputField();
   scheduleBackupStateRefresh();
+  refreshShareableState();
 }
 
 function resultWorkDir(outputDir) {
   const clean = String(outputDir || "").replace(/[\\/]+$/, "");
   return /(?:^|[\\/])翻譯結果$/i.test(clean) ? clean : clean + "\\翻譯結果";
+}
+
+async function refreshShareableState() {
+  const token = ++shareableProbeToken;
+  const outputDir = selectedOutputDir();
+  if (!outputDir) {
+    hasShareableFiles = false;
+    if (token === shareableProbeToken) syncUiState();
+    return;
+  }
+  try {
+    const work = resultWorkDir(outputDir);
+    hasShareableFiles = !!(await invoke("has_shareable_translation_cmd", { workRoot: work }));
+  } catch (_) {
+    hasShareableFiles = false;
+  }
+  if (token === shareableProbeToken) syncUiState();
 }
 
 function applyTheme(theme) {
@@ -339,11 +968,217 @@ function initTheme() {
   applyTheme(saved);
 }
 
+/** —— SFX：輕量 WebAudio 點音效（不依賴外部 ogg 檔）—— */
+const SFX_THROTTLE_MS = 90;
+const SFX_ERROR_GUARD_MS = 1500;
+const SFX_SUCCESS_GUARD_MS = 2500;
+// 優先用很小的本地 ogg 檔；success/error 仍以 WebAudio tone 當保底（避免非使用者觸發時瀏覽器拒絕自動播放）。
+const SFX_AUDIO_URLS = {
+  click: "assets/audio/pickup2.ogg",
+  toggle: "assets/audio/chip-lay-1.ogg",
+  tick: "assets/audio/chips-stack-2.ogg",
+  scroll: "assets/audio/chips-stack-5.ogg",
+};
+const sfxAudioPool = {};
+
+function clampSfxVolume(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0.55;
+  return Math.min(1, Math.max(0, n));
+}
+
+function ensureSfxAudioContext() {
+  if (sfxAudioCtx) return sfxAudioCtx;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+  try {
+    sfxAudioCtx = new AudioCtx();
+    return sfxAudioCtx;
+  } catch (_) {
+    sfxAudioCtx = null;
+    return null;
+  }
+}
+
+function playSfx(kind) {
+  if (sfxMuted) return;
+  const vol = clampSfxVolume(sfxVolume);
+  if (!vol) return;
+  const now = Date.now();
+  if (now - sfxLastPlayAt < SFX_THROTTLE_MS) return;
+  sfxLastPlayAt = now;
+
+  const audioUrl = SFX_AUDIO_URLS[kind];
+  if (audioUrl) {
+    try {
+      const a = sfxAudioPool[kind] || new Audio(audioUrl);
+      sfxAudioPool[kind] = a;
+      a.volume = vol;
+      a.currentTime = 0;
+      const p = a.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+      return; // 由於 click/toggle/tick/scroll 都是使用者觸發，預期可以播放成功
+    } catch (_) {
+      /* fallback: 改用 WebAudio tone */
+    }
+  }
+
+  const ctx = ensureSfxAudioContext();
+  if (!ctx) return;
+  try {
+    if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume().catch(() => null);
+  } catch (_) {
+    /* ignore */
+  }
+
+  const t0 = ctx.currentTime || 0;
+  const makeTone = (freq, durMs, wave = "sine", gainMul = 1) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = wave;
+    osc.frequency.setValueAtTime(freq, t0);
+    const peak = Math.max(0.001, vol * 0.22 * gainMul);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(peak, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + durMs / 1000);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + durMs / 1000 + 0.02);
+  };
+
+  // 目標：避免「吵」；用短包絡 + 少量頻率變化。
+  switch (kind) {
+    case "success":
+      makeTone(1046.5, 95, "triangle", 1.0);
+      makeTone(1318.5, 95, "sine", 0.8);
+      break;
+    case "error":
+      makeTone(220, 115, "sawtooth", 0.9);
+      makeTone(165, 115, "square", 0.35);
+      break;
+    case "tick":
+      makeTone(740, 45, "sine", 0.7);
+      break;
+    case "scroll":
+      makeTone(520, 55, "sine", 0.45);
+      break;
+    case "toggle":
+      makeTone(660, 70, "sine", 0.6);
+      break;
+    case "click":
+    default:
+      makeTone(880, 55, "sine", 0.55);
+      break;
+  }
+}
+
+function maybePlaySfxError() {
+  const now = Date.now();
+  if (now - sfxLastErrorAt < SFX_ERROR_GUARD_MS) return;
+  sfxLastErrorAt = now;
+  playSfx("error");
+}
+
+function maybePlaySfxSuccess(message) {
+  const now = Date.now();
+  if (now - sfxLastSuccessAt < SFX_SUCCESS_GUARD_MS) return;
+  const m = String(message || "");
+  if (!/全部完成|補翻完成|補譯完成|字體包完成|修復完成|已套用|完成/.test(m)) return;
+  sfxLastSuccessAt = now;
+  playSfx("success");
+}
+
+function initSfxControls() {
+  const mutedBox = $("sfx-muted");
+  const volInput = $("sfx-volume");
+  const volLabel = $("sfx-volume-label");
+
+  try {
+    const storedVol = clampSfxVolume(localStorage.getItem(SFX_VOLUME_STORAGE_KEY));
+    sfxVolume = storedVol;
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    const storedMuted = localStorage.getItem(SFX_MUTED_STORAGE_KEY);
+    sfxMuted = storedMuted === "1";
+  } catch (_) {
+    /* ignore */
+  }
+
+  if (mutedBox) {
+    mutedBox.checked = !!sfxMuted;
+    mutedBox.addEventListener("change", () => {
+      sfxMuted = !!mutedBox.checked;
+      try {
+        localStorage.setItem(SFX_MUTED_STORAGE_KEY, sfxMuted ? "1" : "0");
+      } catch (_) {
+        /* ignore */
+      }
+    });
+  }
+
+  if (volInput) {
+    volInput.value = String(clampSfxVolume(sfxVolume));
+    const applyUi = () => {
+      const v = clampSfxVolume(volInput.value);
+      if (sfxMuted && v > 0 && mutedBox && mutedBox.checked) {
+        // 靜音與音量分開：不自動取消靜音
+      }
+      sfxVolume = v;
+      if (volLabel) volLabel.textContent = Math.round(v * 100) + "%";
+      try {
+        localStorage.setItem(SFX_VOLUME_STORAGE_KEY, String(v));
+      } catch (_) {
+        /* ignore */
+      }
+    };
+    volInput.addEventListener("input", applyUi);
+    applyUi();
+  }
+
+  // 使用者點擊：用事件委派觸發 click，避免「滾動/拖曳」造成大量雜訊。
+  document.addEventListener(
+    "click",
+    (ev) => {
+      const t = ev.target;
+      if (t && t.tagName === "INPUT" && t.type === "checkbox") {
+        const id = String(t.id || "");
+        if (id === "sfx-muted") return;
+        if (sfxMuted) return;
+        playSfx("toggle");
+        return;
+      }
+      const el = t && t.closest ? t.closest("button, a") : null;
+      if (!el) return;
+      if (el instanceof HTMLInputElement) return;
+      if (el.tagName === "A" && !el.getAttribute("href")) return;
+      const id = String(el.id || "");
+      if (!id) return;
+      if (!/^btn-|^winbar-|^btn-win-/.test(id) && !el.classList.contains("wb-btn")) {
+        return;
+      }
+      if (el.disabled) return;
+      if (sfxMuted) return;
+      playSfx("click");
+    },
+    { capture: true, passive: true }
+  );
+}
+
 /** UI 日誌：只保留最近幾則供右欄漸進顯示；完整內容看結果資料夾報告檔 */
 const progressLogLines = [];
 const UI_LOG_VISIBLE = 6;
-const MAX_LOG_LINES = 64;
+const MAX_LOG_LINES = 2000;
+const RUN_LOG_FILE = "執行日誌.txt";
+const FONT_LOG_FILE = "字體執行日誌.txt";
+const DEV_TRACE_FILE = "開發進度偵測.txt";
+const RUN_LOG_MAX_BYTES = 256 * 1024;
 let errorLogCount = 0;
+const fontLogLines = [];
+const diagnoseLogLines = [];
+let fontPreviewFace = null;
 
 function nowStamp() {
   const d = new Date();
@@ -356,12 +1191,116 @@ function visibleLogLines() {
   return progressLogLines.slice(-UI_LOG_VISIBLE);
 }
 
-function renderLog() {
+function renderLogNow() {
   const el = $("log");
   if (!el) return;
   el.classList.remove("log-empty");
   el.textContent = visibleLogLines().join("\n");
   el.scrollTop = el.scrollHeight;
+}
+
+function renderPanelLog(el, lines) {
+  if (!el) return;
+  el.classList.toggle("log-empty", lines.length === 0);
+  const visible = lines.length <= UI_LOG_VISIBLE ? lines.slice() : lines.slice(-UI_LOG_VISIBLE);
+  el.textContent = visible.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendPanelLog(lines, msg, level, renderFn, el) {
+  const text = String(msg == null ? "" : msg).replace(/\r\n/g, "\n");
+  if (!text) return;
+  const lv = level || "info";
+  for (const line of text.split("\n")) {
+    let prefix = "[" + nowStamp() + "] ";
+    if (lv === "error") prefix += "【錯誤】";
+    else if (lv === "warn") prefix += "【警告】";
+    lines.push(prefix + line);
+  }
+  while (lines.length > MAX_LOG_LINES) lines.shift();
+  renderFn(el, lines);
+}
+
+function clearFontLog(seedMsg) {
+  fontLogLines.length = 0;
+  if (seedMsg) fontLogLines.push("[" + nowStamp() + "] " + seedMsg);
+  renderPanelLog($("font-log"), fontLogLines);
+}
+
+function appendFontLog(msg, level) {
+  appendPanelLog(fontLogLines, msg, level, renderPanelLog, $("font-log"));
+}
+
+function clearDiagnoseLog(seedMsg) {
+  diagnoseLogLines.length = 0;
+  if (seedMsg) diagnoseLogLines.push("[" + nowStamp() + "] " + seedMsg);
+  renderPanelLog($("diagnose-log"), diagnoseLogLines);
+}
+
+function appendDiagnoseLog(msg, level) {
+  appendPanelLog(diagnoseLogLines, msg, level, renderPanelLog, $("diagnose-log"));
+}
+
+async function flushFontLog(workDir) {
+  if (!workDir) return;
+  const header = "【字體執行日誌】\n與翻譯「執行日誌.txt」分開。每次字體任務結束時覆寫。\n\n";
+  let body = header + fontLogLines.join("\n") + "\n";
+  if (body.length > RUN_LOG_MAX_BYTES) {
+    body = body.slice(0, 800) + "\n…（已截斷）…\n" + body.slice(-(RUN_LOG_MAX_BYTES - 1200));
+  }
+  const path = String(workDir).replace(/[\\/]+$/, "") + "\\" + FONT_LOG_FILE;
+  await invoke("write_text_file", { path, content: body });
+}
+
+function fontWorkDir(outputDir) {
+  const clean = String(outputDir || "").replace(/[\\/]+$/, "");
+  return /(?:^|[\\/])字體結果$/i.test(clean) ? clean : clean + "\\字體結果";
+}
+
+function flushUiFrame() {
+  if (pendingProgressPayload) {
+    const payload = pendingProgressPayload;
+    pendingProgressPayload = null;
+    const percent = payload.percent != null ? payload.percent : 0;
+    const message = payload.message || "處理中…";
+    setProgress(percent, message, { payload });
+  }
+  if (pendingLogRender) {
+    pendingLogRender = false;
+    renderLogNow();
+  }
+  lastUiFlushAt = Date.now();
+}
+
+function scheduleUiFlush() {
+  if (uiFlushRaf || uiFlushTimer) return;
+  const now = Date.now();
+  const delay = Math.max(0, UI_FLUSH_MS - (now - lastUiFlushAt));
+  const kick = () => {
+    uiFlushRaf = window.requestAnimationFrame(() => {
+      uiFlushRaf = 0;
+      flushUiFrame();
+    });
+  };
+  if (delay > 0) {
+    uiFlushTimer = window.setTimeout(() => {
+      uiFlushTimer = 0;
+      kick();
+    }, delay);
+  } else {
+    kick();
+  }
+}
+
+function queueProgressPayload(payload) {
+  pendingProgressPayload = payload || null;
+  scheduleUiFlush();
+}
+
+async function paintBeforeInvoke() {
+  await new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
+  });
 }
 
 function clearLog(seedMsg) {
@@ -371,14 +1310,20 @@ function clearLog(seedMsg) {
   displayPercent = 0;
   lastRealPercent = 0;
   lastRealMessage = "";
+  lastProgressPayload = null;
+  lastActiveStepKey = null;
+  lastActiveStepTotal = null;
+  pendingProgressPayload = null;
+  setProgressStateBadge(null);
   if (seedMsg) progressLogLines.push("[" + nowStamp() + "] " + seedMsg);
-  renderLog();
+  renderLogNow();
 }
 
 function appendLog(msg, level) {
   const text = String(msg == null ? "" : msg).replace(/\r\n/g, "\n");
   if (!text) return;
   const lv = level || "info";
+  if (lv === "error") maybePlaySfxError();
   const lines = text.split("\n");
   for (const line of lines) {
     let prefix = "[" + nowStamp() + "] ";
@@ -398,11 +1343,25 @@ function appendLog(msg, level) {
   while (progressLogLines.length > MAX_LOG_LINES) {
     progressLogLines.shift();
   }
-  renderLog();
+  pendingLogRender = true;
+  scheduleUiFlush();
 }
 
 function appendError(msg) {
   appendLog(msg, "error");
+}
+
+/** 把記憶體日誌覆寫成執行日誌.txt（有上限），供「報告」開啟 */
+async function flushRunLog(workDir) {
+  if (!workDir) return;
+  const header =
+    "【執行日誌】\n最近過程狀態。每次按報告或翻譯任務結束時覆寫。\n\n";
+  let body = header + progressLogLines.join("\n") + "\n";
+  if (body.length > RUN_LOG_MAX_BYTES) {
+    body = body.slice(0, 800) + "\n…（已截斷）…\n" + body.slice(-(RUN_LOG_MAX_BYTES - 1200));
+  }
+  const path = String(workDir).replace(/[\\/]+$/, "") + "\\" + RUN_LOG_FILE;
+  await invoke("write_text_file", { path, content: body });
 }
 
 /** 相容舊呼叫：整段覆寫改為附加；完成摘要用 setLogFinal */
@@ -423,12 +1382,16 @@ function setLogFinal(msg) {
 /** AI 額度用完：提示支持（不提服務商名稱） */
 function maybeHintAiQuota(text) {
   const s = String(text || "");
-  if (!/額度|餘額|沒有回應|金鑰無效|無權限|沒有有效回應|請我喝珍奶|沒有餘力/.test(s)) {
+  if (!/額度|餘額|沒有回應|金鑰無效|無權限|沒有有效回應|請我喝珍奶|沒有餘力|免費代管|429|quota exhausted/.test(s)) {
     return;
   }
   appendLog("────────", "warn");
-  appendLog("開發者目前無法再為 AI 加值，需要你的支持。", "warn");
-  appendLog("有自己的金鑰請重新儲存後再試；也歡迎按下方「請我喝珍奶」。", "warn");
+  appendLog("代管翻譯由開發者個人提供，不是無限額度。", "warn");
+  appendLog("額度用盡時代管不可用；共享庫與本機轉換仍可繼續。", "warn");
+  appendLog(
+    "可支持開發，或改用自訂 API：推薦 DeepSeek（便宜划算），到 platform.deepseek.com 申請後選 DeepSeek 填入。",
+    "warn"
+  );
 }
 
 /** 使用者按停止不是錯誤，畫面不該變成一片紅字 */
@@ -439,11 +1402,16 @@ function isCancellation(e) {
 /** 統一處理各流程的失敗／取消收尾 */
 function handleRunFailure(e, whatFailed) {
   if (isCancellation(e)) {
-    setProgress(0, "已停止");
-    appendLog("已停止。先前完成的部分仍保留在結果資料夾。", "warn");
+    setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "已停止", {
+      payload: { ...(lastProgressPayload || {}), state: "cancelling" },
+    });
+    // 停止掃尾文案由各流程 catch 自行補充；此處只更新進度
     return;
   }
-  setProgress(0, whatFailed, { failed: true });
+  setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), whatFailed, {
+    failed: true,
+    payload: lastProgressPayload,
+  });
   appendError(whatFailed);
   appendError(formatInvokeError(e));
 }
@@ -459,16 +1427,556 @@ function formatInvokeError(e) {
   }
 }
 
-/** mockup 四步：準備 → 掃描 → 翻譯 → 完成（polish/ai/pack 併入 translate） */
-const STEP_ORDER = ["prep", "scan", "translate", "done"];
+function classifyManagedAiError(e) {
+  const detail = String(formatInvokeError(e || "") || "").trim();
+  if (!detail) return null;
+  const m = detail.toLowerCase();
+
+  if (
+    detail.includes("client upgrade required") ||
+    detail.includes("client_upgrade_required") ||
+    m.includes("版本已不能使用")
+  ) {
+    return { kind: "client_upgrade_required", title: "代管 AI 需要更新", message: detail, extra: "" };
+  }
+
+  if (
+    detail.includes("login_required") ||
+    detail.includes("Discord 尚未登入") ||
+    detail.includes("請先登入 Discord") ||
+    detail.includes("請回到工具重新登入")
+  ) {
+    return { kind: "login_required", title: "代管 AI 需要 Discord 驗證", message: detail, extra: "" };
+  }
+
+  if (
+    detail.includes("guild_required") ||
+    detail.includes("加入 ZeitFrei 官方 Discord") ||
+    detail.includes("尚未加入官方伺服器") ||
+    detail.includes("加入官方伺服器")
+  ) {
+    return { kind: "guild_required", title: "代管 AI 需要加入官方伺服器", message: detail, extra: "" };
+  }
+
+  if (
+    detail.includes("代管額度已用盡") ||
+    detail.includes("當日額度") ||
+    detail.includes("餘額") ||
+    detail.includes("免費翻譯的當日額度") ||
+    detail.includes("額度") ||
+    m.includes("quota") ||
+    m.includes("balance")
+  ) {
+    const isSharedWeekly =
+      detail.includes("本週共享額度") ||
+      detail.includes("共享本週") ||
+      detail.includes("sharedPeriod") ||
+      detail.includes("sharedResetAtUtc") ||
+      m.includes("managed shared weekly quota") ||
+      m.includes("shared weekly");
+    return {
+      kind: isSharedWeekly ? "shared_weekly_quota" : "quota_exhausted",
+      title: isSharedWeekly ? "本週共享額度已用完" : "代管 AI 額度用盡",
+      message: detail,
+      extra: isSharedWeekly ? "每週一重置" : "",
+    };
+  }
+
+  if (
+    detail.includes("server_not_ready") ||
+    detail.includes("服務暫時無法使用") ||
+    detail.includes("維護") ||
+    detail.includes("暫時無法使用")
+  ) {
+    return { kind: "server_not_ready", title: "代管 AI 目前不可用", message: detail, extra: "" };
+  }
+
+  return null;
+}
+
+function hideManagedAiErrorModal() {
+  managedAiPaused = false;
+  managedAiCurrentError = null;
+  const ov = $("managed-ai-error-overlay");
+  if (ov) {
+    ov.hidden = true;
+    ov.setAttribute("aria-hidden", "true");
+  }
+}
+
+function showManagedAiErrorModal(cls) {
+  if (!cls) return;
+  managedAiPaused = true;
+  managedAiCurrentError = cls.kind;
+
+  const ov = $("managed-ai-error-overlay");
+  if (!ov) return;
+  ov.hidden = false;
+  ov.setAttribute("aria-hidden", "false");
+
+  const title = $("managed-ai-error-title");
+  const msg = $("managed-ai-error-message");
+  const extra = $("managed-ai-error-extra");
+  if (title) title.textContent = cls.title || "代管 AI 需要確認";
+  if (msg) msg.textContent = cls.message || "";
+  if (extra) extra.textContent = cls.extra || "";
+
+  const actions = $("managed-ai-error-actions");
+  if (actions) {
+    actions.innerHTML = "";
+
+    const mkBtn = (id, text, className) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.id = id;
+      b.className = className || "secondary-button";
+      b.textContent = text;
+      return b;
+    };
+
+    actions.appendChild(mkBtn("btn-managed-ai-try-later", "稍後再試"));
+
+    if (cls.kind === "login_required" || cls.kind === "guild_required") {
+      actions.appendChild(mkBtn("btn-managed-ai-verify-discord", "去驗證 Discord"));
+    } else {
+      actions.appendChild(mkBtn("btn-managed-ai-continue", "繼續"));
+      actions.appendChild(mkBtn("btn-managed-ai-custom-api", "去填自訂 API"));
+    }
+
+    const btnTryLater = $("btn-managed-ai-try-later");
+    if (btnTryLater) {
+      btnTryLater.onclick = () => {
+        hideManagedAiErrorModal();
+        setTranslationState("idle");
+      };
+    }
+
+    const btnVerify = $("btn-managed-ai-verify-discord");
+    if (btnVerify) {
+      btnVerify.onclick = () => {
+        hideManagedAiErrorModal();
+        setTranslationState("idle");
+        try {
+          syncAiModeUi("managed");
+          if ($("ai-auth-details")) $("ai-auth-details").open = true;
+          $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch (_) {}
+      };
+    }
+
+    const btnContinue = $("btn-managed-ai-continue");
+    if (btnContinue) {
+      btnContinue.onclick = () => {
+        hideManagedAiErrorModal();
+        setTranslationState("idle");
+      };
+    }
+
+    const btnCustom = $("btn-managed-ai-custom-api");
+    if (btnCustom) {
+      btnCustom.onclick = () => {
+        hideManagedAiErrorModal();
+        setTranslationState("idle");
+        void changeAiMode("custom").then(() => {
+          $("api-key")?.focus();
+          if ($("adv-details")) $("adv-details").open = true;
+        });
+      };
+    }
+  }
+}
+
+function formatIsoToTaipei(iso) {
+  try {
+    return new Date(iso).toLocaleString("zh-TW", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch (_) {
+    return String(iso || "");
+  }
+}
+
+let lastManagedUsageRefreshAt = 0;
+
+async function refreshManagedAiUsageIndicator(opts = {}) {
+  const el = $("managed-ai-usage-indicator");
+  if (!el) return;
+  if (!$("managed-ai-usage-personal")) return;
+
+  const now = Date.now();
+  const minInterval = opts.force ? 0 : 25 * 1000;
+  if (!opts.force && now - lastManagedUsageRefreshAt < minInterval) return;
+
+  try {
+    const u = await invoke("managed_ai_usage_cmd");
+    if (!u || u.ok !== true) {
+      el.hidden = true;
+      el.setAttribute("aria-hidden", "true");
+      return;
+    }
+
+    const personalSpent = Number(u.userSpent || 0);
+    const personalBudget = Number(u.userBudget || 0);
+    const sharedSpent = Number(u.sharedSpent || 0);
+    const sharedBudget = Number(u.sharedBudget || 0);
+
+    const setCount = (id, spent, budget) => {
+      const el2 = $(id);
+      if (!el2) return;
+      el2.textContent =
+        budget > 0 ? `${formatCount(spent)} / ${formatCount(budget)}` : `${formatCount(spent)}`;
+    };
+
+    setCount("managed-ai-usage-personal", personalSpent, personalBudget);
+    setCount("managed-ai-usage-shared", sharedSpent, sharedBudget);
+
+    const pct = (spent, budget) => {
+      if (!budget || budget <= 0) return 0;
+      return Math.max(0, Math.min(100, Math.round((spent / budget) * 100)));
+    };
+
+    const p = pct(personalSpent, personalBudget);
+    const s = pct(sharedSpent, sharedBudget);
+    $("managed-ai-usage-personal-bar").style.width = p + "%";
+    $("managed-ai-usage-shared-bar").style.width = s + "%";
+
+    const resetAtUtc = u.resetAtUtc || "";
+    const sharedPeriod = String(u.sharedPeriod || u.shared_period || "").trim();
+    const sharedResetAtUtc = u.sharedResetAtUtc || u.shared_reset_at_utc || "";
+    if ($("managed-ai-usage-reset")) {
+      if (sharedPeriod === "week" && sharedResetAtUtc) {
+        $("managed-ai-usage-reset").textContent = `共享重置：${formatIsoToTaipei(sharedResetAtUtc)}（每週一）`;
+      } else if (resetAtUtc) {
+        $("managed-ai-usage-reset").textContent = `重置：${formatIsoToTaipei(resetAtUtc)}`;
+      } else {
+        $("managed-ai-usage-reset").textContent = "重置時間：—";
+      }
+    }
+
+    el.hidden = false;
+    el.setAttribute("aria-hidden", "false");
+    lastManagedUsageRefreshAt = now;
+  } catch (_) {
+    el.hidden = true;
+    el.setAttribute("aria-hidden", "true");
+  }
+}
+
+function setGpRewardPromptVisible(visible) {
+  const prompt = $("gp-reward-prompt");
+  if (!prompt) return;
+  prompt.hidden = !visible;
+  prompt.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
+async function startGpRewardCountdown() {
+  if (gpRewardInFlight) return;
+  const prompt = $("gp-reward-prompt");
+  const status = $("gp-reward-status");
+  const btn = $("btn-gp-reward");
+  if (!prompt || !status || !btn) return;
+
+  gpRewardInFlight = true;
+  btn.disabled = true;
+  status.textContent = "已開啟巴哈姆特貼文，約 60 秒後確認 GP…";
+
+  try {
+    const link = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205441&tnum=1";
+    await openExternalUrl(link);
+  } catch (_) {
+    // 連結開啟失敗也照樣走等待流程
+  }
+
+  clearTimeout(gpRewardTimerId);
+  gpRewardTimerId = setTimeout(async () => {
+    try {
+      status.textContent = "正在確認 GP 加成…";
+      const r = await invoke("managed_ai_gp_reward_cmd");
+      if (r && r.ok === true) {
+        status.textContent = "已領取 GP 加成：個人今日總額度 +50 萬（上限 100 萬）。";
+        await refreshManagedAiUsageIndicator({ force: true }).catch(() => null);
+        try {
+          localStorage.setItem(GP_REWARD_STORAGE_KEY, String(Date.now()));
+        } catch (_) {}
+        setGpRewardPromptVisible(false);
+      } else if (r && r.alreadyClaimed === true) {
+        status.textContent = "這個帳號已領過 GP 加成，不用再重送。";
+        setGpRewardPromptVisible(false);
+      } else {
+        status.textContent = "GP 確認完成，但加成未成功領取。可稍後再試。";
+      }
+    } catch (_) {
+      status.textContent = "GP 確認失敗。可稍後再試。";
+    } finally {
+      gpRewardInFlight = false;
+      btn.disabled = false;
+    }
+  }, 60000);
+}
+
+function ensureUsageFeedbackClientId() {
+  try {
+    const existing = localStorage.getItem(USAGE_FEEDBACK_CLIENT_ID_KEY);
+    if (existing && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing;
+  } catch (_) {}
+
+  let id = "";
+  try {
+    id = crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()) + "_" + Math.random();
+  } catch (_) {
+    id = String(Date.now()) + "_" + Math.random();
+  }
+  id = String(id).replace(/[^A-Za-z0-9_-]/g, "");
+  if (id.length < 8) id = (id + "ABCDEFGH").slice(0, 12);
+  id = id.slice(0, 40);
+
+  try {
+    localStorage.setItem(USAGE_FEEDBACK_CLIENT_ID_KEY, id);
+  } catch (_) {}
+  return id;
+}
+
+function isBlockingOverlayOpen() {
+  if (onboardActive || progressBusy || shareUploadInFlight || managedAiPaused) return true;
+  for (const id of ["guide-overlay", "update-overlay", "feedback-overlay", "managed-ai-error-overlay"]) {
+    const el = $(id);
+    if (el && !el.hidden) return true;
+  }
+  const onboardRoot = $("onboard-root");
+  if (onboardRoot && !onboardRoot.hidden) return true;
+  return false;
+}
+
+function resetFeedbackOverlayForm() {
+  feedbackStep = 1;
+  document.querySelectorAll('input[name="feedback-pain"]').forEach((el) => {
+    el.checked = false;
+  });
+  document.querySelectorAll('input[name="feedback-wish"]').forEach((el) => {
+    el.checked = false;
+  });
+  document.querySelectorAll('input[name="feedback-rating"]').forEach((el) => {
+    el.checked = false;
+  });
+  const noteEl = $("feedback-note");
+  if (noteEl) {
+    noteEl.value = "";
+    noteEl.hidden = true;
+  }
+  syncFeedbackStepUi();
+}
+
+function syncFeedbackStepUi() {
+  const step1 = $("feedback-step-1");
+  const step2 = $("feedback-step-2");
+  const backBtn = $("btn-feedback-back");
+  const nextBtn = $("btn-feedback-next");
+  const submitBtn = $("btn-feedback-submit");
+  if (step1) step1.hidden = feedbackStep !== 1;
+  if (step2) step2.hidden = feedbackStep !== 2;
+  if (backBtn) backBtn.hidden = feedbackStep <= 1;
+  if (nextBtn) nextBtn.hidden = feedbackStep !== 1;
+  if (submitBtn) submitBtn.hidden = feedbackStep !== 2;
+  updateFeedbackNoteVisibility();
+}
+
+function selectedFeedbackPain() {
+  const el = document.querySelector('input[name="feedback-pain"]:checked');
+  return el ? String(el.value || "").trim() : "";
+}
+
+function selectedFeedbackWish() {
+  const el = document.querySelector('input[name="feedback-wish"]:checked');
+  return el ? String(el.value || "").trim() : "";
+}
+
+function selectedFeedbackRating() {
+  const el = document.querySelector('input[name="feedback-rating"]:checked');
+  if (!el) return null;
+  const n = Number(el.value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function feedbackNeedsNote() {
+  const pain = selectedFeedbackPain();
+  const wish = selectedFeedbackWish();
+  const rating = selectedFeedbackRating();
+  return pain === "other" || wish === "other" || rating === 1;
+}
+
+function updateFeedbackNoteVisibility() {
+  const noteEl = $("feedback-note");
+  if (!noteEl) return;
+  const show = feedbackStep === 2 && feedbackNeedsNote();
+  noteEl.hidden = !show;
+  noteEl.required = false;
+}
+
+function hideFeedbackOverlay() {
+  const ov = $("feedback-overlay");
+  if (!ov) return;
+  ov.hidden = true;
+  ov.setAttribute("aria-hidden", "true");
+}
+
+function showFeedbackOverlay() {
+  const ov = $("feedback-overlay");
+  if (!ov) return;
+  resetFeedbackOverlayForm();
+  ov.hidden = false;
+  ov.setAttribute("aria-hidden", "false");
+  const status = $("feedback-status");
+  if (status) status.textContent = "";
+}
+
+function scheduleUsageFeedbackNudge() {
+  clearTimeout(usageFeedbackDelayTimerId);
+  const delayMs = 8000 + Math.floor(Math.random() * 7001);
+  usageFeedbackDelayTimerId = window.setTimeout(() => {
+    void usageFeedbackMaybeNudge();
+  }, delayMs);
+}
+
+async function usageFeedbackMaybeNudge() {
+  const ov = $("feedback-overlay");
+  if (!ov) return;
+  if (translationState !== "complete") return;
+  if (isBlockingOverlayOpen()) {
+    pendingUsageFeedbackNudge = true;
+    return;
+  }
+  if (!ov.hidden) return;
+
+  const now = Date.now();
+  const lastSubmit = (() => {
+    try {
+      return Number(localStorage.getItem(USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY) || 0);
+    } catch (_) {
+      return 0;
+    }
+  })();
+  const lastNudge = (() => {
+    try {
+      return Number(localStorage.getItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY) || 0);
+    } catch (_) {
+      return 0;
+    }
+  })();
+
+  const submitCooldownMs = 21 * 24 * 60 * 60 * 1000;
+  const nudgeCooldownMs = 14 * 24 * 60 * 60 * 1000;
+  if (lastSubmit && now - lastSubmit < submitCooldownMs) return;
+  if (lastNudge && now - lastNudge < nudgeCooldownMs) return;
+
+  const prob = 0.2;
+  if (Math.random() > prob) return;
+
+  try {
+    localStorage.setItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY, String(now));
+  } catch (_) {}
+  showFeedbackOverlay();
+}
+
+function advanceFeedbackStep() {
+  const status = $("feedback-status");
+  if (feedbackStep === 1) {
+    if (!selectedFeedbackPain()) {
+      if (status) status.textContent = "請先選一項困擾（或「沒問題」）。";
+      return;
+    }
+    feedbackStep = 2;
+    if (status) status.textContent = "";
+    syncFeedbackStepUi();
+    return;
+  }
+}
+
+function retreatFeedbackStep() {
+  if (feedbackStep <= 1) return;
+  feedbackStep = 1;
+  const status = $("feedback-status");
+  if (status) status.textContent = "";
+  syncFeedbackStepUi();
+}
+
+async function submitUsageFeedbackFromOverlay() {
+  const status = $("feedback-status");
+  const noteEl = $("feedback-note");
+  const clientId = ensureUsageFeedbackClientId();
+  const painPoint = selectedFeedbackPain();
+  const wish = selectedFeedbackWish();
+  const rating = selectedFeedbackRating();
+
+  if (!painPoint) {
+    if (status) status.textContent = "請回到上一步選擇困擾項目。";
+    return;
+  }
+  if (!wish) {
+    if (status) status.textContent = "請選一項希望優先改善的方向。";
+    return;
+  }
+
+  const note = noteEl && !noteEl.hidden ? String(noteEl.value || "").trim() : "";
+  const notePayload = note ? note : null;
+
+  if (status) status.textContent = "送出中…";
+
+  try {
+    const payload = {
+      clientId,
+      painPoint,
+      wish,
+      note: notePayload,
+    };
+    if (rating != null) payload.rating = rating;
+    const r = await invoke("submit_usage_feedback_cmd", payload);
+    if (r && r.ok === true) {
+      if (status) status.textContent = "已送出回饋，感謝支持！";
+      try {
+        localStorage.setItem(USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY, String(Date.now()));
+      } catch (_) {}
+      hideFeedbackOverlay();
+      return;
+    }
+
+    if (r && r.errorType) {
+      if (status) status.textContent = "送出失敗：" + String(r.errorType);
+    } else {
+      if (status) status.textContent = "送出失敗，請稍後再試。";
+    }
+
+    try {
+      localStorage.setItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY, String(Date.now()));
+    } catch (_) {}
+  } catch (e) {
+    if (status) status.textContent = "送出失敗：" + formatInvokeError(e);
+  }
+}
+
+/** 右側五步：檢查 → 搜尋 → 翻譯 → 補充 → 套用 */
+const STEP_ORDER = ["prep", "scan", "translate", "supplement", "done"];
+/** 步驟只准前進，避免進度文案含「套用」時來回閃爍 */
+let lastStepIdx = -1;
 
 function stepFromProgress(percent, message) {
   const p = Number(percent) || 0;
   const m = String(message || "");
   if (p <= 0) return null;
-  if (p >= 100 || /全部完成|補翻完成|字體包完成|已套用/.test(m)) return "done";
+  // 真正完成語境才進 done；翻譯過程中的「套用／寫出」不算
+  const donePhrase =
+    /全部完成|補翻完成|補譯完成|字體包完成|沒有可再補的缺漏|修復完成|已套用到遊戲/.test(m);
+  if (donePhrase && (p >= 95 || /完成|缺漏/.test(m))) return "done";
+  if (p >= 100 && /完成/.test(m)) return "done";
   if (/失敗|錯誤/.test(m) && p === 0) return "error";
   if (/字體/.test(m)) return p >= 90 ? "done" : "prep";
+  if (/補充[：:]|步驟\s*4|只補仍缺|複查仍缺|補漏/.test(m) || (p >= 82 && p < 97 && /補充|補約|仍缺|待補/.test(m))) {
+    return "supplement";
+  }
   if (p < 6 || /準備中|啟動|讀取上次|工作階段/.test(m)) return "prep";
   if (p < 33 || /本地蒐集|讀模組|掃描|資源包|KubeJS/.test(m)) {
     if (
@@ -479,34 +1987,160 @@ function stepFromProgress(percent, message) {
     }
     return "scan";
   }
+  if (p >= 97 || /備份並|直接套用|正在備份|套用到遊戲/.test(m)) return "done";
   if (p < 100) return "translate";
   return "done";
 }
 
-function updateLinearSteps(percent, message, failed) {
+function stepFromStage(stage) {
+  switch (String(stage || "").trim()) {
+    case "prep":
+      return "prep";
+    case "scan":
+    case "local":
+      return "scan";
+    case "translate":
+      return "translate";
+    case "extras":
+    case "package":
+      return "supplement";
+    case "apply":
+      return "done";
+    default:
+      return null;
+  }
+}
+
+function stepFromStepNumber(step) {
+  const idx = Math.max(1, Number(step) || 0) - 1;
+  return STEP_ORDER[idx] || null;
+}
+
+function resolveStepKey(payload, percent, message) {
+  const directStep = stepFromStepNumber(payload && payload.step);
+  if (directStep) return directStep;
+  const stageStep = stepFromStage(payload && payload.stage);
+  if (stageStep) return stageStep;
+  return stepFromProgress(percent, message);
+}
+
+function stateBadgeLabel(state) {
+  switch (String(state || "").trim()) {
+    case "waiting":
+      return "等待回應";
+    case "retrying":
+      return "重試中";
+    case "throttled":
+      return "已降速（限流）";
+    case "degraded":
+      return "已降級";
+    case "cancelling":
+      return "取消中";
+    default:
+      return "";
+  }
+}
+
+function setProgressStateBadge(state) {
+  const badge = $("prog-state");
+  if (!badge) return;
+  const label = stateBadgeLabel(state);
+  if (!label) {
+    badge.hidden = true;
+    badge.textContent = "";
+    badge.removeAttribute("data-state");
+    return;
+  }
+  badge.hidden = false;
+  badge.textContent = label;
+  badge.setAttribute("data-state", String(state));
+}
+
+function buildStepMeta(payload, stepKey) {
+  if (!payload) return "";
+  const parts = [];
+  const done = payload.done != null ? Number(payload.done) : null;
+  const total = payload.total != null ? Number(payload.total) : null;
+  const unit = (payload.unit || "").trim();
+  let denominatorRaised = false;
+  if (stepKey && total != null) {
+    denominatorRaised =
+      stepKey === lastActiveStepKey &&
+      lastActiveStepTotal != null &&
+      Number.isFinite(total) &&
+      total > lastActiveStepTotal;
+    lastActiveStepKey = stepKey;
+    lastActiveStepTotal = total;
+  } else if (stepKey && stepKey !== lastActiveStepKey) {
+    lastActiveStepKey = stepKey;
+    lastActiveStepTotal = total;
+  }
+  if (done != null && total != null) {
+    parts.push(
+      `${formatCount(Math.max(0, done))} / ${formatCount(Math.max(0, total))}${unit ? ` ${unit}` : ""}`
+    );
+  }
+  if (denominatorRaised) parts.push("分母更新");
+  // 不含 payload.detail（AI 長 metrics 只進命中格）
+  return parts.filter(Boolean).join(" · ");
+}
+
+function updateLinearSteps(percent, message, failed, payload) {
   const root = $("linear-steps");
   if (!root) return;
   const items = root.querySelectorAll(".lin-step");
+  const currentKey = resolveStepKey(payload, percent, message);
+  let idx = currentKey ? STEP_ORDER.indexOf(currentKey) : -1;
   if (failed) {
     items.forEach((el) => {
-      el.classList.remove("active", "done");
-      el.classList.add("error");
+      el.classList.remove("active", "done", "error");
+      const si = STEP_ORDER.indexOf(el.getAttribute("data-step"));
+      if (idx >= 0 && si < idx) el.classList.add("done");
+      else if (si === idx) el.classList.add("error");
+      const meta = el.querySelector("[data-step-meta]");
+      if (meta) {
+        const text = si === idx ? buildStepMeta(payload, currentKey) : "";
+        meta.textContent = text;
+        meta.hidden = !text;
+      }
     });
     return;
   }
-  const cur = stepFromProgress(percent, message);
-  const idx = cur ? STEP_ORDER.indexOf(cur) : -1;
+  const p = Number(percent) || 0;
+  if (p <= 0) {
+    lastStepIdx = -1;
+    lastActiveStepKey = null;
+    lastActiveStepTotal = null;
+  }
+  // 單調前進：翻譯中不因文案回退步驟
+  if (idx >= 0 && lastStepIdx >= 0 && idx < lastStepIdx && p > 0 && p < 100 && currentKey !== "done") {
+    idx = lastStepIdx;
+  }
+  if (idx > lastStepIdx) lastStepIdx = idx;
+  if (currentKey === "done") lastStepIdx = STEP_ORDER.length - 1;
   items.forEach((el) => {
     el.classList.remove("active", "done", "error");
     const si = STEP_ORDER.indexOf(el.getAttribute("data-step"));
-    if (idx < 0) return;
+    if (idx < 0) {
+      const meta = el.querySelector("[data-step-meta]");
+      if (meta) meta.hidden = true;
+      return;
+    }
     if (si < idx) el.classList.add("done");
-    else if (si === idx) el.classList.add(cur === "done" ? "done" : "active");
+    else if (si === idx) el.classList.add(currentKey === "done" ? "done" : "active");
+    const meta = el.querySelector("[data-step-meta]");
+    if (meta) {
+      const text = si === idx ? buildStepMeta(payload, currentKey) : "";
+      meta.textContent = text;
+      meta.hidden = !text;
+    }
   });
-  if (cur === "done") {
+  if (currentKey === "done") {
     items.forEach((el) => {
       el.classList.remove("active");
       el.classList.add("done");
+      const meta = el.querySelector("[data-step-meta]");
+      if (meta) meta.hidden = true;
     });
   }
 }
@@ -522,21 +2156,11 @@ let displayPercent = 0;
 let heartbeatTimer = null;
 
 function formatElapsed(ms) {
-  const s = Math.floor(ms / 1000);
+  const s = Math.floor(Math.max(0, ms) / 1000);
   if (s < 60) return s + " 秒";
   const m = Math.floor(s / 60);
   const r = s % 60;
   return m + " 分 " + r + " 秒";
-}
-
-function formatProgressEta() {
-  const percent = Number(lastRealPercent) || 0;
-  if (!progressBusy || !progressStartedAt || percent < 3 || percent >= 99) return "";
-  const elapsed = Date.now() - progressStartedAt;
-  if (elapsed < 2500) return "";
-  const remaining = Math.round((elapsed * (100 - percent)) / percent);
-  if (!Number.isFinite(remaining) || remaining <= 0 || remaining > 24 * 60 * 60 * 1000) return "";
-  return " · 預估剩餘 " + formatElapsed(remaining);
 }
 
 function setProgBarWorking(on) {
@@ -580,24 +2204,166 @@ function startProgressHeartbeat() {
     const msgEl = $("prog-msg");
     if (msgEl) {
       if (stuckMs > 2000) {
-        msgEl.textContent =
-          baseMsg + " · 已進行 " + elapsed + formatProgressEta() + " · 仍在運作，請稍候";
+        msgEl.textContent = baseMsg + " · 已進行 " + elapsed + " · 仍在運作，請稍候";
         setProgBarWorking(true);
       } else {
-        msgEl.textContent = baseMsg + " · 已進行 " + elapsed + formatProgressEta();
+        msgEl.textContent = baseMsg + " · 已進行 " + elapsed;
         setProgBarWorking(false);
       }
     }
   }, 1000);
 }
 
+/** 正規化進度訊息供日誌去重（去掉易變秒數） */
+function progressLogDedupeKey(percent, message) {
+  const msg = String(message || "")
+    .replace(/本輪\s*\d+\s*秒/g, "本輪*秒")
+    .replace(/合計\s*\d+\s*秒/g, "合計*秒")
+    .replace(/已進行\s*\d+\s*秒/g, "已進行*秒")
+    .replace(/預估剩餘[^·]*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return Math.floor(Number(percent) || 0) + "|" + msg;
+}
+
+function consumeProgressPayload(payload) {
+  if (!payload || !payload.metrics) return;
+  const m = payload.metrics || {};
+  let changed = false;
+  const setMax = (key, value) => {
+    if (value == null || value === "") return;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return;
+    if (coverageMetrics[key] == null || num > Number(coverageMetrics[key] || 0)) {
+      coverageMetrics[key] = num;
+      changed = true;
+    }
+  };
+  const setDirect = (key, value) => {
+    if (value == null || value === "") return;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return;
+    if (coverageMetrics[key] !== num) {
+      coverageMetrics[key] = num;
+      changed = true;
+    }
+  };
+  setMax("glossary", m.glossary);
+  setMax("tm", m.tm);
+  setMax("shared", m.shared);
+  setMax("ai", m.ai);
+  setMax("skipped", m.skipped);
+  setDirect("pending", m.pending);
+  setMax("batchDone", m.batchDone);
+  setMax("batchTotal", m.batchTotal);
+  setMax("batchRetry", m.batchRetry);
+  setMax("batchRetryBatches", m.batchRetryBatches);
+  setMax("batchFail", m.batchFail);
+  setMax("cacheHitTokens", m.cacheHitTokens);
+  setMax("cacheMissTokens", m.cacheMissTokens);
+  setMax("completionTokens", m.completionTokens);
+  setDirect("cacheHitPercent", m.cacheHitPercent);
+  if (payload.detail && /限流|降級|Discord|登入/.test(String(payload.detail))) {
+    coverageMetrics.summary = String(payload.detail).trim();
+    changed = true;
+  } else if (
+    coverageMetrics.batchTotal != null &&
+    coverageMetrics.batchDone != null &&
+    !coverageSettlementLocked
+  ) {
+    const short = `進行中 · ${formatCount(coverageMetrics.batchDone)}／${formatCount(
+      coverageMetrics.batchTotal
+    )} 批`;
+    if (coverageMetrics.summary !== short) {
+      coverageMetrics.summary = short;
+      changed = true;
+    }
+  }
+  if (changed) renderCoverageMetrics();
+}
+
+function shortenProgressMessage(message) {
+  const m = String(message || "").trim();
+  if (!m) return m;
+  if (/等待 Discord|重新登入 Discord|登入已恢復|重新載入 Discord/.test(m)) {
+    return m.length > 80 ? m.slice(0, 77) + "…" : m;
+  }
+  if (m.startsWith("AI 翻譯中…等待本輪回應")) return "AI 翻譯中 · 等待本輪回應";
+  if (m.startsWith("AI 翻譯中…")) return "AI 翻譯中";
+  if (m.startsWith("AI 限流：")) return "AI 已降速（限流）";
+  if (m.startsWith("AI 這一輪沒有新譯文")) return "AI 本輪暫無新譯文";
+  if (m.startsWith("AI 有") && m.includes("批失敗")) return "AI 部分批次失敗，將重送未完成";
+  return m;
+}
+
+function setFontProgress(percent, message, opts) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  const fill = $("font-prog-fill");
+  const pctEl = $("font-prog-pct");
+  const msgEl = $("font-prog-msg");
+  const countEl = $("font-prog-count");
+  if (fill) fill.style.width = (p >= 100 ? 100 : p) + "%";
+  if (pctEl) pctEl.textContent = Math.floor(p >= 100 ? 100 : p) + "%";
+  if (countEl) countEl.textContent = p > 0 ? Math.floor(p) + "% 進行中" : "尚未開始";
+  if (msgEl && message) msgEl.textContent = message;
+  const activeStep = p >= 100 ? "apply" : p >= 70 ? "apply" : p >= 35 ? "build" : p > 0 ? "settings" : "pick";
+  document.querySelectorAll("#font-linear-steps .lin-step").forEach((el) => {
+    const key = el.getAttribute("data-step");
+    const order = ["pick", "settings", "build", "apply"];
+    const idx = order.indexOf(key);
+    const activeIdx = order.indexOf(activeStep);
+    el.classList.toggle("active", idx === activeIdx && p < 100);
+    el.classList.toggle("done", idx >= 0 && idx < activeIdx);
+  });
+  if (message && !(opts && opts.skipLog)) appendFontLog(Math.floor(p) + "%  " + message);
+}
+
+function setDiagnoseProgress(percent, message, opts) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  const fill = $("diagnose-prog-fill");
+  const pctEl = $("diagnose-prog-pct");
+  const msgEl = $("diagnose-prog-msg");
+  const countEl = $("diagnose-prog-count");
+  if (fill) fill.style.width = (p >= 100 ? 100 : p) + "%";
+  if (pctEl) pctEl.textContent = Math.floor(p >= 100 ? 100 : p) + "%";
+  if (countEl) countEl.textContent = p > 0 ? Math.floor(p) + "% 分析中" : "尚未分析";
+  if (msgEl && message) msgEl.textContent = message;
+  const activeStep = p >= 100 ? "result" : p > 0 ? "analyze" : "input";
+  document.querySelectorAll("#diagnose-linear-steps .lin-step").forEach((el) => {
+    const key = el.getAttribute("data-step");
+    const order = ["input", "analyze", "result"];
+    const idx = order.indexOf(key);
+    const activeIdx = order.indexOf(activeStep);
+    el.classList.toggle("active", idx === activeIdx && p < 100);
+    el.classList.toggle("done", idx >= 0 && idx < activeIdx);
+  });
+  if (message && !(opts && opts.skipLog)) appendDiagnoseLog(Math.floor(p) + "%  " + message);
+}
+
 function setProgress(percent, message, opts) {
+  const job = window.__busyJobKind || document.body.dataset.appPage || "translate";
+  if (job === "font") {
+    setFontProgress(percent, message, opts);
+    return;
+  }
+  if (job === "diagnose") {
+    setDiagnoseProgress(percent, message, opts);
+    return;
+  }
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   const failed = opts && opts.failed;
+  const payload = opts && opts.payload ? opts.payload : null;
+  if (!failed && p >= 100) {
+    maybePlaySfxSuccess(message);
+  }
+  if (payload) {
+    lastProgressPayload = payload;
+  } else if (p <= 3 && /準備|讀取上次|修復：尋找工作階段/.test(String(message || ""))) {
+    lastProgressPayload = null;
+  }
   if (!failed && p > 0 && p < 100) {
     lastProgressAt = Date.now();
     lastRealPercent = p;
-    // 真實進度追上時拉高 display
     displayPercent = Math.max(displayPercent, p);
   }
   if (p >= 100 || p === 0) {
@@ -609,18 +2375,20 @@ function setProgress(percent, message, opts) {
   $("prog-pct").textContent = Math.floor(showP >= 100 ? 100 : showP) + "%";
   if (message) {
     lastRealMessage = message;
+    consumeProgressPayload(payload);
     consumeCoverageMessage(message);
     const elapsed =
       progressBusy && progressStartedAt
         ? " · 已進行 " + formatElapsed(Date.now() - progressStartedAt)
         : "";
-    $("prog-msg").textContent = message + elapsed + formatProgressEta();
+    $("prog-msg").textContent = shortenProgressMessage(message) + elapsed;
   }
-  updateLinearSteps(p, message, failed);
+  setProgressStateBadge(payload ? payload.state : failed ? null : null);
+  updateLinearSteps(p, message, failed, payload || (failed ? lastProgressPayload : null));
   setProgBarWorking(false);
-  // 詳細完整日誌：每筆進度都留下（同文案＋同百分比不重複洗版）
+  // 詳細完整日誌：去重（AI 等待秒數變化不重寫）
   if (message && !(opts && opts.skipLog)) {
-    const key = Math.floor(p) + "|" + message;
+    const key = progressLogDedupeKey(p, message);
     if (key !== lastProgressLogKey) {
       lastProgressLogKey = key;
       appendLog(Math.floor(p) + "%  " + message);
@@ -628,23 +2396,49 @@ function setProgress(percent, message, opts) {
   }
 }
 
-function setBusy(busy) {
+function setBusy(busy, jobKind) {
   progressBusy = !!busy;
+  const kind = busy ? (jobKind || "translate") : null;
+  window.__busyJobKind = kind;
+  if (busy) {
+    // 忙碌時不讓更新視窗持續干擾：延遲顯示給完成後處理。
+    try {
+      const overlay = document.getElementById("update-overlay");
+      if (overlay && !overlay.hidden) {
+        if (typeof window.zfUpdateModalSetPending === "function") window.zfUpdateModalSetPending(window.__mcpl_latestUpdateInfo || null);
+        if (typeof window.zfUpdateModalHide === "function") window.zfUpdateModalHide();
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
   if (busy) {
     displayPercent = Math.max(displayPercent, lastRealPercent);
     startProgressHeartbeat();
   } else {
     stopProgressHeartbeat();
+    try {
+      const outputDir = selectedOutputDir() || ($("output")?.value || "").trim();
+      if (outputDir && kind !== "font") void flushRunLog(resultWorkDir(outputDir));
+      const fontOut = ($("font-output")?.value || "").trim();
+      if (fontOut && kind === "font") void flushFontLog(fontWorkDir(fontOut));
+    } catch (_) {
+      /* ignore */
+    }
+    setProgressStateBadge(null);
   }
-  // 停止鈕只在工作中出現，而且刻意不跟著 disabled 一起鎖起來
   const stop = $("btn-stop");
+  const fontStop = $("btn-font-stop");
+  const diagnoseStop = $("btn-diagnose-stop");
   if (stop) {
-    stop.hidden = !busy;
+    stop.hidden = !busy || kind !== "translate";
     stop.disabled = false;
-    stop.textContent = "停止";
+    stop.textContent = "停止翻譯";
   }
-  // 完整使用說明翻譯中仍可點；結束程式也可
-  [
+  if (fontStop) fontStop.hidden = !busy || kind !== "font";
+  if (diagnoseStop) diagnoseStop.hidden = !busy || kind !== "diagnose";
+  // 仍鎖定：開第二個重任務、改路徑、連線設定等
+  const hardLockIds = [
     "btn-run",
     "btn-supplement",
     "btn-repair",
@@ -653,10 +2447,10 @@ function setBusy(busy) {
     "btn-delete-output",
     "btn-inst",
     "btn-save-adv",
+    "btn-test-api",
     "use-ai",
     "backup-before-apply",
-    "translation-mode",
-    "translation-quality",
+    "force-refresh",
     "api-provider",
     "api-key",
     "base-url",
@@ -689,13 +2483,40 @@ function setBusy(busy) {
     "font-apply-current",
     "btn-glossary",
     "target-version",
-    "tab-translate",
-    "tab-font",
-  ].forEach((id) => {
+    "btn-diagnose",
+    "btn-diagnose-latest",
+    "btn-diagnose-report",
+    "error-input",
+    "diagnose-pack-path",
+    "report-category",
+    "report-pack-name",
+    "report-note",
+    "report-unrelated",
+    "btn-helper-prepare",
+    "btn-helper-rescan",
+    "btn-helper-cleanup",
+    "helper-ack-ingame",
+  ];
+  hardLockIds.forEach((id) => {
     const el = $(id);
     if (el) el.disabled = busy;
   });
-  // 翻譯中鎖定路徑與資源包名稱（不可改）
+
+  // 更新相關按鈕：翻譯中避免誤觸（「稍後」仍可關閉視窗）。
+  const updateCheckBtn = $("btn-check-update");
+  if (updateCheckBtn) updateCheckBtn.disabled = busy;
+  const updateManualBtn = $("btn-update-manual");
+  if (updateManualBtn) updateManualBtn.disabled = busy;
+  const updateNowBtn = $("btn-update-now");
+  if (updateNowBtn) updateNowBtn.disabled = busy;
+  const updateLaterBtn = $("btn-update-close");
+  if (updateLaterBtn) updateLaterBtn.disabled = false;
+
+  // 忙碌中仍可切分頁瀏覽（開始鈕另由 syncUiState 看 progressBusy）
+  ["tab-translate", "tab-font", "tab-diagnose"].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = false;
+  });
   ["pack-name", "instance", "output", "reference-pack", "font-pack-name", "font-file", "font-output"].forEach((id) => {
     const el = $(id);
     if (el) {
@@ -705,8 +2526,19 @@ function setBusy(busy) {
   });
   const guide = $("btn-guide");
   if (guide) guide.disabled = false;
+  if (stop) stop.disabled = false;
   syncOutputField();
   syncUiState();
+  if (!busy && typeof window.zfUpdateModalMaybeShowPending === "function") window.zfUpdateModalMaybeShowPending();
+  if (!busy && pendingUsageFeedbackNudge && translationState === "complete" && !isBlockingOverlayOpen()) {
+    pendingUsageFeedbackNudge = false;
+    scheduleUsageFeedbackNudge();
+  }
+}
+
+/** 翻譯開始：不再收合主介面／最小化；僅靠 setBusy 鎖定操控 */
+async function hideUiForTranslateRun() {
+  /* no-op：主區保持可見 */
 }
 
 /** 分頁：translate | font | diagnose */
@@ -765,6 +2597,12 @@ function setTranslationState(state) {
     : "idle";
   document.body.dataset.translationState = translationState;
   syncUiState();
+  if (translationState === "complete" || translationState === "failed") {
+    refreshShareableState();
+  }
+  if (translationState === "complete") {
+    scheduleUsageFeedbackNudge();
+  }
 }
 
 function toggleHidden(id, hidden) {
@@ -809,6 +2647,7 @@ function setOverflowMenuOpen(open) {
 }
 
 function wireShellChrome() {
+  initWinbarChrome();
   const moreBtn = $("btn-more-options");
   if (moreBtn) {
     moreBtn.setAttribute("aria-expanded", "false");
@@ -856,28 +2695,30 @@ function syncUiState() {
   const failed = translationState === "failed";
   const locked = progressBusy || shareUploadInFlight;
   const page = document.body.dataset.appPage || "translate";
-  const instanceReady = hasInstance && !!instanceValidation.ok;
+  const instanceReady = hasInstance && !!instanceValidation.ok && !versionBlocked;
   document.body.dataset.instanceReady = instanceReady ? "1" : "0";
 
-  const hideMore = !instanceReady;
+  const hideMore = !(hasInstance && !!instanceValidation.ok);
   const moreBtn = $("btn-more-options");
   if (moreBtn) moreBtn.hidden = hideMore;
   if (hideMore) closeMoreDrawer();
   ["field-output", "pack-version-group", "translation-method-group", "reference-details"]
-    .forEach((id) => toggleHidden(id, !instanceReady));
+    .forEach((id) => toggleHidden(id, !(hasInstance && !!instanceValidation.ok)));
   const gateHint = $("path-gate-hint");
-  if (gateHint) gateHint.hidden = instanceReady || page !== "translate";
+  if (gateHint) {
+    gateHint.hidden = (hasInstance && !!instanceValidation.ok) || page !== "translate";
+  }
   const aiGroup = $("ai-options-group");
   if (aiGroup) {
-    aiGroup.hidden = !instanceReady;
-    aiGroup.setAttribute("aria-hidden", instanceReady ? "false" : "true");
+    const showAi = hasInstance && !!instanceValidation.ok;
+    aiGroup.hidden = !showAi;
+    aiGroup.setAttribute("aria-hidden", showAi ? "false" : "true");
   }
   const primaryAction = document.querySelector(".primary-action");
-  if (primaryAction) primaryAction.hidden = !instanceReady;
+  if (primaryAction) primaryAction.hidden = !(hasInstance && !!instanceValidation.ok);
   const runDock = document.querySelector(".run-dock");
   if (runDock) {
-    // 翻譯頁未就緒時整欄隱藏；字體／診斷頁仍顯示對應右欄
-    runDock.hidden = page === "translate" && !instanceReady;
+    runDock.hidden = page === "translate" && !(hasInstance && !!instanceValidation.ok);
   }
   const runBtn = $("btn-run");
   if (runBtn) {
@@ -887,14 +2728,29 @@ function syncUiState() {
       ? "請先選擇遊戲資料夾"
       : !instanceValidation.ok
         ? instanceValidation.reason || "實例檢查未通過"
-        : "";
+        : versionBlocked
+          ? versionBlockReason || "Minecraft 版本過舊，無法翻譯"
+          : "";
   }
   toggleHidden("btn-supplement", !complete || locked);
   toggleHidden("btn-repair", !failed || locked);
   toggleHidden("btn-glossary", !instanceReady || locked);
-  toggleHidden("btn-package", !complete || locked);
+  const canShare = hasShareableFiles && !locked;
+  toggleHidden("btn-package", !canShare);
+  clearShareUrlIfInstanceChanged();
+  const fontFileReady = !!($("font-file")?.value || "").trim();
   const fontOutReady = !!($("font-output")?.value || "").trim();
   const translateOutReady = hasOutput;
+  const fontBuild = $("btn-font-build");
+  if (fontBuild) fontBuild.disabled = locked || !fontFileReady || !fontOutReady;
+  const fontFileStatus = $("font-file-validate-status");
+  if (fontFileStatus) {
+    fontFileStatus.textContent = fontFileReady ? "已選取字體檔。" : "尚未選取字體檔。";
+  }
+  const fontOutStatus = $("font-output-validate-status");
+  if (fontOutStatus) {
+    fontOutStatus.textContent = fontOutReady ? "輸出位置已就緒。" : "尚未選擇輸出位置。";
+  }
   const fontApplyCurrent = $("font-apply-current");
   if (fontApplyCurrent) {
     fontApplyCurrent.disabled = locked || !hasInstance;
@@ -902,16 +2758,30 @@ function syncUiState() {
   toggleHidden("btn-open", page !== "translate" || !translateOutReady);
   toggleHidden("btn-open-report", page !== "translate" || !translateOutReady);
   toggleHidden("btn-open-font", page !== "font" || !fontOutReady);
-  toggleHidden("btn-diagnose-latest", !hasInstance || locked);
-  toggleHidden("btn-restore", !hasInstance || !hasApplyBackups || locked);
-  toggleHidden("btn-delete-backups", !hasInstance || !hasApplyBackups || locked);
+  const diagnosePackPath = ($("diagnose-pack-path")?.value || "").trim();
+  toggleHidden("btn-diagnose-latest", !(hasInstance || diagnosePackPath) || locked);
+  toggleHidden("btn-restore", !(hasInstance || diagnosePackPath) || !hasApplyBackups || locked);
+  toggleHidden("btn-delete-backups", !(hasInstance || diagnosePackPath) || !hasApplyBackups || locked);
 
   syncTranslationHelperPanel();
 
   const packageButton = $("btn-package");
-  if (packageButton) packageButton.disabled = !complete || locked;
+  if (packageButton) {
+    packageButton.disabled = !canShare;
+    packageButton.textContent = lastShareUrl ? "複製分享連結" : "分享給其他玩家";
+  }
+  const shareHint = $("share-hint");
+  if (shareHint) {
+    shareHint.hidden = !canShare;
+    if (canShare && lastShareUrl) {
+      shareHint.textContent = "連結已在剪貼簿；再按一次只會複製，不會寫進日誌。連結 24 小時有效。";
+    } else if (canShare && translationState === "complete") {
+      shareHint.textContent =
+        "翻譯已完成：可按上方按鈕分享帶密碼自解檔。成功後改為「複製分享連結」，網址不會寫進日誌。";
+    }
+  }
   const confirmPanel = $("share-confirm-panel");
-  if (confirmPanel) confirmPanel.hidden = !shareConfirmationOpen || !complete;
+  if (confirmPanel) confirmPanel.hidden = !shareConfirmationOpen || !hasShareableFiles;
   const confirmButton = $("btn-share-confirm");
   const reviewed = !!$("share-confirm-reviewed")?.checked;
   const privateFiles = !!$("share-confirm-private")?.checked;
@@ -934,25 +2804,50 @@ function syncTranslationHelperPanel() {
   if (message) message.textContent = status.message || "這是選用的任務補充步驟。";
   const command = $("translation-helper-command");
   const commandText = $("translation-helper-command-text");
-  const hasCommand = !!status.command && ["installed", "existing"].includes(status.state);
+  const readyInGame = status.supported && ["installed", "existing"].includes(status.state);
+  const hasCommand = !!status.command && readyInGame;
   if (command) command.hidden = !hasCommand;
   if (commandText) commandText.textContent = status.command || "";
+  const ackRow = $("helper-ack-row");
+  const ack = $("helper-ack-ingame");
+  if (ackRow) ackRow.hidden = !readyInGame || progressBusy;
+  if (ack && progressBusy) ack.disabled = true;
   const prepare = $("btn-helper-prepare");
   if (prepare) {
     prepare.hidden = status.state !== "available" || progressBusy;
     prepare.disabled = progressBusy;
-    prepare.textContent = "準備任務補充";
+    prepare.textContent = "① 準備輔助模組";
   }
   const rescan = $("btn-helper-rescan");
   if (rescan) {
-    const canRescan = status.supported && ["installed", "existing"].includes(status.state);
-    rescan.hidden = !canRescan || progressBusy;
-    rescan.disabled = progressBusy;
+    const ackOk = !!(ack && ack.checked);
+    const canRescan = readyInGame && ackOk && !progressBusy;
+    rescan.hidden = !readyInGame || progressBusy;
+    rescan.disabled = !canRescan;
+    rescan.textContent = "③ 重新翻譯任務文字";
   }
   const cleanup = $("btn-helper-cleanup");
   if (cleanup) {
     cleanup.hidden = !status.installedByTool || progressBusy;
     cleanup.disabled = progressBusy;
+  }
+  const step1 = $("helper-step-1");
+  const step2 = $("helper-step-2");
+  const step3 = $("helper-step-3");
+  [step1, step2, step3].forEach((el) => {
+    if (!el) return;
+    el.classList.remove("is-current", "is-done");
+  });
+  if (status.state === "available") {
+    if (step1) step1.classList.add("is-current");
+  } else if (readyInGame) {
+    if (step1) step1.classList.add("is-done");
+    if (ack && ack.checked) {
+      if (step2) step2.classList.add("is-done");
+      if (step3) step3.classList.add("is-current");
+    } else {
+      if (step2) step2.classList.add("is-current");
+    }
   }
 }
 
@@ -997,6 +2892,11 @@ async function rescanAfterTranslationHelper() {
     !translationHelperStatus.supported ||
     !["installed", "existing"].includes(translationHelperStatus.state)
   ) return;
+  const ack = $("helper-ack-ingame");
+  if (!ack || !ack.checked) {
+    appendLog("請先勾選「我已啟動遊戲、執行指令並關閉遊戲」再重新翻譯。", "warn");
+    return;
+  }
   appendLog("開始重新掃描剛剛匯出的任務文字。", "info");
   await onRun();
 }
@@ -1031,7 +2931,8 @@ function scheduleBackupStateRefresh() {
 }
 
 async function refreshBackupState() {
-  const instancePath = ($("instance")?.value || "").trim();
+  const instancePath =
+    ($("instance")?.value || "").trim() || ($("diagnose-pack-path")?.value || "").trim();
   const outputDir = selectedOutputDir() || null;
   const token = ++backupProbeToken;
   if (!instancePath) {
@@ -1055,9 +2956,28 @@ async function pickDir(title) {
 }
 
 /** 將已完成的翻譯結果上傳到獨立分享區，連結只保留一天。 */
+function clearShareUrlIfInstanceChanged() {
+  const path = ($("instance")?.value || "").trim();
+  if (lastShareUrl && path !== lastShareInstancePath) {
+    lastShareUrl = "";
+  }
+}
+
+async function copyShareUrl(url) {
+  try {
+    await navigator.clipboard.writeText(url);
+    appendLog("連結已複製（24 小時有效）");
+  } catch (_) {
+    appendLog("無法寫入剪貼簿，請再按「複製分享連結」。", "warn");
+  }
+}
+
 function packageShare() {
-  if (translationState !== "complete") {
-    return log("請先完成翻譯，再檢查結果並建立分享檔。");
+  if (lastShareUrl) {
+    return copyShareUrl(lastShareUrl);
+  }
+  if (!hasShareableFiles) {
+    return log("請先完成翻譯並產生可安裝檔，再建立分享檔。");
   }
   shareConfirmationOpen = true;
   syncUiState();
@@ -1102,15 +3022,13 @@ async function uploadSharePackage() {
     const name = ($("pack-name").value || "模組包翻譯分享").trim();
     appendLog("正在整理可安裝檔案並上傳…");
     const result = await invoke("upload_share_package_cmd", { workRoot: work, name });
-    const url = result.url || result;
-    const expires = Number(result.expiresAt || result.expires_at || 0);
-    try {
-      await navigator.clipboard.writeText(url);
-      appendLog("分享連結已複製：\n" + url);
-    } catch (_) {
-      appendLog("分享連結：\n" + url);
+    const url = String(result.url || result || "").trim();
+    if (!url) {
+      return log("分享失敗：服務沒有回傳連結。");
     }
-    if (expires) appendLog("這個連結只會保留 24 小時，逾期就不能下載。", "warn");
+    lastShareUrl = url;
+    lastShareInstancePath = ($("instance")?.value || "").trim();
+    await copyShareUrl(url);
   } catch (e) {
     log("分享失敗：\n" + formatInvokeError(e));
   }
@@ -1137,6 +3055,8 @@ function syncAiModeUi(mode) {
   if ($("ai-source-custom")) $("ai-source-custom").checked = normalized === "custom";
   if ($("managed-auth-panel")) $("managed-auth-panel").hidden = normalized !== "managed";
   if ($("adv-details")) $("adv-details").hidden = normalized !== "custom";
+  if ($("btn-test-api")) $("btn-test-api").hidden = normalized !== "custom";
+  if ($("api-test-status") && normalized !== "custom") $("api-test-status").textContent = "";
 }
 
 async function refreshAiStatus() {
@@ -1197,12 +3117,32 @@ async function refreshAiStatus() {
       if ($("btn-discord-join")) $("btn-discord-join").hidden = inGuild;
       if (noteEl) {
         noteEl.textContent = ready
-          ? "Discord 會員資格會在每次免費代管翻譯時再次確認。"
+          ? "代管翻譯由開發者個人提供，不是無限額度。額度用盡時代管不可用；共享庫與本機轉換仍可用。線上翻譯可能有錯，歡迎診斷回報。"
           : message || "請先登入 Discord 並加入 ZeitFrei 官方伺服器。";
       }
-      void managedIdentityReady;
+      const gpAlreadySent = (() => {
+        try {
+          return !!localStorage.getItem(GP_REWARD_STORAGE_KEY);
+        } catch (_) {
+          return false;
+        }
+      })();
+      const canShow = !!ready && !usingOwnKey && !managedAiPaused;
+      if (canShow) {
+        void refreshManagedAiUsageIndicator();
+        setGpRewardPromptVisible(!gpAlreadySent && !gpRewardInFlight);
+      } else {
+        setGpRewardPromptVisible(false);
+        const usage = $("managed-ai-usage-indicator");
+        if (usage) {
+          usage.hidden = true;
+          usage.setAttribute("aria-hidden", "true");
+        }
+      }
     } else if (noteEl) {
-      noteEl.textContent = message || "使用自己的金鑰與額度，不需要 Discord 驗證。";
+      noteEl.textContent =
+        message ||
+        "推薦使用 DeepSeek（便宜划算）。到 platform.deepseek.com 申請金鑰後選 DeepSeek 並填入即可；不需 Discord。";
     }
     return s;
   } catch (e) {
@@ -1322,15 +3262,23 @@ function syncCustomProviderUi(provider) {
   if (model) model.disabled = !isOther;
   const note = $("api-provider-note");
   if (note) {
-    note.textContent = isOther
-      ? "請再填寫 Base URL 與模型名稱；一般使用者不需要改這些設定。"
-      : normalized === "glm"
-        ? "只要填 API Key，工具會自動使用智譜 GLM 的官方設定。"
-        : normalized === "openai"
-          ? "只要填 API Key，工具會自動使用 OpenAI 的官方設定。"
-          : normalized === "qwen"
-            ? "只要填 API Key，工具會自動使用通義千問的官方設定。"
-            : "只要填 API Key，工具會自動使用 DeepSeek 的官方設定。";
+    if (isOther) {
+      note.textContent = "請再填寫 Base URL 與模型名稱；一般使用者不需要改這些設定。";
+    } else if (normalized === "glm") {
+      note.textContent = "只要填 API Key，工具會自動使用智譜 GLM 的官方設定。";
+    } else if (normalized === "openai") {
+      note.textContent = "只要填 API Key，工具會自動使用 OpenAI 的官方設定。";
+    } else if (normalized === "qwen") {
+      note.textContent = "只要填 API Key，工具會自動使用通義千問的官方設定。";
+    } else {
+      note.innerHTML =
+        '推薦：便宜划算（官方 deepseek-v4-flash、非思考模式）。只要填 API Key；金鑰申請 <a href="https://platform.deepseek.com" class="inline-ext-link" data-url="https://platform.deepseek.com">platform.deepseek.com</a>';
+      note.querySelector("a.inline-ext-link")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        const url = e.currentTarget.getAttribute("data-url");
+        openExternalUrl(url);
+      });
+    }
   }
 }
 
@@ -1364,9 +3312,46 @@ async function openExternalUrl(url) {
   if (!url) return;
   try {
     await invoke("open_url", { url });
-  } catch (_) {
-    window.open(url, "_blank");
+  } catch (e) {
+    appendLog("無法開啟連結：" + formatInvokeError(e), "warn");
+    throw e;
   }
+}
+
+let _appToastTimer = null;
+
+function showAppToast(message, ms = 2200) {
+  let el = document.getElementById("app-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "app-toast";
+    el.className = "app-toast";
+    el.setAttribute("role", "status");
+    document.body.appendChild(el);
+  }
+  el.textContent = String(message || "");
+  el.classList.add("show");
+  if (_appToastTimer) clearTimeout(_appToastTimer);
+  _appToastTimer = setTimeout(() => {
+    el.classList.remove("show");
+  }, ms);
+}
+
+function initReloadGuard() {
+  window.addEventListener(
+    "keydown",
+    (ev) => {
+      const key = ev.key;
+      const mod = ev.ctrlKey || ev.metaKey;
+      const isReloadKey = key === "F5" || (mod && (key === "r" || key === "R"));
+      if (!isReloadKey) return;
+      ev.preventDefault();
+      if (progressBusy || shareUploadInFlight) {
+        showAppToast("翻譯進行中，無法重新載入。");
+      }
+    },
+    { capture: true }
+  );
 }
 
 async function beginDiscordLogin() {
@@ -1441,8 +3426,24 @@ async function detectVersionForInstance(instancePath, silent) {
   if (!select || !instancePath) return null;
   try {
     const detected = await invoke("detect_mc_version", { instancePath });
+    if (detected && !isSupportedMinecraftVersion(detected)) {
+      clearVersionBlock();
+      setVersionBlock(unsupportedVersionMessage(detected));
+      // 不把非法版本塞進下拉、不自動選上
+      if (!select.value || select.dataset.autoDetected === "true") {
+        select.value = "";
+        select.dataset.autoDetected = "true";
+      }
+      if (status) status.textContent = versionBlockReason;
+      syncUiState();
+      return null;
+    }
+    clearVersionBlock();
     if (detected && !Array.from(select.options).some((option) => option.value === detected)) {
-      select.add(new Option(detected, detected));
+      // 僅允許把已支援版本加入（例如 1.21.x 細部）
+      if (isSupportedMinecraftVersion(detected)) {
+        select.add(new Option(detected, detected));
+      }
     }
     if (detected) {
       if (!select.value || select.dataset.autoDetected === "true") {
@@ -1453,11 +3454,12 @@ async function detectVersionForInstance(instancePath, silent) {
         status.textContent = "已手動指定：Minecraft " + select.value;
       }
     } else if (status && !silent) {
-      status.textContent = "找不到版本，可從下拉選單手動指定";
+      status.textContent = "找不到版本，請從下拉選單指定 1.13 以上";
     }
+    syncUiState();
     return detected || null;
   } catch (e) {
-    if (status && !silent) status.textContent = "版本偵測失敗，可手動指定";
+    if (status && !silent) status.textContent = "版本偵測失敗，請從下拉選單手動指定 1.13 以上";
     return null;
   }
 }
@@ -1483,6 +3485,7 @@ async function validateSelectedInstance(path) {
   const instancePath = String(path || "").trim();
   if (!instancePath) {
     instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
+    clearVersionBlock();
     setInstanceValidateStatus(false, instanceValidation.reason, "idle");
     syncUiState();
     return false;
@@ -1509,15 +3512,34 @@ async function refreshPackTranslationName(instancePath) {
   try {
     const info = await invoke("detect_pack_translation_name", { instancePath });
     const name = info && (info.packName || info.pack_name);
-    if ($("pack-name") && name) $("pack-name").value = name;
+    const el = $("pack-name");
+    if (el && name && el.dataset.auto !== "0") {
+      el.value = name;
+      el.dataset.auto = "1";
+    }
     if ($("pack-version-status")) {
       const version = info && info.version ? info.version : "R1";
       const source = info && info.source ? info.source : "未找到版本檔，使用複查編號";
-      $("pack-version-status").textContent = `資源包版本：${version}（${source}）`;
+      $("pack-version-status").textContent = `資源包版本：${version}（${source}）。可翻譯前自訂名稱；留空則系統產生。`;
     }
   } catch (_) {
-    if ($("pack-version-status")) $("pack-version-status").textContent = "整合包版本尚未偵測，完成翻譯時會使用 R1。";
+    if ($("pack-version-status")) {
+      $("pack-version-status").textContent =
+        "整合包版本尚未偵測，完成翻譯時會使用 R1。可翻譯前自訂名稱；留空則系統產生。";
+    }
   }
+}
+
+/** 送後端的資源包名：仍為自動建議／空白／占位 → 空字串（由系統命名） */
+function packNameForTranslate() {
+  const el = $("pack-name");
+  if (!el) return "";
+  if (el.dataset.auto !== "0") return "";
+  const raw = (el.value || "").trim();
+  if (!raw || raw === "選擇實例後自動命名" || raw === "留空則自動命名") {
+    return "";
+  }
+  return raw;
 }
 
 async function refreshReferencePack() {
@@ -1533,21 +3555,70 @@ async function refreshReferencePack() {
   return "";
 }
 
+function normalizeApiKeyDraft(raw) {
+  const key = String(raw || "").trim();
+  // 畫面遮罩或誤貼 # 不得當成真金鑰送出
+  if (!key || /^#+$/.test(key)) return "";
+  return key;
+}
+
 async function onSaveAdv() {
   try {
+    const keyToSave = normalizeApiKeyDraft(apiKeyDraft);
     await invoke("save_api_settings_cmd", {
-      apiKey: apiKeyDraft.trim(),
+      apiKey: keyToSave,
       baseUrl: ($("base-url").value || "").trim(),
       provider: ($("api-provider").value || "deepseek").trim(),
       model: ($("api-model").value || "").trim(),
     });
     $("api-key").value = ""; // 輸入框清空，畫面上不留金鑰
+    apiKeyDraft = "";
     await refreshApiSettings();
     await refreshAiStatus();
-    log("設定已儲存。");
+    const settings = await invoke("get_api_settings").catch(() => null);
+    const hasKey = !!(settings && (settings.hasKey || settings.has_key));
+    log(
+      hasKey
+        ? "設定已儲存。已存金鑰會用於翻譯與測試；輸入框的 ######## 只是遮罩。"
+        : "設定已儲存。"
+    );
+    if (hasKey) {
+      await testCustomApiKey({ quietLog: false });
+    }
   } catch (e) {
     log("儲存失敗：\n" + String(e));
   }
+}
+
+async function testCustomApiKey(opts) {
+  const quietLog = !!(opts && opts.quietLog);
+  const statusEl = $("api-test-status");
+  const btn = $("btn-test-api");
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = "正在用本機已存金鑰測試連線…";
+  try {
+    const msg = await invoke("test_custom_api_key_cmd");
+    const ok = String(msg || "金鑰有效，可連線到你的 API。");
+    if (statusEl) statusEl.textContent = ok;
+    if (!quietLog) log(ok);
+    return true;
+  } catch (e) {
+    const err = formatInvokeError(e);
+    if (statusEl) statusEl.textContent = "測試失敗：" + err;
+    if (!quietLog) appendError("金鑰測試失敗：" + err);
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function onTestApiKey() {
+  const draft = normalizeApiKeyDraft(apiKeyDraft);
+  if (draft) {
+    await onSaveAdv();
+    return;
+  }
+  await testCustomApiKey({ quietLog: false });
 }
 
 async function onRun() {
@@ -1557,20 +3628,39 @@ async function onRun() {
   if (!(await validateSelectedInstance(instancePath))) {
     return log(instanceValidation.reason || "實例檢查未通過，無法開始翻譯。");
   }
-  if (!outputDir) {
-    outputDir = (await invoke("managed_output_base").catch(() => "")) || "";
-    if (outputDir) setAutoOutputDir(outputDir);
+  if (!outputDir || isLegacySharedWorkPath(outputDir)) {
+    outputDir =
+      (await invoke("managed_output_for_instance", { instancePath }).catch(() => "")) || "";
+    if (outputDir) {
+      setAutoOutputDir(outputDir);
+      appendLog("此整合包專用結果位置：\n" + outputDir);
+    }
   }
   if (!outputDir) return log("翻譯結果位置還沒準備好，請重新選擇遊戲資料夾。");
 
   const useAi = !!$("use-ai").checked;
   if (useAi && !(await ensureAiReadyForAction())) return;
   let targetVersion = ($("target-version")?.value || "").trim();
+  if (targetVersion && !isSupportedMinecraftVersion(targetVersion)) {
+    setVersionBlock(unsupportedVersionMessage(targetVersion));
+    syncUiState();
+    return log(versionBlockReason);
+  }
   if (!targetVersion) {
     targetVersion = (await detectVersionForInstance(instancePath, true)) || "";
   }
+  if (versionBlocked) {
+    return log(versionBlockReason || unsupportedVersionMessage("未知"));
+  }
+  if (!targetVersion) {
+    return log("無法確認 Minecraft 版本。請從版本選單指定 1.13 以上（或年份版 26.x）後再翻譯。");
+  }
+  if (!isSupportedMinecraftVersion(targetVersion)) {
+    return log(unsupportedVersionMessage(targetVersion));
+  }
 
-  setBusy(true);
+  setBusy(true, "translate");
+  lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始翻譯");
@@ -1582,20 +3672,19 @@ async function onRun() {
       : "翻譯完成後會直接套用，不建立備份。"
   );
   setProgress(1, "準備中…");
+  void hideUiForTranslateRun();
+  await paintBeforeInvoke();
 
   try {
     const result = await invoke("one_click_translate", {
       instancePath,
       outputDir,
-      packName: ($("pack-name").value || "").trim(),
+      packName: packNameForTranslate(),
       useAi,
       backupBeforeApply: shouldBackupBeforeApply(),
       referencePack: (($('reference-pack')?.value || "").trim() || null),
       targetVersion: targetVersion || null,
-      translationMode: ($("translation-mode")?.value || "append"),
-      translationQuality: ($("translation-quality")?.value || "thorough"),
       coverageTier: "max",
-      advancedUnpack: !!$("advanced-unpack-consent")?.checked,
     });
     setProgress(100, "全部完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
@@ -1605,10 +3694,23 @@ async function onRun() {
     consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
-    appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「翻譯完成後分享」。");
+    appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「分享給其他玩家」。");
     await cleanupPreparedTranslationHelper();
   } catch (e) {
-    setTranslationState("failed");
+    if (isCancellation(e)) {
+      setTranslationState("idle");
+      appendLog("已停止。先前完成的部分仍保留；有效譯文會盡量上傳共享庫（已上傳過的不會重複灌庫）。", "warn");
+    } else {
+      const cls = classifyManagedAiError(e);
+      if (cls) {
+        setTranslationState("idle");
+        setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "已暫停（代管 AI 需要確認）");
+        showManagedAiErrorModal(cls);
+        appendLog("代管 AI 已暫停。依彈窗指引處理後再重試。", "warn");
+        return;
+      }
+      setTranslationState("failed");
+    }
     handleRunFailure(e, "翻譯失敗");
     if (!isCancellation(e)) {
       appendLog("可把上方錯誤訊息留下來方便排查。");
@@ -1617,6 +3719,26 @@ async function onRun() {
     setBusy(false);
     refreshBackupState();
   }
+}
+
+/** 舊版共用 work／work\\翻譯結果 → 應改走 per-instance */
+function isLegacySharedWorkPath(path) {
+  const n = String(path || "").replace(/[\\/]+$/, "").toLowerCase();
+  if (!n) return false;
+  const marker = "modpack-i18n-tool\\work";
+  const marker2 = "modpack-i18n-tool/work";
+  const idx = Math.max(n.lastIndexOf(marker), n.lastIndexOf(marker2));
+  if (idx < 0) return false;
+  const rest = n.slice(idx).replace(/\//g, "\\");
+  return (
+    rest === "modpack-i18n-tool\\work" ||
+    rest === "modpack-i18n-tool\\work\\翻譯結果" ||
+    /modpack-i18n-tool\\work\\翻譯結果$/i.test(rest)
+  );
+}
+
+function supplementTranslationMode() {
+  return $("force-refresh")?.checked ? "force" : null;
 }
 
 /** 修復：重建 zip／對齊工作階段；可選一併 AI 補缺。不修世界閃退。 */
@@ -1639,24 +3761,41 @@ async function onRepair() {
   const useAi = !!$("use-ai").checked;
   if (useAi && !(await ensureAiReadyForAction())) return;
 
-  setBusy(true);
+  setBusy(true, "translate");
+  lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始修復");
   appendLog("這不能修好「進世界閃退」。");
   setProgress(2, "準備修復…");
+  void hideUiForTranslateRun();
+  await paintBeforeInvoke();
 
   try {
     const result = await invoke("repair_translation_pack", {
       outputDir,
       useAi,
       backupBeforeApply: shouldBackupBeforeApply(),
+      translationMode: supplementTranslationMode(),
     });
     setProgress(100, "修復完成！");
     setLogFinal(result.playerSummary || result.player_summary || JSON.stringify(result, null, 2));
     setTranslationState("complete");
   } catch (e) {
-    setTranslationState("failed");
+    if (isCancellation(e)) {
+      setTranslationState("idle");
+      appendLog("已停止。先前完成的部分仍保留；有效譯文會盡量上傳共享庫（已上傳過的不會重複灌庫）。", "warn");
+    } else {
+      const cls = classifyManagedAiError(e);
+      if (cls) {
+        setTranslationState("idle");
+        setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "已暫停（代管 AI 需要確認）");
+        showManagedAiErrorModal(cls);
+        appendLog("代管 AI 已暫停。依彈窗指引處理後再重試。", "warn");
+        return;
+      }
+      setTranslationState("failed");
+    }
     handleRunFailure(e, "修復失敗");
   } finally {
     setBusy(false);
@@ -1691,18 +3830,22 @@ async function onSupplement() {
     }
   }
 
-  setBusy(true);
+  setBusy(true, "translate");
+  lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
   clearLog("開始再補一些");
   resetCoverageMetrics("補翻統計蒐集中");
   setProgress(3, "準備中…");
+  void hideUiForTranslateRun();
+  await paintBeforeInvoke();
 
   try {
     const result = await invoke("supplement_translate", {
       outputDir,
       useAi,
       backupBeforeApply: shouldBackupBeforeApply(),
+      translationMode: supplementTranslationMode(),
     });
     setProgress(100, "補譯完成！");
     let msg = result.playerSummary || result.player_summary || JSON.stringify(result, null, 2);
@@ -1712,7 +3855,20 @@ async function onSupplement() {
     appendLog("複查完成，結果已重新套用到遊戲。", "info");
     await cleanupPreparedTranslationHelper();
   } catch (e) {
-    setTranslationState("failed");
+    if (isCancellation(e)) {
+      setTranslationState("idle");
+      appendLog("已停止。先前完成的部分仍保留；有效譯文會盡量上傳共享庫（已上傳過的不會重複灌庫）。", "warn");
+    } else {
+      const cls = classifyManagedAiError(e);
+      if (cls) {
+        setTranslationState("idle");
+        setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "已暫停（代管 AI 需要確認）");
+        showManagedAiErrorModal(cls);
+        appendLog("代管 AI 已暫停。依彈窗指引處理後再重試。", "warn");
+        return;
+      }
+      setTranslationState("failed");
+    }
     handleRunFailure(e, "再補一些失敗");
   } finally {
     setBusy(false);
@@ -1727,7 +3883,11 @@ async function onStop() {
     btn.disabled = true;
     btn.textContent = "停止中…";
   }
-  appendLog("已要求停止，等目前這一步做完就會收尾…", "warn");
+  setProgressStateBadge("cancelling");
+  appendLog(
+    "已要求停止，等目前這一步做完就會收尾；有效譯文會上傳共享庫，已上傳過的不會重複灌庫。",
+    "warn"
+  );
   try {
     await invoke("cancel_task");
   } catch (e) {
@@ -1750,9 +3910,58 @@ async function onOpenGlossary() {
   }
 }
 
+async function submitDiagnoseReport() {
+  const category = ($("report-category")?.value || "").trim();
+  const unrelated = !!$("report-unrelated")?.checked;
+  const packName = ($("report-pack-name")?.value || "").trim();
+  const note = ($("report-note")?.value || "").trim();
+  const status = $("report-status");
+  if (!category) {
+    if (status) status.textContent = "請先選類別。";
+    return appendDiagnoseLog("請先選擇回報類別。");
+  }
+  if (!unrelated && !packName) {
+    if (status) status.textContent = "請填整合包名稱，或勾選與包無關。";
+    return appendDiagnoseLog("請填整合包名稱，或勾選「與包無關」。");
+  }
+  const instancePath =
+    ($("diagnose-pack-path")?.value || "").trim() || ($("instance")?.value || "").trim();
+  const diagnosis = lastDiagnosisResult
+    ? JSON.stringify({
+        verdict: lastDiagnosisResult.verdict,
+        summary: lastDiagnosisResult.summary,
+        errorCode: lastDiagnosisResult.errorCode || lastDiagnosisResult.error_code,
+        confidence: lastDiagnosisResult.confidence,
+        nextSteps: lastDiagnosisResult.nextSteps || lastDiagnosisResult.next_steps,
+      })
+    : "";
+  if (status) status.textContent = "正在打包上傳…";
+  try {
+    const result = await invoke("submit_diagnose_report_cmd", {
+      request: {
+        reportCategory: category,
+        packName: unrelated ? "" : packName,
+        packUnrelated: unrelated,
+        packVersion: "",
+        errorCode: lastDiagnosisResult?.errorCode || lastDiagnosisResult?.error_code || "",
+        userNote: note,
+        instancePath: instancePath || null,
+        outputDir: selectedOutputDir() || null,
+        diagnosisJson: diagnosis || null,
+      },
+    });
+    const msg = result.message || result.playerSummary || "已送出（資料 3 天內刪除）。";
+    if (status) status.textContent = msg;
+    appendDiagnoseLog(msg, "info");
+  } catch (e) {
+    const err = formatInvokeError(e);
+    if (status) status.textContent = err;
+    appendDiagnoseLog("診斷回報失敗：" + err, "error");
+  }
+}
+
 function showDiagnosis(result) {
-  const box = $("diagnose-result");
-  if (!box) return;
+  lastDiagnosisResult = result || null;
   const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
   const missing = Array.isArray(result?.missing) ? result.missing : [];
   const suspectedMods = Array.isArray(result?.suspectedMods)
@@ -1778,50 +3987,75 @@ function showDiagnosis(result) {
     unknown: "證據不足",
     no_logs: "沒有可分析記錄",
   }[result?.verdict] || result?.verdict || "未分類";
+  const modeRaw = result?.analysisMode || result?.analysis_mode || "";
+  const modeLabel =
+    modeRaw === "pack_dir" ? "整合包目錄交叉驗證" : modeRaw === "pasted_log" ? "貼上的記錄" : "";
   const summary = String(result?.summary || "沒有足夠資料").replace(/\*\*/g, "");
   const gameExitCode = result?.gameExitCode ?? result?.game_exit_code;
   const source = result?.source || "";
+  const packRoot = result?.packRoot || result?.pack_root || "";
+  const errorCode = result?.errorCode || result?.error_code || "";
+  const codeLabel = {
+    CLASS_MISSING: "缺少類別",
+    CLASS_MISSING_SRP: "缺少 SRParasites 類別",
+    GRAPHICS_RUNTIME: "顯示／原生崩潰",
+    INSUFFICIENT_EVIDENCE: "證據不足",
+    NO_LOGS: "沒有記錄",
+  }[errorCode];
   const text = [
-    `判定：${verdictLabel}\n${summary}`,
-    `證據強度：${confidenceLabel}（這是規則命中的程度，不是保證）`,
-    result?.errorCode || result?.error_code ? `分析代碼：${result.errorCode || result.error_code}` : "",
-    gameExitCode ? `遊戲退出碼：${gameExitCode}（退出碼通常不是根因）` : "",
+    `判定：${verdictLabel}`,
+    summary,
+    modeLabel ? `分析模式：${modeLabel}` : "",
+    `證據強度：${confidenceLabel}`,
+    errorCode ? `分析代碼：${errorCode}${codeLabel ? `（${codeLabel}）` : ""}` : "",
+    gameExitCode ? `遊戲退出碼：${gameExitCode}` : "",
     result?.primaryError || result?.primary_error ? `最接近的錯誤：${result.primaryError || result.primary_error}` : "",
     missing.length ? `可能缺少：${missing.join(", ")}` : "",
     suspectedMods.length ? `可疑模組：${suspectedMods.join(", ")}` : "",
     evidence.length ? `證據：\n- ${evidence.join("\n- ")}` : "",
     nextSteps.length ? `建議下一步：\n- ${nextSteps.join("\n- ")}` : "",
     result?.translationRelated || result?.translation_related
-      ? "翻譯關聯：記錄有直接指向翻譯輸出的證據。請先關遊戲，再用「還原上一次套用」後重試。"
-      : "翻譯關聯：目前沒有直接證據顯示是翻譯造成的。",
+      ? "翻譯關聯：記錄指向翻譯輸出，可試「還原上一次套用」。"
+      : "翻譯關聯：目前沒有直接證據顯示是翻譯造成。",
+    packRoot ? `解析目錄：${packRoot}` : "",
     source ? `資料來源：${source}` : "",
   ]
     .filter(Boolean)
     .join("\n\n");
-  box.textContent = text;
   const rail = $("diagnose-rail-summary");
-  if (rail) rail.textContent = `${verdictLabel}｜證據${confidenceLabel}\n${summary}`;
-  const railMsg = $("diagnose-rail-msg");
-  if (railMsg) {
-    railMsg.textContent =
-      result?.verdict === "maybe_our_files"
-        ? "可能與翻譯輸出有關，可考慮「還原上一次套用」。"
-        : "分析完成；完整細節見左側結果卡。";
+  if (rail) {
+    rail.classList.remove("log-empty");
+    rail.textContent = `${verdictLabel}｜證據${confidenceLabel}\n${summary}\n\n${text}`;
   }
+  appendDiagnoseLog("分析完成：" + (errorCode || verdictLabel));
+  appendDiagnoseLog(text);
   if ((result?.translationRelated || result?.translation_related) && hasApplyBackups) {
-    appendLog("可直接按「還原上一次套用」排除翻譯輸出。", "warn");
+    appendDiagnoseLog("可直接按「還原上一次套用」排除翻譯輸出。", "warn");
   }
 }
 
 async function diagnosePastedText() {
+  const packPath = ($("diagnose-pack-path")?.value || "").trim();
   const text = ($("error-input")?.value || "").trim();
-  if (!text) return log("請先貼上錯誤報告或錯誤碼。");
+  if (!packPath && !text) return appendDiagnoseLog("請先選整合包資料夾，或貼上錯誤報告。");
+  if (progressBusy) return appendDiagnoseLog("其他工作進行中，請稍候。");
+  setBusy(true, "diagnose");
+  clearDiagnoseLog("開始分析…");
+  setProgress(5, "正在分析…");
   try {
-    const result = await invoke("diagnose_error_text", { text });
+    let result;
+    if (packPath) {
+      result = await invoke("diagnose_pack_dir_cmd", { path: packPath });
+    } else {
+      result = await invoke("diagnose_error_text", { text });
+    }
+    setProgress(100, "分析完成");
     showDiagnosis(result);
-    appendLog("錯誤分析完成：" + (result.errorCode || result.error_code || "UNKNOWN"));
   } catch (e) {
+    setProgress(0, "分析失敗", { failed: true });
     showDiagnosis({ summary: "分析失敗：" + formatInvokeError(e) });
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -1845,8 +4079,6 @@ const COVERAGE_ACK_STORAGE_KEY = "modpack-i18n-coverage-ack-hard";
 function wireCoverageTiers() {
   /* 0.2.2：完整度三選已移除；固定 max，此函式保留空殼以免舊呼叫炸掉。 */
 }
-
-let fontPreviewUrl = null;
 
 const FONT_PRESETS = {
   clear: { size: 11, weight: 400, shiftX: 0, shiftY: 0.5, oversample: 5 },
@@ -1899,21 +4131,46 @@ function applyFontPrefs(prefs) {
   if (prefs.packName && $("font-pack-name")) $("font-pack-name").value = prefs.packName;
 }
 
+function applyFontPreviewStyles() {
+  const sample = $("font-preview-sample");
+  if (!sample) return;
+  const size = Number($("font-size")?.value || 11);
+  const shiftX = Number($("font-shift-x")?.value || 0);
+  const shiftY = Number($("font-shift-y")?.value || 0.5);
+  sample.style.fontSize = `${Math.max(14, size * 1.6)}px`;
+  sample.style.transform = `translate(${shiftX}px, ${shiftY}px)`;
+}
+
 async function updateFontPreview(path) {
   const panel = $("font-preview");
   const sample = $("font-preview-sample");
+  const missing = $("font-preview-missing");
   if (!panel || !sample || !path) return;
   try {
-    if (fontPreviewUrl) URL.revokeObjectURL(fontPreviewUrl);
-    // Tauri 本機路徑無法直接 FontFace；用 CSS 近似 size／shift，並標示路徑已選。
     panel.hidden = false;
-    const size = Number($("font-size")?.value || 11);
-    const shiftY = Number($("font-shift-y")?.value || 0.5);
-    sample.style.fontSize = `${Math.max(14, size * 1.6)}px`;
-    sample.style.transform = `translateY(${shiftY}px)`;
-    sample.title = path;
-  } catch (_) {
-    panel.hidden = true;
+    applyFontPreviewStyles();
+    const b64 = await invoke("read_font_file_base64", { fontPath: path });
+    const ext = String(path).toLowerCase().endsWith(".otf") ? "opentype" : "truetype";
+    if (fontPreviewFace) {
+      try {
+        document.fonts.delete(fontPreviewFace);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    fontPreviewFace = new FontFace("mcpl-font-preview", `url(data:font/${ext};base64,${b64})`);
+    await fontPreviewFace.load();
+    document.fonts.add(fontPreviewFace);
+    sample.style.fontFamily = "mcpl-font-preview, sans-serif";
+    if (missing) {
+      const lacksGlyph = typeof document.fonts.check === "function"
+        ? !document.fonts.check('16px "mcpl-font-preview"', "繁")
+        : false;
+      missing.hidden = !lacksGlyph;
+    }
+  } catch (e) {
+    if (missing) missing.hidden = false;
+    appendFontLog("字體預覽失敗：" + String(e), "warn");
   }
 }
 
@@ -1949,6 +4206,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     setTranslationState("idle");
     wireCoverageTiers();
     wireShellChrome();
+    initSfxControls();
+    initReloadGuard();
   } catch (e) {
     forceRevealUi();
     try {
@@ -1961,7 +4220,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // —— 以下全部為同步接線（不可插入 await）——
   syncUiState();
-  ["instance", "output", "font-output"].forEach((id) => {
+  ["instance", "output", "font-output", "diagnose-pack-path"].forEach((id) => {
     const input = $(id);
     if (!input) return;
     input.addEventListener("input", () => {
@@ -2024,7 +4283,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   }
   if ($("btn-scale")) {
-    $("btn-scale").onclick = () => applyUiScale(1);
+    $("btn-scale").onclick = () => {
+      if (isUiAutoScaleOn()) {
+        zoomAutoHint();
+        return;
+      }
+      applyUiScale(1);
+    };
+  }
+  if ($("ui-autoscale")) {
+    $("ui-autoscale").onchange = () => setUiAutoScale(!!$("ui-autoscale").checked);
   }
 
   if ($("use-ai")) $("use-ai").onchange = () => syncUiState();
@@ -2054,6 +4322,30 @@ window.addEventListener("DOMContentLoaded", async () => {
       return openExternalUrl(invite);
     };
   }
+  if ($("btn-managed-ai-close")) {
+    $("btn-managed-ai-close").onclick = () => {
+      hideManagedAiErrorModal();
+      setTranslationState("idle");
+    };
+  }
+  if ($("btn-gp-reward")) {
+    $("btn-gp-reward").onclick = () => startGpRewardCountdown();
+  }
+  if ($("btn-feedback-close")) {
+    $("btn-feedback-close").onclick = () => hideFeedbackOverlay();
+  }
+  if ($("btn-feedback-back")) {
+    $("btn-feedback-back").onclick = () => retreatFeedbackStep();
+  }
+  if ($("btn-feedback-next")) {
+    $("btn-feedback-next").onclick = () => advanceFeedbackStep();
+  }
+  if ($("btn-feedback-submit")) {
+    $("btn-feedback-submit").onclick = () => submitUsageFeedbackFromOverlay();
+  }
+  document.querySelectorAll('input[name="feedback-pain"], input[name="feedback-wish"], input[name="feedback-rating"]').forEach((el) => {
+    el.addEventListener("change", () => updateFeedbackNoteVisibility());
+  });
   if ($("btn-discord-logout")) {
     $("btn-discord-logout").onclick = async () => {
       try {
@@ -2094,11 +4386,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("target-version").onchange = () => {
       const value = $("target-version").value;
       $("target-version").dataset.autoDetected = "false";
+      if (value && !isSupportedMinecraftVersion(value)) {
+        setVersionBlock(unsupportedVersionMessage(value));
+        $("target-version").value = "";
+        if ($("version-status")) $("version-status").textContent = versionBlockReason;
+        syncUiState();
+        return;
+      }
+      clearVersionBlock();
       if ($("version-status")) {
         $("version-status").textContent = value
           ? "已手動指定：Minecraft " + value
-          : "將從遊戲實例自動偵測";
+          : "將從遊戲實例自動偵測（須為 1.13 以上）";
       }
+      syncUiState();
     };
   }
   if ($("minimize-on-close")) {
@@ -2126,6 +4427,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   }
   if ($("btn-save-adv")) $("btn-save-adv").onclick = onSaveAdv;
+  if ($("btn-test-api")) $("btn-test-api").onclick = onTestApiKey;
   if ($("btn-run")) $("btn-run").onclick = onRun;
   if ($("btn-stop")) $("btn-stop").onclick = onStop;
   if ($("btn-glossary")) $("btn-glossary").onclick = onOpenGlossary;
@@ -2134,6 +4436,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-helper-prepare")) $("btn-helper-prepare").onclick = prepareTranslationHelper;
   if ($("btn-helper-rescan")) $("btn-helper-rescan").onclick = rescanAfterTranslationHelper;
   if ($("btn-helper-cleanup")) $("btn-helper-cleanup").onclick = cleanupTranslationHelperFromPanel;
+  if ($("helper-ack-ingame")) {
+    $("helper-ack-ingame").onchange = () => syncTranslationHelperPanel();
+  }
   function openGuideOverlay() {
     const ov = $("guide-overlay");
     if (!ov) return;
@@ -2157,6 +4462,39 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-guide-close")) {
     $("btn-guide-close").onclick = () => closeGuideOverlay();
   }
+  if ($("btn-onboard")) {
+    $("btn-onboard").onclick = () => {
+      const menu = $("overflow-menu");
+      if (menu) menu.hidden = true;
+      const overflow = $("btn-overflow");
+      if (overflow) overflow.setAttribute("aria-expanded", "false");
+      startOnboarding({ force: true });
+    };
+  }
+  if ($("onboard-skip")) {
+    $("onboard-skip").onclick = () => stopOnboarding(true);
+  }
+  if ($("onboard-prev")) {
+    $("onboard-prev").onclick = () => {
+      if (onboardIndex > 0) {
+        onboardIndex -= 1;
+        layoutOnboarding();
+      }
+    };
+  }
+  if ($("onboard-next")) {
+    $("onboard-next").onclick = () => {
+      if (onboardIndex >= ONBOARD_STEPS.length - 1) {
+        stopOnboarding(true);
+        return;
+      }
+      onboardIndex += 1;
+      layoutOnboarding();
+    };
+  }
+  if ($("onboard-shade")) {
+    $("onboard-shade").onclick = () => stopOnboarding(true);
+  }
   // 目錄錨點在 overlay 內平滑滾動
   document.querySelectorAll(".guide-toc a[href^='#']").forEach((a) => {
     a.addEventListener("click", (ev) => {
@@ -2173,24 +4511,38 @@ window.addEventListener("DOMContentLoaded", async () => {
   window.addEventListener("keydown", (ev) => {
     if (ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown" || ev.key === "0")) {
       ev.preventDefault();
+      if (isUiAutoScaleOn()) {
+        zoomAutoHint();
+        return;
+      }
       if (ev.key === "ArrowUp") adjustUiScale(UI_SCALE_STEP);
       else if (ev.key === "ArrowDown") adjustUiScale(-UI_SCALE_STEP);
       else applyUiScale(1);
       return;
     }
-    if (ev.key === "Escape") closeGuideOverlay();
+    if (ev.key === "Escape") {
+      if (onboardActive) {
+        stopOnboarding(true);
+        return;
+      }
+      closeGuideOverlay();
+    }
   });
   window.addEventListener(
     "wheel",
     (ev) => {
       if (!ev.ctrlKey) return;
       ev.preventDefault();
+      if (isUiAutoScaleOn()) {
+        zoomAutoHint();
+        return;
+      }
       adjustUiScale(ev.deltaY < 0 ? UI_SCALE_STEP : -UI_SCALE_STEP);
     },
     { passive: false }
   );
   // 推廣連結（若啟動早期已接線則略過）
-  document.querySelectorAll(".promo-card[data-url]").forEach((el) => {
+  document.querySelectorAll(".promo-card[data-url], #btn-ai-support[data-url]").forEach((el) => {
     if (el.dataset.wired === "1") return;
     el.dataset.wired = "1";
     el.addEventListener("click", async () => {
@@ -2215,9 +4567,10 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (typeof f === "string") {
           $("font-file").value = f;
           updateFontPreview(f);
+          syncUiState();
         }
       } catch (e) {
-        log(String(e));
+        appendFontLog(String(e), "error");
       }
     };
   }
@@ -2225,35 +4578,40 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("btn-font-out").onclick = async () => {
       try {
         const p = await pickDir("選擇字體資源包輸出位置");
-        if (p) $("font-output").value = p;
+        if (p) {
+          $("font-output").value = p;
+          syncUiState();
+        }
       } catch (e) {
-        log(String(e));
+        appendFontLog(String(e), "error");
       }
     };
   }
   if ($("btn-font-build")) {
     $("btn-font-build").onclick = async () => {
       const fontPath = ($("font-file").value || "").trim();
-      const outputDir = (($('font-output')?.value || $('output')?.value || "")).trim();
-      if (!fontPath) return log("請先選擇字體檔。");
-      if (!outputDir) return log("請先選擇字體包的輸出位置。");
-      setBusy(true);
-      lastProgressLogKey = "";
-      clearLog("開始建立字體資源包");
+      const outputDir = ($("font-output")?.value || "").trim();
+      if (!fontPath) return appendFontLog("請先選擇字體檔。");
+      if (!outputDir) return appendFontLog("請先選擇字體包的輸出位置。");
+      if (progressBusy) return appendFontLog("其他工作進行中，請稍候。");
+      setBusy(true, "font");
+      clearFontLog("開始建立字體資源包");
       setProgress(10, "正在建立字體資源包…");
       try {
+        const targetVersion = ($("target-version")?.value || "").trim() || null;
         const r = await invoke("create_font_pack", {
           fontPath,
           outputDir,
           packName: ($("font-pack-name").value || "我的遊戲字體").trim(),
           packDesc: "自訂遊戲字體",
           fontOptions: {
-            size: Number($('font-size')?.value || 11),
-            weight: Number($('font-weight')?.value || 400),
-            shiftX: Number($('font-shift-x')?.value || 0),
-            shiftY: Number($('font-shift-y')?.value || 0.5),
-            oversample: Number($('font-oversample')?.value || 4),
+            size: Number($("font-size")?.value || 11),
+            weight: Number($("font-weight")?.value || 400),
+            shiftX: Number($("font-shift-x")?.value || 0),
+            shiftY: Number($("font-shift-y")?.value || 0.5),
+            oversample: Number($("font-oversample")?.value || 4),
           },
+          targetVersion,
         });
         let finalMessage = r.playerSummary || r.player_summary || JSON.stringify(r, null, 2);
         const packPath = r.packPath || r.pack_path || "";
@@ -2261,7 +4619,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         const instancePath = ($("instance")?.value || "").trim();
         if (shouldApplyFont) {
           if (!instancePath) {
-            appendLog("未選整合包，字體包已建立但未套用。", "warn");
+            appendFontLog("未選整合包，字體包已建立但未套用。", "warn");
           } else if (packPath) {
             setProgress(70, "正在套用字體包到目前實例…");
             const applied = await invoke("apply_font_pack_to_current_instance", {
@@ -2272,13 +4630,15 @@ window.addEventListener("DOMContentLoaded", async () => {
           }
         }
         setProgress(100, shouldApplyFont && instancePath ? "字體包完成並已套用" : "字體包完成");
-        setLogFinal(finalMessage);
+        appendFontLog("────────");
+        appendFontLog(finalMessage);
+        toggleHidden("btn-open-font", false);
       } catch (e) {
         setProgress(0, "失敗", { failed: true });
-        appendLog("建立字體包失敗：");
-        appendLog(String(e));
+        appendFontLog("建立字體包失敗：" + String(e), "error");
       } finally {
         setBusy(false);
+        syncUiState();
       }
     };
   }
@@ -2370,6 +4730,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     el.addEventListener("change", writeFontPrefs);
   });
 
+  if ($("pack-name")) {
+    $("pack-name").addEventListener("input", () => {
+      $("pack-name").dataset.auto = "0";
+    });
+  }
+
   if ($("btn-inst")) $("btn-inst").onclick = async () => {
     try {
       const p = await pickDir("選擇遊戲／整合包資料夾");
@@ -2387,14 +4753,13 @@ window.addEventListener("DOMContentLoaded", async () => {
           try {
             const base =
               (await invoke("managed_output_for_instance", { instancePath: p }).catch(() => null)) ||
-              (await invoke("managed_output_base").catch(() => null)) ||
-              (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null)) ||
-              (await invoke("suggest_resourcepacks_dir", { instancePath: p }));
+              (await invoke("suggest_output_dir", { instancePath: p }).catch(() => null));
             if (base) {
               setAutoOutputDir(base);
               appendLog(
-                "翻譯結果位置已準備好：\n" + base +
-                  "\n翻譯完成會直接套用到整合包資料夾。"
+                "此整合包專用結果位置：\n" +
+                  base +
+                  "\n翻譯完成會直接套用到整合包資料夾。多包請勿共用同一結果資料夾。"
               );
             }
           } catch (_) {
@@ -2448,22 +4813,41 @@ window.addEventListener("DOMContentLoaded", async () => {
     $(id)?.addEventListener("change", syncUiState);
   });
   if ($("btn-diagnose")) $("btn-diagnose").onclick = diagnosePastedText;
+  if ($("btn-diagnose-pack-pick")) {
+    $("btn-diagnose-pack-pick").onclick = async () => {
+      try {
+        const p = await pickDir("選擇要診斷的整合包／實例資料夾");
+        if (!p) return;
+        if ($("diagnose-pack-path")) $("diagnose-pack-path").value = p;
+        scheduleBackupStateRefresh();
+        syncUiState();
+      } catch (e) {
+        log("選取資料夾失敗：" + formatInvokeError(e));
+      }
+    };
+  }
   if ($("btn-diagnose-latest")) {
     $("btn-diagnose-latest").onclick = async () => {
-      const instancePath = ($("instance").value || "").trim();
-      if (!instancePath) return log("請先選擇遊戲資料夾。");
+      const diagnosePath = ($("diagnose-pack-path")?.value || "").trim();
+      const instancePath = diagnosePath || ($("instance")?.value || "").trim();
+      if (!instancePath) return log("請先在診斷頁選整合包資料夾，或到翻譯頁選擇遊戲資料夾。");
+      if (progressBusy) return log("翻譯或其他工作進行中，請等結束或按停止後再診斷。");
+      setBusy(true, "diagnose");
       try {
-        const result = await invoke("diagnose_launch_failure", { instancePath });
+        const result = await invoke("diagnose_pack_dir_cmd", { path: instancePath });
         showDiagnosis(result);
       } catch (e) {
         showDiagnosis({ summary: "讀取最近記錄失敗：" + formatInvokeError(e) });
+      } finally {
+        setBusy(false);
       }
     };
   }
   if ($("btn-restore")) {
     $("btn-restore").onclick = async () => {
-      const instancePath = ($("instance").value || "").trim();
-      if (!instancePath) return log("請先選擇遊戲資料夾。");
+      const instancePath =
+        ($("diagnose-pack-path")?.value || "").trim() || ($("instance")?.value || "").trim();
+      if (!instancePath) return log("請先選擇遊戲資料夾或診斷頁的整合包資料夾。");
       if (!window.confirm("請先關閉 Minecraft。這會回到此備份對應的套用前狀態（若多次套用曾重用同一備份，可能跨過好幾次）。確定繼續？")) return;
       try {
         const result = await invoke("restore_last_apply_cmd", {
@@ -2472,25 +4856,17 @@ window.addEventListener("DOMContentLoaded", async () => {
         });
         const summary = result.playerSummary || result.player_summary || "已還原上一次套用。";
         const warnings = result.warnings || [];
-        appendLog(summary, "warn");
-        if (warnings.length) appendLog("還原警告：\n" + warnings.join("\n"), "warn");
-        const box = $("diagnose-result");
-        if (box) {
-          box.hidden = false;
-          box.textContent = [summary, warnings.length ? "警告：\n" + warnings.join("\n") : ""]
-            .filter(Boolean)
-            .join("\n\n");
-        }
+        appendDiagnoseLog(summary, "warn");
+        appendDiagnoseLog("若懷疑共享庫，補翻時可勾選「重新翻譯缺漏（略過共享庫查找）」再重跑。", "warn");
+        if (warnings.length) appendDiagnoseLog("還原警告：\n" + warnings.join("\n"), "warn");
         await refreshBackupState();
       } catch (e) {
-        appendError("還原失敗：" + formatInvokeError(e));
-        const box = $("diagnose-result");
-        if (box) {
-          box.hidden = false;
-          box.textContent = "還原失敗：" + formatInvokeError(e);
-        }
+        appendDiagnoseLog("還原失敗：" + formatInvokeError(e), "error");
       }
     };
+  }
+  if ($("btn-diagnose-report")) {
+    $("btn-diagnose-report").onclick = submitDiagnoseReport;
   }
   if ($("btn-delete-backups")) {
     $("btn-delete-backups").onclick = async () => {
@@ -2545,16 +4921,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   async function openResultFolder(fromFont) {
     const outputInput = fromFont ? $("font-output") : $("output");
     const outputDir = (outputInput?.value || "").trim();
-    if (!outputDir) return log("還沒選結果位置。");
+    if (!outputDir) return fromFont ? appendFontLog("還沒選字體輸出位置。") : log("還沒選結果位置。");
     try {
-      const work = resultWorkDir(outputDir);
-      try {
-        await invoke("open_path", { path: work });
-      } catch (_) {
-        await invoke("open_path", { path: outputDir });
-      }
+      const work = fromFont ? fontWorkDir(outputDir) : resultWorkDir(outputDir);
+      await invoke("open_path", { path: work });
     } catch (e) {
-      log(String(e));
+      if (fromFont) appendFontLog(String(e), "error");
+      else log(String(e));
     }
   }
   if ($("btn-open")) $("btn-open").onclick = () => openResultFolder(false);
@@ -2567,16 +4940,36 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (el) el.classList.add("log-empty");
     };
   }
+  if ($("btn-clear-font-log")) {
+    $("btn-clear-font-log").onclick = () => clearFontLog("字體日誌已清除");
+  }
+  if ($("btn-clear-diagnose-log")) {
+    $("btn-clear-diagnose-log").onclick = () => clearDiagnoseLog("診斷日誌已清除");
+  }
+  ["font-size", "font-weight", "font-shift-x", "font-shift-y"].forEach((id) => {
+    $(id)?.addEventListener("input", () => {
+      const out = $(id + "-value");
+      const el = $(id);
+      if (out && el) out.textContent = String(el.value);
+      applyFontPreviewStyles();
+    });
+  });
 
   if ($("btn-open-report")) {
     $("btn-open-report").onclick = async () => {
       const outputDir = selectedOutputDir() || ($("output")?.value || "").trim();
       if (!outputDir) return log("還沒選結果位置。");
       const work = resultWorkDir(outputDir);
+      try {
+        await flushRunLog(work);
+      } catch (e) {
+        appendLog("寫入執行日誌失敗：" + String(e), "warn");
+      }
       const candidates = [
-        work + "\\覆蓋範圍說明.txt",
+        work + "\\" + RUN_LOG_FILE,
         work + "\\翻譯錯誤日誌.txt",
-        work + "\\翻譯工作階段.json",
+        work + "\\覆蓋範圍說明.txt",
+        work + "\\" + DEV_TRACE_FILE,
       ];
       let opened = false;
       for (const path of candidates) {
@@ -2602,16 +4995,20 @@ window.addEventListener("DOMContentLoaded", async () => {
   window.clearTimeout(startupRevealFallback);
   forceRevealUi();
   revealInitialContent();
+  window.setTimeout(() => {
+    try {
+      startOnboarding({ force: false });
+    } catch (_) {
+      /* ignore */
+    }
+  }, 350);
 
   try {
     await listen("translate-progress", (ev) => {
       const p = (ev && ev.payload) || {};
-      const percent = p.percent != null ? p.percent : 0;
       const message = p.message || "處理中…";
-      setProgress(percent, message);
-      if (/失敗|錯誤|無法|不存在|損壞/.test(String(message))) {
-        appendError(message);
-      }
+      queueProgressPayload(p);
+      // 進度事件不自動刷紅字；真正錯誤走 translate-log error
     });
   } catch (e) {
     /* 無 event 時仍可跑完後顯示 */
@@ -2656,12 +5053,117 @@ window.addEventListener("DOMContentLoaded", async () => {
 // 介面由 GPT 維護；本區塊只負責把「檢查更新」接到後端，且完全防禦式：
 // 有 #btn-check-update 就接上點擊；沒有也不影響其他功能。
 // 契約：invoke("check_update") → { current, latest, updateAvailable, url, notes, ok, message }
-//       invoke("download_update") → { path, launched, automatic, message }
+//       invoke("download_update") → { path, launched, automatic, shouldExit, message }
 (function wireUpdateChecker() {
   const _invoke =
     (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) || null;
   let latestUpdateInfo = null;
   let updateInFlight = false;
+  let pendingUpdateInfo = null;
+
+  function parseUpdateNotes(notes) {
+    const raw = String(notes || "").trim();
+    if (!raw) return [];
+    return raw
+      .split(/[\n;；]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function isLegacy102Client(version) {
+    return String(version || "")
+      .trim()
+      .replace(/^v/i, "") === "1.0.2";
+  }
+
+  function showUpdateModal(info) {
+    const overlay = document.getElementById("update-overlay");
+    const line = document.getElementById("update-version-line");
+    const list = document.getElementById("update-notes-list");
+    const title = document.getElementById("update-title");
+    const migration = document.getElementById("update-migration-hint");
+    if (!overlay) return;
+    if (title) title.textContent = "MCPL " + (info.latest || "");
+    if (line) {
+      line.textContent =
+        "發現新版本 " + info.latest + "（目前 " + info.current + "）";
+    }
+    if (migration) {
+      if (isLegacy102Client(info.current)) {
+        migration.textContent =
+          "您目前是 1.0.2：請按「手動下載」，關閉舊工具後開啟；之後版本才支援一鍵自動更新。";
+        migration.hidden = false;
+        migration.setAttribute("aria-hidden", "false");
+      } else {
+        migration.textContent = "";
+        migration.hidden = true;
+        migration.setAttribute("aria-hidden", "true");
+      }
+    }
+    if (list) {
+      list.innerHTML = "";
+      const items = parseUpdateNotes(info.notes);
+      if (items.length > 0) {
+        list.hidden = false;
+        items.forEach((item) => {
+          const li = document.createElement("li");
+          li.textContent = item;
+          list.appendChild(li);
+        });
+      } else {
+        list.hidden = true;
+      }
+    }
+    overlay.hidden = false;
+    overlay.setAttribute("aria-hidden", "false");
+  }
+
+  function hideUpdateModal() {
+    const overlay = document.getElementById("update-overlay");
+    if (!overlay) return;
+    overlay.hidden = true;
+    overlay.setAttribute("aria-hidden", "true");
+  }
+
+  function setPendingUpdateInfo(info) {
+    if (info) pendingUpdateInfo = info;
+  }
+
+  // 給 setBusy 使用：翻譯/其他工作完成後，自動補回被延遲的更新。
+  window.zfUpdateModalMaybeShowPending = () => {
+    try {
+      if (pendingUpdateInfo && !progressBusy) {
+        const info = pendingUpdateInfo;
+        pendingUpdateInfo = null;
+        latestUpdateInfo = info;
+        window.__mcpl_latestUpdateInfo = latestUpdateInfo;
+        showUpdateModal(info);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  };
+
+  window.zfUpdateModalHide = hideUpdateModal;
+  window.zfUpdateModalSetPending = setPendingUpdateInfo;
+
+  function scheduleClientExit() {
+    setTimeout(() => {
+      try {
+        const win = window.__TAURI__ && window.__TAURI__.window && window.__TAURI__.window.getCurrentWindow;
+        if (typeof win === "function") win().close().catch(() => {});
+      } catch (_) {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          window.close();
+        } catch (_) {
+          /* ignore */
+        }
+      }, 500);
+    }, 1200);
+  }
 
   async function runUpdateCheck(interactive) {
     if (!_invoke) return;
@@ -2683,30 +5185,32 @@ window.addEventListener("DOMContentLoaded", async () => {
       return;
     }
     latestUpdateInfo = info;
+    window.__mcpl_latestUpdateInfo = latestUpdateInfo;
     if (status) status.textContent = info.message || "";
     if (!info.updateAvailable) {
       if (interactive && typeof appendLog === "function") appendLog(info.message || "已是最新版");
       return;
-    }
-    // 有新版：靜默檢查也提示，但只有互動時才問要不要下載
-    if (typeof appendLog === "function") {
-      appendLog("發現新版本 " + info.latest + "（目前 " + info.current + "）。", "warn");
-      if (info.notes) appendLog("更新內容：" + info.notes);
     }
     const btn = document.getElementById("btn-check-update");
     if (btn) {
       btn.textContent = "下載新版 " + info.latest;
       btn.dataset.mode = "download";
     }
-    if (interactive) {
-      const ok = window.confirm(
-        "發現新版本 " + info.latest + "。\n要立即下載、驗證並自動更新嗎？\n\n更新完成後工具會重新開啟。"
-      );
-      if (ok) await runDownload();
+    if (progressBusy) {
+      setPendingUpdateInfo(info);
+      if (status) status.textContent = interactive ? "目前正在翻譯/其他工作，完成後會顯示更新。" : status.textContent;
+      if (interactive && typeof appendLog === "function") appendLog("忙碌中：更新延遲顯示", "warn");
+      return;
+    }
+    pendingUpdateInfo = null;
+    showUpdateModal(info);
+    if (interactive && typeof appendLog === "function") {
+      appendLog("發現新版本 " + info.latest + "（目前 " + info.current + "）。", "warn");
     }
   }
 
   async function openManualDownload() {
+    hideUpdateModal();
     const url = latestUpdateInfo && latestUpdateInfo.url;
     if (!url || !_invoke) return;
     try {
@@ -2720,25 +5224,48 @@ window.addEventListener("DOMContentLoaded", async () => {
   async function runDownload() {
     if (!_invoke || updateInFlight) return;
     updateInFlight = true;
+    hideUpdateModal();
     const btn = document.getElementById("btn-check-update");
     const status = document.getElementById("update-status");
+    const nowBtn = document.getElementById("btn-update-now");
     if (btn) {
       btn.disabled = true;
       btn.textContent = "正在更新…";
     }
-      if (status) status.textContent = "正在下載並驗證免安裝版";
+    if (nowBtn) nowBtn.disabled = true;
+    if (status) status.textContent = "正在下載並驗證免安裝版";
     try {
       if (typeof appendLog === "function") appendLog("正在下載並驗證新版 EXE，請勿關閉工具…");
-      const r = await _invoke("download_update");
+      const DOWNLOAD_INVOKE_TIMEOUT_MS = 180000; // UI 層硬超時：避免前端等待無限久
+      let timer = null;
+      let r;
+      try {
+        r = await Promise.race([
+          _invoke("download_update"),
+          new Promise((_, reject) => {
+            timer = window.setTimeout(() => {
+              const err = new Error("update_invoke_timeout");
+              err.code = "update_invoke_timeout";
+              reject(err);
+            }, DOWNLOAD_INVOKE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
       const message = (r && r.message) || "免安裝更新檔已啟動。";
       if (typeof appendLog === "function") appendLog(message);
       if (status) status.textContent = r && r.automatic ? "正在更新，稍後會重新開啟" : "請開啟下載的免安裝版完成更新";
+      if (r && (r.shouldExit || r.automatic)) scheduleClientExit();
     } catch (e) {
-      if (typeof appendLog === "function") appendLog("下載更新失敗：" + String(e), "error");
-      if (status) status.textContent = "自動更新失敗";
-      if (latestUpdateInfo && latestUpdateInfo.url) {
-        const manual = window.confirm("自動更新失敗。\n要改用瀏覽器下載官方免安裝版嗎？");
-        if (manual) await openManualDownload();
+      const isTimeout = e && (e.code === "update_invoke_timeout" || String(e).includes("update_invoke_timeout"));
+      if (isTimeout) {
+        if (typeof appendLog === "function") appendLog("更新呼叫超時，前端將恢復但更新可能仍在背景進行。", "warn");
+        if (status) status.textContent = "更新正在背景進行，稍後再看狀態（必要時會重開）。";
+      } else {
+        if (typeof appendLog === "function") appendLog("下載更新失敗：" + String(e), "error");
+        if (status) status.textContent = "自動更新失敗";
+        if (latestUpdateInfo && latestUpdateInfo.url) showUpdateModal(latestUpdateInfo);
       }
     } finally {
       updateInFlight = false;
@@ -2748,6 +5275,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           ? "下載新版 " + latestUpdateInfo.latest
           : "檢查更新";
       }
+      if (nowBtn) nowBtn.disabled = false;
     }
   }
 
@@ -2760,7 +5288,21 @@ window.addEventListener("DOMContentLoaded", async () => {
         else runUpdateCheck(true);
       });
     }
-    // 啟動時安靜檢查一次（不打擾，只更新狀態文字／按鈕標籤）
+    const later = document.getElementById("btn-update-close");
+    if (later && !later.dataset.wired) {
+      later.dataset.wired = "1";
+      later.addEventListener("click", hideUpdateModal);
+    }
+    const manual = document.getElementById("btn-update-manual");
+    if (manual && !manual.dataset.wired) {
+      manual.dataset.wired = "1";
+      manual.addEventListener("click", openManualDownload);
+    }
+    const now = document.getElementById("btn-update-now");
+    if (now && !now.dataset.wired) {
+      now.dataset.wired = "1";
+      now.addEventListener("click", runDownload);
+    }
     runUpdateCheck(false);
   }
 
@@ -2769,6 +5311,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   } else {
     attach();
   }
-  // 讓 UI 端若想手動觸發也有入口
   window.zfCheckUpdate = () => runUpdateCheck(true);
 })();

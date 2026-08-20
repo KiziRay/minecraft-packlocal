@@ -9,8 +9,8 @@
 //! 更新端點與下載連結都非機密，比對邏輯全在本地。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,22 +21,60 @@ use super::secrets::MANAGED_BASE_URL;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MIN_UPDATE_BYTES: usize = 100_000;
 const MAX_UPDATE_BYTES: usize = 256 * 1024 * 1024;
-static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+// 若更新流程掛住，避免鎖永遠不回收；前端也有 download_invoke timeout。
+// stale 門檻需要明顯大於前端 timeout，降低「正常慢」誤觸的機率。
+const UPDATE_STALE_MS: u64 = 20 * 60 * 1000; // 20 分鐘
+static UPDATE_LOCK_TOKEN: AtomicU64 = AtomicU64::new(0);
 
-struct UpdateGuard;
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+struct UpdateGuard {
+    token: u64,
+}
 
 impl UpdateGuard {
     fn acquire() -> Result<Self, String> {
-        UPDATE_IN_PROGRESS
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map(|_| Self)
-            .map_err(|_| "更新已在進行中，請稍候，不要重複點擊。".to_string())
+        let now = now_ms();
+        let cur = UPDATE_LOCK_TOKEN.load(Ordering::SeqCst);
+
+        // 1) 空閒：嘗試從 0 取得鎖
+        if cur == 0 {
+            if UPDATE_LOCK_TOKEN
+                .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(Self { token: now });
+            }
+        }
+
+        // 2) 非空：若鎖超過 stale 門檻，允許接手（CAS token，避免舊 guard 釋放新鎖）
+        if cur != 0 && now.saturating_sub(cur) > UPDATE_STALE_MS {
+            if UPDATE_LOCK_TOKEN
+                .compare_exchange(cur, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(Self { token: now });
+            }
+        }
+
+        Err("更新已在進行中，請稍候，不要重複點擊。".to_string())
     }
 }
 
 impl Drop for UpdateGuard {
     fn drop(&mut self) {
-        UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        // 只有 token 沒變時才回收鎖；避免舊 guard 釋放掉新 guard 的鎖。
+        let _ = UPDATE_LOCK_TOKEN.compare_exchange(
+            self.token,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -216,19 +254,36 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
     let partial = dest.with_extension("download");
     let _ = std::fs::remove_file(&partial);
     std::fs::write(&partial, &bytes).map_err(|e| format!("寫入更新暫存檔失敗：{e}"))?;
+    // 雙雜湊：落盤後再讀一次比對 SHA-256（防寫入中途損壞）
+    let on_disk = std::fs::read(&partial).map_err(|e| format!("讀取更新暫存檔失敗：{e}"))?;
+    if on_disk.len() != bytes.len() || !sha256_hex(&on_disk).eq_ignore_ascii_case(&expected_sha) {
+        let _ = std::fs::remove_file(&partial);
+        return Err("更新 EXE 落盤後完整性複驗失敗，已停止更新。".into());
+    }
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("準備更新 EXE 失敗：{e}"))?;
 
     let (launched, automatic, should_exit) = launch_portable_update(&dest)?;
+    let log_hint = std::env::temp_dir().join(format!(
+        "modpack_i18n_update_{}.log",
+        std::process::id()
+    ));
     Ok(DownloadResult {
         path: dest.display().to_string(),
         launched,
         automatic,
         should_exit,
         message: if automatic {
-            "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。".into()
+            format!(
+                "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。\n若未自動重開，請查看日誌：{}",
+                log_hint.display()
+            )
         } else {
-            format!("已驗證並開啟免安裝更新檔：{}\n若工具沒有自動替換，請關閉目前工具後手動開啟新版。", dest.display())
+            format!(
+                "已驗證並開啟免安裝更新檔：{}\n若工具沒有自動替換，請關閉目前工具後手動開啟新版。\n更新日誌：{}",
+                dest.display(),
+                log_hint.display()
+            )
         },
     })
 }
@@ -237,17 +292,49 @@ fn validate_download_url(url: &str) -> Result<String, String> {
     let value = url.trim();
     let prefix = format!("{}/download/", MANAGED_BASE_URL.trim_end_matches('/'));
     let lower = value.to_ascii_lowercase();
+    let name = value.get(prefix.len()..).unwrap_or("");
     if !value.starts_with(&prefix)
-        || !lower.ends_with("-portable.exe")
+        || !is_mcpl_update_filename(name)
+        || lower.contains("portable")
         || lower.contains("..")
         || lower.contains("%2e")
         || value.contains('\\')
         || value.contains('?')
         || value.contains('#')
+        || name.contains('/')
     {
-        return Err("更新下載連結不是官方免安裝 EXE，已停止更新。".into());
+        return Err("更新下載連結不是官方 MCPL 免安裝 EXE，已停止更新。".into());
     }
     Ok(value.to_string())
+}
+
+fn is_mcpl_update_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.starts_with("mcpl-") || !lower.ends_with(".exe") || lower.contains("portable") {
+        return false;
+    }
+    let Some(ver) = lower
+        .strip_prefix("mcpl-")
+        .and_then(|s| s.strip_suffix(".exe"))
+    else {
+        return false;
+    };
+    let mut parts = ver.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !major.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && !minor.is_empty()
+        && minor.bytes().all(|b| b.is_ascii_digit())
+        && patch.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 fn validate_sha256(value: Option<&str>) -> Result<String, String> {
@@ -269,6 +356,35 @@ fn validate_update_bytes(bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn write_utf16_le_bat(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in content.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("建立更新排程失敗：{e}"))
+}
+
+#[cfg(windows)]
+fn build_portable_update_bat_script(
+    pid: u32,
+    current: &str,
+    current_dir: &str,
+    replacement: &str,
+    backup: &str,
+    log: &str,
+) -> String {
+    format!(
+        "@echo off\r\nset \"LOG={log}\"\r\necho [%date% %time%] update worker started pid={pid}>>\"%LOG%\"\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\necho [%date% %time%] parent exited>>\"%LOG%\"\r\nif exist \"{backup}\" del /f /q \"{backup}\" >>\"%LOG%\" 2>&1\r\nset /a MOVE_TRIES=0\r\n:move_old\r\nset /a MOVE_TRIES+=1\r\nmove /Y \"{current}\" \"{backup}\" >>\"%LOG%\" 2>&1\r\nif errorlevel 1 (\r\n  if %MOVE_TRIES% lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto move_old\r\n  )\r\n  echo [%date% %time%] move old failed>>\"%LOG%\"\r\n  goto cleanup\r\n)\r\nset /a MOVE_TRIES=0\r\n:move_new\r\nset /a MOVE_TRIES+=1\r\nmove /Y \"{replacement}\" \"{current}\" >>\"%LOG%\" 2>&1\r\nif errorlevel 1 (\r\n  if %MOVE_TRIES% lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto move_new\r\n  )\r\n  echo [%date% %time%] move new failed, restoring backup>>\"%LOG%\"\r\n  move /Y \"{backup}\" \"{current}\" >>\"%LOG%\" 2>&1\r\n  goto cleanup\r\n)\r\nif not exist \"{current}\" (\r\n  echo [%date% %time%] target missing, restoring backup>>\"%LOG%\"\r\n  move /Y \"{backup}\" \"{current}\" >>\"%LOG%\" 2>&1\r\n)\r\nif exist \"{current}\" (\r\n  echo [%date% %time%] launching new exe>>\"%LOG%\"\r\n  cd /d \"{current_dir}\"\r\n  start \"\" \"{current}\"\r\n  ping -n 2 127.0.0.1 >nul\r\n  del /f /q \"{backup}\" >>\"%LOG%\" 2>&1\r\n)\r\n:cleanup\r\ndel \"%~f0\"\r\n",
+        pid = pid,
+        current = current,
+        current_dir = current_dir,
+        replacement = replacement,
+        backup = backup,
+        log = log,
+    )
+}
+
+#[cfg(windows)]
 fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -278,24 +394,31 @@ fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), 
     std::fs::copy(path, &replacement).map_err(|e| format!("準備免安裝更新檔失敗：{e}"))?;
 
     // 參考 ZeitFrei 工具箱：由脫離 Tauri Job 的隱藏 bat 等待目前 PID 結束，
-    // 再以同一路徑替換 exe 並重開。這樣不需要 NSIS，也不會直接覆蓋鎖定中的 exe。
+    // 再以同一路徑替換 exe 並重開。UTF-16 bat + move 重試 + 日誌，避免鎖檔靜默失敗。
     let pid = std::process::id();
     let current_s = current.to_string_lossy().replace('"', "");
+    let current_dir_s = current
+        .parent()
+        .map(|p| p.to_string_lossy().replace('"', ""))
+        .unwrap_or_default();
     let replacement_s = replacement.to_string_lossy().replace('"', "");
     let backup_s = backup.to_string_lossy().replace('"', "");
-    let script = format!(
-        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nif exist \"{backup}\" del /f /q \"{backup}\" >nul 2>&1\r\nmove /Y \"{current}\" \"{backup}\" >nul 2>&1\r\nmove /Y \"{replacement}\" \"{current}\" >nul 2>&1\r\nif not exist \"{current}\" move /Y \"{backup}\" \"{current}\" >nul 2>&1\r\nif exist \"{current}\" (\r\n  start \"\" \"{current}\"\r\n  ping -n 2 127.0.0.1 >nul\r\n  del /f /q \"{backup}\" >nul 2>&1\r\n)\r\ndel \"%~f0\"\r\n",
-        pid = pid,
-        current = current_s,
-        replacement = replacement_s,
-        backup = backup_s,
+    let log_path = std::env::temp_dir().join(format!("modpack_i18n_update_{pid}.log"));
+    let log_s = log_path.to_string_lossy().replace('"', "");
+    let script = build_portable_update_bat_script(
+        pid,
+        &current_s,
+        &current_dir_s,
+        &replacement_s,
+        &backup_s,
+        &log_s,
     );
     let script_path = std::env::temp_dir().join(format!("modpack_i18n_update_{pid}.bat"));
-    std::fs::write(&script_path, script).map_err(|e| format!("建立更新排程失敗：{e}"))?;
-    const FLAGS: u32 = 0x0800_0000 | 0x0000_0200 | 0x0100_0000;
+    write_utf16_le_bat(&script_path, &script)?;
+    const FLAGS: u32 = 0x0800_0000 | 0x0000_0008 | 0x0000_0200 | 0x0100_0000;
     let launched = Command::new("cmd.exe")
         .arg("/c")
-        .arg(format!("\"{}\"", script_path.display()))
+        .arg(&script_path)
         .creation_flags(FLAGS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -381,9 +504,13 @@ mod tests {
     #[test]
     fn updater_accepts_only_official_exe_downloads() {
         assert!(validate_download_url(
-            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-portable.exe"
+            "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.0.exe"
         )
         .is_ok());
+        assert!(validate_download_url(
+            "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-portable.exe"
+        )
+        .is_err());
         assert!(validate_download_url("https://example.com/fake.exe").is_err());
         assert!(validate_download_url(
             "https://modpack-i18n.jolin34563.workers.dev/download/minecraftpacklocal-1.0.1-setup.exe"
@@ -393,6 +520,22 @@ mod tests {
             "https://modpack-i18n.jolin34563.workers.dev/download/../fake.exe"
         )
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_update_bat_includes_cd_start_and_log() {
+        let script = build_portable_update_bat_script(
+            12345,
+            "C:\\Tools\\MCPL-1.0.3.exe",
+            "C:\\Tools",
+            "C:\\Tools\\MCPL-1.0.3.new",
+            "C:\\Tools\\MCPL-1.0.3.bak",
+            "C:\\Temp\\modpack_i18n_update_12345.log",
+        );
+        assert!(script.contains("cd /d \"C:\\Tools\""));
+        assert!(script.contains("start \"\" \"C:\\Tools\\MCPL-1.0.3.exe\""));
+        assert!(script.contains("modpack_i18n_update_12345.log"));
     }
 
     #[test]

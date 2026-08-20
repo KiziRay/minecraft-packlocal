@@ -15,6 +15,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::placeholder;
+use super::mech_tokens::is_poisoned_mech_translation;
+use super::translation_quality::is_usable_zh;
 
 /// 上限；超過就不再收新條目（避免無限長大拖慢啟動）。
 const MAX_ENTRIES: usize = 300_000;
@@ -77,6 +79,15 @@ impl Tm {
         let hit = self.entries.get(&key)?.clone();
         // 記憶庫是舊資料：仍要確認佔位符對得上目前這條原文
         if !placeholder::is_compatible(source, &hit) {
+            self.rejected += 1;
+            return None;
+        }
+        if !is_usable_zh(source, &hit) {
+            self.rejected += 1;
+            return None;
+        }
+        if is_poisoned_mech_translation(source, &hit) {
+            self.rejected += 1;
             return None;
         }
         self.hits += 1;
@@ -102,7 +113,11 @@ impl Tm {
         if s.len() > MAX_SOURCE_LEN {
             return;
         }
-        if !placeholder::is_compatible(s, t) {
+        if !placeholder::is_compatible(s, t) || !is_usable_zh(s, t) {
+            self.rejected += 1;
+            return;
+        }
+        if is_poisoned_mech_translation(s, t) {
             self.rejected += 1;
             return;
         }
@@ -136,6 +151,8 @@ impl Tm {
             || s == t
             || s.len() > MAX_SOURCE_LEN
             || !placeholder::is_compatible(s, t)
+            || !is_usable_zh(s, t)
+            || is_poisoned_mech_translation(s, t)
         {
             self.rejected += 1;
             return;
@@ -253,6 +270,18 @@ mod tests {
         // 舊記憶沒有佔位符，但現在這條原文有 → 不可重用，否則遊戲會格式錯誤
         tm.insert("Deals %s damage", "造成傷害");
         assert!(tm.get("Deals %s damage").is_none());
+        assert_eq!(tm.stats().rejected, 1);
+    }
+
+    #[test]
+    fn rejects_unusable_zh_on_insert_and_lookup() {
+        let mut tm = blank();
+        tm.insert("Blue Journal", "Blue Journal");
+        assert_eq!(tm.stats().added, 0);
+
+        tm.entries
+            .insert("Blue Journal".into(), "Blue Journal".into());
+        assert!(tm.get("Blue Journal").is_none());
         assert_eq!(tm.stats().rejected, 1);
     }
 

@@ -20,8 +20,32 @@ import {
   turnstileMissingNames,
   turnstileStatus,
 } from "./turnstile.mjs";
+import {
+  cleanupShares,
+  shareDownload,
+  shareMpuComplete,
+  shareMpuCreate,
+  shareMpuPart,
+  shareOgImage,
+  shareUpload,
+} from "./share.mjs";
+import { GLOSSARY_MAX_ZH_LEN, TM_MAX_ZH_LEN, tmCanUse, tmMerge, tmZhAcceptable } from "./tm.mjs";
+import {
+  cleanupReports,
+  reportDownload,
+  reportMpuComplete,
+  reportMpuCreate,
+  reportMpuPart,
+} from "./report.mjs";
+
+import { submitFeedback } from "./feedback.mjs";
+import { corsHeaders } from "./cors.mjs";
+import { isSafeOutboundUrl } from "./security.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const SHARED_USAGE_TTL = 604800;
+const PERSONAL_USAGE_TTL = 172800;
+const CONTRIBUTE_DAILY_LIMIT = 60;
 
 export default {
   async fetch(request, env) {
@@ -29,7 +53,7 @@ export default {
 
     // CORS 預檢（WebView 內其實同源，但保險起見）
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      return new Response(null, { headers: corsHeaders(request) });
     }
 
     if (url.pathname === "/api/desktop/latest" && request.method === "GET") {
@@ -38,7 +62,7 @@ export default {
 
     // 免安裝 EXE 下載：直接從 R2 串流。/download/<檔名>
     if (url.pathname.startsWith("/download/") && (request.method === "GET" || request.method === "HEAD")) {
-      return download(url, env, request.method === "HEAD");
+      return download(url, env, request.method === "HEAD", request);
     }
 
     if (url.pathname === "/turnstile" && request.method === "GET") {
@@ -53,6 +77,16 @@ export default {
       return completeTurnstile(request, env);
     }
 
+    if (url.pathname === "/api/managed/usage" && request.method === "GET") {
+      return managedUsage(request, env);
+    }
+    if (url.pathname === "/api/managed/gp-reward" && request.method === "POST") {
+      return managedGpReward(request, env);
+    }
+    if (url.pathname === "/api/feedback/submit" && request.method === "POST") {
+      return submitFeedback(request, env);
+    }
+
     if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
       return proxyChat(request, env);
     }
@@ -62,21 +96,46 @@ export default {
       return tmLookup(request, env);
     }
     if (url.pathname === "/tm/contribute" && request.method === "POST") {
-      return tmContribute(request, env);
+      return gatedContribute(request, env, tmContribute);
     }
     if (url.pathname === "/glossary/lookup" && request.method === "POST") {
       return glossaryLookup(request, env);
     }
     if (url.pathname === "/glossary/contribute" && request.method === "POST") {
-      return glossaryContribute(request, env);
+      return gatedContribute(request, env, glossaryContribute);
+    }
+
+    if (url.pathname === "/api/report/mpu-create" && request.method === "POST") {
+      return gatedShare(request, env, reportMpuCreate);
+    }
+    if (url.pathname === "/api/report/mpu-part" && request.method === "PUT") {
+      return gatedShare(request, env, (req, workerEnv, _userId) => reportMpuPart(req, workerEnv, url));
+    }
+    if (url.pathname === "/api/report/mpu-complete" && request.method === "POST") {
+      return gatedShare(request, env, reportMpuComplete);
+    }
+    if (url.pathname.startsWith("/report/") && (request.method === "GET" || request.method === "HEAD")) {
+      return reportDownload(url, env, request.method === "HEAD");
     }
 
     // 分享檔使用獨立的 SHARES R2 bucket，不會寫入安裝檔或翻譯記憶。
     if (url.pathname === "/api/share/upload" && request.method === "POST") {
-      return shareUpload(request, env);
+      return gatedShare(request, env, shareUpload);
+    }
+    if (url.pathname === "/api/share/mpu-create" && request.method === "POST") {
+      return gatedShare(request, env, shareMpuCreate);
+    }
+    if (url.pathname === "/api/share/mpu-part" && request.method === "PUT") {
+      return gatedShare(request, env, (req, workerEnv, _userId) => shareMpuPart(req, workerEnv, url));
+    }
+    if (url.pathname === "/api/share/mpu-complete" && request.method === "POST") {
+      return gatedShare(request, env, shareMpuComplete);
     }
     if (url.pathname.startsWith("/s/") && (request.method === "GET" || request.method === "HEAD")) {
       return shareDownload(url, env, request.method === "HEAD");
+    }
+    if (url.pathname === "/share-og.png" && (request.method === "GET" || request.method === "HEAD")) {
+      return shareOgImage(request.method === "HEAD");
     }
 
     // 健康檢查
@@ -89,17 +148,25 @@ export default {
         service: "modpack-i18n",
         version: env.LATEST_VERSION,
         hasKey: !!(env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim()),
+        usageBound: !!env.USAGE,
+        reportNotifyConfigured: !!(env.DISCORD_REPORT_WEBHOOK && String(env.DISCORD_REPORT_WEBHOOK).trim()),
+        feedbackNotifyConfigured: !!(env.DISCORD_FEEDBACK_WEBHOOK && String(env.DISCORD_FEEDBACK_WEBHOOK).trim()),
+        toolUpdateNotifyConfigured: !!(env.DISCORD_TOOL_UPDATE_WEBHOOK && String(env.DISCORD_TOOL_UPDATE_WEBHOOK).trim()),
+        joinNotifyConfigured: !!(env.DISCORD_JOIN_WEBHOOK && String(env.DISCORD_JOIN_WEBHOOK).trim()),
         authGate: "discord",
         turnstileReady: turnstileConfigured(env),
         turnstile: { ...turnstile, enforced: false },
         turnstileMissing: turnstileMissingNames(env),
+        translationsBound: await estimateTranslationsBound(env),
       });
     }
 
     return json({ error: "not found" }, 404);
   },
   async scheduled(_event, env) {
+    await maybeNotifyToolUpdateOncePerVersion(env);
     await cleanupShares(env);
+    await cleanupReports(env);
   },
 };
 
@@ -114,19 +181,308 @@ function latest(env) {
   });
 }
 
+function nextUtcMidnightIso() {
+  const d = new Date();
+  const next = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0));
+  return next.toISOString();
+}
+
+/** ISO 8601 週（UTC、週一為週首）→ `YYYY-Www`。 */
+export function utcIsoWeek(date = new Date()) {
+  const tmp = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
+  return `${tmp.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
+}
+
+/** 下週一 00:00:00.000Z（共享額度重置時刻）。 */
+export function nextUtcWeekStartIso(date = new Date()) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const isoDow = d.getUTCDay() === 0 ? 7 : d.getUTCDay();
+  const daysToAdd = 8 - isoDow;
+  return new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + daysToAdd, 0, 0, 0, 0)
+  ).toISOString();
+}
+
+export function sharedUsageKey(week = utcIsoWeek()) {
+  return `usage:shared:${week}`;
+}
+
+export function isSharedWeeklyQuotaExhausted(spent, budget) {
+  return budget > 0 && spent >= budget;
+}
+
+/**
+ * KV 讀改寫（非真正 CAS）：寫前再讀一次，降低並行 double-spend。
+ * @returns {{ ok: true, spent: number } | { ok: false, spent: number }}
+ */
+export async function tryIncrementUsageKv(kv, key, delta, ttl, maxTotal = 0) {
+  const readSpent = async () => parseInt((await kv.get(key)) || "0", 10);
+  let spent = await readSpent();
+  let next = spent + delta;
+  if (maxTotal > 0 && next > maxTotal) {
+    return { ok: false, spent };
+  }
+  const again = await readSpent();
+  if (again !== spent) {
+    spent = again;
+    next = spent + delta;
+    if (maxTotal > 0 && next > maxTotal) {
+      return { ok: false, spent };
+    }
+  }
+  await kv.put(key, String(next), { expirationTtl: ttl });
+  return { ok: true, spent: next };
+}
+
+function splitReleaseNotes(notes) {
+  const raw = String(notes || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(/[\n;；]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Discord webhook embed payload（版本更新公告）。 */
+export function buildToolUpdateDiscordPayload(version, releaseNotes, downloadUrl) {
+  const items = splitReleaseNotes(releaseNotes);
+  if (!items.length) return null;
+  const v = String(version || "").trim();
+  if (!v) return null;
+
+  const url = String(downloadUrl || "").trim();
+  const description = items.map((s) => `• ${s}`).join("\n").slice(0, 4000);
+
+  /** @type {Record<string, unknown>} */
+  const embed = {
+    title: `MCPL v${v} 更新`,
+    description,
+    color: 0x35c5c9,
+    footer: { text: "模組包翻譯工具 · ZeitFrei" },
+    timestamp: new Date().toISOString(),
+  };
+
+  if (url) {
+    embed.url = url;
+    embed.fields = [
+      {
+        name: "下載",
+        value: `[MCPL-${v}.exe](${url})`,
+        inline: false,
+      },
+    ];
+  }
+
+  return { embeds: [embed] };
+}
+
+async function maybeNotifyToolUpdateOncePerVersion(env) {
+  const hook = env?.DISCORD_TOOL_UPDATE_WEBHOOK && String(env.DISCORD_TOOL_UPDATE_WEBHOOK).trim();
+  if (!hook) return;
+  if (!env?.USAGE) return;
+
+  const version = String(env.LATEST_VERSION || "").trim();
+  if (!version) return;
+
+  const key = `tool_update_notify:${version}`;
+  const hit = await env.USAGE.get(key);
+  if (hit) return;
+
+  const payload = buildToolUpdateDiscordPayload(version, env.RELEASE_NOTES, env.DOWNLOAD_URL);
+  if (!payload) return;
+
+  let resp;
+  try {
+    if (!isSafeOutboundUrl(hook)) return;
+    resp = await fetch(hook, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (_) {
+    return;
+  }
+  if (!resp?.ok) return;
+  try {
+    await env.USAGE.put(key, "1", { expirationTtl: 180 * 24 * 60 * 60 });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function managedUsage(request, env) {
+  if (!env?.USAGE) return json({ ok: false, error: "usage not configured" }, 503, request);
+  const access = await authorizeManagedIdentity(request, env);
+  if (!access.ok) return access.response;
+
+  const day = utcDay();
+  const week = utcIsoWeek();
+  const sharedKey = sharedUsageKey(week);
+  const sharedSpent = parseInt((await env.USAGE.get(sharedKey)) || "0", 10);
+  const userSpent = parseInt((await env.USAGE.get(`usage:user:${day}:${access.userId}`)) || "0", 10);
+
+  const sharedBudget = parseInt(env.WEEKLY_SHARED_TOKEN_BUDGET || "0", 10);
+  const userBudget = await effectiveUserBudget(env, access.userId);
+
+  return json(
+    {
+      ok: true,
+      day,
+      sharedSpent,
+      sharedBudget,
+      sharedPeriod: "week",
+      sharedWeek: week,
+      sharedResetAtUtc: nextUtcWeekStartIso(),
+      userSpent,
+      userBudget,
+      userPeriod: "day",
+      resetAtUtc: nextUtcMidnightIso(),
+    },
+    200,
+    request
+  );
+}
+
+/** 個人今日總額度 = 基礎上限 +（已領 GP 加成）。 */
+export async function effectiveUserBudget(env, userId) {
+  const base = parseInt(env.PER_USER_DAILY_TOKEN_BUDGET || "0", 10);
+  if (!env?.USAGE || !userId) return base;
+  const bonus = parseInt(env.GP_REWARD_BONUS || "0", 10);
+  if (bonus <= 0) return base;
+  const claimed = await env.USAGE.get(`gp_reward:${userId}`);
+  return claimed ? base + bonus : base;
+}
+
+/** Discord join 公告 embed／純文字（供 webhook 與測試）。 */
+export function renderDiscordJoinContent(userId, displayName) {
+  const id = String(userId || "").trim();
+  const name = String(displayName || id || "使用者")
+    .replace(/[\n\r@<>]/g, "")
+    .trim()
+    .slice(0, 80);
+  if (!/^\d{5,25}$/.test(id)) return null;
+  return `<https://discord.com/users/${id}|${name || id}> 通過官方伺服器驗證，開始使用 MCPL 代管功能。`;
+}
+
+/** 會員驗證成功後，每 user／日最多通知一次（需 USAGE KV + secret）。 */
+export async function maybeNotifyDiscordJoinOncePerDay(userId, displayName, env) {
+  const hook = env?.DISCORD_JOIN_WEBHOOK && String(env.DISCORD_JOIN_WEBHOOK).trim();
+  if (!hook || !env?.USAGE) return;
+  if (!isSafeOutboundUrl(hook)) return;
+
+  const content = renderDiscordJoinContent(userId, displayName);
+  if (!content) return;
+
+  const day = utcDay();
+  const key = `join_notify:${day}:${userId}`;
+  if (await env.USAGE.get(key)) return;
+
+  let resp;
+  try {
+    resp = await fetch(hook, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (_) {
+    return;
+  }
+  if (!resp?.ok) return;
+  try {
+    await env.USAGE.put(key, "1", { expirationTtl: PERSONAL_USAGE_TTL });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function recordContributeAttempt(env, userId) {
+  if (!env?.USAGE || !userId) return { ok: true };
+  const day = utcDay();
+  const key = `contribute:day:${day}:${userId}`;
+  const count = parseInt((await env.USAGE.get(key)) || "0", 10);
+  if (count >= CONTRIBUTE_DAILY_LIMIT) {
+    return { ok: false, error: "contribute rate limited" };
+  }
+  await env.USAGE.put(key, String(count + 1), { expirationTtl: PERSONAL_USAGE_TTL });
+  return { ok: true };
+}
+
+/** proxyChat 個人上限判斷（spent 已達 effectiveBudget 即擋）。 */
+export function isUserDailyQuotaExhausted(spent, effectiveBudget) {
+  return effectiveBudget > 0 && spent >= effectiveBudget;
+}
+
+async function gatedContribute(request, env, handler) {
+  const access = await authorizeManagedIdentity(request, env);
+  if (!access.ok) return access.response;
+  const limited = await recordContributeAttempt(env, access.userId);
+  if (!limited.ok) {
+    return json({ error: limited.error, type: "rate_limited" }, 429, request);
+  }
+  return handler(request, env);
+}
+
+async function managedGpReward(request, env) {
+  if (!env?.USAGE) return json({ ok: false, error: "usage not configured" }, 503, request);
+  const access = await authorizeManagedIdentity(request, env);
+  if (!access.ok) return access.response;
+
+  const userId = access.userId;
+  const gpKey = `gp_reward:${userId}`;
+  const already = await env.USAGE.get(gpKey);
+  if (already) {
+    return json({ ok: false, error: "already_claimed" }, 200);
+  }
+
+  const granted = parseInt(env.GP_REWARD_BONUS || "500000", 10);
+  try {
+    await env.USAGE.put(gpKey, "1");
+  } catch (_) {
+    return json({ ok: false, error: "gp_reward write failed" }, 500);
+  }
+
+  return json({ ok: true, granted });
+}
+
 // ───────────────────────── 共享翻譯記憶（R2，依模組分片）─────────────────────────
 //
 // 儲存：TRANSLATIONS R2 的 tm/v1/<namespace>.json.gz 是精確鍵，
 // tm/v2/global.json.gz 是跨模組候選；不與更新檔 DOWNLOADS 混用。
-// 只在上下文一致時命中；不同譯文會標記 conflict，避免後來的 AI 結果靜默覆蓋先前結果。
+// 多數決命中：跨包 ≥2 票、同包或 pack.* ≥1；不再永久 conflict 凍結。
 // 只存匿名文字與語境，不存本機路徑、Discord 身分或整合包檔案。
 
 const TM_MAX_ITEMS = 5000;
-const TM_MAX_ZH_LEN = 400;
 const TM_SHARD_CAP = 200000; // 單模組分片最多條數（防惡意灌爆）
 const TM_GLOBAL_CAP = 300000;
 const GLOSSARY_MAX_ITEMS = 5000;
 const GLOSSARY_CAP = 300000;
+
+/** /health 用：粗估共享 TM 分片數（R2 list，失敗回 null） */
+async function estimateTranslationsBound(env) {
+  try {
+    if (!env.TRANSLATIONS) return null;
+    let cursor;
+    let count = 0;
+    do {
+      const listed = await env.TRANSLATIONS.list({
+        prefix: "tm/",
+        limit: 1000,
+        cursor,
+      });
+      count += (listed.objects || []).length;
+      cursor = listed.truncated ? listed.cursor : undefined;
+      if (count >= 5000) break; // 健康檢查上限，避免掃太久
+    } while (cursor);
+    return count;
+  } catch {
+    return null;
+  }
+}
 
 function tmShardKey(ns) {
   return `tm/v1/${ns}.json.gz`;
@@ -175,40 +531,6 @@ async function tmReadGlobal(env) {
   }
 }
 
-function tmRecord(value) {
-  if (typeof value === "string") return { zh: value, ctx: "", packs: {}, conflict: false };
-  if (!value || typeof value !== "object" || typeof value.zh !== "string") return null;
-  return {
-    zh: value.zh,
-    ctx: typeof value.ctx === "string" ? value.ctx : "",
-    packs: value.packs && typeof value.packs === "object" ? value.packs : {},
-    conflict: value.conflict === true,
-  };
-}
-
-function tmCanUse(value, ctx) {
-  const record = tmRecord(value);
-  if (!record || !record.zh.trim() || record.conflict) return null;
-  if (record.ctx && ctx && record.ctx !== ctx) return null;
-  return record.zh;
-}
-
-function tmMerge(target, key, next) {
-  const previous = tmRecord(target[key]);
-  if (!previous) {
-    target[key] = next;
-    return next.conflict ? "conflict" : "accepted";
-  }
-  if (previous.zh === next.zh && (!previous.ctx || !next.ctx || previous.ctx === next.ctx)) {
-    const before = Object.keys(previous.packs || {}).length;
-    previous.packs = { ...(previous.packs || {}), ...(next.packs || {}) };
-    target[key] = previous;
-    return Object.keys(previous.packs).length > before ? "accepted" : "duplicate";
-  }
-  target[key] = { ...previous, conflict: true };
-  return "conflict";
-}
-
 async function tmLookup(request, env) {
   if (!env.TRANSLATIONS) return json({ hits: {} });
   let body;
@@ -224,9 +546,10 @@ async function tmLookup(request, env) {
     if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh)) continue;
     const ctx = typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "";
     const sk = tmValidKh(it.sk) ? it.sk : "";
+    const pk = validPackKey(it.pk) ? it.pk : "";
     if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
-    byNs.get(it.ns).set(it.kh, { ctx, sk });
-    queries.set(it.kh, { ctx, sk });
+    byNs.get(it.ns).set(it.kh, { ctx, sk, pk });
+    queries.set(it.kh, { ctx, sk, pk, ns: it.ns });
   }
   const hits = {};
   const nss = [...byNs.keys()];
@@ -237,7 +560,7 @@ async function tmLookup(request, env) {
         const shard = await tmReadShard(env, ns);
         if (!shard) return;
         for (const [kh, query] of byNs.get(ns)) {
-          const zh = tmCanUse(shard[kh], query.ctx);
+          const zh = tmCanUse(shard[kh], query.ctx, query.pk, ns);
           if (zh) hits[kh] = zh;
         }
       })
@@ -248,7 +571,7 @@ async function tmLookup(request, env) {
     const global = await tmReadGlobal(env);
     for (const [kh, query] of missing) {
       if (!query.sk) continue;
-      const zh = tmCanUse(global[query.sk], query.ctx);
+      const zh = tmCanUse(global[query.sk], query.ctx, query.pk, query.ns);
       if (zh) hits[kh] = zh;
     }
   }
@@ -269,12 +592,11 @@ async function tmContribute(request, env) {
   for (const it of items) {
     if (!it || !tmValidNs(it.ns) || !tmValidKh(it.kh) || !tmValidKh(it.sk)) continue;
     const zh = typeof it.zh === "string" ? it.zh.trim() : "";
-    if (!zh || zh.length > TM_MAX_ZH_LEN) continue;
+    if (!tmZhAcceptable(zh, TM_MAX_ZH_LEN)) continue;
     const record = {
       zh,
       ctx: typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "",
       packs: validPackKey(it.pk) ? { [it.pk]: typeof it.pn === "string" ? it.pn.slice(0, 120) : "" } : {},
-      conflict: false,
     };
     if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
     byNs.get(it.ns).set(it.kh, record);
@@ -291,7 +613,7 @@ async function tmContribute(request, env) {
       if (result === "accepted") {
         changed = true;
         accepted++;
-      } else if (result === "conflict") {
+      } else if (result === "variant") {
         changed = true;
         conflicts++;
       }
@@ -313,7 +635,7 @@ async function tmContribute(request, env) {
       if (result === "accepted") {
         accepted++;
         changed = true;
-      } else if (result === "conflict") {
+      } else if (result === "variant") {
         conflicts++;
         changed = true;
       }
@@ -329,8 +651,7 @@ async function tmContribute(request, env) {
 }
 
 // ───────────────────────── 共享術語表 ─────────────────────────
-// 只回傳「沒有衝突且已被至少一個來源確認」的譯名；同一術語不同譯文會停用，
-// 不讓後來的單一使用者靜默覆蓋既有結果。
+// 與 TM 共用多數決：跨包 ≥2 票、同包 1 票；不再永久 conflict 凍結。
 function glossaryKey() {
   return "glossary/v1/global.json.gz";
 }
@@ -353,16 +674,6 @@ function validPackKey(value) {
   return typeof value === "string" && /^[0-9a-f]{16,64}$/.test(value);
 }
 
-function glossaryRecord(value) {
-  if (!value || typeof value !== "object" || typeof value.zh !== "string") return null;
-  return {
-    zh: value.zh,
-    ctx: typeof value.ctx === "string" ? value.ctx : "",
-    packs: value.packs && typeof value.packs === "object" ? value.packs : {},
-    conflict: value.conflict === true,
-  };
-}
-
 async function glossaryLookup(request, env) {
   if (!env.TRANSLATIONS) return json({ hits: {} });
   let body;
@@ -377,11 +688,8 @@ async function glossaryLookup(request, env) {
   const glossary = await readGlossary(env);
   const hits = {};
   for (const [gh, query] of queries) {
-    const record = glossaryRecord(glossary[gh]);
-    if (!record || record.conflict || (record.ctx && query.ctx && record.ctx !== query.ctx)) continue;
-    const packCount = Object.keys(record.packs).length;
-    // 只有至少兩個不同整合包確認，才自動採用共享術語；單一來源不夠可靠。
-    if (packCount >= 2) hits[gh] = record.zh;
+    const zh = tmCanUse(glossary[gh], query.ctx, query.pk, "");
+    if (zh) hits[gh] = zh;
   }
   return json({ hits });
 }
@@ -394,29 +702,26 @@ async function glossaryContribute(request, env) {
   const glossary = await readGlossary(env);
   let accepted = 0;
   let conflicts = 0;
+  let changed = false;
   for (const item of items) {
     if (!item || !validGlossaryHash(item.gh) || !validPackKey(item.pk)) continue;
     const zh = typeof item.zh === "string" ? item.zh.trim() : "";
     const pn = typeof item.pn === "string" ? item.pn.trim().slice(0, 120) : "";
-    if (!zh || zh.length > TM_MAX_ZH_LEN || !pn) continue;
-    const previous = glossaryRecord(glossary[item.gh]);
-    if (!previous) {
-      glossary[item.gh] = { zh, ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "", packs: { [item.pk]: pn }, conflict: false };
+    if (!tmZhAcceptable(zh, GLOSSARY_MAX_ZH_LEN) || !pn) continue;
+    const result = tmMerge(glossary, item.gh, {
+      zh,
+      ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "",
+      packs: { [item.pk]: pn },
+    });
+    if (result === "accepted") {
       accepted++;
-      continue;
-    }
-    if (previous.zh !== zh || (previous.ctx && item.ctx && previous.ctx !== item.ctx)) {
-      previous.conflict = true;
+      changed = true;
+    } else if (result === "variant") {
       conflicts++;
-      continue;
-    }
-    if (!previous.packs[item.pk]) {
-      if (Object.keys(previous.packs).length >= GLOSSARY_CAP) continue;
-      previous.packs[item.pk] = pn;
-      accepted++;
+      changed = true;
     }
   }
-  if (accepted || conflicts) {
+  if (changed) {
     const gz = await gzipBytes(JSON.stringify(glossary));
     await env.TRANSLATIONS.put(glossaryKey(), gz, { httpMetadata: { contentType: "application/gzip" } });
   }
@@ -425,7 +730,7 @@ async function glossaryContribute(request, env) {
 
 // ───────────────────────── 免安裝 EXE 下載（R2）─────────────────────────
 
-async function download(url, env, headOnly) {
+async function download(url, env, headOnly, request) {
   if (!env.DOWNLOADS) {
     return json({ error: "downloads not configured" }, 503);
   }
@@ -447,140 +752,69 @@ async function download(url, env, headOnly) {
   if (!headers.has("content-type")) {
     headers.set("content-type", "application/octet-stream");
   }
-  headers.set("access-control-allow-origin", "*");
+  Object.assign(headers, corsHeaders(request));
   return new Response(headOnly ? null : obj.body, { headers });
 }
 
 // ───────────────────────── 一日分享檔（獨立 R2）─────────────────────────
 
-const SHARE_PREFIX = "v1/";
-const SHARE_TTL_SECONDS = 24 * 60 * 60;
-
-async function shareUpload(request, env) {
+async function gatedShare(request, env, fn) {
   if (!env.SHARES) return json({ error: "share storage not configured" }, 503);
   const access = await authorizeManagedAi(request, env);
   if (!access.ok) return access.response;
-  const type = String(request.headers.get("content-type") || "").split(";")[0].toLowerCase();
-  const maxBytes = Math.min(parseInt(env.SHARE_MAX_BYTES || "104857600", 10) || 104857600, 104857600);
-  const declared = parseInt(request.headers.get("content-length") || "0", 10);
-  if (type !== "application/zip") return json({ error: "zip content type required" }, 415);
-  if (!Number.isFinite(declared) || declared <= 0) return json({ error: "content length required" }, 411);
-  if (declared > maxBytes) return json({ error: "share file too large" }, 413);
-
-  const token = randomShareToken();
-  const expiresAt = Math.floor(Date.now() / 1000) + SHARE_TTL_SECONDS;
-  const key = SHARE_PREFIX + token + ".zip";
-  const rawName = String(request.headers.get("x-zeitfrei-pack-name") || "");
-  let packName = "Minecraft 模組翻譯資源包";
-  try {
-    const decoded = decodeURIComponent(rawName);
-    const cleaned = decoded.replace(/[\\/\u0000-\u001f\u007f]/g, "").trim().slice(0, 120);
-    if (cleaned) packName = cleaned;
-  } catch (_) {}
-  const object = await env.SHARES.put(key, request.body, {
-    httpMetadata: { contentType: "application/zip", cacheControl: "no-store" },
-    customMetadata: {
-      expiresAt: String(expiresAt),
-      uploader: access.userId,
-      service: "packlocal-share",
-      name: packName,
-    },
-  });
-  if (!object) return json({ error: "share upload failed" }, 500);
-  const base = String(env.SHARE_PUBLIC_URL || new URL(request.url).origin).replace(/\/+$/, "");
-  return json({ url: `${base}/s/${token}`, expiresAt });
-}
-
-async function shareDownload(url, env, headOnly) {
-  if (!env.SHARES) return json({ error: "share storage not configured" }, 503);
-  const token = decodeURIComponent(url.pathname.slice("/s/".length).replace(/\/download$/, ""));
-  if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return json({ error: "bad share token" }, 400);
-  const object = await env.SHARES.get(SHARE_PREFIX + token + ".zip");
-  if (!object) return json({ error: "share not found or expired" }, 404);
-  const expiresAt = Number(object.customMetadata?.expiresAt || 0);
-  if (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000)) {
-    await env.SHARES.delete(SHARE_PREFIX + token + ".zip");
-    return json({ error: "share expired" }, 404);
-  }
-  const downloadRequested = headOnly || url.pathname.endsWith("/download") || url.searchParams.get("download") === "1";
-  if (!downloadRequested) {
-    return renderShareLanding(url, env, token, object, expiresAt);
-  }
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set("content-type", "application/zip");
-  headers.set("content-length", String(object.size));
-  headers.set("cache-control", "no-store, max-age=0");
-  headers.set("content-disposition", `attachment; filename*=UTF-8''packlocal-${token}.zip`);
-  return new Response(headOnly ? null : object.body, { headers });
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderShareLanding(url, env, token, object, expiresAt) {
-  const name = String(object.customMetadata?.name || "Minecraft 模組翻譯資源包");
-  const title = name + "｜模組包翻譯分享";
-  const base = String(env.SHARE_PUBLIC_URL || url.origin).replace(/\/+$/, "");
-  const canonical = base + "/s/" + token;
-  const downloadUrl = canonical + "?download=1";
-  const expires = new Date(expiresAt * 1000).toLocaleString("zh-TW", { dateStyle: "medium", timeStyle: "short" });
-  const html = [
-    "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">",
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-    "<meta name=\"robots\" content=\"noindex,nofollow\">",
-    "<meta property=\"og:type\" content=\"website\">",
-    "<meta property=\"og:title\" content=\"" + escapeHtml(title) + "\">",
-    "<meta property=\"og:description\" content=\"24 小時有效的 Minecraft 繁體中文翻譯資源包分享。\">",
-    "<meta property=\"og:url\" content=\"" + escapeHtml(canonical) + "\">",
-    "<meta name=\"twitter:card\" content=\"summary\">",
-    "<title>" + escapeHtml(title) + "</title>",
-    "<style>body{margin:0;background:#101214;color:#e8e5df;font:16px/1.6 system-ui,sans-serif}main{max-width:680px;margin:8vh auto;padding:28px}article{border:1px solid #3d4147;border-radius:14px;background:#191c20;padding:28px;box-shadow:0 20px 70px #0006}p{color:#b8b8b2}.tag{color:#e29a62;font-size:12px;letter-spacing:.14em;text-transform:uppercase}a.button{display:inline-block;background:#dd8951;color:#17110d;text-decoration:none;font-weight:700;padding:11px 18px;border-radius:8px;margin:12px 0}footer{margin-top:28px;font-size:13px;color:#8e918d}footer a{color:#d8a47d;margin-right:14px}</style>",
-    "</head><body><main><article><div class=\"tag\">ZEITFREI · PACKLOCAL SHARE</div>",
-    "<h1>" + escapeHtml(name) + "</h1>",
-    "<p>這是可直接覆蓋到 Minecraft 實例的翻譯資源包。連結只保留 24 小時，下載後請解壓到對應的遊戲資料夾。</p>",
-    "<p>有效期限：<strong>" + escapeHtml(expires) + "</strong></p>",
-    "<a class=\"button\" href=\"" + escapeHtml(downloadUrl) + "\">下載翻譯檔</a>",
-    "<footer>需要更多遊戲與工具？<a href=\"https://cloud.zeitfrei.uk/\">cloud.zeitfrei.uk 遊戲下載</a><a href=\"https://cloud.zeitfrei.uk/zeitfreitool\">ZeitFrei 工具箱</a></footer>",
-    "</article></main></body></html>",
-  ].join("");
-  return new Response(html, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store, max-age=0",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors *; base-uri 'none'",
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-    },
-  });
-}
-
-function randomShareToken() {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-}
-
-async function cleanupShares(env) {
-  if (!env.SHARES) return;
-  const listing = await env.SHARES.list({ prefix: SHARE_PREFIX, limit: 1000 });
-  const now = Math.floor(Date.now() / 1000);
-  const expired = await Promise.all(
-    listing.objects.map(async (object) => {
-      const head = await env.SHARES.head(object.key);
-      return head && Number(head.customMetadata?.expiresAt || 0) <= now ? object.key : null;
-    })
-  );
-  await Promise.all(expired.filter(Boolean).map((key) => env.SHARES.delete(key)));
+  return fn(request, env, access.userId);
 }
 
 // ───────────────────────── AI 代理 ─────────────────────────
+
+/** 只允許 json_object；其他 shape 一律忽略。 */
+export function normalizeResponseFormat(value) {
+  if (value === "json_object") {
+    return { type: "json_object" };
+  }
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 1 &&
+    value.type === "json_object"
+  ) {
+    return { type: "json_object" };
+  }
+  return undefined;
+}
+
+/** 只接受有限 number，夾在 1..8192。 */
+export function clampCompletionTokens(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.min(8192, Math.max(1, Math.floor(value)));
+}
+
+/** DeepSeek 思考模式：enabled／disabled；非法則 undefined。 */
+export function normalizeThinking(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const type = value.type;
+  if (type === "enabled" || type === "disabled") return { type };
+  return undefined;
+}
+
+/** 組裝轉發上游的聊天補全 body（白名單欄位）。 */
+export function buildChatForwardBody(body, env) {
+  const forward = {
+    model: env.UPSTREAM_MODEL || "deepseek-v4-flash",
+    messages: body.messages,
+    temperature: typeof body.temperature === "number" ? body.temperature : 0.1,
+  };
+  const responseFormat = normalizeResponseFormat(body.response_format);
+  if (responseFormat) forward.response_format = responseFormat;
+  const maxTokens = clampCompletionTokens(body.max_tokens);
+  if (maxTokens !== undefined) forward.max_tokens = maxTokens;
+  const maxCompletionTokens = clampCompletionTokens(body.max_completion_tokens);
+  if (maxCompletionTokens !== undefined) forward.max_completion_tokens = maxCompletionTokens;
+  // 強制關閉思考模式；忽略客戶端 thinking（防貴模型／長推理）。
+  forward.thinking = { type: "disabled" };
+  return forward;
+}
 
 async function proxyChat(request, env) {
   const access = await authorizeManagedAi(request, env);
@@ -596,31 +830,40 @@ async function proxyChat(request, env) {
     );
   }
 
-  // 每日總量保護：超過就回 429，客戶端顯示贊助提示。
-  const budget = parseInt(env.DAILY_TOKEN_BUDGET || "0", 10);
+  // 共享週總量 + 個人日上限：超過就回 429。
+  const sharedBudget = parseInt(env.WEEKLY_SHARED_TOKEN_BUDGET || "0", 10);
   const userBudget = parseInt(env.PER_USER_DAILY_TOKEN_BUDGET || "0", 10);
-  if (budget > 0 && env.USAGE) {
-    const dayKey = "usage:" + utcDay();
-    const spent = parseInt((await env.USAGE.get(dayKey)) || "0", 10);
-    if (spent >= budget) {
+  const week = utcIsoWeek();
+  const sharedKey = sharedUsageKey(week);
+  if (sharedBudget > 0 && env.USAGE) {
+    const sharedSpent = parseInt((await env.USAGE.get(sharedKey)) || "0", 10);
+    if (isSharedWeeklyQuotaExhausted(sharedSpent, sharedBudget)) {
       return json(
         {
           error: {
-            message: "daily free translation budget reached",
+            message: "managed shared weekly quota exhausted",
             type: "insufficient_quota",
           },
         },
-        429
+        429,
+        request
       );
     }
   }
   if (userBudget > 0 && env.USAGE) {
     const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
     const spent = parseInt((await env.USAGE.get(userDayKey)) || "0", 10);
-    if (spent >= userBudget) {
+    const effectiveBudget = await effectiveUserBudget(env, access.userId);
+    if (isUserDailyQuotaExhausted(spent, effectiveBudget)) {
       return json(
-        { error: { message: "personal daily translation budget reached", type: "insufficient_quota" } },
-        429
+        {
+          error: {
+            message: "managed personal daily quota exhausted; use custom API or disable AI",
+            type: "insufficient_quota",
+          },
+        },
+        429,
+        request
       );
     }
   }
@@ -645,11 +888,7 @@ async function proxyChat(request, env) {
   }
 
   // 只允許聊天補全所需欄位轉發，並鎖定模型（避免被拿去打別的昂貴模型）。
-  const forward = {
-    model: env.UPSTREAM_MODEL || body.model || "deepseek-chat",
-    messages: body.messages,
-    temperature: typeof body.temperature === "number" ? body.temperature : 0.1,
-  };
+  const forward = buildChatForwardBody(body, env);
 
   const upstream = (env.UPSTREAM_BASE || "https://api.deepseek.com").replace(/\/+$/, "");
   let resp;
@@ -669,19 +908,15 @@ async function proxyChat(request, env) {
   const text = await resp.text();
 
   // 記帳（成功才計；用量以 usage.total_tokens 為準，取不到就估）。
-  if (resp.ok && env.USAGE && (budget > 0 || userBudget > 0)) {
+  if (resp.ok && env.USAGE && (sharedBudget > 0 || userBudget > 0)) {
     try {
       const used = estimateTokens(text, forward);
-      if (budget > 0) {
-        const dayKey = "usage:" + utcDay();
-        const spent = parseInt((await env.USAGE.get(dayKey)) || "0", 10);
-        // 隔日自動歸零：TTL 略長於一天。
-        await env.USAGE.put(dayKey, String(spent + used), { expirationTtl: 172800 });
+      if (sharedBudget > 0) {
+        await tryIncrementUsageKv(env.USAGE, sharedKey, used, SHARED_USAGE_TTL, sharedBudget);
       }
       if (userBudget > 0) {
         const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
-        const userSpent = parseInt((await env.USAGE.get(userDayKey)) || "0", 10);
-        await env.USAGE.put(userDayKey, String(userSpent + used), { expirationTtl: 172800 });
+        await tryIncrementUsageKv(env.USAGE, userDayKey, used, PERSONAL_USAGE_TTL);
       }
     } catch (_) {
       /* 記帳失敗不影響翻譯 */
@@ -691,7 +926,7 @@ async function proxyChat(request, env) {
   // 原樣回傳上游狀態與內容，客戶端既有的 402/429 判斷即可運作。
   return new Response(text, {
     status: resp.status,
-    headers: { ...JSON_HEADERS, ...corsHeaders() },
+    headers: { ...JSON_HEADERS, ...corsHeaders(request) },
   });
 }
 
@@ -750,26 +985,127 @@ async function authorizeManagedIdentity(request, env) {
     };
   }
 
-  try {
-    const response = await fetch(`${authBase}/api/member-tier/${encodeURIComponent(userId)}`, {
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!response.ok) throw new Error("membership check failed");
-    const membership = await response.json();
-    if (!membership || membership.inGuild !== true) {
+  const displayName = String(
+    (account && (account.nickname || account.username || account.display_name || account.name)) || ""
+  )
+    .trim()
+    .slice(0, 80);
+
+  const guild = await verifyGuildMembership(userId, authBase, env);
+  if (!guild.ok) {
+    if (guild.type === "guild_required") {
       return {
         ok: false,
-        response: json({ error: { message: "official discord membership required", type: "guild_required" } }, 403),
+        response: json(
+          { error: { message: "official discord membership required", type: "guild_required" } },
+          403,
+          request
+        ),
       };
     }
-  } catch (_) {
     return {
       ok: false,
-      response: json({ error: { message: "membership verification unavailable", type: "auth_unavailable" } }, 503),
+      response: json(
+        { error: { message: "membership verification unavailable", type: "auth_unavailable" } },
+        503,
+        request
+      ),
     };
   }
 
-  return { ok: true, userId };
+  await maybeNotifyDiscordJoinOncePerDay(userId, displayName, env);
+
+  return { ok: true, userId, displayName };
+}
+
+/** 正向會員快取 TTL（秒）。略過重複 member-tier，減輕高並行閃斷。 */
+export const GUILD_OK_TTL_SECONDS = 900;
+
+export function guildOkKvKey(userId) {
+  return `guild_ok:${userId}`;
+}
+
+export function guildOkCacheRequest(userId, authBase) {
+  const base = String(authBase || "https://cloud.zeitfrei.uk").replace(/\/+$/, "");
+  return new Request(`${base}/__guild_ok_cache/${encodeURIComponent(userId)}`);
+}
+
+/** 讀正向會員快取：優先 USAGE KV，否則 caches.default。 */
+export async function readGuildOkCached(userId, env, authBase) {
+  if (env && env.USAGE) {
+    try {
+      const hit = await env.USAGE.get(guildOkKvKey(userId));
+      return hit === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const cached = await caches.default.match(guildOkCacheRequest(userId, authBase));
+      return !!(cached && cached.ok);
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return false;
+}
+
+/** 寫入正向會員快取（僅 inGuild===true 時呼叫）。 */
+export async function writeGuildOkCached(userId, env, authBase) {
+  if (env && env.USAGE) {
+    try {
+      await env.USAGE.put(guildOkKvKey(userId), "1", { expirationTtl: GUILD_OK_TTL_SECONDS });
+    } catch (_) {
+      /* ignore */
+    }
+    return;
+  }
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const resp = new Response("1", {
+        status: 200,
+        headers: { "cache-control": `public, max-age=${GUILD_OK_TTL_SECONDS}` },
+      });
+      await caches.default.put(guildOkCacheRequest(userId, authBase), resp);
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+/**
+ * 查 Discord 會員。快取命中略過 fetch；明確非會員軟重試 1 次；
+ * HTTP／JSON 失敗 → auth_unavailable（勿誤標 guild_required）。
+ * @returns {{ ok: true } | { ok: false, type: "guild_required"|"auth_unavailable" }}
+ */
+export async function verifyGuildMembership(userId, authBase, env, fetchImpl = fetch) {
+  if (await readGuildOkCached(userId, env, authBase)) {
+    return { ok: true };
+  }
+
+  async function fetchMembershipOnce() {
+    const response = await fetchImpl(
+      `${String(authBase).replace(/\/+$/, "")}/api/member-tier/${encodeURIComponent(userId)}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!response.ok) throw new Error("membership check failed");
+    return await response.json();
+  }
+
+  try {
+    let membership = await fetchMembershipOnce();
+    if (!membership || membership.inGuild !== true) {
+      membership = await fetchMembershipOnce();
+    }
+    if (!membership || membership.inGuild !== true) {
+      return { ok: false, type: "guild_required" };
+    }
+    await writeGuildOkCached(userId, env, authBase);
+    return { ok: true };
+  } catch (_) {
+    return { ok: false, type: "auth_unavailable" };
+  }
 }
 
 function validTranslationMessages(messages) {
@@ -805,18 +1141,10 @@ function utcDay() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
 }
 
-function corsHeaders() {
-  return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization, x-zeitfrei-ai-protocol, x-zeitfrei-client-version, x-zeitfrei-session, x-zeitfrei-turnstile",
-  };
-}
-
-function json(obj, status = 200) {
+function json(obj, status = 200, request) {
   return new Response(JSON.stringify(obj), {
     status,
     // no-store：版本檢查等 API 一定要拿到最新值，不能被邊緣或客戶端快取住舊版本資訊。
-    headers: { ...JSON_HEADERS, "cache-control": "no-store", ...corsHeaders() },
+    headers: { ...JSON_HEADERS, "cache-control": "no-store", ...corsHeaders(request) },
   });
 }

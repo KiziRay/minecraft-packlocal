@@ -20,7 +20,8 @@ use walkdir::WalkDir;
 
 use super::cancel;
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_with_scope;
+use super::deepseek::translate_plain_strings_mapped;
+use super::mech_tokens::is_resource_path_token;
 use super::translation_scope::TranslationScope;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -62,6 +63,7 @@ where
     let mut payloads: Vec<(PathBuf, Value)> = Vec::new();
     let mut unique: Vec<String> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut ns_by_src: HashMap<String, String> = HashMap::new();
     let mut parse_failures: Vec<String> = Vec::new();
 
     for path in &files {
@@ -78,6 +80,7 @@ where
         };
         collect_translatable(&v, &mut |s| {
             if should_translate(s) && seen.insert(s.to_string(), ()).is_none() {
+                super::shared_identity::remember_ns(&mut ns_by_src, s, path, scope);
                 unique.push(s.to_string());
             }
         });
@@ -138,7 +141,7 @@ where
             for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
                 cancel::check()?;
                 let start = batch_index * AI_BATCH_SIZE;
-                let translated = translate_plain_strings_with_scope(batch, scope, |pct, msg| {
+                let translated = translate_plain_strings_mapped(batch, scope, &ns_by_src, |pct, msg| {
                     let done = start + batch.len() * pct as usize / 100;
                     on_progress(30 + ((done * 50) / need_ai.len().max(1)) as u8, msg);
                 })?;
@@ -166,6 +169,8 @@ where
             ..Default::default()
         });
     }
+
+    let _ = super::shared_tm::contribute_plain_pairs(&map, &ns_by_src, "overlay", scope);
 
     // 3) 路徑感知寫回（同一套排除判斷，絕不動到 condition/action 的 name）
     on_progress(88, "Origins 能力：寫出檔案…");
@@ -357,6 +362,9 @@ fn should_translate(s: &str) -> bool {
     if t.len() < 2 {
         return false;
     }
+    if is_resource_path_token(t) {
+        return false;
+    }
     // 純資源 id / 本地化鍵：minecraft:xxx、origins.power.foo.name
     if t.contains(':')
         && !t.contains(' ')
@@ -491,6 +499,8 @@ mod tests {
         assert!(should_translate("Water Breathing"));
         assert!(!should_translate("minecraft:water"));
         assert!(!should_translate("origins.power.foo.name"));
+        assert!(!should_translate("root.txt"));
+        assert!(!should_translate("book/animal_dictionary/root"));
         assert!(!should_translate("a"));
     }
 

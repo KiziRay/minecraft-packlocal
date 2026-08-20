@@ -105,57 +105,8 @@ pub fn run_search_pipeline(
     Ok(graph)
 }
 
-/// 寫入工作圖與玩家向盤點報告。
-pub fn write_search_artifacts(work_root: &Path, graph: &WorkGraph) -> Result<(), String> {
-    fs::create_dir_all(work_root).map_err(|e| format!("無法建立結果目錄：{e}"))?;
-    let graph_path = work_root.join("上下文工作圖.json");
-    let json = serde_json::to_string_pretty(graph).map_err(|e| e.to_string())?;
-    fs::write(&graph_path, json).map_err(|e| format!("寫入工作圖失敗：{e}"))?;
-
-    let mut report = String::from("【文案搜尋盤點】\n\n");
-    report.push_str(&graph.player_summary);
-    report.push_str("\n\n── 來源桶 ──\n");
-    for b in &graph.buckets {
-        let state = match b.state {
-            BucketState::Covered => "已有翻譯",
-            BucketState::Overwritable => "可翻譯",
-            BucketState::ClueOnly => "僅線索",
-            BucketState::Impossible => "無法處理",
-        };
-        report.push_str(&format!(
-            "· {}：{}（約 {} 檔／估 {} 條）{}\n",
-            b.label,
-            state,
-            b.files_found,
-            b.string_estimate,
-            if b.note.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", b.note)
-            }
-        ));
-    }
-    if graph.split_polysemy_count > 0 {
-        report.push_str(&format!(
-            "\n相同用語但意思不同，已分開處理：{} 組。\n",
-            graph.split_polysemy_count
-        ));
-    }
-    if graph.aligned_count > 0 {
-        report.push_str(&format!(
-            "多處出現的同一用語已統一：{} 組。\n",
-            graph.aligned_count
-        ));
-    }
-    if graph.conflict_count > 0 {
-        report.push_str(&format!(
-            "需人工注意的用語衝突：{} 處。\n",
-            graph.conflict_count
-        ));
-    }
-    report.push_str("\n圖片上的字與寫死在程式裡的英文不在範圍內。\n");
-    fs::write(work_root.join("搜尋盤點說明.txt"), report)
-        .map_err(|e| format!("寫入搜尋報告失敗：{e}"))?;
+/// 搜尋管線記憶體結果保留；1.0.2+ 不再寫入工作根除錯盤點檔。
+pub fn write_search_artifacts(_work_root: &Path, _graph: &WorkGraph) -> Result<(), String> {
     Ok(())
 }
 
@@ -215,6 +166,26 @@ fn inventory_buckets(
         false,
         "",
     ));
+    out.push(count_glob_bucket(
+        "jar_patchouli",
+        "模組內 Patchouli 書",
+        &mc.join("mods"),
+        &["data/", "/patchouli_books/"],
+        &[".json", ".txt"],
+        BucketState::Overwritable,
+        false,
+        "寫入 jar-translated 副本，不改原 jar",
+    ));
+    out.push(count_glob_bucket(
+        "jar_citadel_books",
+        "模組內 Citadel 書",
+        &mc.join("mods"),
+        &["assets/", "/book/"],
+        &[".json", ".txt"],
+        BucketState::Overwritable,
+        false,
+        "寫入 jar-translated 副本，不改原 jar",
+    ));
     out.push(count_path_bucket(
         "openloader_zip",
         "OpenLoader 資源包",
@@ -237,19 +208,34 @@ fn inventory_buckets(
         "fancymenu",
         "FancyMenu 選單",
         &mc.join("config").join("fancymenu"),
-        &[".txt", ".json"],
+        &[".txt", ".json", ".local", ".properties"],
         BucketState::Overwritable,
         false,
-        "",
+        "含無引號 description／.local",
+    ));
+    out.push(count_path_bucket(
+        "minemenu",
+        "快捷選單 MineMenu",
+        &mc.join("minemenu"),
+        &["menu.json", ".json"],
+        BucketState::Overwritable,
+        false,
+        "翻譯 title 並以 unicode 寫回",
     ));
     out.push(count_path_bucket(
         "armorsets_loot",
         "套裝／起始／掉落訊息",
         &mc.join("config"),
-        &["armorsets", "starterkit", "EntityLootDrops"],
+        &[
+            "armorsets",
+            "starterkit",
+            "EntityLootDrops",
+            "firstjoin",
+            "deathbackup",
+        ],
         BucketState::Overwritable,
         false,
-        "路徑關鍵字命中",
+        "路徑關鍵字命中；檔數>0 不代表字串已抽完",
     ));
     out.push(count_path_bucket(
         "datapacks",
@@ -455,16 +441,34 @@ fn integrate_work_graph(
     }
     units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
 
-    let player_summary = format!(
-        "已搜尋並整理全文案。來源桶 {} 個；翻譯單元 {} 個。{}",
-        buckets.len(),
-        units.len(),
-        if include_advanced {
-            "（已含進階來源）"
-        } else {
-            "（安全模式：未含進階解包來源）"
-        }
-    );
+    let overwritable: Vec<&BucketInventory> = buckets
+        .iter()
+        .filter(|b| b.state == BucketState::Overwritable && b.files_found > 0)
+        .collect();
+    let listed_files: usize = overwritable.iter().map(|b| b.files_found).sum();
+    let player_summary = if units.is_empty() && listed_files > 0 {
+        format!(
+            "已列舉來源桶 {} 個（可覆寫檔約 {}）；翻譯單元 0——此次僅完成盤點／抽樣，尚未抽出可譯單元，不代表翻譯已完成。{}",
+            buckets.len(),
+            listed_files,
+            if include_advanced {
+                "（已含進階來源）"
+            } else {
+                "（安全模式：未含進階解包來源）"
+            }
+        )
+    } else {
+        format!(
+            "已搜尋並整理全文案。來源桶 {} 個；翻譯單元 {} 個。{}",
+            buckets.len(),
+            units.len(),
+            if include_advanced {
+                "（已含進階來源）"
+            } else {
+                "（安全模式：未含進階解包來源）"
+            }
+        )
+    };
 
     WorkGraph {
         include_advanced,
@@ -673,5 +677,26 @@ mod tests {
         assert!(g.player_summary.contains("進階"));
         let g2 = integrate_work_graph(vec![], vec![], false);
         assert!(g2.player_summary.contains("安全模式"));
+    }
+
+    #[test]
+    fn inventory_includes_jar_book_buckets() {
+        let root = std::env::temp_dir().join(format!("inv_books_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("mods")).unwrap();
+        fs::write(root.join("mods/demo.jar"), b"pk").unwrap();
+        let buckets = inventory_buckets(&root, false, &mut |_, _| {}).unwrap();
+        let patchouli = buckets
+            .iter()
+            .find(|b| b.id == "jar_patchouli")
+            .expect("jar_patchouli bucket");
+        let citadel = buckets
+            .iter()
+            .find(|b| b.id == "jar_citadel_books")
+            .expect("jar_citadel_books bucket");
+        assert!(patchouli.note.contains("jar-translated"));
+        assert!(citadel.note.contains("不改原 jar"));
+        assert_eq!(patchouli.files_found, 1);
+        let _ = fs::remove_dir_all(root);
     }
 }

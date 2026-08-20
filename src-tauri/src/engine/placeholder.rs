@@ -255,8 +255,9 @@ const RE_MASK_TOKENS: &str = concat!(
     r"|\\?@[A-Z][A-Z0-9_]*@",                         // 舊版指南標記 @L@、\@PAGE@
     r"|\\n|\\&",                                      // 字面 \n、\&
     r"|[&§][0-9A-FK-ORa-fk-or]",                      // Minecraft 色碼／格式碼
-    r"|%\d+\$[sdifcbxo%]",                            // 位置格式：%1$s %2$d
-    r"|%[sdifcbxo%]",                                 // 簡單格式：%s %d %f
+    // 與 guard／extract 的 Java String.format 對齊（含 %.2f、%1$s、旗標）
+    r"|%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[bBhHsScCdoxXeEfgGaAtTn%]",
+    r"|%[A-Za-z_][A-Za-z0-9_]*%",                     // 具名 %player%
     r"|\{[^{}]+\}",                                   // 既有大括號佔位符 {key} {0}
     r"|<(?:item|tag|fluid|block):[^<>\s]{1,160}>",     // Minecraft item/tag reference
     r"|#[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+",              // Minecraft tag reference

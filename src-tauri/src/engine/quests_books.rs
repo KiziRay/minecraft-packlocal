@@ -24,7 +24,8 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_with_scope;
+use super::deepseek::translate_plain_strings_mapped;
+use super::mech_tokens::is_resource_path_token;
 use super::translation_scope::TranslationScope;
 
 /// 任務資料庫（DefaultQuests.json）可能很大，放寬到 24MB。
@@ -80,6 +81,7 @@ where
     let mut payloads: Vec<(PathBuf, Value)> = Vec::new();
     let mut unique: Vec<String> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut ns_by_src: HashMap<String, String> = HashMap::new();
     let mut parse_failures: Vec<String> = Vec::new();
 
     for path in &files {
@@ -96,6 +98,7 @@ where
         };
         collect_translatable(&v, &mut |s| {
             if should_translate(s) && seen.insert(s.to_string(), ()).is_none() {
+                super::shared_identity::remember_ns(&mut ns_by_src, s, path, scope);
                 unique.push(s.to_string());
             }
         });
@@ -156,7 +159,7 @@ where
             for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
                 super::cancel::check()?;
                 let start = batch_index * AI_BATCH_SIZE;
-                let translated = translate_plain_strings_with_scope(batch, scope, |pct, msg| {
+                let translated = translate_plain_strings_mapped(batch, scope, &ns_by_src, |pct, msg| {
                     let done = start + batch.len() * pct as usize / 100;
                     on_progress(30 + ((done * 50) / need_ai.len().max(1)) as u8, msg);
                 })?;
@@ -188,6 +191,8 @@ where
             ..Default::default()
         });
     }
+
+    let _ = super::shared_tm::contribute_plain_pairs(&map, &ns_by_src, "overlay", scope);
 
     // 3) 寫回（與擷取共用同一套 walk，結構層字串絕不會被動到）
     on_progress(88, "任務／書本：寫出檔案…");
@@ -421,6 +426,9 @@ fn should_translate(s: &str) -> bool {
     if t.len() < 2 {
         return false;
     }
+    if is_resource_path_token(t) {
+        return false;
+    }
     // 序列化的文字元件字串（NBT display Name 之類）：整段當不透明翻會壞掉，跳過。
     if (t.starts_with('{') || t.starts_with('[')) && (t.contains("\"text\"") || t.contains("\"translate\"")) {
         return false;
@@ -604,5 +612,7 @@ mod tests {
         assert!(should_translate("Cool Sword"));
         assert!(!should_translate("minecraft:diamond"));
         assert!(!should_translate("quest.foo.title"));
+        assert!(!should_translate("root.txt"));
+        assert!(!should_translate("book/animal_dictionary/root"));
     }
 }

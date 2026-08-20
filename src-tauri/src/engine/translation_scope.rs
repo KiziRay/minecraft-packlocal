@@ -2,13 +2,13 @@
 //!
 //! 只保留整合包名稱分類，不把實例路徑、檔案清單或帳號資訊送到伺服器。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use super::hashutil::sha256_hex;
 use super::pack_version::detect_pack_version;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslationScope {
     /// 由整合包名稱正規化後產生的穩定識別，不含版本，方便跨版本重用。

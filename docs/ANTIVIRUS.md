@@ -39,10 +39,11 @@
 1. `npm run build` 產生 `src-tauri/target/release/Minecraft 模組整合包翻譯工具.exe`（免安裝版）。
 2. 簽章（見上）。
 3. 算 sha256：`certutil -hashfile <免安裝 EXE> SHA256`。
-4. 將 EXE 上傳到 Worker 使用的 R2 `DOWNLOADS` bucket，檔名使用 `*-portable.exe`。
-5. 更新 Worker 的版本資訊（見 `worker/wrangler.toml` 的 `LATEST_VERSION`、`DOWNLOAD_URL`，
-   可加 `RELEASE_NOTES`、`sha256`）：改完 `cd worker && npx wrangler deploy`。
-6. 客戶端「檢查更新」就會抓到新版並提示下載。
+4. 將 `MCPL-{版本}.exe` 上傳到 Worker 使用的 R2 `DOWNLOADS` bucket。
+5. 更新 Worker 的版本資訊（見 `worker/wrangler.toml` 的 `LATEST_VERSION`、`DOWNLOAD_URL`、
+   `RELEASE_NOTES`、`UPDATE_SHA256`）：改完 `cd worker && npx wrangler deploy`。
+6. GitHub Release 說明貼與 `RELEASE_NOTES` 相同的 1.0.3 更新內容；1.0.2 遷移提示放 Release 開頭 blockquote，不併入更新條目。
+7. 客戶端「檢查更新」就會抓到新版並提示下載。
 
 > `/api/desktop/latest` 目前回 `{version, url, notes, sha256}`；
 > 在 Worker 回應加上 `sha256` 欄位即可，客戶端會自動比對。

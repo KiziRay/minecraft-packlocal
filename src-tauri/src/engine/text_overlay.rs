@@ -5,6 +5,7 @@
 //! - 路徑提示 + 內容嗅探：不假設單一固定樹；路徑像顯示內容、或 JSON 含 `loc_name` 等鍵才收。
 //! - 資料包 gameplay JSON 只翻「顯示欄位白名單」（`loc_*`／`flavor_text`／`effect_tip`…），
 //!   不掃全部字串，避免把 particle type、guid、id 翻壞。
+//! - **進度（advancement／advancements）同樣只翻顯示欄位**，絕不改 requirements／frame／translate。
 //!
 //! 只輸出到 work 目錄，不直接改實例。
 
@@ -16,7 +17,13 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_with_scope;
+use super::deepseek::translate_plain_strings_mapped;
+use super::mech_tokens::{
+    is_ascii_enum_token, is_bracket_meta_token, is_fancymenu_display_key,
+    is_fancymenu_translatable_source, is_mechanism_path_segment, is_origins_powers_path,
+    is_poisoned_mech_translation, is_resource_path_token, is_sentence_only_aggressive_key,
+    looks_like_display_sentence,
+};
 use super::translation_scope::TranslationScope;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -45,6 +52,7 @@ const DISPLAY_FIELD_KEYS: &[&str] = &[
     "desc",
     "title",
     "subtitle",
+    "landing_text",
     "tooltip",
     "lore",
     "text",
@@ -55,10 +63,16 @@ const DISPLAY_FIELD_KEYS: &[&str] = &[
     "label",
     "caption",
     "wiki",
+    "armorsetname",
+    "customtooltips",
+    "choosekittext",
+    "firstjoinmessage",
+    "backupremindermessage",
 ];
 
 /// 只在已判定為玩家顯示內容的資料夾啟用，避免把一般 JSON 的 name/id 當成文字。
 const AGGRESSIVE_DISPLAY_FIELD_KEYS: &[&str] = &[
+    "name",
     "display_name",
     "displayname",
     "display",
@@ -68,6 +82,8 @@ const AGGRESSIVE_DISPLAY_FIELD_KEYS: &[&str] = &[
     "pages",
     "category",
     "help",
+    "armorsetname",
+    "customtooltips",
 ];
 
 /// `strings_translated` 目前只進 `note`，保留欄位供排查回報用。
@@ -121,6 +137,7 @@ where
     let mut file_payloads: Vec<FilePayload> = Vec::new();
     let mut unique: Vec<String> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut ns_by_src: HashMap<String, String> = HashMap::new();
     let mut parse_failures: Vec<String> = Vec::new();
 
     for path in &files {
@@ -128,6 +145,12 @@ where
             Ok(payload) => {
                 for s in payload.collect_strings() {
                     if should_translate_overlay_string(&s) && seen.insert(s.clone(), ()).is_none() {
+                        super::shared_identity::remember_ns(
+                            &mut ns_by_src,
+                            &s,
+                            &payload.path,
+                            scope,
+                        );
                         unique.push(s);
                     }
                 }
@@ -218,7 +241,7 @@ where
             for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
                 super::cancel::check()?;
                 let batch_start = batch_index * AI_BATCH_SIZE;
-                let translated = translate_plain_strings_with_scope(batch, scope, |pct, msg| {
+                let translated = translate_plain_strings_mapped(batch, scope, &ns_by_src, |pct, msg| {
                     let completed = batch_start + batch.len() * pct as usize / 100;
                     let mapped = 40 + ((completed * 38) / need_ai.len().max(1)) as u8;
                     on_progress(mapped.min(78), msg);
@@ -280,9 +303,12 @@ where
         });
     }
 
-    // 3) 寫出
+    let _ = super::shared_tm::contribute_plain_pairs(&map, &ns_by_src, "overlay", scope);
+
+    // 3) 寫出（Patchouli：en_us 路徑同步寫 zh_tw，避免只改英檔卻算「完成」）
     on_progress(88, "覆寫文字：寫出檔案…");
     let mut written = 0usize;
+    let mut patchouli_zh_tw = 0usize;
     for payload in &file_payloads {
         if let Some(new_bytes) = payload.apply(&map)? {
             let rel = payload
@@ -293,18 +319,45 @@ where
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            fs::write(&out_path, new_bytes).map_err(|e| format!("{}: {e}", out_path.display()))?;
+            fs::write(&out_path, &new_bytes)
+                .map_err(|e| format!("{}: {e}", out_path.display()))?;
             written += 1;
+            if let Some(zh_rel) = book_en_to_zh_tw_rel(rel) {
+                let zh_out = output_dir.join(&zh_rel);
+                if let Some(parent) = zh_out.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&zh_out, &new_bytes)
+                    .map_err(|e| format!("{}: {e}", zh_out.display()))?;
+                patchouli_zh_tw += 1;
+                written += 1;
+            }
         }
     }
 
+    let coverage_hint = if unique.is_empty() {
+        String::new()
+    } else {
+        let translated = map.len();
+        let pct = (translated as f64 * 100.0) / unique.len() as f64;
+        format!(
+            "；覆寫字串覆蓋約 {:.0}%（{translated}/{} 唯一可譯）",
+            pct,
+            unique.len()
+        )
+    };
     let note = format!(
-        "覆寫文字：掃描 {} 檔、唯一字串 {}、翻譯表 {} 條、寫出 {} 檔（patchouli／openloader／kubejs／datapacks／fancymenu／顯示型 config）。流程完成時會直接套用到遊戲{}",
+        "覆寫文字：掃描 {} 檔、唯一字串 {}、翻譯表 {} 條、寫出 {} 檔{}{}（patchouli／openloader／kubejs／datapacks／fancymenu／顯示型 config）。流程完成時會直接套用到遊戲。",
         file_payloads.len(),
         unique.len(),
         map.len(),
         written,
-        "。"
+        if patchouli_zh_tw > 0 {
+            format!("、另寫 Patchouli zh_tw {patchouli_zh_tw} 檔")
+        } else {
+            String::new()
+        },
+        coverage_hint,
     );
     on_progress(100, "覆寫文字完成");
     Ok(OverlayTranslateResult {
@@ -345,11 +398,16 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
         }
     };
 
-    // patchouli_books/**/*.json
+    // patchouli_books/**/*.json／書頁 txt
     let pb = mc.join("patchouli_books");
     if pb.is_dir() {
         for p in walk_files(&pb, &["json"]) {
             push(p);
+        }
+        for p in walk_files(&pb, &["txt"]) {
+            if is_book_locale_txt(&p) {
+                push(p);
+            }
         }
     }
 
@@ -376,13 +434,18 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
                 push(p);
             }
         }
+        for p in walk_files(root, &["txt"]) {
+            if is_book_locale_txt(&p) {
+                push(p);
+            }
+        }
     }
 
     // 部分整合包把玩家看得到的文字放在 config，而不是 datapack。
     // 只依顯示路徑／欄位白名單收取，避免把整個 config 當成語言檔。
     let config_root = mc.join("config");
     if config_root.is_dir() {
-        for p in walk_files(&config_root, &["json", "json5", "txt", "properties"]) {
+        for p in walk_files(&config_root, &["json", "json5", "txt", "properties", "local"]) {
             let is_json = p
                 .extension()
                 .and_then(|s| s.to_str())
@@ -417,7 +480,7 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
         mc.join("defaultconfigs").join("fancymenu"),
     ] {
         if fm.is_dir() {
-            for p in walk_files(&fm, &["txt", "json", "properties"]) {
+            for p in walk_files(&fm, &["txt", "json", "properties", "local"]) {
                 if looks_text_file(&p) {
                     push(p);
                 }
@@ -479,10 +542,26 @@ fn walk_files(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
 }
 
 /// 是否為資料包內「可讀文字」JSON（手翻會開的那類，不限單一模組資料夾名）。
+fn is_advancement_path(path: &Path) -> bool {
+    // 1.20 複數 advancements；1.21+ 單數 advancement
+    path_has_segment(path, "advancements") || path_has_segment(path, "advancement")
+}
+
+fn path_lower_slash(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
 fn is_pack_text_json(path: &Path) -> bool {
+    let lower = path_lower_slash(path);
+    // Origins／powers 交給 origins.rs，避免 Aggressive 雙寫 condition 樹
+    if is_origins_powers_path(&lower) {
+        return false;
+    }
     // 1) 標準文字路徑
     if path_has_segment(path, "lang")
-        || path_has_segment(path, "advancements")
+        || is_advancement_path(path)
         || path_has_segment(path, "patchouli_books")
         || path_has_segment(path, "patchouli")
     {
@@ -502,40 +581,7 @@ fn is_pack_text_json(path: &Path) -> bool {
 
 /// 幾乎不會有玩家可讀字串的資料包子路徑（跨模組通用）。
 fn is_mechanism_only_path(path: &Path) -> bool {
-    let lower = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    const SKIP: &[&str] = &[
-        "/recipes/",
-        "/loot_tables/",
-        "/tags/",
-        "/structures/",
-        "/worldgen/",
-        "/functions/",
-        "/predicates/",
-        "/item_modifiers/",
-        "/dimension/",
-        "/dimension_type/",
-        "/biome/",
-        "/noise_settings/",
-        "/template_pool/",
-        "/processor_list/",
-        "/configured_feature/",
-        "/placed_feature/",
-        "/chat_type/",
-        "/damage_type/",
-        // Mine and Slash 純數值／條件表（顯示名在別處）
-        "/mmorpg_value_calc/",
-        "/mmorpg_stat_condition/",
-        "/mmorpg_stat_effect/",
-        "/mmorpg_stat_compat/",
-        "/mmorpg_auto_item/",
-        "/mmorpg_base_stats/",
-        "/mmorpg_game_balance/",
-        "/mmorpg_atlas_layout/",
-    ];
-    SKIP.iter().any(|s| lower.contains(s))
+    is_mechanism_path_segment(&path_lower_slash(path))
 }
 
 /// 路徑像「給玩家看的內容」——不同模組資料夾名不同，用通用片段比對。
@@ -566,9 +612,7 @@ fn is_display_content_path(path: &Path) -> bool {
         "/lore/",
         "/tips/",
         "/wiki/",
-        "/powers/",
-        "/origins/",
-        "/origin_layers/",
+        // /powers/ /origins/ 不在此列：交給 origins.rs
         // Mine and Slash / Library of Exile 系（CTE 等）常見前綴；其他包若同名也涵蓋
         "/mmorpg_",
         "/library_of_exile",
@@ -626,9 +670,22 @@ fn is_config_text_path(path: &Path) -> bool {
         "chapters",
         "entries",
         "categories",
+        "firstjoinmessage",
+        "deathbackup",
     ]
     .iter()
     .any(|segment| path_has_segment(path, segment))
+        || path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| {
+                let l = s.to_ascii_lowercase();
+                l.contains("firstjoin")
+                    || l.contains("deathbackup")
+                    || l == "starterkit"
+                    || l.ends_with("message")
+            })
+            .unwrap_or(false)
 }
 
 /// 讀檔前段，是否出現顯示欄位鍵（避免把純數值表整包掃進來）。
@@ -655,6 +712,13 @@ fn file_sniffs_display_field(path: &Path) -> bool {
         || s.contains("\"effect_tip\"")
         || s.contains("\"flavor_text\"")
         || s.contains("\"flavour_text\"")
+        || s.contains("\"armorSetName\"")
+        || s.contains("\"customTooltips\"")
+        || s.contains("\"chooseKitText\"")
+        || s.contains("\"firstJoinMessage\"")
+        || s.contains("\"backupReminderMessage\"")
+        || s.contains("description =")
+        || s.contains("description=")
 }
 
 fn path_has_segment(path: &Path, seg: &str) -> bool {
@@ -698,15 +762,19 @@ enum FileKind {
     /// FancyMenu 等：引號字串替換
     QuotedText,
     Markdown,
+    /// Citadel／書頁內文：整檔當一段（無引號散文）
+    WholeText,
     Properties,
 }
 
 /// 字串擷取模式：lang/書本可掃全部；gameplay 資料包只碰顯示欄位。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum StringMode {
     All,
     DisplayFieldsOnly,
     AggressiveDisplayFields,
+    /// FancyMenu layout：只翻 label／description 等顯示鍵。
+    FancyMenuDisplayKeys,
 }
 
 struct FilePayload {
@@ -724,13 +792,17 @@ impl FilePayload {
                     return vec![];
                 };
                 let mut out = Vec::new();
+                let skip_book = is_citadel_style_book_json(&self.path);
                 match self.mode {
                     StringMode::All => collect_json_strings(&v, &mut out),
                     StringMode::DisplayFieldsOnly => {
-                        collect_display_field_strings(&v, &mut out, false)
+                        collect_display_field_strings(&v, &mut out, false, skip_book)
                     }
                     StringMode::AggressiveDisplayFields => {
-                        collect_display_field_strings(&v, &mut out, true)
+                        collect_display_field_strings(&v, &mut out, true, skip_book)
+                    }
+                    StringMode::FancyMenuDisplayKeys => {
+                        collect_display_field_strings(&v, &mut out, false, skip_book)
                     }
                 }
                 out
@@ -749,12 +821,35 @@ impl FilePayload {
                 .filter(|line| !line.trim().is_empty() && line.trim() != "```")
                 .map(str::to_string)
                 .collect(),
-            FileKind::Properties => self
-                .raw
-                .lines()
-                .filter_map(property_value)
-                .map(str::to_string)
-                .collect(),
+            FileKind::WholeText => {
+                let t = self.raw.trim();
+                if t.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![t.to_string()]
+                }
+            }
+            FileKind::Properties => {
+                let fancy = self.mode == StringMode::FancyMenuDisplayKeys;
+                self.raw
+                    .lines()
+                    .filter_map(|line| property_kv(line))
+                    .filter(|(k, v)| {
+                        if !fancy {
+                            return true;
+                        }
+                        if !is_fancymenu_display_key(k) {
+                            return false;
+                        }
+                        // source：只收可讀句，擋圖檔／[source:…] 路徑
+                        if k.eq_ignore_ascii_case("source") {
+                            return is_fancymenu_translatable_source(v);
+                        }
+                        true
+                    })
+                    .map(|(_, v)| v.to_string())
+                    .collect()
+            }
         }
     }
 
@@ -763,13 +858,14 @@ impl FilePayload {
             FileKind::Json => {
                 let mut v: Value = super::lenient_json::parse(&self.raw)
                     .map_err(|e| format!("{}: {e}", self.path.display()))?;
+                let skip_book = is_citadel_style_book_json(&self.path);
                 let changed = match self.mode {
                     StringMode::All => apply_json_strings(&mut v, map),
-                    StringMode::DisplayFieldsOnly => {
-                        apply_display_field_strings(&mut v, map, false)
+                    StringMode::DisplayFieldsOnly | StringMode::FancyMenuDisplayKeys => {
+                        apply_display_field_strings(&mut v, map, false, skip_book)
                     }
                     StringMode::AggressiveDisplayFields => {
-                        apply_display_field_strings(&mut v, map, true)
+                        apply_display_field_strings(&mut v, map, true, skip_book)
                     }
                 };
                 if !changed {
@@ -818,13 +914,28 @@ impl FilePayload {
                     Ok(None)
                 }
             }
+            FileKind::WholeText => {
+                let trimmed = self.raw.trim();
+                let Some(replacement) = map.get(trimmed).or_else(|| map.get(&self.raw)) else {
+                    return Ok(None);
+                };
+                if replacement == trimmed || replacement == &self.raw {
+                    return Ok(None);
+                }
+                let mut output = replacement.clone();
+                if self.raw.ends_with('\n') && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                Ok(Some(output.into_bytes()))
+            }
             FileKind::Properties => {
+                let fancy = self.mode == StringMode::FancyMenuDisplayKeys;
                 let mut changed = false;
                 let mut output = String::with_capacity(self.raw.len());
                 for line in self.raw.split_inclusive('\n') {
                     let has_newline = line.ends_with('\n');
                     let content = line.strip_suffix('\n').unwrap_or(line);
-                    let replacement = property_replaced_line(content, map);
+                    let replacement = property_replaced_line(content, map, fancy);
                     if replacement != content {
                         changed = true;
                     }
@@ -844,13 +955,17 @@ impl FilePayload {
 }
 
 fn string_mode_for_path(path: &Path) -> StringMode {
-    // lang／進度／書本：玩家文案多，沿用全字串
-    if path_has_segment(path, "lang")
-        || path_has_segment(path, "advancements")
-        || path_has_segment(path, "patchouli_books")
-        || path_has_segment(path, "patchouli")
-    {
+    // 進度 JSON：只翻 display 顯示欄位。全字串會改壞 requirements／frame／translate。
+    if is_advancement_path(path) {
+        return StringMode::DisplayFieldsOnly;
+    }
+    // lang：玩家文案多，沿用全字串
+    if path_has_segment(path, "lang") {
         return StringMode::All;
+    }
+    // Patchouli：停用 All，避免 type／recipe／anchor／flag 被翻壞
+    if path_has_segment(path, "patchouli_books") || path_has_segment(path, "patchouli") {
+        return StringMode::AggressiveDisplayFields;
     }
     // 已知玩家顯示內容路徑採積極欄位模式，會多翻 name/display/body/page 等欄位。
     if is_display_content_path(path) || is_config_text_path(path) {
@@ -873,6 +988,47 @@ fn is_display_field_key_for_mode(key: &str, aggressive: bool) -> bool {
     let lower = key.to_ascii_lowercase();
     is_display_field_key(key)
         || (aggressive && AGGRESSIVE_DISPLAY_FIELD_KEYS.contains(&lower.as_str()))
+}
+
+/// Citadel 系書頁 JSON（`assets/*/book/**/*.json`）：`text`／`parent`／`linked_page` 是檔名，不是內文。
+fn is_citadel_style_book_json(path: &Path) -> bool {
+    let lower = path_lower_slash(path);
+    if lower.contains("patchouli") {
+        return false;
+    }
+    let is_json = lower.ends_with(".json") || lower.ends_with(".json5");
+    is_json && lower.contains("/book/")
+}
+
+fn is_book_resource_id_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "parent" | "text" | "linked_page" | "linkedpage"
+    )
+}
+
+fn is_book_content_path(path: &Path) -> bool {
+    let lower = path_lower_slash(path);
+    lower.contains("/book/")
+        || lower.contains("patchouli_books")
+        || lower.contains("/patchouli/")
+}
+
+/// Citadel／Patchouli 的書頁內文（en_us 待譯；zh_cn 轉台灣繁後寫 zh_tw）。
+fn is_book_locale_txt(path: &Path) -> bool {
+    let lower = path_lower_slash(path);
+    if !lower.ends_with(".txt") || !is_book_content_path(path) {
+        return false;
+    }
+    lower.contains("/en_us/")
+        || lower.ends_with("/en_us.txt")
+        || lower.contains("/zh_cn/")
+        || lower.ends_with("/zh_cn.txt")
+}
+
+fn is_book_prose_txt(path: &Path) -> bool {
+    let lower = path_lower_slash(path);
+    lower.ends_with(".txt") && is_book_content_path(path)
 }
 
 fn load_payload(path: &Path) -> Result<FilePayload, String> {
@@ -904,10 +1060,49 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
         });
     }
 
-    if ext == "properties" {
+    if ext == "properties" || ext == "local" {
         return Ok(FilePayload {
             path: path.to_path_buf(),
             kind: FileKind::Properties,
+            mode: StringMode::All,
+            raw,
+        });
+    }
+
+    // FancyMenu layout：只翻顯示鍵，避免 anchor_point／meta 被共享庫或 AI 翻壞
+    if path_has_segment(path, "fancymenu")
+        && (ext == "txt" || ext.is_empty())
+        && raw.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && !t.starts_with('#')
+                && t.contains('=')
+                && !t.trim_start().starts_with('{')
+        })
+    {
+        return Ok(FilePayload {
+            path: path.to_path_buf(),
+            kind: FileKind::Properties,
+            mode: StringMode::FancyMenuDisplayKeys,
+            raw,
+        });
+    }
+
+    // starterkit descriptions：純文字整檔當可譯
+    if path_has_segment(path, "starterkit") && (ext == "txt" || ext.is_empty()) {
+        return Ok(FilePayload {
+            path: path.to_path_buf(),
+            kind: FileKind::Markdown,
+            mode: StringMode::All,
+            raw,
+        });
+    }
+
+    // Citadel／Patchouli 書頁內文：無引號散文，整檔當一段
+    if is_book_prose_txt(path) {
+        return Ok(FilePayload {
+            path: path.to_path_buf(),
+            kind: FileKind::WholeText,
             mode: StringMode::All,
             raw,
         });
@@ -951,7 +1146,7 @@ fn apply_json_strings(v: &mut Value, map: &HashMap<String, String>) -> bool {
     match v {
         Value::String(s) => {
             if let Some(t) = map.get(s) {
-                if t != s {
+                if t != s && !is_poisoned_mech_translation(s, t) {
                     *s = t.clone();
                     return true;
                 }
@@ -981,20 +1176,31 @@ fn apply_json_strings(v: &mut Value, map: &HashMap<String, String>) -> bool {
 }
 
 /// 只擷取顯示欄位下的字串（與 apply 對稱）。
-fn collect_display_field_strings(v: &Value, out: &mut Vec<String>, aggressive: bool) {
+fn collect_display_field_strings(
+    v: &Value,
+    out: &mut Vec<String>,
+    aggressive: bool,
+    skip_book_path_ids: bool,
+) {
     match v {
         Value::Object(m) => {
             for (k, child) in m {
-                if is_display_field_key_for_mode(k, aggressive) {
-                    push_display_value(child, out, aggressive);
+                if skip_book_path_ids && is_book_resource_id_key(k) {
+                    collect_display_field_strings(child, out, aggressive, skip_book_path_ids);
+                } else if is_display_field_key_for_mode(k, aggressive) {
+                    if aggressive && is_sentence_only_aggressive_key(k) {
+                        push_sentence_only_display_value(child, out, aggressive);
+                    } else {
+                        push_display_value(child, out, aggressive);
+                    }
                 } else {
-                    collect_display_field_strings(child, out, aggressive);
+                    collect_display_field_strings(child, out, aggressive, skip_book_path_ids);
                 }
             }
         }
         Value::Array(a) => {
             for x in a {
-                collect_display_field_strings(x, out, aggressive);
+                collect_display_field_strings(x, out, aggressive, skip_book_path_ids);
             }
         }
         _ => {}
@@ -1014,7 +1220,36 @@ fn push_display_value(v: &Value, out: &mut Vec<String>, aggressive: bool) {
             for (k, child) in m {
                 let kl = k.to_ascii_lowercase();
                 if kl == "text" || kl == "extra" || is_display_field_key_for_mode(k, aggressive) {
-                    push_display_value(child, out, aggressive);
+                    if aggressive && is_sentence_only_aggressive_key(k) {
+                        push_sentence_only_display_value(child, out, aggressive);
+                    } else {
+                        push_display_value(child, out, aggressive);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `category` 等：僅句子才進候選（純 id 如 Combat／mining 跳過）。
+fn push_sentence_only_display_value(v: &Value, out: &mut Vec<String>, aggressive: bool) {
+    match v {
+        Value::String(s) => {
+            if looks_like_display_sentence(s) {
+                out.push(s.clone());
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                push_sentence_only_display_value(x, out, aggressive);
+            }
+        }
+        Value::Object(m) => {
+            for (k, child) in m {
+                let kl = k.to_ascii_lowercase();
+                if kl == "text" || kl == "extra" || is_display_field_key_for_mode(k, aggressive) {
+                    push_sentence_only_display_value(child, out, aggressive);
                 }
             }
         }
@@ -1026,6 +1261,7 @@ fn apply_display_field_strings(
     v: &mut Value,
     map: &HashMap<String, String>,
     aggressive: bool,
+    skip_book_path_ids: bool,
 ) -> bool {
     match v {
         Value::Object(m) => {
@@ -1033,13 +1269,20 @@ fn apply_display_field_strings(
             // 先收集鍵，避免邊改邊借
             let keys: Vec<String> = m.keys().cloned().collect();
             for k in keys {
-                let is_disp = is_display_field_key_for_mode(&k, aggressive);
+                let skip_id = skip_book_path_ids && is_book_resource_id_key(&k);
+                let is_disp = !skip_id && is_display_field_key_for_mode(&k, aggressive);
                 if let Some(child) = m.get_mut(&k) {
                     if is_disp {
-                        if apply_display_value(child, map, aggressive) {
+                        let sentence_only = aggressive && is_sentence_only_aggressive_key(&k);
+                        if apply_display_value(child, map, aggressive, sentence_only) {
                             any = true;
                         }
-                    } else if apply_display_field_strings(child, map, aggressive) {
+                    } else if apply_display_field_strings(
+                        child,
+                        map,
+                        aggressive,
+                        skip_book_path_ids,
+                    ) {
                         any = true;
                     }
                 }
@@ -1049,7 +1292,7 @@ fn apply_display_field_strings(
         Value::Array(a) => {
             let mut any = false;
             for x in a {
-                if apply_display_field_strings(x, map, aggressive) {
+                if apply_display_field_strings(x, map, aggressive, skip_book_path_ids) {
                     any = true;
                 }
             }
@@ -1059,11 +1302,19 @@ fn apply_display_field_strings(
     }
 }
 
-fn apply_display_value(v: &mut Value, map: &HashMap<String, String>, aggressive: bool) -> bool {
+fn apply_display_value(
+    v: &mut Value,
+    map: &HashMap<String, String>,
+    aggressive: bool,
+    sentence_only: bool,
+) -> bool {
     match v {
         Value::String(s) => {
+            if sentence_only && !looks_like_display_sentence(s) {
+                return false;
+            }
             if let Some(t) = map.get(s) {
-                if t != s {
+                if t != s && !is_poisoned_mech_translation(s, t) {
                     *s = t.clone();
                     return true;
                 }
@@ -1073,7 +1324,7 @@ fn apply_display_value(v: &mut Value, map: &HashMap<String, String>, aggressive:
         Value::Array(a) => {
             let mut any = false;
             for x in a {
-                if apply_display_value(x, map, aggressive) {
+                if apply_display_value(x, map, aggressive, sentence_only) {
                     any = true;
                 }
             }
@@ -1088,8 +1339,10 @@ fn apply_display_value(v: &mut Value, map: &HashMap<String, String>, aggressive:
                     || kl == "extra"
                     || is_display_field_key_for_mode(&k, aggressive);
                 if touch {
+                    let child_sentence =
+                        sentence_only || (aggressive && is_sentence_only_aggressive_key(&k));
                     if let Some(child) = m.get_mut(&k) {
-                        if apply_display_value(child, map, aggressive) {
+                        if apply_display_value(child, map, aggressive, child_sentence) {
                             any = true;
                         }
                     }
@@ -1106,6 +1359,10 @@ fn apply_display_value(v: &mut Value, map: &HashMap<String, String>, aggressive:
 fn should_translate_overlay_string(s: &str) -> bool {
     let t = s.trim();
     if t.len() < 2 {
+        return false;
+    }
+    // ASCII enum／snake／kebab id、資源檔名／相對路徑不當顯示文
+    if is_ascii_enum_token(t) || is_bracket_meta_token(t) || is_resource_path_token(t) {
         return false;
     }
     // 資源路徑／圖片／音效
@@ -1259,25 +1516,84 @@ fn escape_json_str(s: &str) -> String {
     out
 }
 
-fn property_value(line: &str) -> Option<&str> {
+fn property_kv(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
         return None;
     }
     let separator = trimmed.find('=').or_else(|| trimmed.find(':'))?;
+    let key = trimmed.get(..separator)?.trim();
     let value = trimmed.get(separator + 1..)?.trim();
-    (!value.is_empty()).then_some(value)
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((key, strip_wrapping_quotes(value)))
 }
 
-fn property_replaced_line(line: &str, map: &HashMap<String, String>) -> String {
+fn strip_wrapping_quotes(s: &str) -> &str {
+    let t = s.trim();
+    if t.len() >= 2 {
+        let bytes = t.as_bytes();
+        if (bytes[0] == b'"' && bytes[t.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[t.len() - 1] == b'\'')
+        {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// Patchouli／Citadel 書 `…/en_us/` 或 `…/zh_cn/` → 同相對路徑的 `zh_tw`（供遊戲選繁中）。
+fn book_en_to_zh_tw_rel(rel: &Path) -> Option<PathBuf> {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    let lower = s.to_ascii_lowercase();
+    if !is_book_content_path(rel) {
+        return None;
+    }
+    let from = if lower.contains("/en_us/") || lower.ends_with("/en_us") {
+        ("/en_us/", "/en_us", "\\en_us\\")
+    } else if lower.contains("/zh_cn/") || lower.ends_with("/zh_cn") {
+        ("/zh_cn/", "/zh_cn", "\\zh_cn\\")
+    } else if lower.contains("/zh_hk/") || lower.ends_with("/zh_hk") {
+        ("/zh_hk/", "/zh_hk", "\\zh_hk\\")
+    } else {
+        return None;
+    };
+    let replaced = s
+        .replace(from.0, "/zh_tw/")
+        .replace(from.1, "/zh_tw")
+        .replace(from.2, "\\zh_tw\\");
+    if replaced == s {
+        return None;
+    }
+    Some(PathBuf::from(replaced))
+}
+
+fn property_replaced_line(line: &str, map: &HashMap<String, String>, fancy_only: bool) -> String {
     let Some(separator) = line.find('=').or_else(|| line.find(':')) else {
         return line.to_string();
     };
+    let key = line[..separator].trim();
+    if fancy_only && !is_fancymenu_display_key(key) {
+        return line.to_string();
+    }
     let after = &line[separator + 1..];
     let value = after.trim();
-    let Some(replacement) = map.get(value) else {
+    let lookup = strip_wrapping_quotes(value);
+    if fancy_only
+        && key.eq_ignore_ascii_case("source")
+        && !is_fancymenu_translatable_source(lookup)
+    {
+        return line.to_string();
+    }
+    let Some(replacement) = map.get(lookup).or_else(|| map.get(value)) else {
         return line.to_string();
     };
+    if is_poisoned_mech_translation(lookup, replacement)
+        || is_poisoned_mech_translation(value, replacement)
+    {
+        return line.to_string();
+    }
     let leading_len = after.len() - after.trim_start().len();
     let trailing_len = after.len() - after.trim_end().len();
     let leading = &after[..leading_len];
@@ -1286,7 +1602,16 @@ fn property_replaced_line(line: &str, map: &HashMap<String, String>) -> String {
     } else {
         &after[after.len() - trailing_len..]
     };
-    format!("{}{leading}{replacement}{trailing}", &line[..=separator])
+    let new_value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        let q = &value[..1];
+        format!("{q}{replacement}{q}")
+    } else {
+        replacement.clone()
+    };
+    format!("{}{leading}{new_value}{trailing}", &line[..=separator])
 }
 
 #[cfg(test)]
@@ -1303,6 +1628,12 @@ mod tests {
         )));
         assert!(is_config_text_path(Path::new(
             "minecraft/config/minecolonies/client.json"
+        )));
+        assert!(is_config_text_path(Path::new(
+            "minecraft/config/firstjoinmessage/config.json5"
+        )));
+        assert!(is_config_text_path(Path::new(
+            "minecraft/config/deathbackup/config.json"
         )));
         assert!(!is_config_text_path(Path::new(
             "minecraft/config/jei/jei-world-style.json"
@@ -1327,10 +1658,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("Welcome to the pack".to_string(), "歡迎來到整合包".to_string());
         assert_eq!(
-            property_replaced_line("welcome =  Welcome to the pack  ", &map),
+            property_replaced_line("welcome =  Welcome to the pack  ", &map, false),
             "welcome =  歡迎來到整合包  "
         );
-        assert_eq!(property_value("# welcome = Hello"), None);
+        assert_eq!(property_kv("# welcome = Hello"), None);
     }
 
     #[test]
@@ -1343,5 +1674,405 @@ mod tests {
             string_mode_for_path(Path::new("data/example/recipes/iron.json")),
             StringMode::DisplayFieldsOnly
         ));
+    }
+
+    #[test]
+    fn advancement_paths_use_display_fields_only() {
+        assert!(matches!(
+            string_mode_for_path(Path::new(
+                "data/farmersdelight/advancements/main/get_rich_soil.json"
+            )),
+            StringMode::DisplayFieldsOnly
+        ));
+        assert!(matches!(
+            string_mode_for_path(Path::new(
+                "data/minecraft/advancement/story/mine_stone.json"
+            )),
+            StringMode::DisplayFieldsOnly
+        ));
+        assert!(is_pack_text_json(Path::new(
+            "kubejs/data/pack/advancement/root.json"
+        )));
+    }
+
+    #[test]
+    fn patchouli_uses_aggressive_not_all() {
+        assert!(matches!(
+            string_mode_for_path(Path::new(
+                "patchouli_books/guide/en_us/entries/intro.json"
+            )),
+            StringMode::AggressiveDisplayFields
+        ));
+        assert!(matches!(
+            string_mode_for_path(Path::new("assets/mod/patchouli/book.json")),
+            StringMode::AggressiveDisplayFields
+        ));
+        assert!(matches!(
+            string_mode_for_path(Path::new("assets/mod/lang/en_us.json")),
+            StringMode::All
+        ));
+    }
+
+    #[test]
+    fn patchouli_apply_keeps_type_recipe_anchor() {
+        let raw = r#"{
+  "name": "Intro",
+  "category": "Combat",
+  "pages": [
+    {
+      "type": "crafting",
+      "recipe": "minecraft:stick",
+      "anchor": "stick_page",
+      "title": "Make a Stick",
+      "text": "Craft sticks from planks."
+    }
+  ]
+}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut collected = Vec::new();
+        collect_display_field_strings(&value, &mut collected, true, false);
+        assert!(
+            !collected
+                .iter()
+                .any(|s| s == "crafting" || s == "minecraft:stick" || s == "stick_page"),
+            "mechanism fields must not be collected: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|s| s == "Combat"),
+            "category id must not be collected: {collected:?}"
+        );
+        assert!(collected.iter().any(|s| s == "Make a Stick"), "{collected:?}");
+        assert!(
+            collected
+                .iter()
+                .any(|s| s == "Craft sticks from planks."),
+            "{collected:?}"
+        );
+        assert!(collected.iter().any(|s| s == "Intro"), "{collected:?}");
+
+        let mut map = HashMap::new();
+        map.insert("Make a Stick".into(), "製作木棒".into());
+        map.insert("Craft sticks from planks.".into(), "用木板合成木棒。".into());
+        map.insert("crafting".into(), "合成".into());
+        map.insert("Combat".into(), "戰鬥".into());
+        let mut applied = value.clone();
+        assert!(apply_display_field_strings(&mut applied, &map, true, false));
+        assert_eq!(
+            applied.pointer("/pages/0/type").and_then(|v| v.as_str()),
+            Some("crafting")
+        );
+        assert_eq!(
+            applied.pointer("/pages/0/recipe").and_then(|v| v.as_str()),
+            Some("minecraft:stick")
+        );
+        assert_eq!(
+            applied.pointer("/pages/0/anchor").and_then(|v| v.as_str()),
+            Some("stick_page")
+        );
+        assert_eq!(
+            applied.get("category").and_then(|v| v.as_str()),
+            Some("Combat")
+        );
+        assert_eq!(
+            applied.pointer("/pages/0/title").and_then(|v| v.as_str()),
+            Some("製作木棒")
+        );
+    }
+
+    #[test]
+    fn overlay_filter_rejects_enum_tokens() {
+        assert!(!should_translate_overlay_string("goal"));
+        assert!(!should_translate_overlay_string("strawberry_crate"));
+        assert!(!should_translate_overlay_string("root.txt"));
+        assert!(!should_translate_overlay_string("alligator.json"));
+        assert!(!should_translate_overlay_string("book/animal_dictionary/root"));
+        assert!(should_translate_overlay_string("Get rich soil"));
+        assert!(should_translate_overlay_string("Welcome to the pack"));
+        assert!(!is_resource_path_token("hello"));
+    }
+
+    #[test]
+    fn citadel_book_json_keeps_path_ids() {
+        let raw = r#"{
+  "parent": "root.json",
+  "text": "root.txt",
+  "title": "Alligator",
+  "linked_page": "alligator.json"
+}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut collected = Vec::new();
+        collect_display_field_strings(&value, &mut collected, true, true);
+        assert!(
+            !collected.iter().any(|s| {
+                s == "root.txt" || s == "root.json" || s == "alligator.json"
+            }),
+            "book path ids must not be collected: {collected:?}"
+        );
+        assert!(collected.iter().any(|s| s == "Alligator"), "{collected:?}");
+
+        let mut map = HashMap::new();
+        map.insert("root.txt".into(), "根.txt".into());
+        map.insert("root.json".into(), "根.json".into());
+        map.insert("alligator.json".into(), "短吻鱷.json".into());
+        map.insert("Alligator".into(), "短吻鱷".into());
+        let mut applied = value.clone();
+        assert!(apply_display_field_strings(&mut applied, &map, true, true));
+        assert_eq!(applied.get("text").and_then(|v| v.as_str()), Some("root.txt"));
+        assert_eq!(
+            applied.get("parent").and_then(|v| v.as_str()),
+            Some("root.json")
+        );
+        assert_eq!(
+            applied.get("linked_page").and_then(|v| v.as_str()),
+            Some("alligator.json")
+        );
+        assert_eq!(applied.get("title").and_then(|v| v.as_str()), Some("短吻鱷"));
+        assert!(is_citadel_style_book_json(Path::new(
+            "assets/alexsmobs/book/animal_dictionary/root.json"
+        )));
+        assert!(!is_citadel_style_book_json(Path::new(
+            "patchouli_books/guide/en_us/entries/intro.json"
+        )));
+    }
+
+    #[test]
+    fn landing_text_is_a_display_field() {
+        let raw = r#"{
+  "name": "Iron's Guidebook",
+  "landing_text": "Iron's Spells 'n Spellbooks is an RPG-inspired spellcasting mod.",
+  "book_texture": "patchouli:textures/gui/book_brown.png"
+}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut collected = Vec::new();
+        collect_display_field_strings(&value, &mut collected, true, false);
+        assert!(
+            collected.iter().any(|s| s.contains("RPG-inspired")),
+            "{collected:?}"
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "Iron's Spells 'n Spellbooks is an RPG-inspired spellcasting mod.".into(),
+            "鐵之魔法與法術書是一款 RPG 風格的施法模組。".into(),
+        );
+        map.insert("Iron's Guidebook".into(), "鐵之指南書".into());
+        let mut applied = value.clone();
+        assert!(apply_display_field_strings(&mut applied, &map, true, false));
+        assert_eq!(
+            applied.get("name").and_then(|v| v.as_str()),
+            Some("鐵之指南書")
+        );
+        assert!(applied
+            .get("landing_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("施法模組"));
+    }
+
+    #[test]
+    fn book_en_us_txt_maps_to_zh_tw_and_is_whole_file() {
+        assert!(is_book_locale_txt(Path::new(
+            "assets/alexsmobs/book/animal_dictionary/en_us/root.txt"
+        )));
+        assert!(!is_book_locale_txt(Path::new(
+            "assets/alexsmobs/book/animal_dictionary/root.json"
+        )));
+        assert_eq!(
+            book_en_to_zh_tw_rel(Path::new(
+                "assets/alexsmobs/book/animal_dictionary/en_us/root.txt"
+            )),
+            Some(PathBuf::from(
+                "assets/alexsmobs/book/animal_dictionary/zh_tw/root.txt"
+            ))
+        );
+        assert_eq!(
+            book_en_to_zh_tw_rel(Path::new(
+                "assets/alexsmobs/book/animal_dictionary/zh_cn/root.txt"
+            )),
+            Some(PathBuf::from(
+                "assets/alexsmobs/book/animal_dictionary/zh_tw/root.txt"
+            ))
+        );
+        assert!(is_book_locale_txt(Path::new(
+            "assets/alexsmobs/book/animal_dictionary/zh_cn/root.txt"
+        )));
+        let payload = FilePayload {
+            path: PathBuf::from("assets/alexsmobs/book/animal_dictionary/en_us/root.txt"),
+            kind: FileKind::WholeText,
+            mode: StringMode::All,
+            raw: "Numerous strange creatures inhabit the Overworld.\n".into(),
+        };
+        let collected = payload.collect_strings();
+        assert_eq!(
+            collected,
+            vec!["Numerous strange creatures inhabit the Overworld."]
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "Numerous strange creatures inhabit the Overworld.".into(),
+            "主世界棲息著許多奇特生物。".into(),
+        );
+        let out = payload.apply(&map).unwrap().unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("奇特生物"));
+        assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn powers_and_origins_paths_skipped_by_overlay() {
+        assert!(!is_pack_text_json(Path::new(
+            "data/origins/powers/climbing.json"
+        )));
+        assert!(!is_pack_text_json(Path::new(
+            "kubejs/data/mod/origins/human.json"
+        )));
+        assert!(!is_display_content_path(Path::new(
+            "data/mod/powers/foo.json"
+        )));
+    }
+
+    #[test]
+    fn advancement_apply_keeps_mechanism_ids_and_translates_literal_title() {
+        let raw = r#"{
+  "criteria": { "get_rich_soil": { "trigger": "minecraft:inventory_changed" } },
+  "display": {
+    "frame": "goal",
+    "title": { "translate": "farmersdelight.advancement.get_rich_soil" },
+    "description": { "text": "Get rich soil" }
+  },
+  "requirements": [["get_rich_soil"]]
+}"#;
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        let mut collected = Vec::new();
+        collect_display_field_strings(&value, &mut collected, false, false);
+        assert!(
+            !collected.iter().any(|s| s == "get_rich_soil" || s == "goal"),
+            "mechanism strings must not be collected: {collected:?}"
+        );
+        assert!(
+            !collected
+                .iter()
+                .any(|s| s == "farmersdelight.advancement.get_rich_soil"),
+            "translate keys must not be collected: {collected:?}"
+        );
+        assert!(collected.iter().any(|s| s == "Get rich soil"), "{collected:?}");
+
+        let mut map = HashMap::new();
+        map.insert("Get rich soil".into(), "取得肥沃土壤".into());
+        map.insert("get_rich_soil".into(), "獲得肥沃土壤".into());
+        map.insert("goal".into(), "目標".into());
+        map.insert(
+            "farmersdelight.advancement.get_rich_soil".into(),
+            "肥沃土壤".into(),
+        );
+        assert!(apply_display_field_strings(&mut value, &map, false, false));
+
+        let display = value.get("display").unwrap();
+        assert_eq!(display.get("frame").and_then(|v| v.as_str()), Some("goal"));
+        assert_eq!(
+            display
+                .pointer("/title/translate")
+                .and_then(|v| v.as_str()),
+            Some("farmersdelight.advancement.get_rich_soil")
+        );
+        assert_eq!(
+            display
+                .pointer("/description/text")
+                .and_then(|v| v.as_str()),
+            Some("取得肥沃土壤")
+        );
+        assert_eq!(
+            value
+                .pointer("/requirements/0/0")
+                .and_then(|v| v.as_str()),
+            Some("get_rich_soil")
+        );
+        assert!(value.pointer("/criteria/get_rich_soil").is_some());
+    }
+
+    #[test]
+    fn fancymenu_keeps_anchor_and_rejects_poisoned_hits() {
+        let raw = "\
+type = customization
+anchor_point = mid-left
+label = Multiplayer
+custom_element_layer_name = Side Bar Left
+[groups:][instances:]
+";
+        let payload = FilePayload {
+            path: PathBuf::from("config/fancymenu/customization/Prominence.txt"),
+            kind: FileKind::Properties,
+            mode: StringMode::FancyMenuDisplayKeys,
+            raw: raw.to_string(),
+        };
+        let collected = payload.collect_strings();
+        assert!(collected.iter().any(|s| s == "Multiplayer"), "{collected:?}");
+        assert!(
+            !collected.iter().any(|s| s == "mid-left" || s.contains("Side Bar")),
+            "structure/editor fields must not be collected: {collected:?}"
+        );
+
+        let mut map = HashMap::new();
+        map.insert("Multiplayer".into(), "多人遊戲".into());
+        map.insert("mid-left".into(), "中左".into());
+        map.insert("Side Bar Left".into(), "左側欄".into());
+        let out = payload.apply(&map).unwrap().expect("label should change");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("anchor_point = mid-left"), "{text}");
+        assert!(text.contains("label = 多人遊戲"), "{text}");
+        assert!(text.contains("custom_element_layer_name = Side Bar Left"), "{text}");
+        assert!(!text.contains("中左"), "{text}");
+    }
+
+    #[test]
+    fn fancymenu_text_v2_source_translates_lore_skips_assets() {
+        let raw = "\
+element_type = text_v2
+source = You are a Flameborn.%n%%n%Stop the Void.
+element_type = text_v2
+source = The Talent Tree
+source = [source:local]/config/fancymenu/assets/welcome_screen/who_you_are.png
+label = Start Journey
+";
+        let payload = FilePayload {
+            path: PathBuf::from("config/fancymenu/customization/welcomescreen_welcome_layout.txt"),
+            kind: FileKind::Properties,
+            mode: StringMode::FancyMenuDisplayKeys,
+            raw: raw.to_string(),
+        };
+        let collected = payload.collect_strings();
+        assert!(
+            collected
+                .iter()
+                .any(|s| s.contains("Flameborn") && s.contains("%n%")),
+            "{collected:?}"
+        );
+        assert!(collected.iter().any(|s| s == "The Talent Tree"), "{collected:?}");
+        assert!(collected.iter().any(|s| s == "Start Journey"), "{collected:?}");
+        assert!(
+            !collected.iter().any(|s| s.contains("[source:local]") || s.ends_with(".png")),
+            "{collected:?}"
+        );
+
+        let mut map = HashMap::new();
+        map.insert(
+            "You are a Flameborn.%n%%n%Stop the Void.".into(),
+            "你是焰裔。%n%%n%阻止虛空。".into(),
+        );
+        map.insert("The Talent Tree".into(), "天賦樹".into());
+        map.insert(
+            "[source:local]/config/fancymenu/assets/welcome_screen/who_you_are.png".into(),
+            "不該寫入.png".into(),
+        );
+        map.insert("Start Journey".into(), "開始旅程".into());
+        let out = payload.apply(&map).unwrap().expect("display source/label change");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("你是焰裔。%n%%n%阻止虛空。"), "{text}");
+        assert!(text.contains("source = 天賦樹"), "{text}");
+        assert!(text.contains("label = 開始旅程"), "{text}");
+        assert!(
+            text.contains("[source:local]/config/fancymenu/assets/welcome_screen/who_you_are.png"),
+            "{text}"
+        );
+        assert!(!text.contains("不該寫入"), "{text}");
     }
 }

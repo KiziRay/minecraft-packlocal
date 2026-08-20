@@ -19,7 +19,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 |------|------|------|
 | instancePath | string | 遊戲／實例路徑 |
 | outputDir | string | 翻譯結果位置；預設是每個實例的自動位置，也可由前端指定玩家選的資料夾。若不是 `翻譯結果` 本身，後端會在裡面建立 `翻譯結果/` |
-| packName | string | 相容舊版的參數；後端會忽略並依整合包版本產生名稱 |
+| packName | string | 翻譯前自訂資源包名稱；空白或未改建議名時由後端依整合包版本產生（`模組包翻譯工具+月日+版本`） |
 | useAi | bool | 是否 AI 補缺 |
 | backupBeforeApply | bool | 是否在翻譯完成套用前建立備份；預設前端會勾選 |
 | referencePack | string \| null | 參考 zip 路徑 |
@@ -28,7 +28,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 | translationQuality | string | `fast`、`balanced`（預設）、`thorough`；調整 AI 批次大小與提示，不做 API 分流 |
 | coverageTier | string | 固定傳 `max`（完整挑戰）；後端忽略其他值 |
 
-回傳 `OneClickResult`（camelCase）：`report`, `packPath`, `workRoot`, `namespaces`, `filesWritten`, `keysTotal`, `aiFilled`, `jarTranslation`, `minemenuMsg`, `playerSummary`。`jarTranslation` 會列出掃描、重建、寫入語言檔與略過錯誤。工作區另可能有 `data/`（JAR 內 Patchouli）、`resourcepacks-extra/`（ZIP 內翻譯副本）與 KubeJS 安全白名單輸出。
+回傳 `OneClickResult`（camelCase）：`report`, `packPath`, `workRoot`, `namespaces`, `filesWritten`, `keysTotal`, `aiFilled`, `jarTranslation`, `minemenuMsg`, `playerSummary`。`jarTranslation` 會列出掃描、重建、寫入語言檔與略過錯誤。JAR 內 Patchouli／Citadel 書寫入 `jar-translated/`（套用進 mods）；工作區 `data/` 僅除錯、不套用到遊戲。另可能有 `resourcepacks-extra/`（ZIP 內翻譯副本）與 KubeJS 安全白名單輸出。
 
 事件：過程中 `translate-progress`、`translate-log`。`useAi=false` 時，FTB Quests、文字覆寫、ZIP 文字、Origins、任務／書本與 KubeJS 顯示字串最多 3 路並行；`useAi=true` 維持序列。
 
@@ -64,6 +64,7 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 `套用清單.json` 到備份夾，還原據此精準反轉。
 
 - **貼上錯誤分析** → `diagnose_error_text(text)`：只在本機分析貼上的 crash report、latest.log、debug.log 或錯誤碼；完整記錄會比單一退出碼得到更多結果。`errorCode` 是工具的判斷代碼，不是 Minecraft 的退出碼。
+- **診斷回報** → `submit_diagnose_report_cmd({ request })` → `{ expiresAt, message }`。必填 `reportCategory`；整合包名稱或 `packUnrelated: true`。需 Discord 會籍。打包白名單檔（工作階段路徑脫敏）走 MPU 上傳 `reports/v1/`，上限 100MB，3 天刪除。Webhook 只由 Worker 送連結。閃退請先還原；Force 只停共享庫查找、仍可貢獻。
 
 ### 版本控制器（前端接線）
 
@@ -209,10 +210,27 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 ```
 
 - `ok:false` 代表「暫時查不到」（沒網路等），**不是錯誤**，UI 顯示提示即可。
-   - `download_update` 防止重複執行，只接受官方 Worker `/download/*-portable.exe`；必須通過 SHA-256、100 KB～256 MB 與 `MZ` PE 標頭檢查。
+   - `download_update` 防止重複執行，只接受官方 Worker `/download/MCPL-{semver}.exe`（拒舊 `-portable.exe`）；必須通過 SHA-256、100 KB～256 MB 與 `MZ` PE 標頭檢查。
 - Windows 會下載並驗證官方免安裝 EXE，再由脫離 Tauri Job 的背景排程等待目前工具關閉，替換同一路徑後重新開啟；若無法自動替換，則保留下載檔供使用者手動開啟。
 - 前端接線：按鈕 id 用 `#btn-check-update`（`app.js` 末端自足區塊會自動接上，
   並在啟動時安靜檢查一次、把狀態寫進 `#update-status`）；也可呼叫 `window.zfCheckUpdate()`。
+- 若目前版本為 `1.0.2`，更新彈窗 footnote 會提示改用手動下載（舊版更新器無法自動重開免安裝 exe）。
+
+### 代管額度與 GP（`managed_ai_usage_cmd` / `managed_ai_gp_reward_cmd`）
+
+- `managed_ai_usage_cmd` → Worker `GET /api/managed/usage`，回 `{ ok, userSpent, userBudget, sharedSpent, sharedBudget, resetAtUtc }`。
+- `userBudget` 為個人今日**總額度**（基礎 50 萬；已領 GP 加成後 100 萬）。
+- `managed_ai_gp_reward_cmd` → Worker `POST /api/managed/gp-reward`；成功 `{ ok: true, granted }`；已領 `{ ok: false, alreadyClaimed: true }`。
+
+### 匿名使用回饋（`submit_usage_feedback_cmd`）
+
+| 參數 | 型別 | 說明 |
+|------|------|------|
+| clientId | string | 本機匿名 id（8～64 字元） |
+| rating | number | 1～5 |
+| note | string? | 選填文字 |
+
+→ Worker `POST /api/feedback/submit`；不需 Discord 登入。
 
 ### 取消語意
 
@@ -225,6 +243,59 @@ Rust：`snake_case`；JS 參數 **camelCase**。
 
 前端據此把它顯示成「已停止」而非「失敗」（`app.js` 的 `isCancellation`）。
 每次啟動長任務前後端都會先 `reset_cancel()`。
+
+---
+
+## 分享
+
+### `has_shareable_translation_cmd`
+
+| 參數 | 型別 | 說明 |
+|------|------|------|
+| workRoot | string | 翻譯結果工作根（`翻譯結果/`） |
+
+回傳 `bool`：是否有可分享的安裝檔（資源包／覆寫等，不含說明／session）。
+
+### `upload_share_package_cmd`
+
+| 參數 | 型別 | 說明 |
+|------|------|------|
+| workRoot | string | 翻譯結果工作根 |
+| name | string | 包名（寫入落地頁次要列；本機 SFX 檔名固定「模組包繁中翻譯自解檔.exe」） |
+
+回傳 `{ url, expiresAt }`。需 Discord 公會；本機需 NanaZip。`resourcepacks/` 頂層資料夾會打成同名 zip。成功後前端只複製連結、不把 URL 寫進日誌。HTTP 429 表示今日分享次數或同時未過期檔已達上限。
+
+---
+
+## 代管 AI、額度與回饋
+
+需 Discord 登入且已加入官方伺服器；Worker 端 `/api/managed/*` 以 session cookie 驗證。
+
+### `managed_ai_usage_cmd`
+
+| 參數 | 型別 |
+|------|------|
+| （無） | — |
+
+回傳 `ManagedAiUsageCmdResult`（camelCase）：成功時 `ok: true`，含 `day`、`userSpent`、`userBudget`（含 GP 後 effective 總額度）、`sharedSpent`、`sharedBudget`、`resetAtUtc`。失敗時 `ok: false`，`errorType` 可能為 `login_required`、`guild_required`、`auth_unavailable` 等。
+
+### `managed_ai_gp_reward_cmd`
+
+| 參數 | 型別 |
+|------|------|
+| （無） | — |
+
+回傳 `ManagedAiGpRewardCmdResult`：成功 `ok: true`、`granted`（加成 token 數，目前 50 萬）；已領 `ok: false`、`alreadyClaimed: true`。只寫 `gp_reward:{userId}`，**不**減少已使用量。
+
+### `submit_usage_feedback_cmd`
+
+| 參數 | 型別 | 說明 |
+|------|------|------|
+| clientId | string | 8～64 字元 `[A-Za-z0-9_-]` |
+| rating | number | 1～5 |
+| note | string \| null | 選填，最長 800 字 |
+
+回傳 `SubmitUsageFeedbackCmdResult`（`ok`、失敗時 `errorType`）。匿名；不需 Discord。Worker 設 `DISCORD_FEEDBACK_WEBHOOK` 時會通知維護者。
 
 ---
 

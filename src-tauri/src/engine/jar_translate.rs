@@ -36,6 +36,7 @@ pub fn rewrite_translated_jars(
     translated: &LangMap,
     fallback_english: &LangMap,
     work_root: &Path,
+    mut on_progress: impl FnMut(u64, u64, &str),
 ) -> Result<JarTranslationReport, String> {
     let mc = resolve_minecraft_dir(instance_or_mc)?;
     let mods = mc.join("mods");
@@ -54,28 +55,71 @@ pub fn rewrite_translated_jars(
     let jars = list_jars(&mods);
     report.jars_scanned = jars.len();
 
-    for jar in jars {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let total_done = 0usize;
+    if report.jars_scanned > 0 {
+        on_progress(0, report.jars_scanned as u64, "JAR 翻譯副本：準備重建…");
+    }
+    let mut done = total_done;
+    for chunk in jars.chunks(workers) {
         cancel::check()?;
-        let relative = jar
-            .strip_prefix(&mods)
-            .map_err(|e| format!("JAR 路徑不在 mods 目錄內：{e}"))?;
-        let output = output_root.join(relative);
-        let stem = jar
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown.jar");
-        match rewrite_one_jar(&jar, &output, &values, translated) {
-            Ok(stats) if stats.changed => {
-                report.jars_rewritten += 1;
-                report.lang_files_written += stats.files_written;
-                report.keys_written += stats.keys_written;
-                report.fallback_keys_kept += stats.fallback_keys_kept;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for jar in chunk {
+                let jar = jar.clone();
+                let output_root = output_root.clone();
+                let mods = mods.clone();
+                let values = &values;
+                let translated = translated;
+                handles.push(scope.spawn(move || {
+                    let relative = match jar.strip_prefix(&mods) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(e) => {
+                            return Err(format!("JAR 路徑不在 mods 目錄內：{e}"));
+                        }
+                    };
+                    let output = output_root.join(&relative);
+                    let stem = jar
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown.jar")
+                        .to_string();
+                    match rewrite_one_jar(&jar, &output, values, translated) {
+                        Ok(stats) if stats.changed => Ok(Some((stem, stats))),
+                        Ok(_) => {
+                            let _ = remove_empty_parent(&output, &output_root);
+                            Ok(None)
+                        }
+                        Err(error) => Err(format!("{stem}：{error}")),
+                    }
+                }));
             }
-            Ok(_) => {
-                let _ = remove_empty_parent(&output, &output_root);
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(Some((_stem, stats)))) => {
+                        report.jars_rewritten += 1;
+                        report.lang_files_written += stats.files_written;
+                        report.keys_written += stats.keys_written;
+                        report.fallback_keys_kept += stats.fallback_keys_kept;
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => report.errors.push(error),
+                    Err(_) => report.errors.push("JAR 翻譯副本背景工作 panic".into()),
+                }
+                done += 1;
+                on_progress(
+                    done as u64,
+                    report.jars_scanned as u64,
+                    &format!(
+                        "JAR 翻譯副本：已處理 {}/{} 個 JAR",
+                        done,
+                        report.jars_scanned
+                    ),
+                );
             }
-            Err(error) => report.errors.push(format!("{stem}：{error}")),
-        }
+        });
     }
 
     Ok(report)
@@ -463,6 +507,7 @@ mod tests {
             &translated,
             &LangMap::new(),
             &root.join("work"),
+            |_, _, _| {},
         )
         .unwrap();
         assert_eq!(report.jars_rewritten, 1);
@@ -502,6 +547,7 @@ mod tests {
             &translated,
             &LangMap::new(),
             &root.join("work"),
+            |_, _, _| {},
         )
         .unwrap();
 

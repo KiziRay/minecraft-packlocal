@@ -5,13 +5,14 @@ compatibility_date = "2026-08-01"
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "0.3.0"
+LATEST_VERSION = "1.0.5"
 # 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/minecraft-packlocal-v0.3.0-windows-x64.exe"
-RELEASE_NOTES = "0.3.0：代管 AI 改僅 Discord 門檻（移除多餘 Turnstile）；搜尋工作圖、寫入探針、主流程殼對齊。"
+# SHA 等產 MCPL-1.0.5.exe 並上傳 R2 後再填 UPDATE_SHA256。
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.5.exe"
+RELEASE_NOTES = "只有港繁的模組不再被誤判已翻完；港繁會先轉成台灣用語再補缺；已是台灣繁中的字不再被重複轉換；術語表改為分級，減少誤改介面用語；覆蓋報告可分開看出完成、港繁提示與仍待譯；共享免費額度改為每週 1000 萬；個人每日額度維持 50 萬，按 GP 後 100 萬且不必看影片；回饋改成兩步短選擇題，較不打擾；筆電介面預設不再自動縮太小；右上「⋯」可調整外觀與介面大小；翻譯進行中按 F5 或 Ctrl+R 不會誤中斷；加強登入與免費額度防盜用防超用；更新檔驗證與本機設定保護更嚴；舊版 1.0.3 請改用本版更新"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
-UPSTREAM_MODEL = "deepseek-chat"
+UPSTREAM_MODEL = "deepseek-v4-flash"
 
 # 開發者代管 AI 的桌面授權。v3 協定標頭仍要；門檻改為 Discord 會員（Turnstile 已停用）。
 AUTH_BASE_URL = "https://cloud.zeitfrei.uk"
@@ -20,18 +21,24 @@ TURNSTILE_SITE_KEY = "0x4AAAAAAELdGLixrUpLNaxf"
 TURNSTILE_HOSTNAME = "modpack-i18n.jolin34563.workers.dev"
 TURNSTILE_ENFORCED = "0"
 
-# 免費代管翻譯的每日總量上限（保護開發者的共用金鑰不被少數人刷爆）。
+# 免費代管翻譯的共享週總量上限（保護開發者的共用金鑰不被少數人刷爆）。
 # 超過就回 429，客戶端顯示贊助提示。
-DAILY_TOKEN_BUDGET = "20000000"
+WEEKLY_SHARED_TOKEN_BUDGET = "10000000"
 # 單一 Discord 帳號每日上限；啟用 USAGE KV 後生效。
-PER_USER_DAILY_TOKEN_BUDGET = "1000000"
+PER_USER_DAILY_TOKEN_BUDGET = "500000"
+# 巴哈姆特 GP 加成：寫入 gp_reward:{userId} 後個人今日總額度 += 此值。
+GP_REWARD_BONUS = "500000"
 
 # 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
-UPDATE_SHA256 = "7684df70ed142b39bdb214e726fde28a078cc0dd556184b62b85ff46a6fea3b7"
+UPDATE_SHA256 = "D3C4E3911BD672ACCEC1696BF19C8FAF004BF933ADC180C50038F9991F46AE87"
 
 # 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
 SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"
-SHARE_MAX_BYTES = "104857600"
+SHARE_MAX_BYTES = "4294967296"
+# 分享次數（有 USAGE KV 才生效）：每人每日 3 次、同時未過期 2 個、未完成 MPU 1 小時後刪。
+SHARE_DAILY_LIMIT = "3"
+SHARE_ACTIVE_LIMIT = "2"
+SHARE_MPU_STALE_SECONDS = "3600"
 
 # 免安裝 EXE 存放在 R2 bucket（由 Worker /download/<檔名> 直接串流出去）。
 [[r2_buckets]]
@@ -49,14 +56,16 @@ bucket_name = "modpack-i18n-translations"
 [triggers]
 crons = ["0 * * * *"]
 
-# 每日用量計數（KV）— 選用。沒有它時 Worker 仍可運作，只是不在 Worker 層做每日
-# 上限（DeepSeek 帳號餘額仍是最終上限，用完回 402 → 客戶端顯示贊助提示）。
-# 要啟用每日上限：先建 namespace，取消下面兩行註解並填 id，再 deploy：
-#   npx wrangler kv namespace create USAGE
-# [[kv_namespaces]]
-# binding = "USAGE"
-# id = "<FILL_KV_ID>"
+# 每日用量／分享短碼／診斷回報配額（KV）。
+# 建立：npx wrangler kv namespace create USAGE --config worker/wrangler.toml
+[[kv_namespaces]]
+binding = "USAGE"
+id = "9418f0bb99d94270a43c703a241ee227"
 
 # DEEPSEEK_KEY 用 secret 設定，不進版控：
 #   npx wrangler secret put DEEPSEEK_KEY
+# DISCORD_REPORT_WEBHOOK 只放 secret，永不寫入本檔或 git。
+# DISCORD_FEEDBACK_WEBHOOK：匿名回饋送出用
+# DISCORD_JOIN_WEBHOOK：會員驗證成功後 Discord 公告（secret only，每 user／日防刷）
+# DISCORD_TOOL_UPDATE_WEBHOOK：每次新版本部署通知用
 # TURNSTILE_SECRET_KEY、TURNSTILE_PROOF_SECRET 也只能用 secret 設定，不能寫入本檔。

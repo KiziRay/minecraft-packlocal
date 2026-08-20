@@ -20,6 +20,8 @@ pub struct CoverageSourceFlags {
     pub jar_display: bool,
     pub origins: bool,
     pub script_literals: bool,
+    /// Max：JAR 內說明／class 線索複查（耗時；一鍵改為 AI 之後再跑，不擋主翻譯）
+    pub jar_documentation: bool,
     /// Max 档：額外寫出「待補缺口摘要.txt」（樣本鍵清單，非完整五層盤點）。
     pub write_gap_summary: bool,
 }
@@ -71,6 +73,7 @@ impl CoverageTier {
                 jar_display: false,
                 origins: false,
                 script_literals: false,
+                jar_documentation: false,
                 write_gap_summary: false,
             },
             Self::Standard => CoverageSourceFlags {
@@ -80,9 +83,10 @@ impl CoverageTier {
                 text_overlay: true,
                 archive_overlay: true,
                 jar_patchouli: true,
-                jar_display: true,
+                jar_display: false,
                 origins: true,
                 script_literals: true,
+                jar_documentation: false,
                 write_gap_summary: false,
             },
             Self::Max => CoverageSourceFlags {
@@ -95,6 +99,7 @@ impl CoverageTier {
                 jar_display: true,
                 origins: true,
                 script_literals: true,
+                jar_documentation: false,
                 write_gap_summary: true,
             },
         }
@@ -103,8 +108,8 @@ impl CoverageTier {
     pub fn note(self) -> String {
         match self {
             Self::Quick => "完整度：先翻能玩的（物品／介面／任務主線；略過 ZIP／JAR 顯示／腳本來源）。".into(),
-            Self::Standard => "完整度：標準（多數可讀文字來源；預設一般 AI 品質）。".into(),
-            Self::Max => "完整度：盡量完整（來源同標準、預設較仔細品質；另寫待補缺口摘要；圖內字與程式硬編碼仍可能留下）。".into(),
+            Self::Standard => "完整度：標準（多數可讀文字來源；預設一般 AI 品質；略過 JAR 內非書本顯示 JSON 以加速；主資源包一個、不產一堆 extra zip）。".into(),
+            Self::Max => "完整度：盡量完整（含 JAR 顯示文字與文件複查；預設較仔細品質；主資源包一個、不產一堆 extra zip；另寫待補缺口摘要；圖內字與程式硬編碼仍可能留下）。".into(),
         }
     }
 }
@@ -138,6 +143,7 @@ mod tests {
         assert!(!s.jar_display);
         assert!(!s.script_literals);
         assert!(!s.write_gap_summary);
+        assert!(!s.jar_documentation);
     }
 
     #[test]
@@ -145,9 +151,12 @@ mod tests {
         let std = CoverageTier::Standard.sources();
         let max = CoverageTier::Max.sources();
         assert_eq!(std.archive_overlay, max.archive_overlay);
-        assert_eq!(std.jar_display, max.jar_display);
+        assert!(!std.jar_display);
+        assert!(max.jar_display);
         assert!(!std.write_gap_summary);
         assert!(max.write_gap_summary);
+        assert!(!std.jar_documentation);
+        assert!(!max.jar_documentation);
     }
 
     #[test]

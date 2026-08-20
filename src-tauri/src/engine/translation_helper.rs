@@ -134,7 +134,7 @@ pub fn inspect_translation_helper(
                 &loader,
                 spec.map(|item| item.command).unwrap_or(""),
                 if spec.is_some() {
-                    "輔助模組已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來按「重新掃描並清理」。"
+                    "輔助模組已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來：勾選確認再按「③ 重新翻譯任務文字」。"
                 } else {
                     "這個輔助模組版本目前已不在支援清單，但它是工具先前下載的檔案；可以直接清理。"
                 },
@@ -176,7 +176,7 @@ pub fn inspect_translation_helper(
                 &version,
                 &loader,
                 spec.command,
-                "輔助模組已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來按「重新掃描並清理」。",
+            "輔助模組已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來：勾選確認再按「③ 重新翻譯任務文字」。",
                 spec.source_url,
                 Some(path),
                 true,
@@ -194,7 +194,7 @@ pub fn inspect_translation_helper(
             &version,
             &loader,
             spec.command,
-            "已找到相容的輔助模組，不會重複下載。請啟動一次遊戲，執行下方指令，關閉遊戲後回來按「重新掃描並清理」。",
+            "已找到相容的輔助模組，不會重複下載。請啟動一次遊戲，執行下方指令，關閉遊戲後回來：勾選確認再按「③ 重新翻譯任務文字」。",
             spec.source_url,
             Some(existing),
             false,
@@ -266,7 +266,7 @@ pub fn prepare_translation_helper(
         &version,
         &loader,
         spec.command,
-        "已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來按「重新掃描並清理」。",
+        "已準備好。請啟動一次遊戲，執行下方指令，關閉遊戲後回來：勾選確認再按「③ 重新翻譯任務文字」。",
         spec.source_url,
         Some(target),
         true,
@@ -536,8 +536,24 @@ fn is_owned_mod_path(minecraft_dir: &Path, candidate: &Path) -> bool {
     }
 }
 
+fn app_data_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("modpack-i18n-tool"))
+}
+
+fn helper_state_path(output_dir: &Path) -> PathBuf {
+    let key = output_dir
+        .to_string_lossy()
+        .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
+    app_data_root()
+        .unwrap_or_else(|| output_dir.to_path_buf())
+        .join("helper-state")
+        .join(format!("{key}.json"))
+}
+
 fn state_paths(output_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![output_dir.join(STATE_FILE)];
+    let mut paths = vec![helper_state_path(output_dir)];
+    // 舊版曾寫在結果目錄；仍讀取以便遷移
+    paths.push(output_dir.join(STATE_FILE));
     if output_dir.file_name().and_then(|name| name.to_str()) != Some("翻譯結果") {
         paths.push(output_dir.join("翻譯結果").join(STATE_FILE));
     }
@@ -555,8 +571,10 @@ fn read_state_file(path: &Path) -> Option<HelperState> {
 }
 
 fn write_owned_state(output_dir: &Path, state: &HelperState) -> Result<(), String> {
-    fs::create_dir_all(output_dir).map_err(|e| format!("無法建立狀態資料夾：{e}"))?;
-    let path = output_dir.join(STATE_FILE);
+    let path = helper_state_path(output_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("無法建立狀態資料夾：{e}"))?;
+    }
     let text = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     fs::write(path, text).map_err(|e| format!("無法保存輔助模組狀態：{e}"))
 }

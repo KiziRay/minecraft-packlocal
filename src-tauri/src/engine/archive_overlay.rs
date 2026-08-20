@@ -65,8 +65,15 @@ where
         let name = archive.display().to_string();
         on_progress(
             1 + ((index * 80) / archives.len()) as u8,
-            &format!("ZIP 文字：檢查第 {}/{} 個…", index + 1, archives.len()),
+            &format!("ZIP 文字：封存 {}/{}", index + 1, archives.len()),
         );
+        if is_under_resourcepacks(minecraft_dir, archive) {
+            // 語言檔已併入主資源包；不再複製 resourcepacks/*.zip 到 resourcepacks-extra。
+            report.skipped.push(format!(
+                "{name}：略過 resourcepacks 內 ZIP（語言檔會寫入主資源包，不另產 resourcepacks-extra 副本）"
+            ));
+            continue;
+        }
         match process_archive(
             minecraft_dir,
             archive,
@@ -205,7 +212,14 @@ fn process_archive(
 
     let translated_root = stage_root.join(format!("{id}-out"));
     let overlay = translate_text_overlays(&stage, &translated_root, use_ai, scope, |pct, msg| {
-        on_progress(10 + pct.saturating_mul(70) / 100, msg);
+        let rewritten = if msg.contains("掃描多根目錄") {
+            "ZIP 文字：批次翻譯抽出檔…".to_string()
+        } else if let Some(rest) = msg.strip_prefix("覆寫文字：") {
+            format!("ZIP 文字：{rest}")
+        } else {
+            msg.to_string()
+        };
+        on_progress(10 + pct.saturating_mul(70) / 100, &rewritten);
     })?;
     if overlay.files_written == 0 {
         return Ok((0, 0));
@@ -257,18 +271,18 @@ fn process_archive(
     Ok((rewritten, overlay.strings_translated))
 }
 
-fn archive_output_path(work_root: &Path, relative: &str, archive: &Path) -> PathBuf {
-    if relative
-        .split('/')
-        .next()
-        .is_some_and(|root| root.eq_ignore_ascii_case("resourcepacks"))
-    {
-        return work_root.join("resourcepacks-extra").join(
-            archive
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("overlay.zip")),
-        );
-    }
+fn is_under_resourcepacks(mc: &Path, archive: &Path) -> bool {
+    archive
+        .strip_prefix(mc)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|root| root.as_os_str().eq_ignore_ascii_case("resourcepacks"))
+        .unwrap_or(false)
+}
+
+/// 產出路徑＝工作根＋遊戲內相對路徑。
+/// 歷史上 resourcepacks 曾改寫到 `resourcepacks-extra`；現已略過該來源，若仍被呼叫則維持相對路徑。
+fn archive_output_path(work_root: &Path, relative: &str, _archive: &Path) -> PathBuf {
     work_root.join(relative)
 }
 
@@ -285,14 +299,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resourcepack_archives_use_separate_output_root() {
+    fn resourcepack_archives_keep_relative_output_path() {
         let p = archive_output_path(Path::new("work"), "resourcepacks/base.zip", Path::new("x/base.zip"));
-        assert_eq!(p, Path::new("work/resourcepacks-extra/base.zip"));
+        assert_eq!(p, Path::new("work/resourcepacks/base.zip"));
     }
 
     #[test]
     fn ordinary_archives_keep_their_game_relative_root() {
         let p = archive_output_path(Path::new("work"), "datapacks/base.zip", Path::new("x/base.zip"));
         assert_eq!(p, Path::new("work/datapacks/base.zip"));
+    }
+
+    #[test]
+    fn detects_resourcepacks_archive_for_skip() {
+        let mc = Path::new("C:/game/.minecraft");
+        assert!(is_under_resourcepacks(
+            mc,
+            &mc.join("resourcepacks").join("pack.zip")
+        ));
+        assert!(!is_under_resourcepacks(
+            mc,
+            &mc.join("datapacks").join("pack.zip")
+        ));
     }
 }

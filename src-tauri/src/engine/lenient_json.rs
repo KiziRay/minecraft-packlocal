@@ -5,6 +5,7 @@
 //! ——該模組全程英文，而且使用者分不清是工具漏翻還是檔案壞了。
 //!
 //! 這裡先嚴格解析；失敗就把註解與尾逗號清掉（**字串字面值內原樣保留**）再試一次。
+//! 另救 UTF-8 BOM、非法 ASCII control、無效 `\` escape。
 //! 真的還是壞（例：模組自己括號寫錯）才回 `Err`，由呼叫端記進錯誤日誌，不再靜默。
 //!
 //! 技術參考 Koudesuk/Modpack_Translator（MIT）的 `_relax_json`，見 `NOTICE.md`。
@@ -35,12 +36,92 @@ fn trailing_comma_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex"))
 }
 
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+/// 非法 ASCII control → 空白（保留 `\n` `\r` `\t`）。
+fn sanitize_ascii_controls(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            let u = c as u32;
+            if u < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// 字串內無效 JSON escape：`\x` → `\\x`（保留合法 `\"\\\/bfnrtu`）。
+fn fix_invalid_json_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if !in_string {
+            out.push(c);
+            if c == '"' {
+                in_string = true;
+            }
+            continue;
+        }
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some('"') | Some('\\') | Some('/') | Some('b') | Some('f') | Some('n')
+                | Some('r') | Some('t') => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                }
+                Some('u') => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                    for _ in 0..4 {
+                        match chars.peek().copied() {
+                            Some(h) if h.is_ascii_hexdigit() => {
+                                out.push(chars.next().unwrap());
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Some(_) => {
+                    out.push('\\');
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn recover_controls_and_escapes(raw: &str) -> String {
+    fix_invalid_json_escapes(&sanitize_ascii_controls(raw))
+}
+
 /// 解析（先嚴格、失敗再寬鬆）。回 `Err` 代表連寬鬆都救不回來。
 pub fn parse(text: &str) -> Result<Value, String> {
+    let text = strip_bom(text);
+    if text.trim().is_empty() {
+        return Err("空檔".into());
+    }
     if let Ok(v) = serde_json::from_str::<Value>(text) {
         return Ok(v);
     }
-    serde_json::from_str::<Value>(&relax(text)).map_err(|e| e.to_string())
+    let relaxed = relax(text);
+    if let Ok(v) = serde_json::from_str::<Value>(&relaxed) {
+        return Ok(v);
+    }
+    let recovered = recover_controls_and_escapes(&relaxed);
+    serde_json::from_str::<Value>(&recovered).map_err(|e| e.to_string())
 }
 
 /// 解析成 `{ key: 字串 }`（語言檔用）。非字串值略過。頂層不是物件則回 `Err`。
@@ -84,7 +165,6 @@ mod tests {
 
     #[test]
     fn recovers_trailing_comma() {
-        // Gson 讀得動、serde 嚴格會拒收
         let m = parse_object_strings(r#"{"item.foo":"劍","item.bar":"盾",}"#).unwrap();
         assert_eq!(m.get("item.bar").map(|s| s.as_str()), Some("盾"));
         assert_eq!(m.len(), 2);
@@ -100,7 +180,6 @@ mod tests {
 
     #[test]
     fn does_not_touch_slashes_inside_strings() {
-        // 字串內的 // 與 , 不可被當註解／尾逗號處理
         let m = parse_object_strings(r#"{"url":"https://a.com/x","k":"a,b"}"#).unwrap();
         assert_eq!(m.get("url").map(|s| s.as_str()), Some("https://a.com/x"));
         assert_eq!(m.get("k").map(|s| s.as_str()), Some("a,b"));
@@ -108,12 +187,44 @@ mod tests {
 
     #[test]
     fn genuinely_broken_json_is_an_error_not_silent() {
-        // 括號沒關——連寬鬆都救不回，必須回 Err（呼叫端才能記錄）
         assert!(parse(r#"{"a": "b" "#).is_err());
     }
 
     #[test]
     fn non_object_top_level_reports_error() {
         assert!(parse_object_strings(r#"["a","b"]"#).is_err());
+    }
+
+    #[test]
+    fn recovers_utf8_bom() {
+        let raw = "\u{feff}{\"a\":\"1\"}";
+        let m = parse_object_strings(raw).unwrap();
+        assert_eq!(m.get("a").map(|s| s.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn empty_file_is_explicit_error() {
+        assert_eq!(parse("").unwrap_err(), "空檔");
+        assert_eq!(parse("   \n\t  ").unwrap_err(), "空檔");
+        assert_eq!(parse("\u{feff}").unwrap_err(), "空檔");
+    }
+
+    #[test]
+    fn recovers_control_char_inside_string() {
+        let raw = "{\"a\":\"hello\u{0000}world\"}";
+        let m = parse_object_strings(raw).unwrap();
+        assert_eq!(m.get("a").map(|s| s.as_str()), Some("hello world"));
+    }
+
+    #[test]
+    fn recovers_invalid_escape() {
+        let raw = r#"{"a":"path\x\y"}"#;
+        let m = parse_object_strings(raw).unwrap();
+        assert_eq!(m.get("a").map(|s| s.as_str()), Some(r"path\x\y"));
+    }
+
+    #[test]
+    fn still_fails_on_unclosed_brace_after_recovery() {
+        assert!(parse("{\"a\": \"b\"").is_err());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "modpack-i18n-tool"
-version = "0.3.0"
+version = "1.0.5"
 description = "模組包一鍵繁中翻譯"
 authors = ["ZeitFrei"]
 edition = "2021"
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
@@ -25,6 +26,7 @@ dirs = "5"
 open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 zhconv = { version = "0.4.1", default-features = false, features = ["mediawiki-tw", "compress"] }
+unicode-normalization = "0.1"
 
 [profile.release]
 opt-level = "s"

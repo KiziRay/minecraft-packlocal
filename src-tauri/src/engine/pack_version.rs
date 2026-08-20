@@ -81,6 +81,29 @@ pub fn build_pack_name(instance_or_minecraft: &Path) -> (String, PackVersionInfo
     (safe, info)
 }
 
+/// 翻譯輸出資源包名：自訂非空則 sanitize；空白／占位則系統 `build_pack_name`。
+/// 回傳 `(名稱, 版本資訊, 是否自訂)`。
+pub fn resolve_output_pack_name(
+    custom: &str,
+    instance_or_minecraft: &Path,
+) -> (String, PackVersionInfo, bool) {
+    let (auto_name, mut info) = build_pack_name(instance_or_minecraft);
+    let trimmed = custom.trim();
+    if trimmed.is_empty()
+        || trimmed == "選擇實例後自動命名"
+        || trimmed == "留空則自動命名"
+    {
+        return (auto_name, info, false);
+    }
+    match sanitize_folder_name(trimmed) {
+        Ok(safe) => {
+            info.pack_name = safe.clone();
+            (safe, info, true)
+        }
+        Err(_) => (auto_name, info, false),
+    }
+}
+
 fn read_version(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let json: Value = serde_json::from_str(&text).ok()?;
@@ -241,6 +264,44 @@ mod tests {
         let (name, _) = build_pack_name(&root);
         assert!(name.starts_with("模組包翻譯工具+"));
         assert!(name.ends_with("+release-7"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_empty_custom_uses_system_name() {
+        let root = temp_root("resolve-empty");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("minecraft")).unwrap();
+        let (auto, _, _) = resolve_output_pack_name("", &root);
+        let (from_placeholder, _, custom) =
+            resolve_output_pack_name("選擇實例後自動命名", &root);
+        assert_eq!(auto, from_placeholder);
+        assert!(!custom);
+        assert!(auto.starts_with("模組包翻譯工具+"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_custom_name_is_sanitized() {
+        let root = temp_root("resolve-custom");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("minecraft")).unwrap();
+        let (name, info, custom) = resolve_output_pack_name("  我的繁中包  ", &root);
+        assert!(custom);
+        assert_eq!(name, "我的繁中包");
+        assert_eq!(info.pack_name, "我的繁中包");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_invalid_custom_falls_back_to_system() {
+        let root = temp_root("resolve-bad");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("minecraft")).unwrap();
+        let (auto, _, _) = resolve_output_pack_name("", &root);
+        let (name, _, custom) = resolve_output_pack_name("bad/name", &root);
+        assert!(!custom);
+        assert_eq!(name, auto);
         let _ = fs::remove_dir_all(&root);
     }
 

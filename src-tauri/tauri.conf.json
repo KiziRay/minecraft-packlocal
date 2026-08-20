@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Minecraft 模組整合包翻譯工具",
   "mainBinaryName": "Minecraft 模組整合包翻譯工具",
-  "version": "0.3.0",
+  "version": "1.0.5",
   "identifier": "uk.zeitfrei.modpack-i18n",
   "build": {
     "frontendDist": "../src"
@@ -12,33 +12,35 @@
     "windows": [
       {
         "label": "main",
-        "title": "模組包翻譯工具｜ZeitFrei",
+        "title": "模組包翻譯工具",
         "width": 1080,
         "height": 760,
         "minWidth": 360,
         "minHeight": 400,
         "resizable": true,
         "maximizable": true,
+        "decorations": false,
+        "shadow": true,
         "center": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' asset: https://asset.localhost data: blob:; connect-src 'self' ipc: http://ipc.localhost https://modpack-i18n.jolin34563.workers.dev https://*.workers.dev; media-src 'self'"
     }
   },
   "bundle": {
     "active": false,
-    "publisher": "ZeitFrei",
-    "copyright": "© 2026 ZeitFrei",
+    "publisher": "模組包翻譯工具",
+    "copyright": "© 2026",
     "category": "Utility",
     "shortDescription": "把 Minecraft 模組整合包翻成台灣繁體中文",
-    "longDescription": "讀取整合包語言檔，轉換簡體中文、補上缺少翻譯並輸出資源包。技術由 ZeitFrei 提供。",
+    "longDescription": "讀取整合包語言檔，轉換簡體中文、補上缺少翻譯並輸出資源包。",
     "icon": [
-      "icons/zeitfrei-generated-v2/32x32.png",
-      "icons/zeitfrei-generated-v2/128x128.png",
-      "icons/zeitfrei-generated-v2/128x128@2x.png",
-      "icons/zeitfrei-generated-v2/icon.icns",
-      "icons/zeitfrei-generated-v2/icon.ico"
+      "icons/packlocal-v3/32x32.png",
+      "icons/packlocal-v3/128x128.png",
+      "icons/packlocal-v3/128x128@2x.png",
+      "icons/packlocal-v3/icon.icns",
+      "icons/packlocal-v3/icon.ico"
     ]
   }
 }

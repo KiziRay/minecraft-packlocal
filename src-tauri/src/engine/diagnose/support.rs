@@ -83,6 +83,11 @@ fn has_strong_signature(log: &str) -> bool {
         || looks_like_mod_loading_failure(log)
         || looks_like_world_tick_failure(log)
         || looks_like_missing_registry(log)
+        || looks_like_ftb_typeid_corruption(log)
+        || looks_like_resource_path_corruption(log)
+        || looks_like_advancement_corruption(log)
+        || looks_like_patchouli_type_corruption(log)
+        || looks_like_mojibake_text(log)
         || strong_translation_evidence(log)
 }
 
@@ -129,16 +134,17 @@ pub(super) fn classify_runtime_failure(log: &str) -> Option<(&'static str, Strin
             ],
         ));
     }
+    // 僅真原生／建窗失敗；禁止全文 OpenGL∧error（System Details 雜訊不得勝出）。
     if lower.contains("exception_access_violation")
         || lower.contains("hs_err_pid")
         || lower.contains("glfw error")
+        || lower.contains("failed to create the glfw window")
         || lower.contains("failed to create window")
-        || (lower.contains("opengl") && lower.contains("error"))
-        || (lower.contains("lwjgl") && lower.contains("error"))
+        || lower.contains("failed to create display")
     {
         return Some((
             "GRAPHICS_RUNTIME",
-            "記錄比較像 Java 虛擬機、OpenGL、LWJGL 或顯示卡驅動錯誤，沒有翻譯檔證據。"
+            "記錄比較像 Java 虛擬機原生崩潰、GLFW 或建窗失敗，沒有翻譯檔證據。"
                 .into(),
             vec![
                 "更新顯示卡驅動，並確認啟動器沒有使用錯誤的 Java 或顯示卡。",
@@ -147,6 +153,31 @@ pub(super) fn classify_runtime_failure(log: &str) -> Option<(&'static str, Strin
         ));
     }
     None
+}
+
+/// 擷取 NoClassDefFoundError／ClassNotFoundException 的 FQCN。
+pub(super) fn extract_class_missing(log: &str) -> Option<String> {
+    for pattern in [
+        r"(?i)(?:NoClassDefFoundError|ClassNotFoundException)\s*:?\s*([a-zA-Z0-9_$/]+(?:\.[a-zA-Z0-9_$/]+)*)",
+        r#"(?i)Could not find class[:\s]+['"]?([a-zA-Z0-9_$/]+(?:\.[a-zA-Z0-9_$/]+)*)"#,
+    ] {
+        if let Some(capture) = re(pattern).captures(log) {
+            if let Some(value) = capture.get(1) {
+                let fqcn = value.as_str().replace('/', ".");
+                if fqcn.contains('.') || fqcn.len() >= 3 {
+                    return Some(fqcn);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn looks_like_srparasites_class_missing(fqcn: &str) -> bool {
+    let lower = fqcn.to_ascii_lowercase();
+    lower.contains("scapeandrunparasites")
+        || lower.contains("srppotions")
+        || lower.contains("srparasites")
 }
 
 pub(super) fn looks_like_dependency_failure(log: &str) -> bool {
@@ -310,8 +341,125 @@ fn mentions_lang_path(log: &str) -> bool {
         || lower.contains(".lang")
 }
 
+/// Citadel／書頁 JSON 把檔名當 ResourceLocation，翻成非 ASCII 後崩潰。
+/// 典型：`ResourceLocationException` + `zh_tw/根.txt` 或 citadel／`book/`。
+pub(super) fn looks_like_resource_path_corruption(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    let has_rl_ex = lower.contains("resourcelocationexception")
+        || lower.contains("non [a-z0-9/._-]")
+        || lower.contains("non [a-z0-9._-]");
+    if !has_rl_ex || !log.chars().any(|c| !c.is_ascii()) {
+        return false;
+    }
+    if lower.contains("ftbquests:")
+        || lower.contains("ftbquests/")
+        || lower.contains("config/ftbquests")
+        || lower.contains("patchouli")
+    {
+        return false;
+    }
+    lower.contains("citadel")
+        || lower.contains("/book/")
+        || lower.contains(":book/")
+        || lower.contains("guibasicbook")
+        || lower.contains("animal_dictionary")
+        || (lower.contains("zh_tw/") && (lower.contains(".txt") || lower.contains(".json")))
+}
+
+/// FTB Quests 的 type／shape 等結構 id 被翻成非 ASCII（或非法 ResourceLocation）時的崩潰特徵。
+/// 典型：`ResourceLocationException` + `ftbquests:`，或 Non [a-z0-9...] 路徑含非 ASCII。
+pub(super) fn looks_like_ftb_typeid_corruption(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    let has_rl_ex = lower.contains("resourcelocationexception")
+        || lower.contains("non [a-z0-9/._-]")
+        || lower.contains("non [a-z0-9._-]");
+    if !has_rl_ex {
+        return false;
+    }
+    if lower.contains("ftbquests:") || lower.contains("ftbquests/") || lower.contains("config/ftbquests")
+    {
+        return true;
+    }
+    // 非法 path 夾帶非 ASCII（常見於 type 被翻成中文）
+    log.lines().any(|line| {
+        let l = line.to_ascii_lowercase();
+        (l.contains("resourcelocation") || l.contains("non [a-z0-9"))
+            && line.chars().any(|c| !c.is_ascii())
+    })
+}
+
+/// 進度 JSON 的 requirements／frame／translate 被翻壞。
+/// 典型：`Unknown required criterion '中文'`，或 advancement 解析後 `FrameType`／`DisplayInfo` NPE。
+pub(super) fn looks_like_advancement_corruption(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    let has_unknown_criterion = lower.contains("unknown required criterion");
+    let non_ascii_criterion = log.lines().any(|line| {
+        let l = line.to_ascii_lowercase();
+        l.contains("unknown required criterion") && line.chars().any(|c| !c.is_ascii())
+    });
+    if has_unknown_criterion && non_ascii_criterion {
+        return true;
+    }
+    let has_frame_npe = lower.contains("frametype")
+        && lower.contains("nullpointerexception")
+        && (lower.contains("displayinfo") || lower.contains("advancement"));
+    let has_advancement_parse = lower.contains("parsing error loading custom advancement")
+        || lower.contains("serveradvancementmanager")
+        || has_unknown_criterion;
+    has_frame_npe && has_advancement_parse
+}
+
+/// Patchouli 書頁 `type` 被翻成非 ASCII／未知頁型。
+/// 典型：Unknown page type、patchouli book error、ResourceLocation 含中文。
+pub(super) fn looks_like_patchouli_type_corruption(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    let mentions_patchouli = lower.contains("patchouli")
+        || lower.contains("patchouli_books")
+        || lower.contains("vazkii.patchouli");
+    if !mentions_patchouli {
+        return false;
+    }
+    let unknown_page = lower.contains("unknown page type")
+        || lower.contains("unknown page")
+        || lower.contains("invalid page type");
+    let rl_bad = (lower.contains("resourcelocationexception")
+        || lower.contains("non [a-z0-9/._-]"))
+        && log.chars().any(|c| !c.is_ascii());
+    unknown_page || rl_bad
+}
+
+/// 日誌／貼文出現典型 UTF-8 被當 Latin-1 解的怪碼（Ã/å/æ…），且提到語言／資源包。
+/// 不做 codec 重寫；引導還原後重產或檢查第三方包。
+pub(super) fn looks_like_mojibake_text(log: &str) -> bool {
+    let has_mojibake = log.contains('Ã')
+        || log.contains('å')
+        || log.contains('æ')
+        || log.contains('Â')
+        || log.contains("Ã¤")
+        || log.contains("Ã©");
+    if !has_mojibake {
+        return false;
+    }
+    let lower = log.to_ascii_lowercase();
+    lower.contains("zh_tw")
+        || lower.contains("lang/")
+        || lower.contains("resourcepack")
+        || lower.contains("resource pack")
+        || lower.contains("語言")
+        || lower.contains("翻译")
+        || lower.contains("翻譯")
+}
+
 /// 路徑／輸出證據＋資料載入錯誤，或 MissingFormatArgumentException＋翻譯輸出。
 pub(super) fn strong_translation_evidence(log: &str) -> bool {
+    if looks_like_ftb_typeid_corruption(log)
+        || looks_like_resource_path_corruption(log)
+        || looks_like_advancement_corruption(log)
+        || looks_like_patchouli_type_corruption(log)
+        || looks_like_mojibake_text(log)
+    {
+        return true;
+    }
     if !mentions_our_output(log) {
         return false;
     }
@@ -439,6 +587,11 @@ fn is_cleanup_noise(lower: &str) -> bool {
         || lower.contains("finished unloading")
         || lower.contains("process exited")
         || lower.contains("assertion failed: !(handle->flags")
+        || lower.contains("gl info:")
+        || lower.starts_with("opengl:")
+        || lower.contains("-- system details --")
+        || lower.contains("launched version:")
+        || lower.contains("jvm flags:")
 }
 
 fn is_error_line(lower: &str) -> bool {

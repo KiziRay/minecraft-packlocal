@@ -116,17 +116,19 @@ pub fn load_pack_zh(pack_path: &Path) -> Result<LangMap, String> {
     super::pack_out::load_pack_zh_any(pack_path)
 }
 
-/// 從 pending 去掉已有中文的 key
+/// 從 pending 去掉「有效中文」的 key；假中文／混雜仍算待補。
 pub fn remaining_pending(pending: &LangMap, zh: &LangMap) -> LangMap {
     let mut out: LangMap = HashMap::new();
     for (ns, map) in pending {
         for (k, en) in map {
-            let has = zh.get(ns).and_then(|m| m.get(k)).is_some();
-            if !has {
-                // 略過空字串（無法翻譯）
-                if en.trim().is_empty() {
-                    continue;
-                }
+            if en.trim().is_empty() {
+                continue;
+            }
+            let zh_val = zh.get(ns).and_then(|m| m.get(k));
+            let done = zh_val
+                .map(|z| super::translation_quality::is_usable_zh(en, z))
+                .unwrap_or(false);
+            if !done {
                 out.entry(ns.clone())
                     .or_default()
                     .insert(k.clone(), en.clone());
@@ -136,8 +138,53 @@ pub fn remaining_pending(pending: &LangMap, zh: &LangMap) -> LangMap {
     out
 }
 
+/// 將資源包內不合格譯文（仍英／混雜）重新列入待補；來源字串用現有值（常即英文或碎片）。
+pub fn rework_unusable_zh(zh: &LangMap) -> LangMap {
+    use super::translation_quality::{is_mixed_fragment, is_still_english, is_usable_zh};
+    let mut out: LangMap = HashMap::new();
+    for (ns, map) in zh {
+        for (k, v) in map {
+            if v.trim().is_empty() {
+                continue;
+            }
+            if is_usable_zh("", v) {
+                continue;
+            }
+            if is_still_english(v) || is_mixed_fragment(v) {
+                out.entry(ns.clone())
+                    .or_default()
+                    .insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 合併兩份 pending（後者覆蓋同 key）。
+pub fn merge_pending(into: &mut LangMap, extra: &LangMap) {
+    for (ns, map) in extra {
+        let slot = into.entry(ns.clone()).or_default();
+        for (k, v) in map {
+            slot.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 pub fn count_map(m: &LangMap) -> usize {
     m.values().map(|x| x.len()).sum()
+}
+
+/// 本機略過免譯字串（資源 id、純數字、URL 等），避免進 pending／送 AI。
+pub fn filter_local_untranslatable(pending: &mut LangMap) -> usize {
+    use super::deepseek::looks_untranslatable;
+    let mut skipped = 0usize;
+    for map in pending.values_mut() {
+        let before = map.len();
+        map.retain(|_, v| !looks_untranslatable(v));
+        skipped += before - map.len();
+    }
+    pending.retain(|_, m| !m.is_empty());
+    skipped
 }
 
 /// 依 session 名稱在輸出目錄附近找 zip／資料夾
@@ -178,4 +225,24 @@ pub fn find_pack_near(output_dir: &Path, pack_name: &str, pack_path_hint: &str) 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_local_untranslatable_skips_resource_id() {
+        let mut pending: LangMap = HashMap::new();
+        let map = pending.entry("minecraft".into()).or_default();
+        map.insert("item.stone".into(), "minecraft:stone".into());
+        map.insert("item.diamond_sword".into(), "Diamond Sword".into());
+        let skipped = filter_local_untranslatable(&mut pending);
+        assert_eq!(skipped, 1);
+        assert_eq!(count_map(&pending), 1);
+        assert_eq!(
+            pending["minecraft"]["item.diamond_sword"],
+            "Diamond Sword"
+        );
+    }
 }

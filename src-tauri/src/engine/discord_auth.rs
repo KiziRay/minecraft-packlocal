@@ -17,6 +17,15 @@ const WEBSITE_URL: &str = "https://cloud.zeitfrei.uk";
 pub const DISCORD_INVITE_URL: &str = "https://discord.gg/zeitfrei";
 static LOGIN_CANCEL: AtomicBool = AtomicBool::new(false);
 
+fn new_oauth_state() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    Instant::now().hash(&mut h);
+    std::process::id().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscordAuthStatus {
@@ -232,7 +241,10 @@ pub fn login_discord_blocking(app: AppHandle) -> Value {
         .local_addr()
         .map(|addr| addr.port())
         .unwrap_or(19420);
-    let url = format!("{WEBSITE_URL}/api/desktop-auth?redirect=http://127.0.0.1:{port}/callback");
+    let oauth_state = new_oauth_state();
+    let url = format!(
+        "{WEBSITE_URL}/api/desktop-auth?redirect=http://127.0.0.1:{port}/callback&state={oauth_state}"
+    );
     let _ = app.emit("discord-login-url", json!({ "url": url }));
     let _ = open::that(&url);
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -251,6 +263,12 @@ pub fn login_discord_blocking(app: AppHandle) -> Value {
                 }
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
                 if let Ok(data) = serde_json::from_str::<Value>(body) {
+                    let returned_state = data.get("state").and_then(Value::as_str);
+                    if let Some(returned_state) = returned_state {
+                        if returned_state != oauth_state {
+                            return json!({ "ok": false, "error": "invalid_state" });
+                        }
+                    }
                     if let Some(token) = data.get("token").and_then(Value::as_str) {
                         if decode_inner(token).is_none() {
                             return json!({ "ok": false, "error": "invalid_token" });

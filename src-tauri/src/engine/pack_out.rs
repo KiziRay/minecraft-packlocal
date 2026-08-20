@@ -139,6 +139,52 @@ pub fn pack_format_for_version(version: &str) -> Option<u32> {
     best.map(|(_, f)| f)
 }
 
+/// 本工具最低支援 Minecraft 1.13；年份版（major ≥ 26，如 26.1）另算支援。
+pub fn is_supported_minecraft_version(version: &str) -> bool {
+    let Some(parts) = parse_version(version) else {
+        return false;
+    };
+    if parts[0] >= 26 {
+        return true;
+    }
+    if parts[0] != 1 {
+        return false;
+    }
+    cmp_version(&parts, &[1, 13]) != std::cmp::Ordering::Less
+}
+
+pub fn ensure_supported_minecraft_version(version: &str) -> Result<(), String> {
+    if is_supported_minecraft_version(version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "本工具僅支援 Minecraft 1.13 以上（含年份版 26.x），偵測到 {version}，無法翻譯。"
+        ))
+    }
+}
+
+/// 指定或偵測版本後過閘；兩者皆無或無法解析 → 要求手動指定 1.13+。
+pub fn ensure_minecraft_version_for_translate(
+    target_version: Option<&str>,
+    minecraft_dir: &Path,
+) -> Result<String, String> {
+    let resolved = target_version
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| detect_minecraft_version(minecraft_dir));
+    match resolved {
+        Some(v) => {
+            ensure_supported_minecraft_version(&v)?;
+            Ok(v)
+        }
+        None => Err(
+            "無法確認 Minecraft 版本。請從版本選單指定 1.13 以上（或年份版 26.x）後再翻譯。"
+                .into(),
+        ),
+    }
+}
+
 fn parse_version(s: &str) -> Option<Vec<u32>> {
     let cleaned: String = s
         .trim()
@@ -489,6 +535,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn supported_minecraft_version_gate() {
+        assert!(!is_supported_minecraft_version("1.12.2"));
+        assert!(!is_supported_minecraft_version("1.7.10"));
+        assert!(!is_supported_minecraft_version("1.12"));
+        assert!(!is_supported_minecraft_version("not-a-version"));
+        assert!(is_supported_minecraft_version("1.13"));
+        assert!(is_supported_minecraft_version("1.13.2"));
+        assert!(is_supported_minecraft_version("1.20.1"));
+        assert!(is_supported_minecraft_version("26.1"));
+        assert!(ensure_supported_minecraft_version("1.12.2").is_err());
+        assert!(ensure_supported_minecraft_version("1.13").is_ok());
+    }
+
+    #[test]
     fn maps_known_versions_to_pack_format() {
         assert_eq!(pack_format_for_version("1.20.1"), Some(15));
         assert_eq!(pack_format_for_version("1.19.2"), Some(9));
@@ -582,6 +642,34 @@ mod tests {
     fn missing_instance_falls_back_instead_of_panicking() {
         let fmt = detect_pack_format(Path::new("Z:/definitely/not/here"));
         assert_eq!(fmt, FALLBACK_PACK_FORMAT);
+    }
+
+    #[test]
+    fn lang_json_write_is_valid_utf8_with_cjk() {
+        let root = std::env::temp_dir().join(format!("pack_utf8_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut lang: LangMap = HashMap::new();
+        lang.entry("minecraft".into()).or_default().insert(
+            "block.minecraft.stone".into(),
+            "石頭與繁中測試—UTF8".into(),
+        );
+        let opts = BuildOptions {
+            output_dir: root.display().to_string(),
+            pack_folder_name: "utf8pack".into(),
+            pack_description: "測試".into(),
+            pack_format: 15,
+            target_version: Some("1.20.1".into()),
+        };
+        let built = build_resource_pack(&lang, &opts).unwrap();
+        let zh_path = PathBuf::from(&built.pack_dir)
+            .join("assets/minecraft/lang/zh_tw.json");
+        let bytes = fs::read(&zh_path).unwrap();
+        assert!(std::str::from_utf8(&bytes).is_ok(), "must be UTF-8");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("石頭與繁中測試—UTF8"));
+        assert!(!text.contains('Ã'));
+        let _ = fs::remove_dir_all(root);
     }
 }
 

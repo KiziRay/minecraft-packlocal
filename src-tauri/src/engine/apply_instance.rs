@@ -454,7 +454,6 @@ pub fn apply_to_instance(
     let defaultconfigs_src = work.join("defaultconfigs");
     let global_packs_src = work.join("global_packs");
     let paxi_src = work.join("paxi");
-    let data_src = work.join("data");
     let jar_src = work.join("jar-translated");
 
     let has_patchouli = dir_has_files(&patchouli_src);
@@ -466,7 +465,6 @@ pub fn apply_to_instance(
     let has_defaultconfigs = dir_has_files(&defaultconfigs_src);
     let has_global_packs = dir_has_files(&global_packs_src);
     let has_paxi = dir_has_files(&paxi_src);
-    let has_data = dir_has_files(&data_src);
     let has_jars = dir_has_files(&jar_src);
     let has_resourcepacks_extra = dir_has_files(&resourcepacks_extra_src);
 
@@ -482,7 +480,6 @@ pub fn apply_to_instance(
         && !has_defaultconfigs
         && !has_global_packs
         && !has_paxi
-        && !has_data
         && !has_jars
         && !has_resourcepacks_extra
     {
@@ -530,7 +527,6 @@ pub fn apply_to_instance(
         (&defaultconfigs_src, "defaultconfigs", has_defaultconfigs),
         (&global_packs_src, "global_packs", has_global_packs),
         (&paxi_src, "paxi", has_paxi),
-        (&data_src, "data", has_data),
     ] {
         if enabled {
             collect_planned_tree(source, &mc.join(name), &mut planned_targets);
@@ -628,7 +624,6 @@ pub fn apply_to_instance(
             (&defaultconfigs_src, "defaultconfigs"),
             (&global_packs_src, "global_packs"),
             (&paxi_src, "paxi"),
-            (&data_src, "data"),
         ] {
             if dir_has_files(source) && mc.join(name).is_dir() {
                 copy_dir_recursive(&mc.join(name), &backup_root.join(name))?;
@@ -758,7 +753,6 @@ pub fn apply_to_instance(
         (&defaultconfigs_src, "defaultconfigs"),
         (&global_packs_src, "global_packs"),
         (&paxi_src, "paxi"),
-        (&data_src, "data"),
     ] {
         if dir_has_files(source) {
             merge_copy_dir(source, &mc.join(name), &mc, &mut manifest)?;
@@ -778,6 +772,9 @@ pub fn apply_to_instance(
                 (create_backup && !backup_reused).then_some(&backup_root),
                 &mut manifest,
             )?;
+            for warn in warn_enabled_packs_covering_font(&mc, name) {
+                warnings.push(warn);
+            }
         }
     }
 
@@ -1106,6 +1103,116 @@ fn enable_resource_pack(
     Ok(())
 }
 
+/// 已啟用且含 `assets/*/font/` 的資源包可能蓋掉翻譯／自訂字體 → 警告（不做 codec 重寫）。
+fn warn_enabled_packs_covering_font(mc: &Path, our_zip_name: &str) -> Vec<String> {
+    let options = mc.join("options.txt");
+    let Ok(text) = fs::read_to_string(&options) else {
+        return Vec::new();
+    };
+    let Some(list_line) = text.lines().find(|l| l.starts_with("resourcePacks:")) else {
+        return Vec::new();
+    };
+    let value = list_line.strip_prefix("resourcePacks:").unwrap_or("").trim();
+    let our_entry = format!("file/{our_zip_name}");
+    let mut suspects = Vec::new();
+    for raw in value.split('"') {
+        let entry = raw.trim();
+        if entry.is_empty()
+            || entry == "vanilla"
+            || entry == ","
+            || entry == "["
+            || entry == "]"
+            || entry == our_entry
+        {
+            continue;
+        }
+        let Some(name) = entry.strip_prefix("file/") else {
+            continue;
+        };
+        if pack_contains_font_override(mc, name) {
+            suspects.push(name.to_string());
+        }
+    }
+    if suspects.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "以下已啟用資源包含 font/，可能蓋過翻譯或自訂字體顯示：{}。請在資源包選單把「繁中翻譯／字體包」置頂，或暫時停用上述包後重開遊戲。",
+        suspects.join("、")
+    )]
+}
+
+fn pack_contains_font_override(mc: &Path, pack_name: &str) -> bool {
+    let rp = mc.join("resourcepacks").join(pack_name);
+    if rp.is_dir() {
+        return dir_has_font_assets(&rp);
+    }
+    if rp.is_file() {
+        return zip_has_font_assets(&rp);
+    }
+    // 名稱可能沒副檔名
+    let zip = mc.join("resourcepacks").join(format!("{pack_name}.zip"));
+    if zip.is_file() {
+        return zip_has_font_assets(&zip);
+    }
+    false
+}
+
+fn dir_has_font_assets(root: &Path) -> bool {
+    let walker = walkdir::WalkDir::new(root).max_depth(8);
+    for entry in walker.into_iter().flatten() {
+        let path = entry.path();
+        let lower = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        if lower.contains("/font/") && path.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn zip_has_font_assets(zip_path: &Path) -> bool {
+    let Ok(file) = fs::File::open(zip_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name().replace('\\', "/").to_ascii_lowercase();
+        if name.contains("/font/") && !entry.is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod apply_font_warn_tests {
+    use super::*;
+
+    #[test]
+    fn detects_font_dir_in_loose_pack() {
+        let root = std::env::temp_dir().join(format!("font_warn_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let pack = mc.join("resourcepacks").join("GuiFontPack");
+        fs::create_dir_all(pack.join("assets/minecraft/font")).unwrap();
+        fs::write(pack.join("assets/minecraft/font/default.json"), "{}").unwrap();
+        fs::write(
+            mc.join("options.txt"),
+            "resourcePacks:[\"file/GuiFontPack\",\"file/繁體中文翻譯.zip\"]\n",
+        )
+        .unwrap();
+        let warns = warn_enabled_packs_covering_font(&mc, "繁體中文翻譯.zip");
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("GuiFontPack"));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1273,5 +1380,24 @@ mod tests {
         assert!(err.contains("不符"));
         assert!(PathBuf::from(&applied.backup_dir).is_dir());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn does_not_copy_work_data_into_minecraft_data() {
+        let root = std::env::temp_dir().join(format!("apply_no_mc_data_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(work.join("jar-translated")).unwrap();
+        fs::create_dir_all(work.join("data/example")).unwrap();
+        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
+        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
+        fs::write(work.join("data/example/book.json"), b"{}").unwrap();
+
+        apply_to_instance(&mc, &work, None, false).unwrap();
+        assert!(!mc.join("data/example/book.json").exists());
+        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
+        let _ = fs::remove_dir_all(root);
     }
 }

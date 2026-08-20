@@ -35,6 +35,7 @@ pub fn load_reference_zh_tw(path: &Path) -> Result<(LangMap, usize), String> {
 /// 把 reference 填進 base：base 沒有的 key 才補（本機，不 AI）
 /// 回傳補了幾條
 pub fn merge_fill_missing(base: &mut LangMap, reference: &LangMap) -> usize {
+    use super::translation_quality::is_usable_zh;
     let mut n = 0usize;
     for (ns, map) in reference {
         let slot = base.entry(ns.clone()).or_default();
@@ -43,19 +44,33 @@ pub fn merge_fill_missing(base: &mut LangMap, reference: &LangMap) -> usize {
             if t.is_empty() {
                 continue;
             }
+            if !is_usable_zh("", v) {
+                continue;
+            }
             if !slot.contains_key(k) {
                 slot.insert(k.clone(), v.clone());
                 n += 1;
+            } else if let Some(cur) = slot.get(k) {
+                if !is_usable_zh("", cur) {
+                    slot.insert(k.clone(), v.clone());
+                    n += 1;
+                }
             }
         }
     }
     n
 }
 
-/// 從 pending_en 去掉 base 已有的 key
+/// 從 pending_en 去掉 base 已有「有效中文」的 key
 pub fn subtract_covered(pending: &mut LangMap, base: &LangMap) {
+    use super::translation_quality::is_usable_zh;
     pending.retain(|ns, map| {
-        map.retain(|k, _| base.get(ns).and_then(|m| m.get(k)).is_none());
+        map.retain(|k, en| {
+            match base.get(ns).and_then(|m| m.get(k)) {
+                Some(zh) => !is_usable_zh(en, zh),
+                None => true,
+            }
+        });
         !map.is_empty()
     });
 }

@@ -6,16 +6,16 @@
 - **不處理**圖片／貼圖上的字
 - 產出資源包 zip + 任務／書本等可覆蓋檔；可一鍵套用（可選擇是否備份）
 - 不宣稱 100% 漢化
-- **免安裝任何額外東西**（簡繁轉換內建於執行檔）
+- **翻譯／套用免安裝額外工具**（簡繁轉換內建於執行檔）；啟動需 Windows **WebView2**；「分享給其他玩家」需本機已裝 **NanaZip**
 
-目前版本：**0.3.0**（以 src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json 三處同步為準）
+目前版本：**1.0.5**（以 src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json 三處同步為準）。正式版發佈檔名 `MCPL-1.0.5.exe`。
 
 免費代管翻譯需登入 Discord 並加入 ZeitFrei 官方伺服器；也可改用自備 API 金鑰。
 
 ## 支援範圍（一句話）
 
 **會翻**：Forge／NeoForge／Fabric／Quilt 的語言檔；FTB Quests、Patchouli 書本、OpenLoader、KubeJS、FancyMenu、資料包文字；Origins／Apoli 能力；Better Questing／HQM／Heracles／Modonomicon 任務／書本。支援 Minecraft **1.13～1.21.x 與年份版 26.x**。
-**不翻**：圖片上的字、寫死在程式碼／KubeJS 腳本裡的字串、GuideME 的 Markdown 書本、`.zip` 資料包、基岩版。
+**不翻**：圖片上的字、寫死在程式碼／KubeJS 腳本裡的字串、GuideME 的 Markdown 書本、`.zip` 資料包、基岩版市集加密包（合規下終端玩家通常讀不到明文 lang；作者明文／授權包才是未來可能路徑，本工具不做破解）。
 完整清單與**免責條款** → [`docs/支援範圍與免責聲明.md`](./docs/支援範圍與免責聲明.md)。
 
 模組 JAR 內的 `assets/<模組>/lang/*.json`／`.lang` 會被讀取並建立繁中副本；簽章 JAR 會安全略過，避免重打包後失效。
@@ -65,15 +65,13 @@
 | [docs/EXTENDING.md](./docs/EXTENDING.md) | 開發 | 如何加新文字來源 |
 | [docs/USER-GUIDE.md](./docs/USER-GUIDE.md) | 玩家／文案 | 使用說明全文結構 |
 | [docs/COMMUNITY.md](./docs/COMMUNITY.md) | 產品 | 社群期望與紅線 |
-| [docs/CHANGELOG.md](./docs/CHANGELOG.md) | 所有人 | 版本紀錄 |
-| [docs/詳細使用說明.md](./docs/詳細使用說明.md) | 玩家 | 實例、資料夾、安裝與分享 |
 
 ---
 
 ## 開發者快速開始
 
 ```bash
-# 需求：Rust stable、Node、Windows WebView2（無其他執行期依賴）
+# 需求：Rust stable、Node、Windows WebView2；分享功能另需本機 NanaZip
 
 cd modpack-i18n-tool
 npm install

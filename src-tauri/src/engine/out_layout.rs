@@ -7,6 +7,8 @@ use walkdir::WalkDir;
 
 /// 固定結果資料夾名稱
 pub const RESULT_DIR_NAME: &str = "翻譯結果";
+/// 字體包專用結果資料夾（與翻譯完全分開）
+pub const FONT_RESULT_DIR_NAME: &str = "字體結果";
 
 /// 清掉翻譯中斷後留下的暫存，不碰玩家的翻譯結果與備份。
 pub fn cleanup_transient_work(work_root: &Path) -> Result<(), String> {
@@ -114,26 +116,72 @@ fn resolve_work_root(user_output: &Path) -> PathBuf {
     user_output.join(RESULT_DIR_NAME)
 }
 
+fn resolve_font_work_root(user_output: &Path) -> PathBuf {
+    let name = user_output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if name == FONT_RESULT_DIR_NAME {
+        return user_output.to_path_buf();
+    }
+    if name.eq_ignore_ascii_case("resourcepacks") {
+        if let Some(parent) = user_output.parent() {
+            return parent.join(FONT_RESULT_DIR_NAME);
+        }
+    }
+    user_output.join(FONT_RESULT_DIR_NAME)
+}
+
+/// 字體包專用結果根：user_output/字體結果（不建翻譯 config 等）。
+pub fn ensure_font_result_layout(user_output: &Path) -> Result<PathBuf, String> {
+    if user_output.as_os_str().is_empty() {
+        return Err("字體輸出路徑是空的。".into());
+    }
+    fs::create_dir_all(user_output).map_err(|e| format!("無法建立字體輸出根目錄：{e}"))?;
+    let work_root = resolve_font_work_root(user_output);
+    fs::create_dir_all(&work_root).map_err(|e| format!("無法建立「{FONT_RESULT_DIR_NAME}」：{e}"))?;
+    let resourcepacks = work_root.join("resourcepacks");
+    fs::create_dir_all(&resourcepacks).map_err(|e| e.to_string())?;
+    let readme = work_root.join("【請閱讀】字體輸出說明.txt");
+    if !readme.is_file() {
+        let body = format!(
+            "【字體資源包 — 輸出目錄說明】\n\
+\n\
+本資料夾只放字體資源包，與「翻譯結果」完全分開。\n\
+\n\
+  {FONT_RESULT_DIR_NAME}/\n\
+    resourcepacks/  ← 建立的字體包資料夾\n\
+    字體執行日誌.txt ← 字體分頁的操作紀錄（若有）\n\
+\n\
+工作根目錄：\n{}\n",
+            work_root.display()
+        );
+        let _ = fs::write(readme, body);
+    }
+    Ok(work_root)
+}
+
 fn write_readme(layout: &ResultLayout) -> Result<(), String> {
     let body = format!(
         "【模組包繁中翻譯 — 輸出目錄說明】\n\
 \n\
 本資料夾由工具自動建立，請不要只把整個根目錄當 resourcepacks。\n\
+每個整合包預設各有獨立結果位置（勿多包共用同一資料夾）。\n\
 \n\
 目錄結構：\n\
   {RESULT_DIR_NAME}/\n\
     resourcepacks/     ← 翻譯完成會直接套用；需要手動時才複製到遊戲 resourcepacks\n\
-    resourcepacks-extra/ ← ZIP 資料包／資源包翻譯副本（工具套用時一起複製）\n\
     config/ftbquests/  ← 任務／劇情：完成時依備份選項覆蓋到遊戲 config\\ftbquests\n\
     config/openloader/ ← 文字覆寫（若有）\n\
     config/starterkit/、armorsets/、minecolonies/ 等 ← 顯示型設定文字（若有）\n\
     patchouli_books/   ← 書本（若有）\n\
     kubejs/            ← 語言覆寫與安全白名單腳本字串（若有）\n\
-    data/               ← JAR 內 Patchouli 書本覆寫（若有）\n\
     jar-translated/    ← 翻譯後 JAR 副本（套用時依備份選項放入 mods）\n\
     minemenu/          ← 若有快捷選單修正檔\n\
     翻譯工作階段.json  ← 補翻／修復用，勿亂刪\n\
     覆蓋範圍說明.txt   ← 會翻什麼／不會翻什麼（社群誠實原則）\n\
+    翻譯錯誤日誌.txt、執行日誌.txt ← 回報用\n\
+    字體包請用「字體」分頁，輸出到「字體結果/」，勿混在本資料夾。\n\
 \n\
 建議流程：\n\
 1. 關閉遊戲\n\
@@ -152,6 +200,8 @@ fn write_readme(layout: &ResultLayout) -> Result<(), String> {
 pub struct CoverageStats {
     pub keys_zh: usize,
     pub keys_pending: usize,
+    pub keys_tw_playable: usize,
+    pub keys_hk_hint: usize,
     pub ai_filled: usize,
     pub ai_enabled: bool,
     pub jars_scanned: usize,
@@ -220,10 +270,11 @@ pub fn write_gap_summary_file(
 pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Result<PathBuf, String> {
     let path = layout.work_root.join("覆蓋範圍說明.txt");
     let covered_pct = if stats.keys_zh + stats.keys_pending > 0 {
-        (stats.keys_zh as f64 * 100.0) / (stats.keys_zh + stats.keys_pending) as f64
+        (stats.keys_tw_playable as f64 * 100.0) / (stats.keys_zh + stats.keys_pending) as f64
     } else {
         0.0
     };
+    let _ = covered_pct;
     let source_summary = if stats.ai_enabled {
         format!("（含本機合併與 AI 新補；AI 本次新寫入約 {} 條）", stats.ai_filled)
     } else {
@@ -239,6 +290,12 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
     } else {
         "4. 不用線上服務做分類找檔；掃描與分類都在本機完成\n"
     };
+    let redline4 = if stats.ai_enabled {
+        "4. 線上翻譯可能有錯；歡迎用診斷頁回報。不滿意請先還原上次套用。\n"
+    } else {
+        "4. 不把金鑰寫進分享檔或公開貼文\n"
+    };
+    let handling_34 = format!("{reference_summary}{ai_rule}");
     let source_lines = if stats.source_notes.is_empty() {
         "• 本次沒有額外來源統計。\n".to_string()
     } else {
@@ -262,8 +319,10 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 （依全球 Minecraft／整合包玩家社群常見期望撰寫；本工具不宣稱 100% 漢化）\n\
 \n\
 ═══ 這次大概蓋到什麼 ═══\n\
-• 中文鍵約 {} 條{}\n\
-• 仍待補英文約 {} 條（語言檔層級粗估完成度約 {:.1}%）\n\
+• 【台灣繁中已覆蓋】約 {} 條（不含純港繁提示）\n\
+• 【港繁提示已轉台】約 {} 條（仍可能需補缺）\n\
+• 【仍待譯】約 {} 條\n\
+• 中文鍵合計約 {} 條{}\n\
 • 掃過模組 jar 約 {} 個；翻譯副本重建 {} 個、寫入 {} 個語言檔、{} 個失敗\n\
 • 完整度授權：{}\n\
 • 補譯命中：術語表 {}／翻譯記憶 {}／共享庫 {}\n\
@@ -276,11 +335,11 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 1. mods／資源包／KubeJS 等語言檔 → 產出 zh_tw 資源包 zip\n\
 2. 簡中 → 台灣繁體（OpenCC s2twp，本機）\n\
 {}\
-4. FTB Quests 任務文字（輸出到 config/ftbquests，完成時直接套用）\n\
-5. 文字覆寫：patchouli_books／openloader／kubejs／顯示型 config 等（完成時直接套用）\n\
-6. 任務／書本系統：Better Questing／HQM／Heracles／Modonomicon（顯示欄位，best-effort）\n\
-7. Origins／Apoli 能力名稱與說明（路徑感知，不動識別字）\n\
-8. JAR 原檔只讀；翻譯副本是否在套用前備份同名 mods 檔，由玩家選項決定\n\
+5. FTB Quests 任務文字（輸出到 config/ftbquests，完成時直接套用）\n\
+6. 文字覆寫：patchouli_books／openloader／kubejs／顯示型 config 等（完成時直接套用）\n\
+7. 任務／書本系統：Better Questing／HQM／Heracles／Modonomicon（顯示欄位，best-effort）\n\
+8. Origins／Apoli 能力名稱與說明（路徑感知，不動識別字）\n\
+9. JAR 原檔只讀；翻譯副本是否在套用前備份同名 mods 檔，由玩家選項決定\n\
 \n\
 ═══ 本次來源明細 ═══\n\
 {}\
@@ -289,10 +348,13 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 1. 圖片上的字（紅線，本工具不處理圖片）\n\
 2. 寫死在 Java 程式碼／KubeJS 任意腳本邏輯裡的字串（不解析程式碼；僅處理明確白名單的顯示 API）\n\
 3. 特殊或動態生成的 Markdown 結構仍可能需要手動檢查；一般文字 ZIP 已會安全重建\n\
-4. 基岩版（Bedrock）整合包（格式不同，不支援）\n\
+4. 基岩版（Bedrock）整合包（格式不同；市集加密包無法合規自動翻）\n\
 5. 未掃到的特殊格式、動態生成文字\n\
 6. 世界閃退、缺模組、結構包問題（與翻譯無關，本工具不修）\n\
 7. 機翻腔、專有名詞不一致（社群包也會寫「不保證完美」）\n\
+8. Essential 等客戶端模組：部分 UI 寫死在 class／快取，資源包無法覆蓋（見手翻 UNTRANSLATABLE 說明）\n\
+9. MIDI／Drop Rate 等若僅在介面或 class 硬編碼、無 lang 鍵，本工具無法翻譯\n\
+10. 僅含港繁（zh_hk）的模組不算台灣繁中已完成\n\
 \n\
 本次略過／需要人工檢查：\n\
 {}\
@@ -307,13 +369,15 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 ═══ 建議你怎麼用 ═══\n\
 1. 關遊戲 → 等工具完成直接套用；若要手動安裝再複製 zip／任務\n\
 2. 語言選繁體中文（台灣）並啟用資源包\n\
-3. 不滿意用備份還原；可「只補缺漏」續跑\n\
+3. 若遊戲仍英文，請查看上方「港繁提示／仍待譯」欄\n\
+4. 不滿意用備份還原；可「只補缺漏」續跑；閃退請先還原再診斷回報\n\
 \n\
 產生位置：\n{}\n",
+        stats.keys_tw_playable,
+        stats.keys_hk_hint,
+        stats.keys_pending,
         stats.keys_zh,
         source_summary,
-        stats.keys_pending,
-        covered_pct,
         stats.jars_scanned,
         stats.jars_rewritten,
         stats.jar_lang_files,
@@ -338,10 +402,10 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
         } else {
             stats.quests_note.as_str()
         },
-        reference_summary,
-        ai_rule,
+        handling_34,
         source_lines,
         unsupported_lines,
+        redline4,
         layout.work_root.display()
     );
     fs::write(&path, body).map_err(|e| e.to_string())?;
@@ -443,6 +507,8 @@ mod tests {
             &CoverageStats {
                 keys_zh: 3,
                 keys_pending: 1,
+                keys_tw_playable: 3,
+                keys_hk_hint: 0,
                 ai_filled: 0,
                 ai_enabled: false,
                 jars_scanned: 1,

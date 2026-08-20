@@ -78,36 +78,55 @@ pub fn is_safe_zip_entry_name(name: &str) -> bool {
     true
 }
 
-/// 確認 resolved 路徑落在 base 之下（防 path traversal）
+/// 確認 resolved 路徑落在 base 之下（防 path traversal）。
+/// 不存在的路徑也會先正規化到 base 底下再回傳，避免回傳未解析的逃逸路徑。
 pub fn ensure_under_base(base: &Path, candidate: &Path) -> Result<PathBuf, String> {
     let base_c = dunce_canonicalize(base)?;
-    // 若 candidate 尚不存在，用 parent 檢查
-    let check = if candidate.exists() {
-        dunce_canonicalize(candidate)?
-    } else if let Some(parent) = candidate.parent() {
-        let p = if parent.as_os_str().is_empty() {
-            base_c.clone()
-        } else if parent.exists() {
-            dunce_canonicalize(parent)?
-        } else {
-            // 逐段確保沒有 ..
-            validate_no_parent_dir(candidate)?;
-            return Ok(candidate.to_path_buf());
-        };
-        if !p.starts_with(&base_c) && p != base_c {
-            // parent under base is enough for new file
-            if !p.starts_with(&base_c) {
-                return Err("偵測到不安全的輸出路徑，已阻擋。".into());
-            }
+    validate_no_parent_dir(candidate)?;
+
+    if candidate.exists() {
+        let check = dunce_canonicalize(candidate)?;
+        if !check.starts_with(&base_c) {
+            return Err("偵測到不安全的輸出路徑，已阻擋。".into());
         }
-        return Ok(candidate.to_path_buf());
-    } else {
-        base_c.clone()
-    };
-    if !check.starts_with(&base_c) {
-        return Err("偵測到不安全的輸出路徑，已阻擋。".into());
+        return Ok(check);
     }
-    Ok(check)
+
+    let abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base_c.join(candidate)
+    };
+    validate_no_parent_dir(&abs)?;
+
+    // 已存在的最深祖先必須在 base 下
+    let mut probe = abs.as_path();
+    while !probe.exists() {
+        probe = match probe.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => break,
+        };
+    }
+    if probe.exists() {
+        let parent_c = dunce_canonicalize(probe)?;
+        if !parent_c.starts_with(&base_c) {
+            return Err("偵測到不安全的輸出路徑，已阻擋。".into());
+        }
+    }
+
+    let Ok(rel) = abs.strip_prefix(&base_c) else {
+        // 絕對路徑但前綴不同 → 拒絕
+        return Err("偵測到不安全的輸出路徑，已阻擋。".into());
+    };
+    let mut out = base_c;
+    for c in rel.components() {
+        match c {
+            Component::Normal(s) => out.push(s),
+            Component::CurDir => {}
+            _ => return Err("偵測到不安全的輸出路徑，已阻擋。".into()),
+        }
+    }
+    Ok(out)
 }
 
 fn validate_no_parent_dir(p: &Path) -> Result<(), String> {
@@ -187,6 +206,10 @@ pub fn validate_api_key(key: &str) -> Result<(), String> {
     }
     if k.contains('\0') || k.contains('\r') || k.contains('\n') {
         return Err("API 金鑰含有無效字元。".into());
+    }
+    // UI 用 ######## 遮罩顯示；禁止把遮罩字串誤存成金鑰
+    if k.chars().all(|c| c == '#') {
+        return Err("請貼上真正的 API 金鑰，不要儲存畫面上的 # 遮罩字元。".into());
     }
     Ok(())
 }
@@ -311,5 +334,13 @@ mod tests {
         assert!(is_probably_network_path(Path::new(r"Y:\packs\instance")));
         assert!(is_probably_network_path(Path::new(r"z:/packs/instance")));
         assert!(!is_probably_network_path(Path::new(r"C:\Games\instance")));
+    }
+
+    #[test]
+    fn api_key_rejects_ui_hash_mask() {
+        assert!(validate_api_key("").is_ok());
+        assert!(validate_api_key("sk-real-key-123").is_ok());
+        assert!(validate_api_key("########").is_err());
+        assert!(validate_api_key("###").is_err());
     }
 }

@@ -70,6 +70,98 @@ fn default_ai_mode() -> String {
     "managed".into()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiProvider {
+    Managed,
+    Deepseek,
+    Glm,
+    Openai,
+    Qwen,
+    Other,
+}
+
+impl AiProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Deepseek => "deepseek",
+            Self::Glm => "glm",
+            Self::Openai => "openai",
+            Self::Qwen => "qwen",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderRateTable {
+    pub prompt_cache_hit_per_mtok_usd: Option<f64>,
+    pub prompt_cache_miss_per_mtok_usd: Option<f64>,
+    pub completion_per_mtok_usd: Option<f64>,
+}
+
+impl ProviderRateTable {
+    pub fn estimate_usd(
+        self,
+        prompt_cache_hit_tokens: usize,
+        prompt_cache_miss_tokens: usize,
+        completion_tokens: usize,
+    ) -> Option<f64> {
+        let hit = self.prompt_cache_hit_per_mtok_usd?;
+        let miss = self.prompt_cache_miss_per_mtok_usd?;
+        let completion = self.completion_per_mtok_usd?;
+        Some(
+            (prompt_cache_hit_tokens as f64 / 1_000_000.0) * hit
+                + (prompt_cache_miss_tokens as f64 / 1_000_000.0) * miss
+                + (completion_tokens as f64 / 1_000_000.0) * completion,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderCapabilities {
+    pub supports_json_mode: bool,
+    pub max_tokens_field: MaxTokensField,
+    pub start_parallel: usize,
+    pub rates: ProviderRateTable,
+}
+
+impl ProviderCapabilities {
+    pub fn estimated_cost_usd(
+        self,
+        prompt_cache_hit_tokens: usize,
+        prompt_cache_miss_tokens: usize,
+        completion_tokens: usize,
+    ) -> Option<f64> {
+        self.rates.estimate_usd(
+            prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens,
+            completion_tokens,
+        )
+    }
+
+    pub fn cost_note(
+        self,
+        provider: AiProvider,
+        prompt_cache_hit_tokens: usize,
+        prompt_cache_miss_tokens: usize,
+        completion_tokens: usize,
+    ) -> Option<String> {
+        let usd = self.estimated_cost_usd(
+            prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens,
+            completion_tokens,
+        )?;
+        Some(format!("AI token 成本估算（{}）：US${usd:.4}", provider.label()))
+    }
+}
+
 fn normalize_ai_mode(mode: &str) -> Option<&'static str> {
     match mode.trim().to_ascii_lowercase().as_str() {
         "managed" => Some("managed"),
@@ -112,6 +204,58 @@ fn infer_provider(base_url: &str) -> &'static str {
 
 fn current_provider(s: &SecretsFile) -> &'static str {
     normalize_provider(&s.api_provider).unwrap_or_else(|| infer_provider(&s.deepseek_base))
+}
+
+fn provider_kind(provider: &str) -> AiProvider {
+    match provider {
+        PROVIDER_DEEPSEEK => AiProvider::Deepseek,
+        PROVIDER_GLM => AiProvider::Glm,
+        PROVIDER_OPENAI => AiProvider::Openai,
+        PROVIDER_QWEN => AiProvider::Qwen,
+        _ => AiProvider::Other,
+    }
+}
+
+pub fn provider_capabilities(provider: AiProvider) -> ProviderCapabilities {
+    match provider {
+        AiProvider::Managed => ProviderCapabilities {
+            supports_json_mode: true,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            // DeepSeek 以併發連線為限（非 RPM）；代管與自訂齊 16，靠 AIMD 遇 429 降速
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+        AiProvider::Deepseek => ProviderCapabilities {
+            supports_json_mode: true,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+        AiProvider::Openai => ProviderCapabilities {
+            supports_json_mode: true,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+        AiProvider::Glm => ProviderCapabilities {
+            supports_json_mode: true,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+        AiProvider::Qwen => ProviderCapabilities {
+            supports_json_mode: true,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+        AiProvider::Other => ProviderCapabilities {
+            supports_json_mode: false,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            start_parallel: 16,
+            rates: ProviderRateTable::default(),
+        },
+    }
 }
 
 fn preset(provider: &str) -> Option<(&'static str, &'static str)> {
@@ -174,6 +318,8 @@ pub struct ApiConfig {
     pub model: String,
     /// true＝走開發者代管 Worker；false＝使用者自填金鑰直連上游。
     pub managed: bool,
+    pub provider: AiProvider,
+    pub capabilities: ProviderCapabilities,
 }
 
 /// 讀取「使用者自填」的金鑰設定；沒填回 `None`。
@@ -185,8 +331,9 @@ pub fn load_api_config() -> Option<ApiConfig> {
     if api_key.is_empty() {
         return None;
     }
-    let provider = current_provider(&s);
-    let (base_url, model) = if let Some((base, model)) = preset(provider) {
+    let provider_name = current_provider(&s);
+    let provider = provider_kind(provider_name);
+    let (base_url, model) = if let Some((base, model)) = preset(provider_name) {
         (base.to_string(), model.to_string())
     } else {
         let base_url = validate_api_base_url(&s.deepseek_base).ok()?;
@@ -198,6 +345,8 @@ pub fn load_api_config() -> Option<ApiConfig> {
         base_url,
         model,
         managed: false,
+        provider,
+        capabilities: provider_capabilities(provider),
     })
 }
 
@@ -215,6 +364,8 @@ pub fn resolve_ai_config() -> Result<ApiConfig, String> {
         base_url: MANAGED_BASE_URL.to_string(),
         model: default_model(),
         managed: true,
+        provider: AiProvider::Managed,
+        capabilities: provider_capabilities(AiProvider::Managed),
     })
 }
 
@@ -241,7 +392,31 @@ fn write_file(s: &SecretsFile) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(p, serde_json::to_string_pretty(s).unwrap() + "\n").map_err(|e| e.to_string())
+    fs::write(&p, serde_json::to_string_pretty(s).unwrap() + "\n").map_err(|e| e.to_string())?;
+    harden_secrets_file_acl(&p);
+    Ok(())
+}
+
+/// 盡力把 secrets 檔限縮成目前使用者可讀寫（Windows icacls；失敗不阻寫入）。
+fn harden_secrets_file_acl(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let Some(path_str) = path.to_str() else {
+            return;
+        };
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if user.is_empty() {
+            return;
+        }
+        let grant = format!("{user}:(R,W)");
+        let _ = std::process::Command::new("icacls")
+            .args([path_str, "/inheritance:r", "/grant:r", &grant])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
 }
 
 /// 儲存設定。**api_key 若空白則保留原本已存的金鑰**（不刪測試用 key）。
@@ -346,7 +521,7 @@ pub fn set_minimize_on_close(v: bool) -> Result<(), String> {
 mod tests {
     use super::{
         api_chat_completions_url, infer_provider, normalize_ai_mode, normalize_provider, preset,
-        validate_model,
+        provider_capabilities, validate_model, AiProvider, MaxTokensField,
     };
 
     #[test]
@@ -403,6 +578,25 @@ mod tests {
         assert_eq!(
             api_chat_completions_url("https://example.com/v1/chat/completions"),
             "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn capability_table_uses_expected_parallel_caps() {
+        assert_eq!(provider_capabilities(AiProvider::Managed).start_parallel, 16);
+        assert_eq!(provider_capabilities(AiProvider::Deepseek).start_parallel, 16);
+        assert_eq!(provider_capabilities(AiProvider::Other).start_parallel, 16);
+    }
+
+    #[test]
+    fn capability_table_uses_provider_specific_token_fields() {
+        assert_eq!(
+            provider_capabilities(AiProvider::Openai).max_tokens_field,
+            MaxTokensField::MaxCompletionTokens
+        );
+        assert_eq!(
+            provider_capabilities(AiProvider::Deepseek).max_tokens_field,
+            MaxTokensField::MaxTokens
         );
     }
 }

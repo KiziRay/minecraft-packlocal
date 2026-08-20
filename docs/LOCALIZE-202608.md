@@ -110,7 +110,7 @@
 | M1.3 | **FTB lang 匯出相容** | 與 FTB Quest Localizer 生態互通 | 已做：保留 FTB SNBT 原格式直接覆寫，避免誤轉成 gameplay lang | FTB 流程整合 |
 | M1.4 | **Heracles／Modonomicon 邊角路徑** | 任務漏 | 已擴充路徑片段並在補翻／修復流程重跑 | `quests_books` 路徑單測 |
 | M1.5 | **Patchouli 在 jar 內書** | 僅掃實例覆寫時漏 | 已做：抽出 `data/*/patchouli_books` 成 work/data 覆寫，原 JAR 不改 | `jar_patchouli` 單測 |
-| M1.6 | **覆蓋報告不夠「完整」** | 玩家不知漏哪 | 已做：來源明細 + 略過／錯誤清單 | 報告檔欄位齊 |
+| M1.6 | **覆蓋報告不夠「完整」** | 玩家不知漏哪 | **1.0.5**：三欄＝台灣可玩／港繁 hint／仍待譯；zh_hk 不算 covered | 報告檔欄位齊 |
 | M1.7 | **格式自癒寫回 TM** | 壞譯文污染記憶 | 已做：`Tm::insert` 與 AI 回寫雙重 guard | 測試拒寫 |
 
 ### P2 — 完整度長尾／體驗
@@ -333,6 +333,21 @@ cd modpack-i18n-tool
 npm run check
 npm run test
 ```
+
+---
+
+## W7 — 覆蓋判斷與 zh_hk（產品 1.0.5）
+
+| 規則 | 說明 |
+|------|------|
+| `zh_tw` | 原生台繁；計入台灣可玩；**不再**整包 s2twp |
+| `zh_cn` | 合併時 s2twp → `CnConverted`；計入可玩 |
+| `zh_hk` | 僅補缺 + s2twp → `HkHint`；**不**計 covered／skip |
+| skip-if-complete | 只算 playable 來源 |
+| 覆蓋報告 | 台灣可玩／港繁提示／仍待譯 三欄 |
+| 共享代管額度 | **每週** 1000 萬；個人仍每日 |
+
+驗收：僅 zh_hk 的 ns 不得觸發 skip；報告有 hk_hint 說明。
 
 ---
 

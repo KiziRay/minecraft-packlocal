@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::jar_scan::resolve_minecraft_dir;
+use super::out_layout::{ensure_font_result_layout, FONT_RESULT_DIR_NAME};
 use super::pack_out::{pack_format_for_version, pack_mcmeta_value};
 use super::security::{check_font_file, ensure_under_base, sanitize_folder_name};
 
@@ -13,6 +14,7 @@ use super::security::{check_font_file, ensure_under_base, sanitize_folder_name};
 const DEFAULT_FONT_PACK_NAME: &str = "繁體中文遊戲字體";
 /// 未指定版本／format 時的保底（約對應 1.21）。
 const DEFAULT_FONT_PACK_FORMAT: u32 = 34;
+const ASCII_SKIP: &str = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,17 +136,15 @@ pub fn build_font_resource_pack_with_options(
         pack_desc.trim().chars().take(120).collect()
     };
 
-    // 字體包也進「翻譯結果/resourcepacks」（若已是工作根則直接用）
+    // 字體包進專用「字體結果/resourcepacks」，不與翻譯結果混用
     let work = if output_dir
         .file_name()
         .and_then(|s| s.to_str())
-        == Some(super::out_layout::RESULT_DIR_NAME)
+        == Some(FONT_RESULT_DIR_NAME)
     {
         output_dir.to_path_buf()
     } else {
-        super::out_layout::ensure_result_layout(output_dir)
-            .map(|l| l.work_root)
-            .unwrap_or_else(|_| output_dir.join(super::out_layout::RESULT_DIR_NAME))
+        ensure_font_result_layout(output_dir)?
     };
     fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let pack_root = work.join("resourcepacks").join(&name);
@@ -165,14 +165,24 @@ pub fn build_font_resource_pack_with_options(
     fs::copy(font_file, &dest_font).map_err(|e| format!("複製字體失敗：{e}"))?;
 
     let provider_file = format!("minecraft:include/{font_name}");
+    let space_advance = (options.provider_size() * 0.36).clamp(3.0, 8.0);
     let prov = serde_json::json!({
-        "providers": [{
-            "type": "ttf",
-            "file": provider_file,
-            "shift": [options.shift_x, options.shift_y],
-            "size": options.provider_size(),
-            "oversample": options.oversample
-        }]
+        "providers": [
+            {
+                "type": "space",
+                "advances": {
+                    " ": space_advance
+                }
+            },
+            {
+                "type": "ttf",
+                "file": provider_file,
+                "shift": [options.shift_x, options.shift_y],
+                "size": options.provider_size(),
+                "oversample": options.oversample,
+                "skip": ASCII_SKIP
+            }
+        ]
     });
     let font_json = serde_json::to_string_pretty(&prov).unwrap() + "\n";
     let font_base = pack_root.join("assets").join("minecraft").join("font");
@@ -193,9 +203,11 @@ pub fn build_font_resource_pack_with_options(
         format!(
             "【自訂字體資源包】\n\
 1. 把整個「{}」資料夾放到遊戲的 resourcepacks。\n\
-2. 設定 → 資源包 → 啟用它。\n\
-3. 建議關閉「強制使用 Unicode 字型」後重開遊戲。\n\
-4. 若字太糊或太細，可換另一個字體檔再產生一次。\n",
+2. 設定 → 資源包 → 啟用它，並把字體包拖到列表「最上方」（優先於 GUI／材質包）。\n\
+3. 關閉「強制使用 Unicode 字型」（Force Unicode）後重開遊戲。\n\
+4. 若字變成□方框：多半是缺字形 → 換支援繁中的字體檔再建一次。\n\
+5. 若字變成 Ã/å/æ 之類怪碼：不是字體問題 → 還原套用後用本工具重產，並檢查是否有第三方語言包蓋過。\n\
+6. 若字太糊或太細，可換另一個字體檔再產生一次。\n",
             name
         ),
     )
@@ -210,8 +222,9 @@ pub fn build_font_resource_pack_with_options(
 • 設定：大小 {:.1}、字重感 {:.0}、位移 ({:.1}, {:.1})、清晰度 {:.1}\n\n\
 【怎麼用】\n\
 1. 複製到遊戲 resourcepacks\n\
-2. 啟用此資源包\n\
-3. 關閉「強制使用 Unicode 字型」後重開遊戲",
+2. 啟用並置頂（高於 GUI／其他材質包）\n\
+3. 關閉「強制使用 Unicode 字型」後重開遊戲\n\
+4. □方框＝換字體；Ã/å/æ＝還原後重產翻譯／檢查第三方語言包",
             name,
             pack_root.display(),
             options.size,
@@ -299,6 +312,8 @@ pub fn apply_font_pack_to_instance(
         fs::copy(font_pack_path, &dest).map_err(|e| format!("複製字體資源包失敗：{e}"))?;
     }
 
+    enable_font_pack_at_top(&mc, name)?;
+
     let backup_line = backup_path
         .as_deref()
         .map(|p| format!("\n• 已備份同名舊資源包：\n{p}"))
@@ -307,11 +322,59 @@ pub fn apply_font_pack_to_instance(
         copied_path: dest.display().to_string(),
         backup_path,
         player_summary: format!(
-            "字體資源包已套用到目前實例 resourcepacks。\n• 位置：\n{}{}",
+            "字體資源包已套用到目前實例 resourcepacks，並已移到啟用列表最上方。\n• 位置：\n{}{}",
             dest.display(),
             backup_line
         ),
     })
+}
+
+/// 在 options.txt 啟用字體包並置頂（高於 GUI／其他材質包）。
+fn enable_font_pack_at_top(mc: &Path, pack_name: &str) -> Result<(), String> {
+    let options = mc.join("options.txt");
+    let existed = options.is_file();
+    let original = if existed {
+        fs::read_to_string(&options).map_err(|e| format!("讀取 options.txt 失敗：{e}"))?
+    } else {
+        String::new()
+    };
+    let entry = if pack_name.ends_with(".zip") {
+        format!("file/{pack_name}")
+    } else {
+        format!("file/{pack_name}")
+    };
+    let quoted = format!("\"{entry}\"");
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in original.lines() {
+        if let Some(value) = line.strip_prefix("resourcePacks:") {
+            found = true;
+            let trimmed = value.trim();
+            let mut items: Vec<String> = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty() && s != &entry)
+                .collect();
+            items.insert(0, entry.clone());
+            let list = items
+                .into_iter()
+                .map(|item| format!("\"{item}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("resourcePacks:[{list}]"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        lines.push(format!("resourcePacks:[{quoted}]"));
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    fs::write(&options, updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
+    Ok(())
 }
 
 fn backup_root_for(font_pack_path: &Path) -> PathBuf {
@@ -339,6 +402,39 @@ fn same_path(left: &Path, right: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// 供前端 FontFace 預覽：回傳 base64（不含 data: 前綴）。
+pub fn read_font_preview_base64(font_path: &str) -> Result<String, String> {
+    let font = PathBuf::from(font_path.trim().trim_matches('"'));
+    cjk_font_file_name(&font)?;
+    check_font_file(&font)?;
+    let bytes = fs::read(&font).map_err(|e| format!("讀取字體檔失敗：{e}"))?;
+    Ok(base64_encode(&bytes))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
