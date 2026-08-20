@@ -142,6 +142,8 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       // hasKey：代管金鑰是否已正確設定（只回布林，不洩漏值）
       // turnstile*：保留欄位供舊版相容；P0 起代管閘門不再依賴 Turnstile。
+      // 部署後打 /health 即觸發版本更新 Discord 公告（每版 KV 防重一次）。
+      await maybeNotifyToolUpdateOncePerVersion(env);
       const turnstile = turnstileStatus(env);
       return json({
         ok: true,
@@ -164,7 +166,6 @@ export default {
     return json({ error: "not found" }, 404);
   },
   async scheduled(_event, env) {
-    await maybeNotifyToolUpdateOncePerVersion(env);
     await cleanupShares(env);
     await cleanupReports(env);
   },
@@ -172,7 +173,13 @@ export default {
 
 // ───────────────────────── 更新端點 ─────────────────────────
 
-function latest(env) {
+async function latest(env) {
+  // 版本一上線：首次被查詢時發 Discord（非 hourly cron；與 /health 共用 KV 防重）
+  try {
+    await maybeNotifyToolUpdateOncePerVersion(env);
+  } catch (_) {
+    /* ignore */
+  }
   return json({
     version: env.LATEST_VERSION || "0.0.0",
     url: env.DOWNLOAD_URL || "",

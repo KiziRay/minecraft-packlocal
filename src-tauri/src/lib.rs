@@ -60,7 +60,7 @@ use engine::{
     ManagedAiGpRewardCmdResult, ManagedAiUsageCmdResult, SubmitUsageFeedbackCmdResult,
     dev_progress,
 };
-use engine::{check_update_engine, download_and_launch};
+use engine::{check_update_engine, cleanup_update_residuals, download_and_launch};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -75,6 +75,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 /// 關閉視窗時是否縮小（與 secrets 同步）
 static MINIMIZE_ON_CLOSE: AtomicBool = AtomicBool::new(true);
+/// 正在套用更新並即將 exit：關閉視窗時不可改成「縮到背景」。
+static UPDATE_EXITING: AtomicBool = AtomicBool::new(false);
 
 const STATE_RUNNING: &str = "running";
 const STATE_WAITING: &str = "waiting";
@@ -4193,9 +4195,11 @@ async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
                 "message": d.message,
             });
             if should_exit {
+                UPDATE_EXITING.store(true, Ordering::SeqCst);
                 let exit_app = app.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    // ZeitFrei do_update：給 bat／子行程一點時間後 exit
+                    std::thread::sleep(std::time::Duration::from_millis(600));
                     exit_app.exit(0);
                 });
             }
@@ -4371,8 +4375,9 @@ async fn apply_translation_to_game(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 啟動時載入偏好
+    // 啟動時載入偏好；清自動更新殘留（ZeitFrei run() 開頭同款）
     MINIMIZE_ON_CLOSE.store(get_minimize_on_close(), Ordering::Relaxed);
+    cleanup_update_residuals();
 
     let mut builder = tauri::Builder::default();
     // 單實例須最先註冊；第二次啟動會聚焦既有視窗（跨版本互斥由同一 identifier 達成）
@@ -4393,6 +4398,9 @@ pub fn run() {
                 return;
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if UPDATE_EXITING.load(Ordering::Relaxed) {
+                    return;
+                }
                 if MINIMIZE_ON_CLOSE.load(Ordering::Relaxed) {
                     api.prevent_close();
                     let _ = window

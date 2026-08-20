@@ -125,7 +125,7 @@ npx wrangler kv namespace create USAGE
 
 `WEEKLY_SHARED_TOKEN_BUDGET` 控制所有人的**每週**共享總量（目前 1000 萬，UTC 週一 00:00 重置），`PER_USER_DAILY_TOKEN_BUDGET` 控制單一 Discord 帳號的**每日**總額度（目前 50 萬）。到巴哈姆特貼文按 GP 並領取加成後，個人今日總額度為 100 萬（`GP_REWARD_BONUS` +50 萬，寫入 `gp_reward:{userId}`，**不是**減少已使用量）。共享 KV key 為 `usage:shared:YYYY-Www`（TTL 7 天）；個人仍為 `usage:user:YYYY-MM-DD:{userId}`。沒有 KV 也能運作，但不會在 Worker 層記帳；此時以 DeepSeek 帳號餘額為最終上限。
 
-Discord webhook：`DISCORD_TOOL_UPDATE_WEBHOOK`（版本更新）、`DISCORD_FEEDBACK_WEBHOOK`（匿名回饋）、`DISCORD_REPORT_WEBHOOK`（診斷回報）、`DISCORD_JOIN_WEBHOOK`（會員驗證成功公告，需 secret + USAGE KV 防刷）。
+Discord webhook：`DISCORD_TOOL_UPDATE_WEBHOOK`（版本更新：deploy 後首次 `/health` 或 `/api/desktop/latest` 觸發，每版一次）、`DISCORD_FEEDBACK_WEBHOOK`（匿名回饋）、`DISCORD_REPORT_WEBHOOK`（診斷回報）、`DISCORD_JOIN_WEBHOOK`（會員驗證成功公告，需 secret + USAGE KV 防刷）。
 
 分享次數同樣綁 USAGE KV：`SHARE_DAILY_LIMIT`（預設 3）與 `SHARE_ACTIVE_LIMIT`（預設 2，同時未過期檔）。沒有 KV 時不擋上傳、不發短碼。超限回 429（客戶端顯示「今天的分享次數已達上限」）。未完成 multipart 超過 `SHARE_MPU_STALE_SECONDS`（預設 1 小時）會在 hourly cleanup 中止。短碼 KV 鍵 `share:id:<8碼>` TTL 24 小時，cleanup 會同時刪 R2 物件與短碼。
 

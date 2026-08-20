@@ -1,10 +1,12 @@
 //! 檢查更新（通知＋驗證＋安裝）。
 //!
-//! 本專案只發佈免安裝 EXE，不直接改寫正在執行的 exe。流程採用 ZeitFrei-Tool 的可靠性原則：
+//! 本專案只發佈免安裝 EXE。Windows 更新流程對齊 ZeitFrei-Tool `do_update`：
 //!   1. 打 Worker `/api/desktop/latest` 拿最新版本
 //!   2. 比版本，較新才提示
-//!   3. 防連點，下載官方免安裝 EXE 到暫存，強制驗 SHA-256、檔案大小與 PE 標頭
-//!   4. Windows 由脫離父行程的背景工作等待舊程式結束，再替換同一路徑並重新開啟
+//!   3. 下載到 `%TEMP%\MCPL_Update.exe`，強制驗 SHA-256、檔案大小與 PE
+//!   4. 優先：執行中 exe 改名 `.bak` → copy 新檔到原路徑 → 隱藏延遲 bat 等 PID 死再 start
+//!   5. rename 失敗則 fallback：寫 `.new` + 延遲 bat move+start
+//!   6. `app.exit(0)`；新版啟動時清 `.bak`／`.new`，並排 post-update 保底重開
 //!
 //! 更新端點與下載連結都非機密，比對邏輯全在本地。
 
@@ -250,7 +252,8 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
         return Err("更新 EXE 完整性驗證失敗，已停止更新。請改用官方下載連結。".into());
     }
 
-    let dest = download_target(&url, &latest.version);
+    // 固定暫存檔名（與 ZeitFrei_Update.exe 同策略），避免中文檔名／括號干擾。
+    let dest = update_temp_exe_path();
     let partial = dest.with_extension("download");
     let _ = std::fs::remove_file(&partial);
     std::fs::write(&partial, &bytes).map_err(|e| format!("寫入更新暫存檔失敗：{e}"))?;
@@ -263,29 +266,25 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("準備更新 EXE 失敗：{e}"))?;
 
-    let (launched, automatic, should_exit) = launch_portable_update(&dest)?;
-    let log_hint = std::env::temp_dir().join(format!(
-        "modpack_i18n_update_{}.log",
-        std::process::id()
-    ));
+    let (launched, automatic, should_exit) = apply_portable_update(&dest)?;
     Ok(DownloadResult {
         path: dest.display().to_string(),
         launched,
         automatic,
         should_exit,
         message: if automatic {
-            format!(
-                "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。\n若未自動重開，請查看日誌：{}",
-                log_hint.display()
-            )
+            "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。".into()
         } else {
             format!(
-                "已驗證並開啟免安裝更新檔：{}\n若工具沒有自動替換，請關閉目前工具後手動開啟新版。\n更新日誌：{}",
-                dest.display(),
-                log_hint.display()
+                "已驗證並開啟免安裝更新檔：{}\n若工具沒有自動替換，請關閉目前工具後手動開啟新版。",
+                dest.display()
             )
         },
     })
+}
+
+fn update_temp_exe_path() -> PathBuf {
+    std::env::temp_dir().join("MCPL_Update.exe")
 }
 
 fn validate_download_url(url: &str) -> Result<String, String> {
@@ -356,101 +355,224 @@ fn validate_update_bytes(bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn write_utf16_le_bat(path: &std::path::Path, content: &str) -> Result<(), String> {
-    let mut bytes = vec![0xFF, 0xFE];
-    for unit in content.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    std::fs::write(path, bytes).map_err(|e| format!("建立更新排程失敗：{e}"))
+fn write_bat_file(path: &std::path::Path, content: &str) -> Result<(), String> {
+    std::fs::write(path, content.as_bytes()).map_err(|e| format!("建立更新排程失敗：{e}"))
 }
 
+/// ZeitFrei-Tool `spawn_hidden_bat`：優先隱藏且能重開，失敗再放寬。
 #[cfg(windows)]
-fn build_portable_update_bat_script(
-    pid: u32,
-    current: &str,
-    current_dir: &str,
-    replacement: &str,
-    backup: &str,
-    log: &str,
-) -> String {
-    format!(
-        "@echo off\r\nset \"LOG={log}\"\r\necho [%date% %time%] update worker started pid={pid}>>\"%LOG%\"\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\necho [%date% %time%] parent exited>>\"%LOG%\"\r\nif exist \"{backup}\" del /f /q \"{backup}\" >>\"%LOG%\" 2>&1\r\nset /a MOVE_TRIES=0\r\n:move_old\r\nset /a MOVE_TRIES+=1\r\nmove /Y \"{current}\" \"{backup}\" >>\"%LOG%\" 2>&1\r\nif errorlevel 1 (\r\n  if %MOVE_TRIES% lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto move_old\r\n  )\r\n  echo [%date% %time%] move old failed>>\"%LOG%\"\r\n  goto cleanup\r\n)\r\nset /a MOVE_TRIES=0\r\n:move_new\r\nset /a MOVE_TRIES+=1\r\nmove /Y \"{replacement}\" \"{current}\" >>\"%LOG%\" 2>&1\r\nif errorlevel 1 (\r\n  if %MOVE_TRIES% lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto move_new\r\n  )\r\n  echo [%date% %time%] move new failed, restoring backup>>\"%LOG%\"\r\n  move /Y \"{backup}\" \"{current}\" >>\"%LOG%\" 2>&1\r\n  goto cleanup\r\n)\r\nif not exist \"{current}\" (\r\n  echo [%date% %time%] target missing, restoring backup>>\"%LOG%\"\r\n  move /Y \"{backup}\" \"{current}\" >>\"%LOG%\" 2>&1\r\n)\r\nif exist \"{current}\" (\r\n  echo [%date% %time%] launching new exe>>\"%LOG%\"\r\n  cd /d \"{current_dir}\"\r\n  start \"\" \"{current}\"\r\n  ping -n 2 127.0.0.1 >nul\r\n  del /f /q \"{backup}\" >>\"%LOG%\" 2>&1\r\n)\r\n:cleanup\r\ndel \"%~f0\"\r\n",
-        pid = pid,
-        current = current,
-        current_dir = current_dir,
-        replacement = replacement,
-        backup = backup,
-        log = log,
-    )
-}
-
-#[cfg(windows)]
-fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+fn spawn_hidden_bat(bat: &std::path::Path, breakaway: bool) -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    let current = std::env::current_exe().map_err(|e| format!("找不到目前工具位置：{e}"))?;
-    let replacement = current.with_extension("new");
-    let backup = current.with_extension("bak");
-    std::fs::copy(path, &replacement).map_err(|e| format!("準備免安裝更新檔失敗：{e}"))?;
+    let bat_s = bat.to_string_lossy().replace('"', "");
+    if bat_s.is_empty() || !bat.exists() {
+        return false;
+    }
+    let mut hide_flags: u32 = 0x0800_0000 | 0x0000_0200; // NO_WINDOW | NEW_PROCESS_GROUP
+    if breakaway {
+        hide_flags |= 0x0100_0000; // BREAKAWAY_FROM_JOB
+    }
+    let mut det_flags: u32 = 0x0000_0008 | 0x0000_0200; // DETACHED | NEW_PROCESS_GROUP
+    if breakaway {
+        det_flags |= 0x0100_0000;
+    }
 
-    // 參考 ZeitFrei 工具箱：由脫離 Tauri Job 的隱藏 bat 等待目前 PID 結束，
-    // 再以同一路徑替換 exe 並重開。UTF-16 bat + move 重試 + 日誌，避免鎖檔靜默失敗。
-    let pid = std::process::id();
-    let current_s = current.to_string_lossy().replace('"', "");
-    let current_dir_s = current
-        .parent()
-        .map(|p| p.to_string_lossy().replace('"', ""))
-        .unwrap_or_default();
-    let replacement_s = replacement.to_string_lossy().replace('"', "");
-    let backup_s = backup.to_string_lossy().replace('"', "");
-    let log_path = std::env::temp_dir().join(format!("modpack_i18n_update_{pid}.log"));
-    let log_s = log_path.to_string_lossy().replace('"', "");
-    let script = build_portable_update_bat_script(
-        pid,
-        &current_s,
-        &current_dir_s,
-        &replacement_s,
-        &backup_s,
-        &log_s,
-    );
-    let script_path = std::env::temp_dir().join(format!("modpack_i18n_update_{pid}.bat"));
-    write_utf16_le_bat(&script_path, &script)?;
-    const FLAGS: u32 = 0x0800_0000 | 0x0000_0008 | 0x0000_0200 | 0x0100_0000;
-    let launched = Command::new("cmd.exe")
-        .arg("/c")
-        .arg(&script_path)
-        .creation_flags(FLAGS)
+    // 1) cmd /c bat + CREATE_NO_WINDOW（不要用 DETACHED，也不要先假成功的 VBS）
+    if Command::new("cmd")
+        .args(["/c", &bat_s])
+        .creation_flags(hide_flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .is_ok();
-    if launched {
+        .is_ok()
+    {
+        return true;
+    }
+
+    // 2) PowerShell 隱藏啟動 cmd /c bat
+    let ps = format!(
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','{}') -WindowStyle Hidden",
+        bat_s.replace('\'', "''")
+    );
+    if Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+        .creation_flags(hide_flags)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+    {
+        return true;
+    }
+
+    // 3) VBS Run 0
+    let vbs_path = bat.with_extension("vbs");
+    let vbs = format!(
+        "CreateObject(\"WScript.Shell\").Run \"cmd /c \"\"{}\"\"\", 0, False\r\n",
+        bat_s
+    );
+    if std::fs::write(&vbs_path, vbs).is_ok() {
+        let vbs_s = vbs_path.to_string_lossy().replace('"', "");
+        if Command::new("wscript.exe")
+            .args(["//B", "//Nologo", &vbs_s])
+            .creation_flags(hide_flags)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    // 4) DETACHED fallback（可能閃黑框，總比沒重開好）
+    Command::new("cmd")
+        .args(["/c", &bat_s])
+        .creation_flags(det_flags)
+        .spawn()
+        .is_ok()
+}
+
+/// 等本 PID 結束後再 `start` 新 exe（主路徑：檔已替換完成）。
+#[cfg(windows)]
+fn build_delayed_start_bat(pid: u32, exe: &str) -> String {
+    format!(
+        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nif exist \"{exe}\" start \"\" \"{exe}\"\r\ndel \"%~f0\"\r\n",
+        pid = pid,
+        exe = exe
+    )
+}
+
+/// rename 失敗時：等 PID 結束後把 `.new` move 回原檔名再 start。
+#[cfg(windows)]
+fn build_fallback_replace_bat(pid: u32, new_path: &str, cur_path: &str) -> String {
+    format!(
+        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nmove /Y \"{new}\" \"{cur}\" >nul\r\nif exist \"{cur}\" start \"\" \"{cur}\"\r\ndel \"%~f0\"\r\n",
+        pid = pid,
+        new = new_path,
+        cur = cur_path
+    )
+}
+
+/// 剛被更新拉起時（旁有 .bak）：約 3 秒後若本程式已死再拉一次（ZeitFrei post-update）。
+#[cfg(windows)]
+fn schedule_post_update_relaunch(exe: &std::path::Path) {
+    let path_s = exe.to_string_lossy().replace('"', "");
+    let exe_name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "MCPL.exe".into());
+    let script = format!(
+        "@echo off\r\nping -n 4 127.0.0.1 >nul\r\ntasklist /FI \"IMAGENAME eq {name}\" 2>nul | find /I \"{name}\" >nul\r\nif not errorlevel 1 exit /b 0\r\nif exist \"{exe}\" start \"\" \"{exe}\"\r\ndel \"%~f0\"\r\n",
+        name = exe_name.replace('"', ""),
+        exe = path_s
+    );
+    let pid = std::process::id();
+    let bat = std::env::temp_dir().join(format!("mcpl_post_update_{pid}.bat"));
+    let bat_w = std::env::temp_dir().join(format!("mcpl_post_update_{pid}_w.bat"));
+    if write_bat_file(&bat, &script).is_err() {
+        return;
+    }
+    let _ = write_bat_file(&bat_w, &script);
+    let _ = spawn_hidden_bat(&bat, true)
+        || spawn_hidden_bat(&bat, false)
+        || spawn_hidden_bat(&bat_w, true)
+        || spawn_hidden_bat(&bat_w, false);
+}
+
+/// 啟動時清更新殘留；若有 `.bak` 表示剛完成自動更新，排保底重開。
+pub fn cleanup_update_residuals() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let bak = exe.with_extension("bak");
+    #[cfg(windows)]
+    if bak.exists() {
+        schedule_post_update_relaunch(&exe);
+    }
+    let _ = std::fs::remove_file(&bak);
+    let _ = std::fs::remove_file(exe.with_extension("new"));
+    let _ = std::fs::remove_file(exe.with_extension("update.bat"));
+    let _ = std::fs::remove_file(update_temp_exe_path());
+}
+
+/// ZeitFrei-Tool `do_update` Windows 主流程：
+/// 1) 執行中舊 exe 改名 `.bak`（Windows 允許改名鎖定檔）
+/// 2) 新檔 copy 到原路徑
+/// 3) 延遲 bat 等本 PID 死再 start（BREAKAWAY 脫 Job）
+/// 4) 回傳 should_exit，由 command 端 `app.exit(0)`
+/// rename 失敗 → fallback：寫 `.new` + 等 PID 後 move+start
+#[cfg(windows)]
+fn apply_portable_update(tmp: &std::path::Path) -> Result<(bool, bool, bool), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let current = std::env::current_exe().map_err(|e| format!("找不到目前工具位置：{e}"))?;
+    let bak = current.with_extension("bak");
+    let _ = std::fs::remove_file(&bak);
+
+    let renamed = std::fs::rename(&current, &bak);
+    if renamed.is_ok() {
+        if let Err(e) = std::fs::copy(tmp, &current) {
+            let _ = std::fs::rename(&bak, &current);
+            return Err(format!(
+                "無法寫入新版（多半是防毒攔截）：{e}。請改用更新視窗的「手動下載」。"
+            ));
+        }
+        let _ = std::fs::remove_file(tmp);
+
+        let path_s = current.to_string_lossy().replace('"', "");
+        let pid = std::process::id();
+        let script = build_delayed_start_bat(pid, &path_s);
+        let script_path = current.with_extension("update.bat");
+        write_bat_file(&script_path, &script)?;
+
+        let mut launched = spawn_hidden_bat(&script_path, true) || spawn_hidden_bat(&script_path, false);
+        if !launched {
+            // bat 失敗才 breakaway 直開（備援；父仍活著，仍有 Job 風險）
+            const DIRECT_FLAGS: u32 = 0x0800_0000 | 0x0000_0200 | 0x0100_0000;
+            let mut cmd = Command::new(&current);
+            if let Some(dir) = current.parent() {
+                cmd.current_dir(dir);
+            }
+            cmd.creation_flags(DIRECT_FLAGS);
+            launched = cmd.spawn().is_ok();
+        }
+        if !launched {
+            return Err("已更新完成，但自動重啟失敗，請手動開啟程式。".into());
+        }
+        // 給子行程一點時間；真正 start 仍等 PID 結束（與 ZeitFrei 一致）
+        std::thread::sleep(std::time::Duration::from_millis(600));
         return Ok((true, true, true));
     }
 
-    let _ = std::fs::remove_file(&replacement);
-    open::that(path)
-        .map(|_| (true, false, false))
-        .map_err(|e| format!("更新檔已下載，但無法啟動：{e}"))
+    // fallback：複製到 .new，延遲 bat 等 PID 後 move+start
+    let next_to = current.with_extension("new");
+    let _ = std::fs::remove_file(&next_to);
+    std::fs::copy(tmp, &next_to).map_err(|e| format!("無法寫入更新檔：{e}"))?;
+    let _ = std::fs::remove_file(tmp);
+
+    let cur_str = current.to_string_lossy().replace('"', "");
+    let new_str = next_to.to_string_lossy().replace('"', "");
+    let pid = std::process::id();
+    let script = build_fallback_replace_bat(pid, &new_str, &cur_str);
+    let script_path = current.with_extension("update.bat");
+    write_bat_file(&script_path, &script)?;
+    if !spawn_hidden_bat(&script_path, true) && !spawn_hidden_bat(&script_path, false) {
+        return Err("已下載更新檔，但無法啟動重啟腳本，請關閉程式後手動覆蓋 exe。".into());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    Ok((true, true, true))
 }
 
 #[cfg(not(windows))]
-fn launch_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
+fn apply_portable_update(path: &std::path::Path) -> Result<(bool, bool, bool), String> {
     open::that(path)
         .map(|_| (true, false, false))
         .map_err(|e| format!("更新檔已下載，但無法啟動：{e}"))
-}
-
-/// 暫存檔名：保留原副檔名（通常 .exe），避免被當成未知格式。
-fn download_target(url: &str, version: &str) -> PathBuf {
-    let ext = url
-        .rsplit('/')
-        .next()
-        .and_then(|name| name.rsplit_once('.').map(|(_, e)| e))
-        .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or("exe");
-    std::env::temp_dir().join(format!("模組包翻譯工具_更新_{version}.{ext}"))
 }
 
 #[cfg(test)]
@@ -462,7 +584,6 @@ mod tests {
         assert!(is_newer("0.5.0", "0.4.0"));
         assert!(is_newer("0.4.1", "0.4.0"));
         assert!(is_newer("1.0.0", "0.9.9"));
-        // 字串比較會誤判 0.10 < 0.9；數字比較不會
         assert!(is_newer("0.10.0", "0.9.0"));
     }
 
@@ -493,12 +614,9 @@ mod tests {
     }
 
     #[test]
-    fn download_target_keeps_exe_extension() {
-        let p = download_target("https://x/modpack.exe", "0.5.0");
-        assert!(p.to_string_lossy().ends_with(".exe"));
-        // 沒有副檔名時退回 exe
-        let p2 = download_target("https://x/download", "0.5.0");
-        assert!(p2.to_string_lossy().ends_with(".exe"));
+    fn update_temp_uses_ascii_name() {
+        let p = update_temp_exe_path();
+        assert!(p.to_string_lossy().ends_with("MCPL_Update.exe"));
     }
 
     #[test]
@@ -524,18 +642,24 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn portable_update_bat_includes_cd_start_and_log() {
-        let script = build_portable_update_bat_script(
-            12345,
-            "C:\\Tools\\MCPL-1.0.3.exe",
-            "C:\\Tools",
-            "C:\\Tools\\MCPL-1.0.3.new",
-            "C:\\Tools\\MCPL-1.0.3.bak",
-            "C:\\Temp\\modpack_i18n_update_12345.log",
+    fn delayed_start_bat_matches_zeitfrei_shape() {
+        let script = build_delayed_start_bat(12345, "D:\\Down\\MCPL-1.0.3 (1).exe");
+        assert!(script.contains("PID eq 12345"));
+        assert!(script.contains("start \"\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
+        // if exist 單行（無區塊括號包住路徑），括號檔名安全
+        assert!(script.contains("if exist \"D:\\Down\\MCPL-1.0.3 (1).exe\" start"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fallback_replace_bat_matches_zeitfrei_shape() {
+        let script = build_fallback_replace_bat(
+            99,
+            "D:\\Down\\MCPL-1.0.3 (1).new",
+            "D:\\Down\\MCPL-1.0.3 (1).exe",
         );
-        assert!(script.contains("cd /d \"C:\\Tools\""));
-        assert!(script.contains("start \"\" \"C:\\Tools\\MCPL-1.0.3.exe\""));
-        assert!(script.contains("modpack_i18n_update_12345.log"));
+        assert!(script.contains("move /Y \"D:\\Down\\MCPL-1.0.3 (1).new\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
+        assert!(script.contains("start \"\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
     }
 
     #[test]

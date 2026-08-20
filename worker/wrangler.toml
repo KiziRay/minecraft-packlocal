@@ -9,7 +9,7 @@ LATEST_VERSION = "1.0.5"
 # 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
 # SHA 等產 MCPL-1.0.5.exe 並上傳 R2 後再填 UPDATE_SHA256。
 DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.5.exe"
-RELEASE_NOTES = "只有港繁的模組不再被誤判已翻完；港繁會先轉成台灣用語再補缺；已是台灣繁中的字不再被重複轉換；術語表改為分級，減少誤改介面用語；覆蓋報告可分開看出完成、港繁提示與仍待譯；共享免費額度改為每週 1000 萬；個人每日額度維持 50 萬，按 GP 後 100 萬且不必看影片；回饋改成兩步短選擇題，較不打擾；筆電介面預設不再自動縮太小；右上「⋯」可調整外觀與介面大小；翻譯進行中按 F5 或 Ctrl+R 不會誤中斷；加強登入與免費額度防盜用防超用；更新檔驗證與本機設定保護更嚴；舊版 1.0.3 請改用本版更新"
+RELEASE_NOTES = "只有港繁的模組不再被誤判已翻完；港繁會先轉成台灣用語再補缺；已是台灣繁中的字不再被重複轉換；術語表改為分級，減少誤改介面用語；覆蓋報告可分開看出完成、港繁提示與仍待譯；共享免費額度改為每週 1000 萬；個人每日額度維持 50 萬，按 GP 後 100 萬且不必看影片；回饋改成兩步短選擇題，較不打擾；筆電介面預設不再自動縮太小；右上「⋯」可調整外觀與介面大小；翻譯進行中按 F5 或 Ctrl+R 不會誤中斷；加強登入與免費額度防盜用防超用；更新檔驗證與本機設定保護更嚴；更新完成後會自動重新開啟（與 ZeitFrei 工具箱相同作法）；舊版 1.0.3 請改用本版更新"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-v4-flash"
@@ -30,7 +30,7 @@ PER_USER_DAILY_TOKEN_BUDGET = "500000"
 GP_REWARD_BONUS = "500000"
 
 # 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
-UPDATE_SHA256 = "D3C4E3911BD672ACCEC1696BF19C8FAF004BF933ADC180C50038F9991F46AE87"
+UPDATE_SHA256 = "DFCDD88761B4B4B39EFB6D252F5AE2B9FEB416CE5848D94DD19E246640B98821"
 
 # 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
 SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"

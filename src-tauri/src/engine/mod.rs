@@ -145,7 +145,9 @@ pub use translation_helper::{
     cleanup_translation_helper, inspect_translation_helper, prepare_translation_helper,
     TranslationHelperStatus,
 };
-pub use updater::{check_update as check_update_engine, download_and_launch, UpdateCheck};
+pub use updater::{
+    check_update as check_update_engine, cleanup_update_residuals, download_and_launch, UpdateCheck,
+};
 pub use usage_feedback::{
     managed_ai_gp_reward_cmd, managed_ai_usage_cmd, submit_usage_feedback_cmd, ManagedAiGpRewardCmdResult,
     ManagedAiUsageCmdResult, SubmitUsageFeedbackCmdResult,
