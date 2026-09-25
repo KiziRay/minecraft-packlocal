@@ -39,16 +39,22 @@ fn read_newest_log(mc: &Path) -> Option<(String, String)> {
 
 fn read_bounded(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
+    let whole = String::from_utf8_lossy(&bytes);
     if bytes.len() <= MAX_READ_BYTES {
-        return Some(String::from_utf8_lossy(&bytes).into_owned());
+        return Some(whole.into_owned());
     }
 
-    let head_len = HEAD_READ_BYTES.min(bytes.len());
+    // 先整份解碼再切，而且切在字元邊界上。
+    //
+    // 舊版直接切位元組陣列（`&bytes[..head_len]`）再各自 lossy 解碼，
+    // 切點落在多位元組字元中間時那個字會變成 `�`——中文的閃退記錄剛好每次都中。
+    // 使用者看到的是自己記錄裡憑空出現的亂碼，還會以為是遊戲壞了。
+    let head_len = HEAD_READ_BYTES.min(whole.len());
     let tail_len = MAX_READ_BYTES.saturating_sub(head_len);
-    let tail_start = bytes.len().saturating_sub(tail_len);
-    let mut text = String::from_utf8_lossy(&bytes[..head_len]).into_owned();
+    let tail_start = whole.len().saturating_sub(tail_len);
+    let mut text = super::super::safe_text::safe_slice(&whole, 0, head_len).to_string();
     text.push_str("\n\n[中間記錄過長，已省略；保留檔案開頭與最後錯誤段落]\n\n");
-    text.push_str(&String::from_utf8_lossy(&bytes[tail_start..]));
+    text.push_str(super::super::safe_text::safe_slice(&whole, tail_start, whole.len()));
     Some(text)
 }
 

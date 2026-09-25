@@ -3,14 +3,11 @@
 // 主要職責：
 //  1. GET  /api/desktop/latest   → 桌面版更新檢查（回最新版本 + 下載連結）
 //  2. GET/POST /turnstile        → Cloudflare 真人驗證與短效憑證
-//  3. POST /v1/chat/completions  → 驗證 Discord + Turnstile 後代理 AI
-//  4. /download、/tm、/glossary  → R2 免安裝 EXE 與共享翻譯資料
+//  3. /download、/tm、/glossary  → R2 免安裝 EXE 與共享翻譯資料
+//  4. /api/share、/api/report    → 24h 分享與診斷回報（獨立 SHARES bucket）
 //
-// 為什麼要代理而不是把金鑰編進 exe：
-//  - 金鑰若進 exe，任何人反編譯就能抽出，開發者的免費額度幾天內被刷爆。
-//  - 代理讓金鑰只存在 Worker secret，且可限流／隨時切換／統計用量。
-//
-// 客戶端在使用者「沒有自填金鑰」時走這裡；使用者自填金鑰則直連上游，不經本 Worker。
+// AI 翻譯不再由本 Worker 代管；客戶端走自訂 API、GPT 或本機模型。
+// Discord 會籍仍用於分享、診斷回報與（之後）本地模型檔下載閘門。
 
 import {
   completeTurnstile,
@@ -39,13 +36,18 @@ import {
 } from "./report.mjs";
 
 import { submitFeedback } from "./feedback.mjs";
+import { issueThreadHealth, submitIssueThread } from "./issue-thread.mjs";
 import { corsHeaders } from "./cors.mjs";
 import { isSafeOutboundUrl } from "./security.mjs";
+import { localLlmBound, localLlmFile, localLlmManifest } from "./local-llm.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const SHARED_USAGE_TTL = 604800;
 const PERSONAL_USAGE_TTL = 172800;
-const CONTRIBUTE_DAILY_LIMIT = 60;
+const DEFAULT_CONTRIBUTE_USER_DAILY_LIMIT = 120;
+const DEFAULT_CONTRIBUTE_IP_DAILY_LIMIT = 40;
+const DEFAULT_LOOKUP_IP_MINUTE_LIMIT = 240;
+const LOOKUP_USAGE_TTL = 120;
 
 export default {
   async fetch(request, env) {
@@ -57,7 +59,7 @@ export default {
     }
 
     if (url.pathname === "/api/desktop/latest" && request.method === "GET") {
-      return latest(env);
+      return latest(env, request);
     }
 
     // 免安裝 EXE 下載：直接從 R2 串流。/download/<檔名>
@@ -77,18 +79,23 @@ export default {
       return completeTurnstile(request, env);
     }
 
-    if (url.pathname === "/api/managed/usage" && request.method === "GET") {
-      return managedUsage(request, env);
-    }
-    if (url.pathname === "/api/managed/gp-reward" && request.method === "POST") {
-      return managedGpReward(request, env);
-    }
     if (url.pathname === "/api/feedback/submit" && request.method === "POST") {
       return submitFeedback(request, env);
     }
-
-    if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
-      return proxyChat(request, env);
+    // 設定健康檢查：部署後用瀏覽器打開就知道 secret 有沒有設對，不回傳任何密鑰
+    if (url.pathname === "/api/issue-thread/health" && request.method === "GET") {
+      return issueThreadHealth(env);
+    }
+    if (url.pathname === "/api/issue-thread" && request.method === "POST") {
+      const access = await authorizeManagedIdentity(request, env);
+      if (!access.ok) return access.response;
+      return submitIssueThread(request, env, access);
+    }
+    if (url.pathname === "/api/local-llm/manifest" && request.method === "GET") {
+      return localLlmManifest(request, env, authorizeManagedIdentity);
+    }
+    if (url.pathname.startsWith("/api/local-llm/file/") && (request.method === "GET" || request.method === "HEAD")) {
+      return localLlmFile(request, env, url, authorizeManagedIdentity);
     }
 
     // 共享翻譯記憶（社群）：keyed by (模組, key, 原文) 的雜湊，存 R2、依模組分片。
@@ -109,7 +116,7 @@ export default {
       return gatedShare(request, env, reportMpuCreate);
     }
     if (url.pathname === "/api/report/mpu-part" && request.method === "PUT") {
-      return gatedShare(request, env, (req, workerEnv, _userId) => reportMpuPart(req, workerEnv, url));
+      return gatedShare(request, env, (req, workerEnv, userId) => reportMpuPart(req, workerEnv, url, userId));
     }
     if (url.pathname === "/api/report/mpu-complete" && request.method === "POST") {
       return gatedShare(request, env, reportMpuComplete);
@@ -126,7 +133,7 @@ export default {
       return gatedShare(request, env, shareMpuCreate);
     }
     if (url.pathname === "/api/share/mpu-part" && request.method === "PUT") {
-      return gatedShare(request, env, (req, workerEnv, _userId) => shareMpuPart(req, workerEnv, url));
+      return gatedShare(request, env, (req, workerEnv, userId) => shareMpuPart(req, workerEnv, url, userId));
     }
     if (url.pathname === "/api/share/mpu-complete" && request.method === "POST") {
       return gatedShare(request, env, shareMpuComplete);
@@ -160,6 +167,8 @@ export default {
         turnstile: { ...turnstile, enforced: false },
         turnstileMissing: turnstileMissingNames(env),
         translationsBound: await estimateTranslationsBound(env),
+        tmGlobal: await estimateTmGlobalHealth(env),
+        localLlmBound: await localLlmBound(env),
       });
     }
 
@@ -173,19 +182,117 @@ export default {
 
 // ───────────────────────── 更新端點 ─────────────────────────
 
-async function latest(env) {
+async function latest(env, request) {
   // 版本一上線：首次被查詢時發 Discord（非 hourly cron；與 /health 共用 KV 防重）
   try {
     await maybeNotifyToolUpdateOncePerVersion(env);
   } catch (_) {
     /* ignore */
   }
-  return json({
-    version: env.LATEST_VERSION || "0.0.0",
-    url: env.DOWNLOAD_URL || "",
-    notes: env.RELEASE_NOTES || "",
+  const baseVersion = String(env.LATEST_VERSION || "0.0.0").trim();
+  const requestedBuild = new URL(request.url).searchParams.get("build") || "";
+  const currentBuild = String(env.UPDATE_BUILD_ID || "").trim();
+  const payload = {
+    version: desktopUpdateVersionForBuild(baseVersion, requestedBuild, currentBuild),
+    // 舊版更新器只接受 MCPL-<major>.<minor>.<patch>.exe（恰好三段）；不可回四段檔名。
+    url: resolveDesktopDownloadUrl(env.DOWNLOAD_URL, env.LEGACY_DOWNLOAD_URL),
+        notes: [env.RELEASE_NOTES, env.RELEASE_NOTES_EXTRA].filter((value) => value && String(value).trim()).join("；"),
     sha256: env.UPDATE_SHA256 || env.INSTALLER_SHA256 || "",
-  });
+  };
+  // 設定齊備才附上 manifest。缺任何一項就整個不輸出，維持舊行為——
+  // 半套的 manifest 比沒有更危險（客戶端會拿它當信任依據）。
+  const manifest = buildReleaseManifest(env);
+  if (manifest) payload.manifest = manifest;
+  return json(payload);
+}
+
+/**
+ * 由設定組出 release manifest（桌面端 `engine/release_manifest.rs` 的對應合約）。
+ *
+ * 回 `null` 代表「這個部署還沒設定 manifest」，`latest()` 就完全不輸出該欄位。
+ * 舊客戶端本來就忽略未知欄位，新客戶端看不到 manifest 時沿用舊版本比對路徑。
+ *
+ * 注意：這裡**不做簽章**。私鑰永遠不進 Worker secret，簽章是離線人工步驟；
+ * 未簽章的 manifest 在客戶端只會被 test 之類的非正式通道接受，stable 一律拒絕。
+ */
+export function buildReleaseManifest(env) {
+  const channel = String(env.RELEASE_CHANNEL || "").trim().toLowerCase();
+  const version = String(env.MANIFEST_VERSION || "").trim();
+  const buildId = String(env.MANIFEST_BUILD_ID || "").trim();
+  const releasedAt = String(env.MANIFEST_RELEASED_AT || "").trim();
+  const commit = String(env.MANIFEST_COMMIT || "").trim();
+  const buildTime = String(env.MANIFEST_BUILD_TIME || "").trim();
+  const bytes = Number(env.MANIFEST_ARTIFACT_BYTES || 0);
+  const sha256 = String(env.UPDATE_SHA256 || env.INSTALLER_SHA256 || "").trim();
+  const url = resolveDesktopDownloadUrl(env.DOWNLOAD_URL, env.LEGACY_DOWNLOAD_URL);
+
+  if (!["stable", "beta", "canary", "test"].includes(channel)) return null;
+  if (!/^\d+\.\d+\.\d+$/.test(version)) return null;
+  if (!buildId || !releasedAt || !commit || !buildTime) return null;
+  if (!/^[0-9a-f]{64}$/i.test(sha256)) return null;
+  if (!Number.isInteger(bytes) || bytes <= 0) return null;
+  if (!url || !url.toLowerCase().startsWith("https://")) return null;
+
+  const manifest = {
+    schemaVersion: 1,
+    channel,
+    version,
+    buildId,
+    releasedAt,
+    provenance: {
+      commit,
+      // 沒有明說乾淨就當 dirty：失效安全方向朝「擋掉 stable 發布」。
+      dirty: String(env.MANIFEST_DIRTY || "true").trim().toLowerCase() !== "false",
+      buildTime,
+      builder: String(env.MANIFEST_BUILDER || "local").trim(),
+    },
+    artifact: { name: url.split("/").pop(), url, sha256, bytes },
+    compat: { minClientVersion: String(env.MANIFEST_MIN_CLIENT || "0.0.0").trim() },
+  };
+
+  const signature = String(env.MANIFEST_SIGNATURE || "").trim();
+  const keyId = String(env.MANIFEST_KEY_ID || "").trim();
+  if (signature && keyId) {
+    manifest.trust = { algorithm: "ed25519-v1", keyId, signature };
+  }
+  return manifest;
+}
+
+/** 同版維護更新：新建置帶 build ID，舊建置收到可比較的維護版號。跨版（build 不符）直接回 LATEST。 */
+export function desktopUpdateVersionForBuild(baseVersion, requestedBuild, currentBuild) {
+  const base = String(baseVersion || "0.0.0").trim() || "0.0.0";
+  const requested = String(requestedBuild || "").trim();
+  const current = String(currentBuild || "").trim();
+  if (current && requested === current) return base;
+  if (!requested) return base;
+  if (current && requested !== current) return base;
+  const segments = base.split(".").filter(Boolean);
+  return segments.length >= 4 ? base : `${base}.1`;
+}
+
+/** 舊版桌面更新器只接受 MCPL-x.y.z.exe（恰好三段數字）。 */
+export function isLegacyCompatibleMcplDownloadUrl(url) {
+  const name = String(url || "").split("/").pop()?.toLowerCase() || "";
+  return /^mcpl-\d+\.\d+\.\d+\.exe$/.test(name);
+}
+
+/** 永遠回傳舊版更新器可接受的直連；四段檔名一律改走 LEGACY。 */
+export function resolveDesktopDownloadUrl(downloadUrl, legacyDownloadUrl) {
+  const legacy = String(legacyDownloadUrl || "").trim();
+  const primary = String(downloadUrl || "").trim();
+  if (legacy && isLegacyCompatibleMcplDownloadUrl(legacy)) return legacy;
+  if (primary && isLegacyCompatibleMcplDownloadUrl(primary)) return primary;
+  return legacy || primary;
+}
+
+export function desktopDownloadUrlForBuild(downloadUrl, legacyDownloadUrl, requestedBuild, currentBuild) {
+  const compatible = resolveDesktopDownloadUrl(downloadUrl, legacyDownloadUrl);
+  const requested = String(requestedBuild || "").trim();
+  const current = String(currentBuild || "").trim();
+  if (!requested) return compatible;
+  if (current && requested === current) return compatible;
+  if (current && requested !== current) return compatible;
+  return compatible;
 }
 
 function nextUtcMidnightIso() {
@@ -321,38 +428,6 @@ async function maybeNotifyToolUpdateOncePerVersion(env) {
   }
 }
 
-async function managedUsage(request, env) {
-  if (!env?.USAGE) return json({ ok: false, error: "usage not configured" }, 503, request);
-  const access = await authorizeManagedIdentity(request, env);
-  if (!access.ok) return access.response;
-
-  const day = utcDay();
-  const week = utcIsoWeek();
-  const sharedKey = sharedUsageKey(week);
-  const sharedSpent = parseInt((await env.USAGE.get(sharedKey)) || "0", 10);
-  const userSpent = parseInt((await env.USAGE.get(`usage:user:${day}:${access.userId}`)) || "0", 10);
-
-  const sharedBudget = parseInt(env.WEEKLY_SHARED_TOKEN_BUDGET || "0", 10);
-  const userBudget = await effectiveUserBudget(env, access.userId);
-
-  return json(
-    {
-      ok: true,
-      day,
-      sharedSpent,
-      sharedBudget,
-      sharedPeriod: "week",
-      sharedWeek: week,
-      sharedResetAtUtc: nextUtcWeekStartIso(),
-      userSpent,
-      userBudget,
-      userPeriod: "day",
-      resetAtUtc: nextUtcMidnightIso(),
-    },
-    200,
-    request
-  );
-}
 
 /** 個人今日總額度 = 基礎上限 +（已領 GP 加成）。 */
 export async function effectiveUserBudget(env, userId) {
@@ -364,25 +439,76 @@ export async function effectiveUserBudget(env, userId) {
   return claimed ? base + bonus : base;
 }
 
-/** Discord join 公告 embed／純文字（供 webhook 與測試）。 */
-export function renderDiscordJoinContent(userId, displayName) {
+/** Discord 頭像 CDN；無 hash 時用預設頭像。 */
+export function discordAvatarUrl(userId, avatarHash) {
   const id = String(userId || "").trim();
-  const name = String(displayName || id || "使用者")
+  if (!/^\d{5,25}$/.test(id)) return null;
+  const hash = String(avatarHash || "").trim();
+  if (/^[a-fA-F0-9_]{16,128}$/.test(hash)) {
+    const ext = hash.startsWith("a_") ? "gif" : "png";
+    return `https://cdn.discordapp.com/avatars/${id}/${hash}.${ext}?size=128`;
+  }
+  let index = 0;
+  try {
+    index = Number((BigInt(id) >> 22n) % 6n);
+  } catch (_) {
+    index = 0;
+  }
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+}
+
+/**
+ * Discord join 公告 webhook payload（embed，無 content 以免 URL unfurl）。
+ * 成員資訊放 author＋fields（勿只靠 description markdown 使用者連結，客戶端常不顯示）。
+ * @param {string} userId
+ * @param {string} [displayName]
+ * @param {string} [avatarHash]
+ */
+export function buildDiscordJoinPayload(userId, displayName, avatarHash) {
+  const id = String(userId || "").trim();
+  const name = String(displayName || "")
     .replace(/[\n\r@<>]/g, "")
     .trim()
     .slice(0, 80);
   if (!/^\d{5,25}$/.test(id)) return null;
-  return `<https://discord.com/users/${id}|${name || id}> 通過官方伺服器驗證，開始使用 MCPL 代管功能。`;
+  const label = name || id;
+  const profileUrl = `https://discord.com/users/${id}`;
+  const icon = discordAvatarUrl(id, avatarHash);
+  /** @type {Record<string, unknown>} */
+  const embed = {
+    author: {
+      name: label.slice(0, 256),
+      url: profileUrl,
+      ...(icon ? { icon_url: icon } : {}),
+    },
+    title: "通過官方伺服器驗證",
+    description: `${label} 開始使用 MCPL。`,
+    color: 0x35c5c9,
+    fields: [
+      { name: "成員", value: label.slice(0, 256), inline: true },
+      { name: "Discord ID", value: `\`${id}\``, inline: true },
+    ],
+    footer: { text: "模組包翻譯工具 · ZeitFrei" },
+    timestamp: new Date().toISOString(),
+  };
+  if (icon) embed.thumbnail = { url: icon };
+  return { embeds: [embed] };
+}
+
+/** @deprecated 測試／相容：回傳 join embed 的 description。 */
+export function renderDiscordJoinContent(userId, displayName, avatarHash) {
+  const payload = buildDiscordJoinPayload(userId, displayName, avatarHash);
+  return payload?.embeds?.[0]?.description || null;
 }
 
 /** 會員驗證成功後，每 user／日最多通知一次（需 USAGE KV + secret）。 */
-export async function maybeNotifyDiscordJoinOncePerDay(userId, displayName, env) {
+export async function maybeNotifyDiscordJoinOncePerDay(userId, displayName, env, avatarHash) {
   const hook = env?.DISCORD_JOIN_WEBHOOK && String(env.DISCORD_JOIN_WEBHOOK).trim();
   if (!hook || !env?.USAGE) return;
   if (!isSafeOutboundUrl(hook)) return;
 
-  const content = renderDiscordJoinContent(userId, displayName);
-  if (!content) return;
+  const payload = buildDiscordJoinPayload(userId, displayName, avatarHash);
+  if (!payload) return;
 
   const day = utcDay();
   const key = `join_notify:${day}:${userId}`;
@@ -393,7 +519,7 @@ export async function maybeNotifyDiscordJoinOncePerDay(userId, displayName, env)
     resp = await fetch(hook, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(8000),
     });
   } catch (_) {
@@ -407,54 +533,63 @@ export async function maybeNotifyDiscordJoinOncePerDay(userId, displayName, env)
   }
 }
 
-async function recordContributeAttempt(env, userId) {
-  if (!env?.USAGE || !userId) return { ok: true };
+function parsePositiveInt(value, fallback) {
+  const parsed = parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function clientIpBucket(request) {
+  const ip = String(request.headers.get("CF-Connecting-IP") || "").trim().slice(0, 128);
+  return `ip:${ip || "unknown"}`;
+}
+
+async function recordContributeAttempt(env, bucketId, limit) {
+  if (!env?.USAGE || !bucketId) return { ok: true };
   const day = utcDay();
-  const key = `contribute:day:${day}:${userId}`;
+  const key = `contribute:day:${day}:${bucketId}`;
   const count = parseInt((await env.USAGE.get(key)) || "0", 10);
-  if (count >= CONTRIBUTE_DAILY_LIMIT) {
+  if (count >= limit) {
     return { ok: false, error: "contribute rate limited" };
   }
   await env.USAGE.put(key, String(count + 1), { expirationTtl: PERSONAL_USAGE_TTL });
   return { ok: true };
 }
 
-/** proxyChat 個人上限判斷（spent 已達 effectiveBudget 即擋）。 */
+async function recordLookupAttempt(env, request, scope) {
+  if (!env?.USAGE) return { ok: true };
+  const limit = parsePositiveInt(env.LOOKUP_IP_MINUTE_LIMIT, DEFAULT_LOOKUP_IP_MINUTE_LIMIT);
+  const minute = Math.floor(Date.now() / 60000);
+  const key = `lookup:minute:${minute}:${scope}:${clientIpBucket(request)}`;
+  const count = parseInt((await env.USAGE.get(key)) || "0", 10);
+  if (count >= limit) return { ok: false, error: "lookup rate limited" };
+  await env.USAGE.put(key, String(count + 1), { expirationTtl: LOOKUP_USAGE_TTL });
+  return { ok: true };
+}
+
+/** 個人日額度是否已用盡（spent 已達 effectiveBudget）。 */
 export function isUserDailyQuotaExhausted(spent, effectiveBudget) {
   return effectiveBudget > 0 && spent >= effectiveBudget;
 }
 
 async function gatedContribute(request, env, handler) {
-  const access = await authorizeManagedIdentity(request, env);
-  if (!access.ok) return access.response;
-  const limited = await recordContributeAttempt(env, access.userId);
+  const protocol = requireManagedProtocol(request, env);
+  if (!protocol.ok) return protocol.response;
+  let bucketId = clientIpBucket(request);
+  let limit = parsePositiveInt(env.CONTRIBUTE_IP_DAILY_LIMIT, DEFAULT_CONTRIBUTE_IP_DAILY_LIMIT);
+  if (hasContributeSession(request)) {
+    const access = await authorizeManagedIdentity(request, env);
+    if (access.ok) {
+      bucketId = `user:${access.userId}`;
+      limit = parsePositiveInt(env.CONTRIBUTE_USER_DAILY_LIMIT, DEFAULT_CONTRIBUTE_USER_DAILY_LIMIT);
+    }
+  }
+  const limited = await recordContributeAttempt(env, bucketId, limit);
   if (!limited.ok) {
     return json({ error: limited.error, type: "rate_limited" }, 429, request);
   }
   return handler(request, env);
 }
 
-async function managedGpReward(request, env) {
-  if (!env?.USAGE) return json({ ok: false, error: "usage not configured" }, 503, request);
-  const access = await authorizeManagedIdentity(request, env);
-  if (!access.ok) return access.response;
-
-  const userId = access.userId;
-  const gpKey = `gp_reward:${userId}`;
-  const already = await env.USAGE.get(gpKey);
-  if (already) {
-    return json({ ok: false, error: "already_claimed" }, 200);
-  }
-
-  const granted = parseInt(env.GP_REWARD_BONUS || "500000", 10);
-  try {
-    await env.USAGE.put(gpKey, "1");
-  } catch (_) {
-    return json({ ok: false, error: "gp_reward write failed" }, 500);
-  }
-
-  return json({ ok: true, granted });
-}
 
 // ───────────────────────── 共享翻譯記憶（R2，依模組分片）─────────────────────────
 //
@@ -522,7 +657,8 @@ async function tmReadShard(env, ns) {
   try {
     const buf = await obj.arrayBuffer();
     return JSON.parse(await gunzipToStr(buf));
-  } catch (_) {
+  } catch (err) {
+    await recordTranslationReadError(env, tmShardKey(ns), err);
     return null;
   }
 }
@@ -533,18 +669,60 @@ async function tmReadGlobal(env) {
   try {
     const buf = await obj.arrayBuffer();
     return JSON.parse(await gunzipToStr(buf));
-  } catch (_) {
+  } catch (err) {
+    await recordTranslationReadError(env, "tm/v2/global.json.gz", err);
     return {};
   }
 }
 
+async function recordTranslationReadError(env, key, err) {
+  const message = String(err?.message || err || "unknown").slice(0, 160);
+  console.warn(`translation shard parse failed: ${key}: ${message}`);
+  if (!env?.USAGE) return;
+  try {
+    await env.USAGE.put(
+      `translations:parse_error:${utcDay()}:${key}`,
+      JSON.stringify({ key, message, at: new Date().toISOString() }).slice(0, 500),
+      { expirationTtl: PERSONAL_USAGE_TTL }
+    );
+  } catch (_) {
+    /* logging must not break lookup/contribute */
+  }
+}
+
+function tmGlobalSoftCap() {
+  return Math.floor(TM_GLOBAL_CAP * 0.8);
+}
+
+function tmGlobalSoftCapExceeded(global) {
+  return Object.keys(global || {}).length >= tmGlobalSoftCap();
+}
+
+async function estimateTmGlobalHealth(env) {
+  try {
+    if (!env.TRANSLATIONS) return null;
+    const global = await tmReadGlobal(env);
+    const items = Object.keys(global || {}).length;
+    return {
+      items,
+      softCap: tmGlobalSoftCap(),
+      hardCap: TM_GLOBAL_CAP,
+      softCapExceeded: items >= tmGlobalSoftCap(),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 async function tmLookup(request, env) {
-  if (!env.TRANSLATIONS) return json({ hits: {} });
+  const limited = await recordLookupAttempt(env, request, "tm");
+  if (!limited.ok) return json({ error: limited.error, type: "rate_limited" }, 429, request);
+  if (!env.TRANSLATIONS) return lookupJson({ hits: {} }, 200, request);
   let body;
   try {
     body = await request.json();
   } catch (_) {
-    return json({ error: "bad json" }, 400);
+    return lookupJson({ error: "bad json" }, 400, request);
   }
   const items = Array.isArray(body.items) ? body.items.slice(0, TM_MAX_ITEMS) : [];
   const byNs = new Map();
@@ -554,9 +732,17 @@ async function tmLookup(request, env) {
     const ctx = typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "";
     const sk = tmValidKh(it.sk) ? it.sk : "";
     const pk = validPackKey(it.pk) ? it.pk : "";
+    const pks = Array.isArray(it.pks)
+      ? it.pks.filter((value) => validPackKey(value)).slice(0, 16)
+      : pk
+        ? [pk]
+        : [];
+    // mv＝提供這個 namespace 的 mod 檔（含版本）。有帶的話，
+    // 「不同整合包但同一個模組的同一版本」一票就能採用（見 tm.mjs tmCanUse）。
+    const mv = validModIdentity(it.mv) ? it.mv : "";
     if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
-    byNs.get(it.ns).set(it.kh, { ctx, sk, pk });
-    queries.set(it.kh, { ctx, sk, pk, ns: it.ns });
+    byNs.get(it.ns).set(it.kh, { ctx, sk, pk, pks, mv });
+    queries.set(it.kh, { ctx, sk, pk, pks, mv, ns: it.ns });
   }
   const hits = {};
   const nss = [...byNs.keys()];
@@ -567,7 +753,13 @@ async function tmLookup(request, env) {
         const shard = await tmReadShard(env, ns);
         if (!shard) return;
         for (const [kh, query] of byNs.get(ns)) {
-          const zh = tmCanUse(shard[kh], query.ctx, query.pk, ns);
+          const zh = tmCanUse(
+            shard[kh],
+            query.ctx,
+            query.pks.length ? query.pks : query.pk,
+            ns,
+            query.mv
+          );
           if (zh) hits[kh] = zh;
         }
       })
@@ -578,11 +770,17 @@ async function tmLookup(request, env) {
     const global = await tmReadGlobal(env);
     for (const [kh, query] of missing) {
       if (!query.sk) continue;
-      const zh = tmCanUse(global[query.sk], query.ctx, query.pk, query.ns);
+      const zh = tmCanUse(
+        global[query.sk],
+        query.ctx,
+        query.pks.length ? query.pks : query.pk,
+        query.ns,
+        query.mv
+      );
       if (zh) hits[kh] = zh;
     }
   }
-  return json({ hits });
+  return lookupJson({ hits }, 200, request);
 }
 
 async function tmContribute(request, env) {
@@ -604,6 +802,8 @@ async function tmContribute(request, env) {
       zh,
       ctx: typeof it.ctx === "string" ? it.ctx.slice(0, 64) : "",
       packs: validPackKey(it.pk) ? { [it.pk]: typeof it.pn === "string" ? it.pn.slice(0, 120) : "" } : {},
+      // 記下這一票是在哪個 mod 版本下貢獻的，供跨整合包重用判定
+      mods: validModIdentity(it.mv) ? { [it.mv]: 1 } : {},
     };
     if (!byNs.has(it.ns)) byNs.set(it.ns, new Map());
     byNs.get(it.ns).set(it.kh, record);
@@ -635,6 +835,9 @@ async function tmContribute(request, env) {
   }
   if (globalEntries.size) {
     const global = await tmReadGlobal(env);
+    if (tmGlobalSoftCapExceeded(global)) {
+      return json({ ok: true, accepted, conflicts, globalSkipped: true });
+    }
     let changed = false;
     for (const [sk, next] of globalEntries) {
       if (Object.keys(global).length >= TM_GLOBAL_CAP && !(sk in global)) continue;
@@ -668,7 +871,8 @@ async function readGlossary(env) {
   if (!object) return {};
   try {
     return JSON.parse(await gunzipToStr(await object.arrayBuffer()));
-  } catch (_) {
+  } catch (err) {
+    await recordTranslationReadError(env, glossaryKey(), err);
     return {};
   }
 }
@@ -681,24 +885,47 @@ function validPackKey(value) {
   return typeof value === "string" && /^[0-9a-f]{16,64}$/.test(value);
 }
 
+/**
+ * mod 檔識別（含版本），例如 `create-1.20.1-0.5.1.f`。
+ *
+ * 這是客戶端送來的自由字串，會被存進 R2，所以在邊界收斂：
+ * 只收小寫英數與 `. _ - +`，長度上限 120。不合格的一律當成沒有帶——
+ * 那只會退回原本的兩票門檻，不會出錯。
+ */
+function validModIdentity(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 120 &&
+    /^[0-9a-z._+-]+$/.test(value)
+  );
+}
+
 async function glossaryLookup(request, env) {
-  if (!env.TRANSLATIONS) return json({ hits: {} });
+  const limited = await recordLookupAttempt(env, request, "glossary");
+  if (!limited.ok) return json({ error: limited.error, type: "rate_limited" }, 429, request);
+  if (!env.TRANSLATIONS) return lookupJson({ hits: {} }, 200, request);
   let body;
-  try { body = await request.json(); } catch (_) { return json({ error: "bad json" }, 400); }
+  try { body = await request.json(); } catch (_) { return lookupJson({ error: "bad json" }, 400, request); }
   const items = Array.isArray(body.items) ? body.items.slice(0, GLOSSARY_MAX_ITEMS) : [];
   const queries = new Map();
   for (const item of items) {
     if (!item || !validGlossaryHash(item.gh)) continue;
     const pk = validPackKey(item.pk) ? item.pk : "";
-    queries.set(item.gh, { pk, ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "" });
+    const pks = Array.isArray(item.pks)
+      ? item.pks.filter((value) => validPackKey(value)).slice(0, 16)
+      : pk
+        ? [pk]
+        : [];
+    queries.set(item.gh, { pk, pks, ctx: typeof item.ctx === "string" ? item.ctx.slice(0, 64) : "" });
   }
   const glossary = await readGlossary(env);
   const hits = {};
   for (const [gh, query] of queries) {
-    const zh = tmCanUse(glossary[gh], query.ctx, query.pk, "");
+    const zh = tmCanUse(glossary[gh], query.ctx, query.pks.length ? query.pks : query.pk, "");
     if (zh) hits[gh] = zh;
   }
-  return json({ hits });
+  return lookupJson({ hits }, 200, request);
 }
 
 async function glossaryContribute(request, env) {
@@ -712,6 +939,7 @@ async function glossaryContribute(request, env) {
   let changed = false;
   for (const item of items) {
     if (!item || !validGlossaryHash(item.gh) || !validPackKey(item.pk)) continue;
+    if (Object.keys(glossary).length >= GLOSSARY_CAP && !(item.gh in glossary)) continue;
     const zh = typeof item.zh === "string" ? item.zh.trim() : "";
     const pn = typeof item.pn === "string" ? item.pn.trim().slice(0, 120) : "";
     if (!tmZhAcceptable(zh, GLOSSARY_MAX_ZH_LEN) || !pn) continue;
@@ -767,192 +995,80 @@ async function download(url, env, headOnly, request) {
 
 async function gatedShare(request, env, fn) {
   if (!env.SHARES) return json({ error: "share storage not configured" }, 503);
-  const access = await authorizeManagedAi(request, env);
+  const access = await authorizeManagedIdentity(request, env);
   if (!access.ok) return access.response;
   return fn(request, env, access.userId);
 }
 
-// ───────────────────────── AI 代理 ─────────────────────────
-
-/** 只允許 json_object；其他 shape 一律忽略。 */
-export function normalizeResponseFormat(value) {
-  if (value === "json_object") {
-    return { type: "json_object" };
-  }
-  if (
-    value &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.keys(value).length === 1 &&
-    value.type === "json_object"
-  ) {
-    return { type: "json_object" };
-  }
-  return undefined;
-}
-
-/** 只接受有限 number，夾在 1..8192。 */
-export function clampCompletionTokens(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return Math.min(8192, Math.max(1, Math.floor(value)));
-}
-
-/** DeepSeek 思考模式：enabled／disabled；非法則 undefined。 */
-export function normalizeThinking(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const type = value.type;
-  if (type === "enabled" || type === "disabled") return { type };
-  return undefined;
-}
-
-/** 組裝轉發上游的聊天補全 body（白名單欄位）。 */
-export function buildChatForwardBody(body, env) {
-  const forward = {
-    model: env.UPSTREAM_MODEL || "deepseek-v4-flash",
-    messages: body.messages,
-    temperature: typeof body.temperature === "number" ? body.temperature : 0.1,
-  };
-  const responseFormat = normalizeResponseFormat(body.response_format);
-  if (responseFormat) forward.response_format = responseFormat;
-  const maxTokens = clampCompletionTokens(body.max_tokens);
-  if (maxTokens !== undefined) forward.max_tokens = maxTokens;
-  const maxCompletionTokens = clampCompletionTokens(body.max_completion_tokens);
-  if (maxCompletionTokens !== undefined) forward.max_completion_tokens = maxCompletionTokens;
-  // 強制關閉思考模式；忽略客戶端 thinking（防貴模型／長推理）。
-  forward.thinking = { type: "disabled" };
-  return forward;
-}
-
-async function proxyChat(request, env) {
-  const access = await authorizeManagedAi(request, env);
-  if (!access.ok) return access.response;
-
-  // trim：擋掉空字串／只有換行的 secret（貼進遮罩提示常見的坑），也避免結尾換行害上游 401。
-  const key = env.DEEPSEEK_KEY && String(env.DEEPSEEK_KEY).trim();
-  if (!key) {
-    // secret 未設或值為空：明確告訴客戶端這是「服務端未就緒」，不是使用者金鑰問題。
-    return json(
-      { error: { message: "managed translation not configured", type: "server_not_ready" } },
-      503
-    );
-  }
-
-  // 共享週總量 + 個人日上限：超過就回 429。
-  const sharedBudget = parseInt(env.WEEKLY_SHARED_TOKEN_BUDGET || "0", 10);
-  const userBudget = parseInt(env.PER_USER_DAILY_TOKEN_BUDGET || "0", 10);
-  const week = utcIsoWeek();
-  const sharedKey = sharedUsageKey(week);
-  if (sharedBudget > 0 && env.USAGE) {
-    const sharedSpent = parseInt((await env.USAGE.get(sharedKey)) || "0", 10);
-    if (isSharedWeeklyQuotaExhausted(sharedSpent, sharedBudget)) {
-      return json(
-        {
-          error: {
-            message: "managed shared weekly quota exhausted",
-            type: "insufficient_quota",
-          },
-        },
-        429,
-        request
-      );
-    }
-  }
-  if (userBudget > 0 && env.USAGE) {
-    const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
-    const spent = parseInt((await env.USAGE.get(userDayKey)) || "0", 10);
-    const effectiveBudget = await effectiveUserBudget(env, access.userId);
-    if (isUserDailyQuotaExhausted(spent, effectiveBudget)) {
-      return json(
-        {
-          error: {
-            message: "managed personal daily quota exhausted; use custom API or disable AI",
-            type: "insufficient_quota",
-          },
-        },
-        429,
-        request
-      );
-    }
-  }
-
-  let body;
-  try {
-    const declaredSize = parseInt(request.headers.get("content-length") || "0", 10);
-    if (declaredSize > 250000) {
-      return json({ error: { message: "request too large", type: "invalid_request" } }, 413);
-    }
-    const raw = await request.text();
-    if (raw.length > 250000) {
-      return json({ error: { message: "request too large", type: "invalid_request" } }, 413);
-    }
-    body = JSON.parse(raw);
-  } catch (_) {
-    return json({ error: { message: "invalid json body" } }, 400);
-  }
-
-  if (!validTranslationMessages(body.messages)) {
-    return json({ error: { message: "invalid translation messages", type: "invalid_request" } }, 400);
-  }
-
-  // 只允許聊天補全所需欄位轉發，並鎖定模型（避免被拿去打別的昂貴模型）。
-  const forward = buildChatForwardBody(body, env);
-
-  const upstream = (env.UPSTREAM_BASE || "https://api.deepseek.com").replace(/\/+$/, "");
-  let resp;
-  try {
-    resp = await fetch(upstream + "/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + key,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(forward),
-    });
-  } catch (e) {
-    return json({ error: { message: "upstream unreachable" } }, 502);
-  }
-
-  const text = await resp.text();
-
-  // 記帳（成功才計；用量以 usage.total_tokens 為準，取不到就估）。
-  if (resp.ok && env.USAGE && (sharedBudget > 0 || userBudget > 0)) {
-    try {
-      const used = estimateTokens(text, forward);
-      if (sharedBudget > 0) {
-        await tryIncrementUsageKv(env.USAGE, sharedKey, used, SHARED_USAGE_TTL, sharedBudget);
-      }
-      if (userBudget > 0) {
-        const userDayKey = `usage:user:${utcDay()}:${access.userId}`;
-        await tryIncrementUsageKv(env.USAGE, userDayKey, used, PERSONAL_USAGE_TTL);
-      }
-    } catch (_) {
-      /* 記帳失敗不影響翻譯 */
-    }
-  }
-
-  // 原樣回傳上游狀態與內容，客戶端既有的 402/429 判斷即可運作。
-  return new Response(text, {
-    status: resp.status,
-    headers: { ...JSON_HEADERS, ...corsHeaders(request) },
-  });
-}
 
 async function authorizeManagedAi(request, env) {
-  // P0：Turnstile 整體多餘 → 僅 Discord 會員門檻；真人驗證不再擋代管 AI／分享。
+  // Discord 會籍閘門（分享／回報）；不再代理免費代管 AI。
   return authorizeManagedIdentity(request, env);
 }
 
-async function authorizeManagedIdentity(request, env) {
+function requireManagedProtocol(request, env) {
   const expectedProtocol = String(env.MANAGED_AI_PROTOCOL || "3");
   if (request.headers.get("x-zeitfrei-ai-protocol") !== expectedProtocol) {
     return {
       ok: false,
       response: json(
         { error: { message: "client upgrade required", type: "client_upgrade_required" } },
-        426
+        426,
+        request
       ),
     };
   }
+  return { ok: true };
+}
+
+function hasContributeSession(request) {
+  const session = String(request.headers.get("x-zeitfrei-session") || "").trim();
+  return !!session && session.length >= 40 && session.length <= 8192 && /^[A-Za-z0-9+/=_-]+$/.test(session);
+}
+
+/**
+ * `x-zeitfrei-session` → 帳號資訊的短效快取。
+ *
+ * 這支函式原本每次呼叫都對 `AUTH_BASE_URL` 做一次跨站 `fetch`——單一使用者下載一次
+ * 7.38 GB 的本地模型（32 MB 一段）要切成約 230 個 Range 請求，等於每次下載對外
+ * 打 230 次帳號驗證，每次量到 150–250ms。這是本地模型「網速夠快卻只有個位數 MB/s」
+ * 的主因之一：不是頻寬不夠，是每個分段開頭都要先付一次跨站握手的時間。
+ *
+ * key 用 session 的雜湊而非原始值：KV 鍵有 512 bytes 上限，session cookie 本身
+ * 可以到 8192 字元；雜湊也避免把使用者的 session 明碼存進 KV。
+ */
+export const AUTH_SESSION_CACHE_TTL_SECONDS = 60;
+
+export async function sessionCacheKey(session) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(session));
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `session_ok:${hex}`;
+}
+
+export async function readSessionCached(session, env) {
+  if (!env?.USAGE) return null;
+  try {
+    const raw = await env.USAGE.get(await sessionCacheKey(session));
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export async function writeSessionCached(session, account, env) {
+  if (!env?.USAGE) return;
+  try {
+    await env.USAGE.put(await sessionCacheKey(session), JSON.stringify(account), {
+      expirationTtl: AUTH_SESSION_CACHE_TTL_SECONDS,
+    });
+  } catch (_) {
+    /* 快取寫入失敗不影響本次請求，下次照樣會走一次完整驗證 */
+  }
+}
+
+async function authorizeManagedIdentity(request, env) {
+  const protocol = requireManagedProtocol(request, env);
+  if (!protocol.ok) return protocol;
 
   const session = String(request.headers.get("x-zeitfrei-session") || "").trim();
   if (!session || session.length < 40 || session.length > 8192 || !/^[A-Za-z0-9+/=_-]+$/.test(session)) {
@@ -963,25 +1079,28 @@ async function authorizeManagedIdentity(request, env) {
   }
 
   const authBase = String(env.AUTH_BASE_URL || "https://cloud.zeitfrei.uk").replace(/\/+$/, "");
-  let account;
-  try {
-    const response = await fetch(`${authBase}/api/check-upload`, {
-      headers: { Cookie: `cf_storage_v3_session=${session}` },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (response.status === 401) {
+  let account = await readSessionCached(session, env);
+  if (!account) {
+    try {
+      const response = await fetch(`${authBase}/api/check-upload`, {
+        headers: { Cookie: `cf_storage_v3_session=${session}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (response.status === 401) {
+        return {
+          ok: false,
+          response: json({ error: { message: "discord login expired", type: "login_required" } }, 401),
+        };
+      }
+      if (!response.ok) throw new Error("account check failed");
+      account = await response.json();
+    } catch (_) {
       return {
         ok: false,
-        response: json({ error: { message: "discord login expired", type: "login_required" } }, 401),
+        response: json({ error: { message: "login verification unavailable", type: "auth_unavailable" } }, 503),
       };
     }
-    if (!response.ok) throw new Error("account check failed");
-    account = await response.json();
-  } catch (_) {
-    return {
-      ok: false,
-      response: json({ error: { message: "login verification unavailable", type: "auth_unavailable" } }, 503),
-    };
+    await writeSessionCached(session, account, env);
   }
 
   const userId = String((account && account.user_id) || "");
@@ -993,10 +1112,23 @@ async function authorizeManagedIdentity(request, env) {
   }
 
   const displayName = String(
-    (account && (account.nickname || account.username || account.display_name || account.name)) || ""
+    (account &&
+      (account.nickname ||
+        account.global_name ||
+        account.username ||
+        account.display_name ||
+        account.name ||
+        account.user)) ||
+      ""
   )
     .trim()
     .slice(0, 80);
+
+  const avatarHash = String(
+    (account && (account.avatar || account.avatar_hash || account.avatarHash)) || ""
+  )
+    .trim()
+    .slice(0, 128);
 
   const guild = await verifyGuildMembership(userId, authBase, env);
   if (!guild.ok) {
@@ -1020,7 +1152,7 @@ async function authorizeManagedIdentity(request, env) {
     };
   }
 
-  await maybeNotifyDiscordJoinOncePerDay(userId, displayName, env);
+  await maybeNotifyDiscordJoinOncePerDay(userId, displayName, env, avatarHash);
 
   return { ok: true, userId, displayName };
 }
@@ -1115,32 +1247,6 @@ export async function verifyGuildMembership(userId, authBase, env, fetchImpl = f
   }
 }
 
-function validTranslationMessages(messages) {
-  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 4) return false;
-  let total = 0;
-  for (const message of messages) {
-    if (!message || !["system", "user"].includes(message.role) || typeof message.content !== "string") {
-      return false;
-    }
-    total += message.content.length;
-    if (total > 180000) return false;
-  }
-  return messages.some((message) => message.role === "user");
-}
-
-function estimateTokens(text, forward) {
-  try {
-    const v = JSON.parse(text);
-    if (v && v.usage && typeof v.usage.total_tokens === "number") {
-      return v.usage.total_tokens;
-    }
-  } catch (_) {
-    /* fall through */
-  }
-  // 粗估：輸入字元數 / 3
-  const chars = JSON.stringify(forward.messages || "").length;
-  return Math.ceil(chars / 3);
-}
 
 // ───────────────────────── 工具 ─────────────────────────
 
@@ -1153,5 +1259,12 @@ function json(obj, status = 200, request) {
     status,
     // no-store：版本檢查等 API 一定要拿到最新值，不能被邊緣或客戶端快取住舊版本資訊。
     headers: { ...JSON_HEADERS, "cache-control": "no-store", ...corsHeaders(request) },
+  });
+}
+
+function lookupJson(obj, status = 200, request) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...JSON_HEADERS, "cache-control": "private, max-age=60", ...corsHeaders(request) },
   });
 }

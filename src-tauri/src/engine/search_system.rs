@@ -97,7 +97,7 @@ pub fn run_search_pipeline(
     on_progress(
         18,
         &format!(
-            "搜尋完成：{} 個來源桶、{} 個翻譯單元",
+            "清點完成：找到 {} 個可翻譯的位置、{} 段文字",
             graph.buckets.len(),
             graph.units.len()
         ),
@@ -448,24 +448,24 @@ fn integrate_work_graph(
     let listed_files: usize = overwritable.iter().map(|b| b.files_found).sum();
     let player_summary = if units.is_empty() && listed_files > 0 {
         format!(
-            "已列舉來源桶 {} 個（可覆寫檔約 {}）；翻譯單元 0——此次僅完成盤點／抽樣，尚未抽出可譯單元，不代表翻譯已完成。{}",
+            "已檢查 {} 個可翻譯的位置（約 {} 個檔案）。這一步只做清點，接下來才會真正翻譯。{}",
             buckets.len(),
             listed_files,
             if include_advanced {
                 "（已含進階來源）"
             } else {
-                "（安全模式：未含進階解包來源）"
+                "（未包含需要解開模組檔的來源）"
             }
         )
     } else {
         format!(
-            "已搜尋並整理全文案。來源桶 {} 個；翻譯單元 {} 個。{}",
+            "文字清點完成：{} 個位置、{} 段文字。{}",
             buckets.len(),
             units.len(),
             if include_advanced {
                 "（已含進階來源）"
             } else {
-                "（安全模式：未含進階解包來源）"
+                "（未包含需要解開模組檔的來源）"
             }
         )
     };
@@ -673,10 +673,21 @@ mod tests {
 
     #[test]
     fn player_summary_mentions_mode() {
+        // 這條守的是「有沒有把兩種模式講清楚」，不是特定字眼。
+        // 「安全模式」對玩家沒有意義，已改成講後果：有沒有去解開模組檔。
         let g = integrate_work_graph(vec![], vec![], true);
-        assert!(g.player_summary.contains("進階"));
+        assert!(g.player_summary.contains("進階"), "{}", g.player_summary);
         let g2 = integrate_work_graph(vec![], vec![], false);
-        assert!(g2.player_summary.contains("安全模式"));
+        assert!(
+            g2.player_summary.contains("未包含需要解開模組檔"),
+            "{}",
+            g2.player_summary
+        );
+        // 內部術語不該出現在給玩家看的句子裡
+        for text in [&g.player_summary, &g2.player_summary] {
+            assert!(!text.contains("來源桶"), "內部術語外洩：{text}");
+            assert!(!text.contains("翻譯單元"), "內部術語外洩：{text}");
+        }
     }
 
     #[test]

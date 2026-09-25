@@ -4,9 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::cancel;
+use super::game_process::{self, GameRunning};
 use super::jar_scan::resolve_minecraft_dir;
 use super::out_layout::{ensure_result_layout, ResultLayout, RESULT_DIR_NAME};
-use super::session::{find_session_file, load_session};
+use super::session::{find_session_file, is_tool_resource_pack, load_session};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -421,16 +423,44 @@ fn restore_tree(from: &Path, to: &Path) -> (usize, Vec<String>) {
 /// 將「翻譯結果」套用到遊戲：resourcepacks zip + config 文字覆寫 + minemenu
 /// + patchouli_books / kubejs / 資料包根目錄（若 work 有）。
 /// 不修改原始 mods/*.jar；翻譯副本套用前會備份被覆蓋的目標。
+/// 一鍵套用。**這是唯一的寫入入口**，遊戲關閉檢查在這裡做（P0-02）。
+///
+/// 為什麼不能只靠前端：`app.js` 的 `ensureGameClosed` 只擋得到它自己接線的按鈕，
+/// 而 one_click／補翻／修復／單獨套用最後全都走到這個函式。前端檢查與實際寫入
+/// 之間還有選路徑、跳確認等空窗，遊戲可能在那段時間被開起來。
 pub fn apply_to_instance(
     instance_path: &Path,
     output_or_work: &Path,
     pack_name_hint: Option<&str>,
     create_backup: bool,
 ) -> Result<ApplyResult, String> {
+    let running = game_process::is_game_running(instance_path);
+    apply_to_instance_with_game_state(instance_path, output_or_work, pack_name_hint, create_backup, running)
+}
+
+/// 套用本體。把「偵測遊戲行程」這個會碰全域狀態的動作留在外層，
+/// 這裡只依傳入的判定結果行事——測試才能覆蓋 Yes／No／Unknown 三種情境
+/// 而不必真的去啟動一個 Minecraft。
+pub fn apply_to_instance_with_game_state(
+    instance_path: &Path,
+    output_or_work: &Path,
+    pack_name_hint: Option<&str>,
+    create_backup: bool,
+    running: GameRunning,
+) -> Result<ApplyResult, String> {
+    cancel::check()?;
     if !instance_path.exists() {
         return Err("找不到遊戲資料夾，請重新選擇。".into());
     }
     let mc = resolve_minecraft_dir(instance_path)?;
+    crate::dev_log!(
+        "apply",
+        "開始套用 instance={} 來源={} 資源包提示={:?} 建立備份={}",
+        instance_path.display(),
+        output_or_work.display(),
+        pack_name_hint,
+        create_backup
+    );
     let layout = ensure_result_layout(output_or_work)?;
     let work = &layout.work_root;
 
@@ -536,6 +566,32 @@ pub fn apply_to_instance(
         collect_planned_tree(&jar_src, &mc.join("mods"), &mut planned_targets);
     }
 
+    // ── 後端最後一道遊戲關閉檢查（P0-02）──
+    //
+    // 位置刻意壓到這裡：上面全是唯讀的規劃（算 planned_targets），下一行才開始寫檔。
+    // 檢查與第一次寫入之間愈短，「檢查完使用者才把遊戲打開」的空窗愈小。
+    match &running {
+        GameRunning::Yes { detail } => {
+            crate::dev_log!("apply", "後端閘門擋下套用：遊戲正在執行 instance={}", instance_path.display());
+            return Err(format!(
+                "Minecraft 正在使用這個整合包，已停止套用。\n\
+                 現在寫入可能造成檔案被鎖、只套用一半，或讓遊戲讀到壞掉的資源包。\n\
+                 請完全關閉遊戲（含啟動器裡載入中的實例）後再套用一次。\n\
+                 （{detail}）"
+            ));
+        }
+        GameRunning::No => {}
+        GameRunning::Unknown => {
+            // 失效方向＝放行。偵測不出來（非 Windows、沒有 PowerShell、權限不足、逾時）
+            // 若一律擋下，會把「查不到」變成新的卡關。但**不得偽裝成已確認關閉**：
+            // 這句話會進 warnings，使用者看得到這次沒能確認。
+            warnings.push(
+                "這次無法確認 Minecraft 是否已關閉（偵測不可用），已照常套用。若遊戲內出現殘缺翻譯，請關閉遊戲後再套用一次。"
+                    .into(),
+            );
+        }
+    }
+
     let mut stamp = backup_stamp();
     // 備份跟著翻譯結果走，刪除結果資料夾時可以一次清理；相同實例與目標已經有完整備份時直接沿用。
     let mut backup_root = layout
@@ -566,8 +622,15 @@ pub fn apply_to_instance(
         let dest_rp = mc.join("resourcepacks").join(name);
         if dest_rp.is_file() {
             let bak = backup_root.join("resourcepacks");
-            fs::create_dir_all(&bak).ok();
-            let _ = fs::copy(&dest_rp, bak.join(name));
+            fs::create_dir_all(&bak)
+                .map_err(|e| format!("建立資源包備份資料夾失敗：{e}"))?;
+            // 同 backup_matching_tree：備份失敗不能吞，否則會「沒備份卻照樣覆蓋」
+            fs::copy(&dest_rp, bak.join(name)).map_err(|e| {
+                format!(
+                    "備份既有資源包 {name} 失敗：{e}
+已停止套用，避免在沒有備份的情況下覆蓋。常見原因是遊戲還開著把檔案鎖住，或磁碟空間不足。"
+                )
+            })?;
         }
         // 若有同名資料夾資源包也備份
         let folder = mc
@@ -595,8 +658,12 @@ pub fn apply_to_instance(
         // ── 備份 minemenu ──
         if menu_src.is_file() && menu_dest.is_file() {
             let bak = backup_root.join("minemenu");
-            fs::create_dir_all(&bak).ok();
-            let _ = fs::copy(&menu_dest, bak.join("menu.json"));
+            fs::create_dir_all(&bak)
+                .map_err(|e| format!("建立快捷選單備份資料夾失敗：{e}"))?;
+            fs::copy(&menu_dest, bak.join("menu.json")).map_err(|e| {
+                format!("備份既有快捷選單設定失敗：{e}
+已停止套用，避免在沒有備份的情況下覆蓋。")
+            })?;
         }
 
         // ── 備份 patchouli_books ──
@@ -691,6 +758,17 @@ pub fn apply_to_instance(
         })?;
         record_written(&mut manifest, &mc, &dest, existed);
         zip_copied = Some(dest.display().to_string());
+        // 寫一份指紋標記，供下次「開始翻譯」判斷這個 zip 到底是不是這個整合包產生的
+        // ——同一個實例路徑換了完全不同的整合包時，resourcepacks 裡的舊 zip 不會自動
+        // 消失，沒有這個標記就只能憑檔名判斷「有就合併」，可能把舊包的翻譯誤merge進
+        // 新包（見 lib.rs 的 run_one_click 合併點）。寫失敗不影響套用本身，忽略即可。
+        let fingerprint = super::session::mods_fingerprint(instance_path);
+        let meta_name = format!("{}.meta.json", name.trim_end_matches(".zip"));
+        let meta = serde_json::json!({ "modsFingerprint": fingerprint });
+        let _ = fs::write(
+            rp.join(meta_name),
+            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        );
     }
 
     // ── 複製 ZIP 內翻譯覆寫（不與主翻譯包混在一起）──
@@ -773,6 +851,9 @@ pub fn apply_to_instance(
                 &mut manifest,
             )?;
             for warn in warn_enabled_packs_covering_font(&mc, name) {
+                warnings.push(warn);
+            }
+            for warn in collect_post_apply_warnings(&mc, work, Some(name)) {
                 warnings.push(warn);
             }
         }
@@ -861,6 +942,15 @@ pub fn apply_to_instance(
             "無／未複製"
         },
         overlay_line,
+    );
+
+    let warning_block = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n注意：\n• {}", warnings.join("\n• "))
+    };
+    let player_summary = format!(
+        "{player_summary}{warning_block}"
     );
 
     Ok(ApplyResult {
@@ -975,7 +1065,20 @@ fn backup_matching_tree(src: &Path, dest: &Path, bak_root: &Path) -> Result<(), 
             if let Some(parent) = bak.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            let _ = fs::copy(&existing, &bak);
+            // 備份失敗必須讓整個套用停下來，不能吞掉。
+            //
+            // 這個函式備份的是使用者的 config、kubejs 與**原始 mod JAR**，
+            // 呼叫端接下來就會覆寫它們。舊版用 `let _ =` 忽略複製失敗，於是
+            // 檔案被鎖住（遊戲還開著）、磁碟滿、或沒有寫入權限時，工具會
+            // 「沒有備份卻照樣覆蓋」並回報成功——使用者事後按「還原上一次套用」
+            // 才發現原始檔案已經永久消失。使用者選了備份就是要這份保障。
+            fs::copy(&existing, &bak).map_err(|e| {
+                format!(
+                    "備份 {} 失敗：{e}\n為了不讓原始檔案在沒有備份的情況下被覆蓋，已停止套用。\
+常見原因是遊戲還開著把檔案鎖住，或磁碟空間不足。",
+                    existing.display()
+                )
+            })?;
         }
     }
     Ok(())
@@ -1017,6 +1120,7 @@ fn merge_copy_dir(
         .into_iter()
         .filter_map(|e| e.ok())
     {
+        cancel::check()?;
         let path = entry.path();
         let rel = path.strip_prefix(src).unwrap_or(path);
         let target = dst.join(rel);
@@ -1050,6 +1154,53 @@ fn record_written(manifest: &mut ApplyManifest, mc: &Path, target: &Path, existe
     }
 }
 
+/// 套用後檢查：多個工具 zip、options 未啟用本次包等。
+fn collect_post_apply_warnings(
+    mc: &Path,
+    _work: &Path,
+    applied_zip_name: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let rp = mc.join("resourcepacks");
+    if rp.is_dir() {
+        let mut tool_count = 0usize;
+        for entry in fs::read_dir(&rp).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let stem = name
+                .trim_end_matches(".zip")
+                .trim_end_matches(".ZIP");
+            if is_tool_resource_pack(stem) {
+                tool_count += 1;
+            }
+        }
+        if tool_count >= 2 {
+            out.push(format!(
+                "遊戲 resourcepacks 內有 {tool_count} 個「模組包翻譯工具+*」資源包；請在遊戲設定裡只啟用最新一個，並停用舊版以免混亂。"
+            ));
+        }
+    }
+    if let Some(zip_name) = applied_zip_name {
+        if !options_lists_resource_pack(mc, zip_name) {
+            out.push(format!(
+                "options.txt 似乎未啟用本次套用的「{zip_name}」；若進遊戲後沒看到繁中，請在資源包列表手動啟用。"
+            ));
+        }
+    }
+    out
+}
+
+fn options_lists_resource_pack(mc: &Path, zip_name: &str) -> bool {
+    let options = mc.join("options.txt");
+    let Ok(text) = fs::read_to_string(&options) else {
+        return false;
+    };
+    let entry = format!("file/{zip_name}");
+    text.lines().any(|line| {
+        line.starts_with("resourcePacks:")
+            && (line.contains(&format!("\"{entry}\"")) || line.contains(zip_name))
+    })
+}
+
 fn enable_resource_pack(
     mc: &Path,
     zip_name: &str,
@@ -1069,6 +1220,16 @@ fn enable_resource_pack(
                 .map_err(|e| format!("備份 options.txt 失敗：{e}"))?;
         }
     }
+    // options.txt 一律另存一份，不受「要不要備份」選項影響。
+    //
+    // 它只有幾 KB，但壞掉的代價是整個遊戲開不起來：使用者實測遇過資源包清單
+    // 被清空，導致字體找不到材質 → 資源重載失敗 → 模型沒烘焙 → 標題畫面閃退。
+    // 這種東西不該跟「要不要備份翻譯結果」綁在一起。
+    if existed {
+        let _ = fs::write(options.with_extension("txt.mcpl-bak"), &original);
+    }
+    // 動之前先記下清單，動完之後要驗證一個都沒少
+    let packs_before = super::resource_pack_guard::parse_pack_list(&original);
 
     let entry = format!("file/{zip_name}");
     let mut found = false;
@@ -1098,7 +1259,26 @@ fn enable_resource_pack(
     }
     let mut updated = lines.join("\n");
     updated.push('\n');
-    fs::write(&options, updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
+    fs::write(&options, &updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
+
+    // 寫完馬上重讀驗證：原本清單裡的每一個資源包都必須還在。
+    //
+    // 這道驗證是使用者那次閃退換來的——工具動了 options.txt 卻沒有確認結果，
+    // 等到遊戲缺材質、字體載入失敗、模型烘焙不完、標題畫面空指標才發現。
+    // 少掉任何一項就把原檔寫回去並回報失敗，寧可不啟用翻譯包，也不能讓
+    // 使用者的遊戲開不起來。
+    let after_text = fs::read_to_string(&options).unwrap_or_default();
+    let packs_after = super::resource_pack_guard::parse_pack_list(&after_text);
+    let diff = super::resource_pack_guard::diff_pack_lists(&packs_before, &packs_after);
+    if !diff.is_safe() {
+        let _ = fs::write(&options, &original);
+        return Err(format!(
+            "啟用翻譯資源包時偵測到原本的資源包清單少了 {} 項（{}），已還原 options.txt 不做修改。\
+請手動在遊戲的資源包畫面啟用「{zip_name}」。",
+            diff.missing.len(),
+            diff.missing.join("、")
+        ));
+    }
     record_written(manifest, mc, &options, existed);
     Ok(())
 }
@@ -1218,6 +1398,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backup_failure_stops_the_apply_instead_of_overwriting_unprotected() {
+        // 這條釘死一個會造成永久資料遺失的缺陷：
+        // backup_matching_tree 備份的是使用者的原始 mod JAR／config，呼叫端接著
+        // 就會覆寫它們。舊版用 `let _ =` 吞掉複製失敗，於是檔案被鎖住（遊戲還開著）
+        // 或磁碟滿的時候，會「沒有備份卻照樣覆蓋」並回報成功——使用者事後想還原
+        // 才發現原始檔案已經沒了。備份失敗必須讓整個套用停下來。
+        let root = std::env::temp_dir().join(format!("apply_bakfail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let dest = root.join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("a.jar"), b"new").unwrap();
+        fs::write(dest.join("a.jar"), b"original").unwrap();
+
+        // 正常情況：備份得起來就成功，而且備份內容是「原始」那一份
+        let bak_ok = root.join("bak_ok");
+        backup_matching_tree(&src, &dest, &bak_ok).unwrap();
+        assert_eq!(fs::read(bak_ok.join("a.jar")).unwrap(), b"original");
+
+        // 失敗情況：備份根目錄被一個同名檔案佔住，建立子目錄／複製一定失敗
+        let blocked = root.join("blocked");
+        fs::write(&blocked, b"I am a file, not a directory").unwrap();
+        let result = backup_matching_tree(&src, &dest, &blocked);
+        assert!(result.is_err(), "備份失敗時必須回傳錯誤，不能靜默繼續");
+        // 原始檔案必須原封不動——呼叫端會因為這個錯誤而中止，不會覆寫它
+        assert_eq!(fs::read(dest.join("a.jar")).unwrap(), b"original");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn enables_pack_and_keeps_existing_resource_packs() {
         let root = std::env::temp_dir().join(format!("apply_options_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1236,6 +1448,81 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 建一個「有東西可套用」的最小場景，回傳 (root, mc, work)。
+    fn stage_applyable(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("apply_gate_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(work.join("jar-translated")).unwrap();
+        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
+        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
+        (root, mc, work)
+    }
+
+    #[test]
+    fn game_running_blocks_apply_with_zero_writes() {
+        // P0-02：後端是最後一道關卡。遊戲開著時必須拒絕，而且**一個檔案都不能動**。
+        let (root, mc, work) = stage_applyable("yes");
+        let err = apply_to_instance_with_game_state(
+            &mc,
+            &work,
+            None,
+            true,
+            GameRunning::Yes { detail: "偵測到這個整合包的遊戲行程正在執行。".into() },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Minecraft 正在使用這個整合包"), "訊息要說得出發生什麼：{err}");
+        assert!(err.contains("關閉遊戲"), "要告訴使用者下一步怎麼做：{err}");
+
+        // 零寫入：原始檔沒被換掉，也沒有留下任何備份資料夾
+        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"original");
+        let leftovers: Vec<_> = fs::read_dir(&work)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("翻譯套用備份_"))
+            .collect();
+        assert!(leftovers.is_empty(), "被擋下時不得留下半成品備份目錄");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_game_state_proceeds_but_says_so() {
+        // 偵測不出來時失效方向朝放行（不能把「查不到」變成新的卡關），
+        // 但不得偽裝成已確認關閉——使用者要看得到這次沒能確認。
+        let (root, mc, work) = stage_applyable("unknown");
+        let result =
+            apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::Unknown).unwrap();
+
+        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated", "Unknown 應放行");
+        assert!(
+            result.warnings.iter().any(|w| w.contains("無法確認")),
+            "Unknown 必須留下未確認的紀錄，實際警告：{:?}",
+            result.warnings
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirmed_closed_game_has_no_unconfirmed_warning() {
+        // 確定沒開時不該冒出「無法確認」這種讓人以為有問題的字。
+        let (root, mc, work) = stage_applyable("no");
+        let result =
+            apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
+        assert!(!result.warnings.iter().any(|w| w.contains("無法確認")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_yes_blocks_apply() {
+        assert!(GameRunning::Yes { detail: String::new() }.blocks_apply());
+        assert!(!GameRunning::No.blocks_apply());
+        // 這條是刻意的：查不出來不擋，否則沒有 PowerShell 的環境永遠套用不了
+        assert!(!GameRunning::Unknown.blocks_apply());
+    }
+
     #[test]
     fn applies_translated_jars_after_backing_up_originals() {
         let root = std::env::temp_dir().join(format!("apply_jars_{}", std::process::id()));
@@ -1247,7 +1534,7 @@ mod tests {
         fs::write(mc.join("mods/example.jar"), b"original").unwrap();
         fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
 
-        let result = apply_to_instance(&mc, &work, None, true).unwrap();
+        let result = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
         assert_eq!(result.jars_copied, 1);
         assert!(result.backup_created);
         assert!(!result.backup_reused);
@@ -1271,10 +1558,10 @@ mod tests {
         fs::write(mc.join("mods/example.jar"), b"original").unwrap();
         fs::write(work.join("jar-translated/example.jar"), b"translated-v1").unwrap();
 
-        let first = apply_to_instance(&mc, &work, None, true).unwrap();
+        let first = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
         let first_backup = first.backup_dir.clone();
         fs::write(work.join("jar-translated/example.jar"), b"translated-v2").unwrap();
-        let second = apply_to_instance(&mc, &work, None, true).unwrap();
+        let second = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
 
         assert!(!second.backup_created);
         assert!(second.backup_reused);
@@ -1305,7 +1592,7 @@ mod tests {
         fs::write(mc.join("mods/example.jar"), b"original").unwrap();
         fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
 
-        let result = apply_to_instance(&mc, &work, None, false).unwrap();
+        let result = apply_to_instance_with_game_state(&mc, &work, None, false, GameRunning::No).unwrap();
         assert!(!result.backup_created);
         assert!(result.backup_dir.is_empty());
         assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
@@ -1352,7 +1639,7 @@ mod tests {
         fs::write(mc.join("config/unknown_display_mod/start.txt"), "原文").unwrap();
         fs::write(work.join("config/unknown_display_mod/start.txt"), "繁中").unwrap();
 
-        let result = apply_to_instance(&mc, &work, None, true).unwrap();
+        let result = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
         assert!(result.backup_created);
         assert_eq!(
             fs::read_to_string(mc.join("config/unknown_display_mod/start.txt")).unwrap(),
@@ -1375,7 +1662,7 @@ mod tests {
         fs::write(mc.join("mods/example.jar"), b"original").unwrap();
         fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
 
-        let applied = apply_to_instance(&mc, &work, None, true).unwrap();
+        let applied = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
         let err = restore_last_apply_in(&other, Some(&work)).unwrap_err();
         assert!(err.contains("不符"));
         assert!(PathBuf::from(&applied.backup_dir).is_dir());
@@ -1395,7 +1682,7 @@ mod tests {
         fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
         fs::write(work.join("data/example/book.json"), b"{}").unwrap();
 
-        apply_to_instance(&mc, &work, None, false).unwrap();
+        apply_to_instance_with_game_state(&mc, &work, None, false, GameRunning::No).unwrap();
         assert!(!mc.join("data/example/book.json").exists());
         assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
         let _ = fs::remove_dir_all(root);

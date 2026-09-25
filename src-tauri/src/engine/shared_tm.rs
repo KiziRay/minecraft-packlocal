@@ -10,21 +10,28 @@
 //! 設計原則：
 //! - **完全隱藏、無勾選、預設開**；沒有網路或服務未就緒時略過，但寫入可觀測狀態（空庫／失敗／命中）。
 //! - 只送**字串**（原文＋譯文＋模組 id＋key 的雜湊），**不含任何個人資料、路徑、身分**；匿名。
+//! - 貢獻免登入；若本機已有 ZeitFrei session，才附帶 session 讓雲端做濫用防護。
 //! - 收回來的每條仍會過佔位符守衛才採用（呼叫端負責）。
 //!
 //! 儲存在開發者的 Cloudflare Worker + R2（依模組 id 分片）。端點 URL 非機密。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
 use std::cell::Cell;
+#[cfg(not(test))]
+use std::fs;
+#[cfg(not(test))]
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use unicode_normalization::UnicodeNormalization;
 
+use super::discord_auth::managed_ai_session_cookie;
 use super::hashutil::sha256_hex;
 use super::jar_scan::LangMap;
+use super::lang_provenance::{get_source, LangSource, ProvenanceMap};
 use super::mech_tokens::is_poisoned_mech_translation;
 use super::placeholder;
 use super::secrets::MANAGED_BASE_URL;
@@ -32,6 +39,7 @@ use super::shared_contribute_queue;
 use super::shared_identity;
 use super::translation_quality::is_usable_zh;
 use super::translation_scope::TranslationScope;
+use super::turnstile::MANAGED_AI_PROTOCOL;
 
 /// 單次請求最多帶幾條（保護 Worker／回應大小）。
 const MAX_ITEMS: usize = 3000;
@@ -43,6 +51,80 @@ const CONTRIBUTE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTRIBUTE_WALL_BUDGET: Duration = Duration::from_secs(10);
 /// 單次呼叫最多送幾個 chunk（其餘入隊稍後再試）。
 const MAX_CHUNKS_PER_CALL: usize = 2;
+#[cfg(not(test))]
+const SWEEP_CURSOR_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SweepCursorFile {
+    #[serde(default)]
+    cursors: HashMap<String, usize>,
+}
+
+#[cfg(not(test))]
+fn sweep_cursor_path() -> PathBuf {
+    super::paths::resolve_file(Path::new("shared_tm_sweep_cursor.json"))
+}
+
+#[cfg(not(test))]
+fn load_sweep_cursor_file() -> SweepCursorFile {
+    fs::read_to_string(sweep_cursor_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<SweepCursorFile>(&text).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn load_sweep_cursor_file() -> SweepCursorFile {
+    SweepCursorFile::default()
+}
+
+#[cfg(not(test))]
+fn save_sweep_cursor_file(mut file: SweepCursorFile) {
+    if file.cursors.len() > SWEEP_CURSOR_LIMIT {
+        let mut pairs: Vec<_> = file.cursors.into_iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        file.cursors = pairs.into_iter().take(SWEEP_CURSOR_LIMIT).collect();
+    }
+    let path = sweep_cursor_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&file) {
+        let _ = fs::write(path, text + "\n");
+    }
+}
+
+#[cfg(test)]
+fn save_sweep_cursor_file(_file: SweepCursorFile) {}
+
+fn sweep_cursor_key(scope: &TranslationScope) -> String {
+    if scope.pack_key.trim().is_empty() {
+        "unknown".into()
+    } else {
+        scope.pack_key.trim().to_string()
+    }
+}
+
+fn load_sweep_cursor(scope: &TranslationScope, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    load_sweep_cursor_file()
+        .cursors
+        .get(&sweep_cursor_key(scope))
+        .copied()
+        .unwrap_or(0)
+        % len
+}
+
+fn save_sweep_cursor(scope: &TranslationScope, cursor: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut file = load_sweep_cursor_file();
+    file.cursors.insert(sweep_cursor_key(scope), cursor % len);
+    save_sweep_cursor_file(file);
+}
 
 thread_local! {
     static SKIP_SHARED_LOOKUP: Cell<bool> = const { Cell::new(false) };
@@ -124,14 +206,11 @@ impl LookupResult {
         match self.status {
             LookupStatus::Skipped => "社群共享庫：本次未查詢".into(),
             LookupStatus::Failed => "社群共享庫：查詢失敗（已略過，不影響本機翻譯）".into(),
-            LookupStatus::Empty => format!(
-                "社群共享庫：已連線但 0 命中（查 {} 條；庫可能尚空）",
-                self.queried
-            ),
+            LookupStatus::Empty => format!("社群共享庫：查 {} 條，命中 0", self.queried),
             LookupStatus::Hits => format!(
-                "社群共享庫命中 {} 條（查 {} 條）",
-                self.hits.len(),
-                self.queried
+                "社群共享庫：查 {} 條，命中 {}",
+                self.queried,
+                self.hits.len()
             ),
         }
     }
@@ -224,7 +303,13 @@ pub fn lookup_detailed(jobs: &[SharedTmJob]) -> LookupResult {
             });
             if let Some(scope) = &job.scope {
                 item["pk"] = json!(scope.pack_key.clone());
+                item["pks"] = json!(scope.lookup_pack_keys());
                 item["pn"] = json!(scope.pack_name.clone());
+            }
+            // 模組身分：讓雲端分辨「不同整合包，但同一個模組的同一版本」。
+            // 那種情況兩份譯文說的是同一個模組的同一個字串，一票就夠。
+            if let Some(mv) = super::translation_scope::mod_identity_of(&job.namespace) {
+                item["mv"] = json!(mv);
             }
             items.push(item);
         }
@@ -297,6 +382,9 @@ pub struct ContributeResult {
     pub failed: bool,
     /// 因牆鐘／chunk 上限未送出、已寫入本機佇列的條數。
     pub deferred: usize,
+    /// 佇列超出上限時丟掉的舊項目數。
+    pub dropped: usize,
+    pub status_note: Option<String>,
 }
 
 impl ContributeResult {
@@ -304,13 +392,21 @@ impl ContributeResult {
         if self.attempted == 0 && !self.failed && self.deferred == 0 {
             return None;
         }
+        if let Some(note) = self.status_note.clone() {
+            return Some(append_queue_note(note, self.deferred, self.dropped));
+        }
         if self.failed && self.accepted == 0 && self.deferred == 0 {
             return Some("社群共享庫：貢獻失敗已略過（不影響本機翻譯）".into());
         }
-        let mut note = if self.accepted > 0 || self.attempted > 0 {
+        let mut note = if self.accepted > 0 {
             format!(
                 "已匿名貢獻共享庫 accepted＝{}（衝突 {}，送出 {}；與「翻譯完成後分享」無關）",
                 self.accepted, self.conflicts, self.attempted
+            )
+        } else if self.attempted > 0 {
+            format!(
+                "社群共享庫：送出 {} 條，雲端未接受新項目（衝突 {}；與「翻譯完成後分享」無關）",
+                self.attempted, self.conflicts
             )
         } else {
             "社群共享庫：本次貢獻已略過（不影響本機翻譯）".into()
@@ -321,8 +417,26 @@ impl ContributeResult {
                 self.deferred
             ));
         }
+        if self.dropped > 0 {
+            note.push_str(&format!(
+                "；待同步佇列已滿，最舊的 {} 條已移到側錄檔保存（你的翻譯結果不受影響）",
+                self.dropped
+            ));
+        }
         Some(note)
     }
+}
+
+fn append_queue_note(mut note: String, deferred: usize, dropped: usize) -> String {
+    if deferred > 0 {
+        note.push_str(&format!("；{} 條暫存本機佇列稍後再送", deferred));
+    }
+    if dropped > 0 {
+        note.push_str(&format!(
+            "；待同步佇列已滿，最舊的 {dropped} 條已移到側錄檔保存（你的翻譯結果不受影響）"
+        ));
+    }
+    note
 }
 
 /// 依牆鐘與 chunk 上限，決定本輪要送的條目與延後入隊的剩餘。
@@ -415,7 +529,9 @@ fn contribute_budgeted(
             if !filtered.is_empty() {
                 // 停止掃尾：不把超量整包塞進佇列（避免 Drop 卡死）
                 if !skip_flush {
-                    shared_contribute_queue::enqueue(&filtered);
+                    total.dropped = total
+                        .dropped
+                        .saturating_add(shared_contribute_queue::enqueue(&filtered));
                     total.deferred = total.deferred.saturating_add(filtered.len());
                 } else {
                     total.deferred = total.deferred.saturating_add(filtered.len());
@@ -465,12 +581,23 @@ impl ContributeLangMapsOpts {
 }
 
 /// 一鍵結束／停止掃尾：把 en∩zh 可用譯文貢獻（略過本輪已上傳）。
+///
+/// `provenance` 用來認出「哪些譯文是從本機參考包合併進來的」——那些**不上傳**，
+/// 理由見 [`collect_lang_map_share_entries`]。傳 `None` 代表沒有來源資訊，
+/// 這時一律照舊全部上傳（舊呼叫點的相容行為）。
 pub fn contribute_lang_maps(
     en: &LangMap,
     zh: &LangMap,
     scope: &TranslationScope,
+    provenance: Option<&ProvenanceMap>,
 ) -> ContributeResult {
-    contribute_lang_maps_limited(en, zh, scope, ContributeLangMapsOpts::success_sweep())
+    contribute_lang_maps_limited(
+        en,
+        zh,
+        scope,
+        provenance,
+        ContributeLangMapsOpts::success_sweep(),
+    )
 }
 
 /// 有條數／時間／flush 上限的 LangMap 貢獻。
@@ -478,9 +605,17 @@ pub fn contribute_lang_maps_limited(
     en: &LangMap,
     zh: &LangMap,
     scope: &TranslationScope,
+    provenance: Option<&ProvenanceMap>,
     opts: ContributeLangMapsOpts,
 ) -> ContributeResult {
-    let entries = collect_lang_map_share_entries(en, zh, scope, opts.max_entries, opts.deadline);
+    let entries = collect_lang_map_share_entries(
+        en,
+        zh,
+        scope,
+        provenance,
+        opts.max_entries,
+        opts.deadline,
+    );
     if entries.is_empty() {
         return ContributeResult::default();
     }
@@ -495,10 +630,23 @@ pub fn contribute_lang_maps_limited(
 }
 
 /// 邊掃邊略過已送 keyhash；達 max_entries 或 deadline 即停（不掃完全包）。
+/// 掃出這一輪可以貢獻給共享庫的譯文。
+///
+/// # 為什麼要看來源
+///
+/// 「本機合併參考翻譯包」是掃**你自己這台電腦**的下載／文件／桌面資料夾
+/// （`merge_ref.rs`），把找到的第三方翻譯包合併進來。那些內容是別人的作品，
+/// 站長選擇**不把它們上傳到共享庫**。
+///
+/// 但這條路過去沒有任何來源過濾，參考包的內容會跟自己翻的一起被送上去。
+/// 現在依 `provenance` 跳過 [`LangSource::RefPack`]，其餘五種來源
+/// （原生繁中／簡中轉繁／AI 補譯／術語表／翻譯記憶）照常上傳——
+/// 共享庫的機制本身不受影響。
 pub(crate) fn collect_lang_map_share_entries(
     en: &LangMap,
     zh: &LangMap,
     scope: &TranslationScope,
+    provenance: Option<&ProvenanceMap>,
     max_entries: usize,
     deadline: Instant,
 ) -> Vec<SharedTmEntry> {
@@ -507,18 +655,12 @@ pub(crate) fn collect_lang_map_share_entries(
     }
     let sent = contribute_tracker().lock().ok();
     let mut seen = HashSet::new();
-    let mut entries: Vec<SharedTmEntry> = Vec::new();
-    'outer: for (ns, en_map) in en {
-        if Instant::now() >= deadline || entries.len() >= max_entries {
-            break;
-        }
+    let mut candidates: Vec<(String, String, String, String)> = Vec::new();
+    for (ns, en_map) in en {
         let Some(zh_map) = zh.get(ns) else {
             continue;
         };
         for (key, source) in en_map {
-            if Instant::now() >= deadline || entries.len() >= max_entries {
-                break 'outer;
-            }
             let Some(translated) = zh_map.get(key) else {
                 continue;
             };
@@ -533,22 +675,58 @@ pub(crate) fn collect_lang_map_share_entries(
             if is_poisoned_mech_translation(src, tr) {
                 continue;
             }
-            let kh = keyhash(ns, key, source);
-            if !seen.insert(kh.clone()) {
+            // 集中判定（P0-03）：本來就不該翻的東西不得寫進共享庫。
+            //
+            // 共享庫的污染是**永久**的：一旦 `botania.entry.bcIntegration` 這種語言 key
+            // 被當成「原文」上傳，之後所有整合包查到它都會拿到一個假譯文。
+            // 這是四個出口裡最不能漏的一個。
+            if !super::eligibility::classify(super::eligibility::Candidate {
+                source_kind: "lang",
+                logical_key: key,
+                text: src,
+            })
+            .may_store_in_shared_data()
+            {
                 continue;
             }
-            if sent.as_ref().is_some_and(|s| s.contains(&kh)) {
-                continue;
+            // 本機參考包的內容不上傳（站長選定）
+            if let Some(prov) = provenance {
+                if get_source(prov, ns, key) == Some(LangSource::RefPack) {
+                    continue;
+                }
             }
-            entries.push(SharedTmEntry {
-                namespace: ns.clone(),
-                key: key.clone(),
-                source: source.clone(),
-                translated: translated.clone(),
-                context: None,
-                scope: Some(scope.clone()),
-            });
+            candidates.push((ns.clone(), key.clone(), source.clone(), translated.clone()));
         }
+    }
+    candidates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let start = load_sweep_cursor(scope, candidates.len());
+    let mut entries: Vec<SharedTmEntry> = Vec::new();
+    let mut inspected = 0usize;
+    for idx in 0..candidates.len() {
+        if Instant::now() >= deadline || entries.len() >= max_entries {
+            break;
+        }
+        let actual = (start + idx) % candidates.len();
+        let (ns, key, source, translated) = candidates[actual].clone();
+        inspected = inspected.saturating_add(1);
+        let kh = keyhash(&ns, &key, &source);
+        if !seen.insert(kh.clone()) {
+            continue;
+        }
+        if sent.as_ref().is_some_and(|s| s.contains(&kh)) {
+            continue;
+        }
+        entries.push(SharedTmEntry {
+            namespace: ns,
+            key,
+            source,
+            translated,
+            context: None,
+            scope: Some(scope.clone()),
+        });
+    }
+    if inspected > 0 {
+        save_sweep_cursor(scope, start.saturating_add(inspected), candidates.len());
     }
     entries
 }
@@ -596,7 +774,88 @@ fn merge_contribute_result(into: &mut ContributeResult, other: ContributeResult)
     into.accepted = into.accepted.saturating_add(other.accepted);
     into.conflicts = into.conflicts.saturating_add(other.conflicts);
     into.deferred = into.deferred.saturating_add(other.deferred);
+    into.dropped = into.dropped.saturating_add(other.dropped);
+    if into.status_note.is_none() {
+        into.status_note = other.status_note;
+    }
     into.failed = into.failed || other.failed;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContributePostOutcome {
+    Accepted { accepted: usize, conflicts: usize },
+    Unauthorized,
+    UpgradeRequired,
+    RateLimited,
+    Failed,
+}
+
+fn contribute_status_note(outcome: ContributePostOutcome) -> Option<String> {
+    match outcome {
+        ContributePostOutcome::Unauthorized => {
+            Some("雲端尚未更新，貢獻暫存佇列".into())
+        }
+        ContributePostOutcome::UpgradeRequired => {
+            Some("社群共享庫：雲端要求新版協定，請更新工具後再貢獻".into())
+        }
+        ContributePostOutcome::RateLimited => {
+            Some("社群共享庫：雲端忙碌或速率限制（429），貢獻暫存佇列".into())
+        }
+        ContributePostOutcome::Failed => {
+            Some("社群共享庫：貢獻失敗，已暫存本機佇列稍後再送".into())
+        }
+        ContributePostOutcome::Accepted { .. } => None,
+    }
+}
+
+fn apply_contribute_headers(
+    req: reqwest::blocking::RequestBuilder,
+    session: Option<String>,
+) -> reqwest::blocking::RequestBuilder {
+    let req = req
+        .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
+        .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"));
+    if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
+        req.header("X-Zeitfrei-Session", session)
+    } else {
+        req
+    }
+}
+
+fn optional_session_cookie() -> Option<String> {
+    managed_ai_session_cookie().ok()
+}
+
+fn post_contribute_chunk(
+    client: &reqwest::blocking::Client,
+    body: &Value,
+) -> ContributePostOutcome {
+    let req = client
+        .post(format!("{}/tm/contribute", base()))
+        .json(body);
+    let resp = match apply_contribute_headers(req, optional_session_cookie()).send() {
+        Ok(resp) => resp,
+        Err(_) => return ContributePostOutcome::Failed,
+    };
+    let status = resp.status();
+    if status.is_success() {
+        if let Ok(v) = resp.json::<Value>() {
+            return ContributePostOutcome::Accepted {
+                accepted: v.get("accepted").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                conflicts: v.get("conflicts").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            };
+        }
+        return ContributePostOutcome::Accepted {
+            accepted: 0,
+            conflicts: 0,
+        };
+    }
+    match status.as_u16() {
+        401 => ContributePostOutcome::Unauthorized,
+        426 => ContributePostOutcome::UpgradeRequired,
+        429 => ContributePostOutcome::RateLimited,
+        _ => ContributePostOutcome::Failed,
+    }
 }
 
 /// 直接貢獻、不先 flush（給佇列 flush 用，避免遞迴）。仍做 payload keyhash 去重。
@@ -632,23 +891,29 @@ pub(crate) fn contribute_without_flush_budget(
 
     let (to_send, deferred_by_budget) =
         split_contribute_budget(&filtered, max_chunks, deadline);
-    if !deferred_by_budget.is_empty() {
-        shared_contribute_queue::enqueue(&deferred_by_budget);
-    }
 
     if to_send.is_empty() {
+        let dropped = if deferred_by_budget.is_empty() {
+            0
+        } else {
+            shared_contribute_queue::enqueue(&deferred_by_budget)
+        };
         return ContributeResult {
             deferred: deferred_by_budget.len(),
+            dropped,
             ..ContributeResult::default()
         };
     }
 
     let Some(client) = contribute_client() else {
-        shared_contribute_queue::enqueue(&to_send);
+        let dropped = shared_contribute_queue::enqueue(&to_send)
+            .saturating_add(shared_contribute_queue::enqueue(&deferred_by_budget));
         return ContributeResult {
             failed: true,
             attempted: to_send.len(),
             deferred: deferred_by_budget.len().saturating_add(to_send.len()),
+            dropped,
+            status_note: contribute_status_note(ContributePostOutcome::Failed),
             ..ContributeResult::default()
         };
     };
@@ -661,6 +926,9 @@ pub(crate) fn contribute_without_flush_budget(
     let mut sent_ok: Vec<SharedTmEntry> = Vec::new();
     let mut attempted = 0usize;
     let mut deferred_mid = 0usize;
+    let mut dropped = 0usize;
+    let mut status_note: Option<String> = None;
+    let mut saw_upgrade_required = false;
 
     let mut chunk_iter = to_send.chunks(MAX_ITEMS).peekable();
     while let Some(chunk) = chunk_iter.next() {
@@ -669,7 +937,7 @@ pub(crate) fn contribute_without_flush_budget(
             while let Some(more) = chunk_iter.next() {
                 rest.extend_from_slice(more);
             }
-            shared_contribute_queue::enqueue(&rest);
+            dropped = dropped.saturating_add(shared_contribute_queue::enqueue(&rest));
             deferred_mid = deferred_mid.saturating_add(rest.len());
             break;
         }
@@ -686,34 +954,49 @@ pub(crate) fn contribute_without_flush_budget(
                 });
                 if let Some(scope) = &entry.scope {
                     item["pk"] = json!(scope.pack_key.clone());
+                    item["pks"] = json!(scope.lookup_pack_keys());
                     item["pn"] = json!(scope.pack_name.clone());
+                }
+                // 見查詢端同名欄位的說明
+                if let Some(mv) = super::translation_scope::mod_identity_of(&entry.namespace) {
+                    item["mv"] = json!(mv);
                 }
                 item
             })
             .collect();
         let body = json!({ "items": items });
-        match client
-            .post(format!("{}/tm/contribute", base()))
-            .json(&body)
-            .send()
-        {
-            Ok(resp) if resp.status().is_success() => {
+        match post_contribute_chunk(&client, &body) {
+            ContributePostOutcome::Accepted {
+                accepted: chunk_accepted,
+                conflicts: chunk_conflicts,
+            } => {
                 any_ok = true;
                 sent_ok.extend_from_slice(chunk);
-                if let Ok(v) = resp.json::<Value>() {
-                    accepted += v.get("accepted").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                    conflicts += v.get("conflicts").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                }
+                accepted = accepted.saturating_add(chunk_accepted);
+                conflicts = conflicts.saturating_add(chunk_conflicts);
             }
-            _ => {
+            outcome => {
                 any_fail = true;
-                failed_entries.extend(chunk.iter().cloned());
+                if outcome == ContributePostOutcome::UpgradeRequired {
+                    saw_upgrade_required = true;
+                    status_note = contribute_status_note(outcome);
+                } else {
+                    if status_note.is_none() {
+                        status_note = contribute_status_note(outcome);
+                    }
+                    failed_entries.extend(chunk.iter().cloned());
+                }
             }
         }
     }
 
-    if !failed_entries.is_empty() {
-        shared_contribute_queue::enqueue(&failed_entries);
+    if !saw_upgrade_required {
+        if !deferred_by_budget.is_empty() {
+            dropped = dropped.saturating_add(shared_contribute_queue::enqueue(&deferred_by_budget));
+        }
+        if !failed_entries.is_empty() {
+            dropped = dropped.saturating_add(shared_contribute_queue::enqueue(&failed_entries));
+        }
     }
     if any_ok && !sent_ok.is_empty() {
         note_sent_entries(&sent_ok);
@@ -724,16 +1007,32 @@ pub(crate) fn contribute_without_flush_budget(
         accepted,
         conflicts,
         failed: any_fail && !any_ok,
-        deferred: deferred_by_budget
-            .len()
-            .saturating_add(deferred_mid)
-            .saturating_add(failed_entries.len()),
+        deferred: if saw_upgrade_required {
+            deferred_mid
+        } else {
+            deferred_by_budget
+                .len()
+                .saturating_add(deferred_mid)
+                .saturating_add(failed_entries.len())
+        },
+        dropped,
+        status_note,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static TRACKER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn tracker_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TRACKER_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("tracker test lock")
+    }
 
     #[test]
     fn keyhash_is_stable_and_scoped() {
@@ -802,6 +1101,7 @@ mod tests {
 
     #[test]
     fn contribute_tracker_skips_already_noted() {
+        let _lock = tracker_test_lock();
         reset_contribute_tracker();
         let entry = SharedTmEntry {
             namespace: "testmod".into(),
@@ -863,11 +1163,43 @@ mod tests {
             conflicts: 0,
             failed: false,
             deferred: 100,
+            dropped: 0,
+            status_note: None,
         }
         .player_note()
         .expect("note");
         assert!(note.contains("100"));
         assert!(note.contains("佇列"));
+    }
+
+    #[test]
+    fn contribute_without_session_headers_still_allow_attempt_and_queue_note() {
+        let client = contribute_client().expect("client");
+        let request = apply_contribute_headers(
+            client
+                .post("https://example.com/tm/contribute")
+                .json(&serde_json::json!({ "items": [] })),
+            None,
+        )
+        .build()
+        .expect("request");
+        assert!(request.headers().contains_key("X-Zeitfrei-AI-Protocol"));
+        assert!(request.headers().contains_key("X-Zeitfrei-Client-Version"));
+        assert!(!request.headers().contains_key("X-Zeitfrei-Session"));
+
+        let note = ContributeResult {
+            attempted: 1,
+            accepted: 0,
+            conflicts: 0,
+            failed: true,
+            deferred: 1,
+            dropped: 0,
+            status_note: contribute_status_note(ContributePostOutcome::Unauthorized),
+        }
+        .player_note()
+        .expect("note");
+        assert!(note.contains("雲端尚未更新"));
+        assert!(note.contains("暫存"));
     }
 
     fn lang_pair(n: usize) -> (LangMap, LangMap) {
@@ -884,6 +1216,7 @@ mod tests {
 
     #[test]
     fn collect_lang_map_respects_max_entries() {
+        let _lock = tracker_test_lock();
         reset_contribute_tracker();
         let (en, zh) = lang_pair(50);
         let scope = TranslationScope::from_name("Test Pack");
@@ -891,6 +1224,7 @@ mod tests {
             &en,
             &zh,
             &scope,
+            None,
             10,
             Instant::now() + Duration::from_secs(5),
         );
@@ -899,6 +1233,7 @@ mod tests {
 
     #[test]
     fn collect_lang_map_skips_already_sent() {
+        let _lock = tracker_test_lock();
         reset_contribute_tracker();
         let (en, zh) = lang_pair(5);
         let scope = TranslationScope::from_name("Test Pack");
@@ -906,6 +1241,7 @@ mod tests {
             &en,
             &zh,
             &scope,
+            None,
             5,
             Instant::now() + Duration::from_secs(5),
         );
@@ -915,6 +1251,7 @@ mod tests {
             &en,
             &zh,
             &scope,
+            None,
             5,
             Instant::now() + Duration::from_secs(5),
         );
@@ -924,6 +1261,7 @@ mod tests {
 
     #[test]
     fn collect_lang_map_expired_deadline_returns_empty() {
+        let _lock = tracker_test_lock();
         reset_contribute_tracker();
         let (en, zh) = lang_pair(20);
         let scope = TranslationScope::from_name("Test Pack");
@@ -931,6 +1269,7 @@ mod tests {
             &en,
             &zh,
             &scope,
+            None,
             20,
             Instant::now() - Duration::from_secs(1),
         );

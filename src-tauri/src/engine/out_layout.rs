@@ -47,6 +47,35 @@ pub fn cleanup_transient_work(work_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 刪掉「建了但整個流程都沒東西寫進去」的結果子資料夾。
+///
+/// `ensure_result_layout()` 為了讓後續流程可以直接寫檔，一開始就把
+/// `resourcepacks`／`config`／`minemenu` 都建好；但不是每個整合包都有
+/// FTB Quests 設定或快捷選單（實測某整合包跑完 `config/` 與 `minemenu/`
+/// 都是 0 個檔案）。留著空資料夾會讓使用者以為「這裡本來該有東西卻沒產出」。
+///
+/// 只刪「遞迴下去連一個檔案都沒有」的目錄，有任何內容一律不動。
+pub fn prune_empty_result_dirs(work_root: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for name in ["config", "minemenu", "data", "resourcepacks-extra", "jar-translated"] {
+        let dir = work_root.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let has_file = WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().is_file());
+        if has_file {
+            continue;
+        }
+        if fs::remove_dir_all(&dir).is_ok() {
+            removed.push(name.to_string());
+        }
+    }
+    removed
+}
+
 /// 完整路徑組合都先算好，呼叫端取用哪幾個由流程決定（未取用的仍保留供診斷）。
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -217,6 +246,8 @@ pub struct CoverageStats {
     pub glossary_hits: usize,
     pub tm_hits: usize,
     pub shared_hits: usize,
+    pub shared_glossary_hits: usize,
+    pub prior_merged: usize,
     pub coverage_tier: String,
 }
 
@@ -274,7 +305,6 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
     } else {
         0.0
     };
-    let _ = covered_pct;
     let source_summary = if stats.ai_enabled {
         format!("（含本機合併與 AI 新補；AI 本次新寫入約 {} 條）", stats.ai_filled)
     } else {
@@ -319,13 +349,15 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 （依全球 Minecraft／整合包玩家社群常見期望撰寫；本工具不宣稱 100% 漢化）\n\
 \n\
 ═══ 這次大概蓋到什麼 ═══\n\
+• 【台灣可玩覆蓋率】約 {:.1}%（台灣繁中已覆蓋 ÷（中文鍵＋仍待譯））\n\
 • 【台灣繁中已覆蓋】約 {} 條（不含純港繁提示）\n\
 • 【港繁提示已轉台】約 {} 條（仍可能需補缺）\n\
 • 【仍待譯】約 {} 條\n\
 • 中文鍵合計約 {} 條{}\n\
 • 掃過模組 jar 約 {} 個；翻譯副本重建 {} 個、寫入 {} 個語言檔、{} 個失敗\n\
 • 完整度授權：{}\n\
-• 補譯命中：術語表 {}／翻譯記憶 {}／共享庫 {}\n\
+• 接續上次：{} 條\n\
+• 補譯命中：本機術語 {}／共享術語 {}／共享庫 {}／翻譯記憶 {}\n\
 • 資源包：{}\n\
 • pack_format：{}（不相容時遊戲會提示，可回報版本）\n\
 • 參考包：{}\n\
@@ -373,6 +405,7 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
 4. 不滿意用備份還原；可「只補缺漏」續跑；閃退請先還原再診斷回報\n\
 \n\
 產生位置：\n{}\n",
+        covered_pct,
         stats.keys_tw_playable,
         stats.keys_hk_hint,
         stats.keys_pending,
@@ -387,9 +420,11 @@ pub fn write_coverage_report(layout: &ResultLayout, stats: &CoverageStats) -> Re
         } else {
             stats.coverage_tier.as_str()
         },
+        stats.prior_merged,
         stats.glossary_hits,
-        stats.tm_hits,
+        stats.shared_glossary_hits,
         stats.shared_hits,
+        stats.tm_hits,
         stats.pack_path,
         stats.pack_format,
         if stats.ref_note.is_empty() {
@@ -524,6 +559,8 @@ mod tests {
                 glossary_hits: 0,
                 tm_hits: 0,
                 shared_hits: 0,
+                shared_glossary_hits: 0,
+                prior_merged: 0,
                 coverage_tier: "standard".into(),
             },
         )

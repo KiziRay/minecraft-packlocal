@@ -1,0 +1,380 @@
+/* —— 全工具唯一總設定：**獨立整頁**（站長指定，不再是側欄浮層） —— */
+.app-settings {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+}
+.app-settings[hidden] {
+  display: none !important;
+}
+/* 翻譯進行中：會影響這次結果的區塊變灰。純偏好不鎖，改了也不影響結果。 */
+.settings-group-locked {
+  opacity: 0.55;
+}
+.settings-group-locked * {
+  cursor: not-allowed;
+}
+.settings-locked-hint {
+  margin: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.settings-locked-hint[hidden] {
+  display: none !important;
+}
+.app-settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.app-settings-head h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  letter-spacing: -0.03em;
+}
+.app-settings-sub {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.app-settings-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.app-settings-saved {
+  font-size: 12px;
+  color: var(--ok, #3d8f6a);
+  white-space: nowrap;
+}
+.app-settings-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.app-settings-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.app-settings-tab[aria-selected="true"],
+.app-settings-tab.active {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/*
+  設定分級標籤。使用者問過「哪些關掉也沒差、哪些一定要開」——
+  與其寫在說明文件裡，不如直接標在開關旁邊。
+*/
+.settings-tier {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+.settings-tier.tier-recommended {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: color-mix(in srgb, var(--accent) 70%, var(--ink));
+}
+/* 「一律開啟」那幾項不是選項，是工具在幫使用者擋掉已知災情的說明。 */
+.settings-always-on {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.settings-always-on li + li {
+  margin-top: 6px;
+}
+.settings-always-on strong {
+  color: var(--ink);
+}
+.app-settings-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 12px 16px 28px;
+}
+.app-settings-pane[hidden] {
+  display: none !important;
+}
+.app-settings-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.app-settings-group {
+  margin: 0 0 18px;
+  padding: 0 0 4px;
+  border-bottom: 1px solid var(--line);
+}
+.app-settings-group:last-child {
+  border-bottom: 0;
+}
+.app-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.app-settings-row {
+  flex-wrap: wrap;
+}
+.app-settings-row > span:last-child {
+  color: var(--muted);
+  font-size: 13px;
+}
+.app-settings-select {
+  cursor: default;
+}
+.app-settings-select select {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  cursor: pointer;
+}
+.output-custom-root-panel {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+.output-custom-root-panel[hidden] {
+  display: none !important;
+}
+.output-custom-root-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.output-custom-root-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.output-custom-root-controls input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+.app-settings-check {
+  cursor: pointer;
+}
+.app-settings-range {
+  flex-wrap: nowrap;
+}
+.app-settings-range input[type="range"] {
+  flex: 1 1 8rem;
+  min-width: 6rem;
+}
+.app-settings-check input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+.app-settings-guide-host {
+  min-height: 0;
+}
+.app-settings-guide-host .guide-body {
+  display: grid;
+  grid-template-columns: minmax(120px, 160px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+.app-settings-guide-host .guide-toc {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+.app-settings-guide-host .guide-toc a {
+  color: var(--muted);
+  text-decoration: none;
+}
+.app-settings-guide-host .guide-toc a:hover {
+  color: var(--ink);
+}
+.app-settings-guide-host .guide-content {
+  width: 100%;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.app-settings-guide-host .guide-content section,
+.app-settings-guide-host .guide-callout,
+.app-settings-guide-host .guide-jump-row {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+}
+.app-settings-guide-host .guide-content h1,
+.app-settings-guide-host .guide-lead,
+.app-settings-guide-host .guide-footer {
+  margin-left: 2px;
+  margin-right: 2px;
+}
+.app-settings-guide-host .guide-content h2 {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.app-settings {
+  max-height: none;
+}
+.app-settings-guide-host .guide-body {
+  display: grid;
+  grid-template-columns: minmax(120px, 160px) minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: start;
+}
+.app-settings-guide-host .guide-toc {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 0.35rem 0.75rem;
+  max-height: none;
+}
+.run-control-row,
+.output-danger-row,
+.input-row,
+.guide-jump-row {
+  flex-wrap: wrap;
+}
+
+.app-settings-body,
+.more-options-body {
+  line-height: 1.45;
+}
+
+.app-settings-group {
+  margin-bottom: 14px;
+  padding-bottom: 2px;
+}
+
+.app-settings-row {
+  min-height: var(--hit-min);
+  margin-bottom: 6px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 900px) {
+  .app-settings-head {
+    flex-wrap: wrap;
+  }
+  .app-settings-tabs {
+    overflow-x: auto;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-settings-row,
+  .app-settings-range {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+  .app-settings-guide-host .guide-body {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .consent-body {
+    grid-template-columns: 1fr;
+  }
+}
+.guide-jump-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 14px;
+}
+@media (max-width: 900px) {
+  .app-settings-guide-host .guide-body {
+    grid-template-columns: 1fr;
+  }
+  .app-settings-guide-host .guide-toc {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+
+
+/* ── 設定視窗（獨立的作業系統視窗）──────────────────────────────────
+   同一份 index.html 也服務設定視窗（見 lib.rs open_settings_window）。
+   那邊沒有工作台，也用系統標題列，所以主視窗的圓角外框、標題列留白、
+   分頁列高度全部要收掉，讓設定內容直接鋪滿整個視窗。 */
+body[data-window-role="settings"] .app {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+body[data-window-role="settings"] .app-atmosphere {
+  display: none;
+}
+body[data-window-role="settings"] .workspace {
+  padding: 0;
+}
+/* 工作台的整個外框（三個分頁 ＋ 右側步驟欄 ＋ 日誌）都不屬於設定視窗。
+   只把三個分頁設成 hidden 是不夠的——外框本身還在，會把設定內容整個
+   擠到畫面下方看不到的地方，看起來就像白畫面。
+   用 CSS 而不是 JS：任何後續程式碼再怎麼把分頁 unhide 都翻不掉這一條。 */
+body[data-window-role="settings"] .workspace-frame {
+  display: none !important;
+}
+body[data-window-role="settings"] #page-settings {
+  height: 100%;
+  max-height: none;
+}
+/* 頁尾的「離開」在設定視窗裡沒有意義——那會關掉整個工具 */
+body[data-window-role="settings"] #btn-quit {
+  display: none;
+}

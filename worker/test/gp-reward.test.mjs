@@ -65,5 +65,5 @@ test("managedUsage 回傳欄位語意：GP 後 userBudget 為 effective 總額�
 test("join Discord 公告已恢復", () => {
   const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
   assert.ok(src.includes("maybeNotifyDiscordJoinOncePerDay"));
-  assert.ok(src.includes("renderDiscordJoinContent"));
+  assert.ok(src.includes("buildDiscordJoinPayload"));
 });

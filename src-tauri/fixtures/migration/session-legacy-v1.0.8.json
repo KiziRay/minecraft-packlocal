@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "instancePath": "C:/Games/OldPack",
+  "outputDir": "C:/Games/OldPack/繁中翻譯輸出",
+  "packName": "OldPack 繁中",
+  "packPath": "C:/Games/OldPack/繁中翻譯輸出/OldPack 繁中",
+  "pendingEn": { "create": { "item.create.cog": "Cogwheel" } },
+  "pendingCount": 1,
+  "keysZh": 12,
+  "note": "1.0.8 工作階段"
+}

@@ -243,6 +243,21 @@ const BUILTIN: &[(&str, &str)] = &[
     ("Spectator", "旁觀者模式"),
 ];
 
+/// 一詞多義、**不可**強制統一譯名的詞。
+///
+/// 這些詞在不同畫面代表不同東西，硬套單一譯名會製造新的誤譯：
+/// 光影設定的 `Saturation` 是「飽和度」，狀態效果的 `Saturation` 是「飽食」。
+/// 收在這裡的詞會降級成「只進 prompt 給 AI 當參考」，由 AI 依上下文決定，
+/// `enforce_terms` 不會事後把它改掉。
+const CONTEXT_DEPENDENT: &[&str] = &[
+    // 狀態效果＝飽食；畫質／色彩設定＝飽和度
+    "Saturation",
+    // 狀態效果＝抗性提升；電路與環境模組＝電阻／抗性
+    "Resistance",
+    // 物品欄＝經驗；教學文字＝體驗
+    "Experience",
+];
+
 /// 譯後修飾用的片語規則（沿用舊 `load_phrase_dict` 行為）。
 const BUILTIN_PHRASES: &[(&str, &str)] = &[
     ("of Elemental Resistance", "元素抗性"),
@@ -296,7 +311,11 @@ impl Glossary {
     /// 整條字串剛好是已知術語 → 直接給官方譯名，不用送 AI。
     /// 僅 **Enforce** 層（T0／T1）；T2 大表不直翻，避免誤傷。
     pub fn exact(&self, english: &str) -> Option<&str> {
-        let key = english.trim().to_ascii_lowercase();
+        let key = english
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
         if self.tiers.get(&key).copied() != Some(GlossaryTier::Enforce) {
             return None;
         }
@@ -304,6 +323,7 @@ impl Glossary {
     }
 
     /// `exact` + `placeholder::guard`：表內缺 `%s` 等毒譯文則拒絕。
+    #[allow(dead_code)]
     pub fn exact_safe(&self, english: &str) -> Option<String> {
         let zh = self.exact(english)?;
         let mut guard = placeholder::GuardStats::default();
@@ -455,12 +475,10 @@ fn replace_ascii_word_case_insensitive(text: &str, needle: &str, replacement: &s
     (out, count)
 }
 
-/// 使用者自訂術語表路徑：`%APPDATA%\modpack-i18n-tool\glossary.json`
+/// 使用者自訂術語表路徑：可攜式根（執行檔旁 `modpack-i18n-data\`）優先；
+/// 既有安裝（`%APPDATA%\modpack-i18n-tool\`）仍讀得到，見 `engine::paths`。
 pub fn user_glossary_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("modpack-i18n-tool")
-        .join("glossary.json")
+    super::paths::resolve_file(Path::new("glossary.json"))
 }
 
 /// 官方繁中術語表（1945 條，Minecraft 香草物品／方塊／生物…）。
@@ -573,6 +591,15 @@ pub fn load(extra: Option<&Path>) -> Glossary {
         );
     }
 
+    // 一詞多義的詞降級成只進 prompt：留著給 AI 當參考，但不事後強制改寫。
+    // 必須排在所有 T0 之後、使用者表之前——使用者明講的譯名仍然最大。
+    for en in CONTEXT_DEPENDENT {
+        let key = en.trim().to_ascii_lowercase();
+        if let Some(tier) = tiers.get_mut(&key) {
+            *tier = GlossaryTier::PromptOnly;
+        }
+    }
+
     let mut user_entries = 0usize;
     for path in [Some(user_glossary_path()), extra.map(|p| p.to_path_buf())]
         .into_iter()
@@ -661,7 +688,14 @@ pub fn ensure_user_glossary_template() -> Option<PathBuf> {
         "Creeper": "苦力怕",
         "Ancient Debris": "遠古遺骸"
     });
-    fs::write(&path, serde_json::to_string_pretty(&sample).ok()? + "\n").ok()?;
+    // 先寫暫存檔再改名：範本是玩家會直接編輯的檔案，
+    // 半截的 JSON 會讓 `read_json_map` 靜默讀不到，玩家改了半天沒生效卻查不出原因。
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(&sample).ok()? + "\n").ok()?;
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return None;
+    }
     Some(path)
 }
 
@@ -701,6 +735,37 @@ mod tests {
         let g = load(None);
         let terms = g.prompt_cache_terms(&["Powered Rail".to_string()]);
         assert!(!terms.iter().any(|(en, _)| en == "Power"));
+    }
+
+    #[test]
+    fn context_dependent_terms_are_never_force_enforced() {
+        // 光影設定的 Saturation 是「飽和度」，狀態效果的是「飽食」。
+        // 硬套任何一個都會在另一個畫面製造誤譯，所以只能給 AI 當參考。
+        let g = load(None);
+        for en in CONTEXT_DEPENDENT {
+            // None＝這個詞根本不在任何術語表裡，那這條降級規則就是死設定
+            assert_eq!(
+                g.tier_of(en),
+                Some(GlossaryTier::PromptOnly),
+                "{en} 是一詞多義，不得留在 Enforce 層（None 代表它已不在術語表，該從清單移除）"
+            );
+            assert_eq!(g.exact(en), None, "{en} 不該被直翻");
+        }
+        // 降級不等於刪掉：仍要留在 prompt 提示裡
+        let terms: Vec<&str> = g.terms.iter().map(|(en, _)| en.as_str()).collect();
+        assert!(
+            terms.iter().any(|en| en.eq_ignore_ascii_case("Saturation")),
+            "降級後仍要留給 AI 當參考"
+        );
+    }
+
+    #[test]
+    fn fencing_terms_are_translated_not_transliterated() {
+        // 小模型會把這些法文借詞音譯成人名，或整段跳過
+        let g = load(None);
+        assert_eq!(g.exact("Passado"), Some("突刺"));
+        assert_eq!(g.exact("Remise"), Some("續刺"));
+        assert_eq!(g.exact("riposte"), Some("還擊"));
     }
 
     #[test]

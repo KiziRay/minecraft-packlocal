@@ -70,6 +70,14 @@ where
     F: FnMut(u8, &str),
 {
     let mc = resolve_minecraft_dir(instance_or_mc)?;
+    crate::dev_log!(
+        "scan",
+        "開始掃描 instance={} mc={} opencc={} strip_zhi={}",
+        instance_or_mc.display(),
+        mc.display(),
+        do_opencc,
+        strip_of_zhi
+    );
     let mut raw: RawLang = HashMap::new();
     let mut jars = 0usize;
     let mut rps = 0usize;
@@ -77,6 +85,9 @@ where
     let mut errors = Vec::new();
     let mut non_priority_lang_skips = 0usize;
     let mut scan_cache = ScanCache::load();
+    // namespace → 提供它的 mod 檔（含版本）。掃完登記給共享庫用，見
+    // `translation_scope::remember_mod_identities`。
+    let mut mod_identity: HashMap<String, String> = HashMap::new();
 
     // ─── 1) mods jar / zip（平行掃描；含 Essential 等雙 jar，只讀 lang 不拆包）───
     on_progress(6, "本地整理：列出模組檔…");
@@ -103,6 +114,7 @@ where
                 let mut local_errors: Vec<String> = Vec::new();
                 let mut local_skips = 0usize;
                 let mut local_jars = 0usize;
+                let mut local_identity: HashMap<String, String> = HashMap::new();
                 for path in &chunk {
                     if cancel::is_cancelled() {
                         break;
@@ -113,22 +125,30 @@ where
                         local_errors.push(format!("{}: {}", name, e));
                         continue;
                     }
-                    if let Err(e) =
-                        harvest_archive(path, &mut local_raw, &mut local_errors, &mut local_skips)
-                    {
+                    if let Err(e) = harvest_archive(
+                        path,
+                        &mut local_raw,
+                        &mut local_errors,
+                        &mut local_skips,
+                        &mut local_identity,
+                    ) {
                         local_errors.push(format!("{}: {}", name, e));
                     }
                 }
-                (local_raw, local_errors, local_jars, local_skips)
+                (local_raw, local_errors, local_jars, local_skips, local_identity)
             }));
         }
         let mut done = 0usize;
+        let total_handles = handles.len();
         for (gi, handle) in handles.into_iter().enumerate() {
             match handle.join() {
-                Ok((partial, errs, count, skips)) => {
+                Ok((partial, errs, count, skips, identity)) => {
                     merge_raw_lang(&mut raw, partial);
                     errors.extend(errs);
                     non_priority_lang_skips += skips;
+                    for (ns, jar) in identity {
+                        mod_identity.entry(ns).or_insert(jar);
+                    }
                     jars += count;
                     done += count;
                     let pct = 8 + (((done as u32) * 14) / total_j as u32).min(14) as u8;
@@ -137,7 +157,7 @@ where
                         &format!(
                             "本地整理：模組批次 {}/{}（已 {}/{}）",
                             gi + 1,
-                            n_workers,
+                            total_handles,
                             done,
                             jar_paths.len()
                         ),
@@ -147,7 +167,12 @@ where
                     errors.push("模組掃描執行緒異常結束".into());
                 }
             }
+            // 已取消：繼續 join 完其餘執行緒避免 detach，最後由 cancel::check 上拋
+            if cancel::is_cancelled() {
+                // fall through; remaining joins happen in subsequent loop iterations
+            }
         }
+        cancel::check()?;
     }
 
     cancel::check()?;
@@ -156,7 +181,7 @@ where
     on_progress(23, "本地整理：讀資源包語言…");
     let rp_root = mc.join("resourcepacks");
     if rp_root.is_dir() {
-        let entries: Vec<PathBuf> = fs::read_dir(&rp_root)
+        let mut entries: Vec<PathBuf> = fs::read_dir(&rp_root)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
@@ -170,6 +195,7 @@ where
                     .collect()
             })
             .unwrap_or_default();
+        entries.sort();
         let total_r = entries.len().max(1);
         for (idx, path) in entries.iter().enumerate() {
             rps += 1;
@@ -194,9 +220,15 @@ where
                     errors.push(format!("{}: {}", file_name_str(path), e));
                     continue;
                 }
-                if let Err(e) =
-                    harvest_archive(path, &mut raw, &mut errors, &mut non_priority_lang_skips)
-                {
+                // 資源包不是模組，不登記模組身分（用一份丟棄的暫存表）
+                let mut ignored_identity: HashMap<String, String> = HashMap::new();
+                if let Err(e) = harvest_archive(
+                    path,
+                    &mut raw,
+                    &mut errors,
+                    &mut non_priority_lang_skips,
+                    &mut ignored_identity,
+                ) {
                     errors.push(format!("{}: {}", file_name_str(path), e));
                 }
             }
@@ -348,6 +380,15 @@ where
         ),
     );
 
+    // 登記「namespace → 提供它的 mod 檔」，讓共享庫能分辨
+    // 「不同整合包，但同一個模組的同一版本」——那種情況一票就夠。
+    crate::dev_log!(
+        "scan",
+        "模組身分登記 {} 個 namespace（供共享庫跨整合包重用）",
+        mod_identity.len()
+    );
+    super::translation_scope::remember_mod_identities(mod_identity);
+
     let report = ScanReport {
         minecraft_dir: mc.display().to_string(),
         jars_scanned: jars,
@@ -363,6 +404,25 @@ where
         scan_cache_hits: cache_hits,
         errors,
     };
+    crate::dev_log!(
+        "scan",
+        "掃描結束 jar={} 資源包={} 鬆散檔={} 命名空間={} 已有中文={} 待翻={} \
+（台繁{}／簡轉{}／港繁提示{}）快取命中={} 錯誤={}",
+        report.jars_scanned,
+        report.resourcepacks_scanned,
+        report.loose_lang_files,
+        report.namespaces,
+        report.keys_zh,
+        report.keys_need_ai,
+        report.keys_from_zh_tw,
+        report.keys_from_zh_cn,
+        report.keys_from_zh_hk_hint,
+        report.scan_cache_hits,
+        report.errors.len()
+    );
+    for e in report.errors.iter().take(50) {
+        crate::dev_log!("scan", "掃描錯誤：{e}");
+    }
     Ok((zh, en_only, provenance, report))
 }
 
@@ -394,6 +454,7 @@ fn list_archive_files(root: &Path, max_depth: usize) -> Vec<PathBuf> {
             out.push(path.to_path_buf());
         }
     }
+    out.sort();
     out
 }
 
@@ -401,7 +462,16 @@ fn merge_raw_lang(into: &mut RawLang, from: RawLang) {
     for (ns, locales) in from {
         let ns_entry = into.entry(ns).or_default();
         for (loc, map) in locales {
-            ns_entry.entry(loc).or_default().extend(map);
+            let slot = ns_entry.entry(loc).or_default();
+            for (k, v) in map {
+                match slot.get(&k) {
+                    // Prefer longer non-empty value so FS order does not flip source text.
+                    Some(old) if !old.trim().is_empty() && old.len() >= v.len() => {}
+                    _ => {
+                        slot.insert(k, v);
+                    }
+                }
+            }
         }
     }
 }
@@ -907,7 +977,15 @@ fn harvest_archive(
     raw: &mut RawLang,
     errors: &mut Vec<String>,
     non_priority_skips: &mut usize,
+    mod_identity: &mut HashMap<String, String>,
 ) -> Result<(), String> {
+    // 這個 jar 的識別＝**含版本**的檔名（去掉副檔名）。
+    // 共享庫要靠它分辨「不同整合包但同一個模組的同一版本」，
+    // 所以不能沿用 pack_key 那支刻意去掉版本的正規化。
+    let jar_identity = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let f = File::open(path).map_err(|e| e.to_string())?;
     let mut zip = ZipArchive::new(f).map_err(|e| e.to_string())?;
     if zip.len() > 80_000 {
@@ -952,6 +1030,13 @@ fn harvest_archive(
         };
         if !is_safe_ns(&ns) {
             continue;
+        }
+        // 這個 namespace 由這個 jar 提供。同一個 ns 出現在多個 jar 時
+        // （少見，通常是相容層）保留第一個就好——重點是版本比對得上。
+        if !jar_identity.is_empty() {
+            mod_identity
+                .entry(ns.clone())
+                .or_insert_with(|| jar_identity.clone());
         }
         let fname = parts[li + 1];
         let locale = fname

@@ -3,17 +3,20 @@
 //! 共享術語與共享 TM 分開保存。只有同一術語被同一整合包或多個整合包重複
 //! 確認，且沒有未解決衝突時才會回傳給桌面工具；單一來源不會直接變成全域
 //! 強制譯名，避免一個錯誤翻譯污染所有使用者。
+//! 貢獻免登入；若本機已有 ZeitFrei session，才附帶 session 讓雲端做濫用防護。
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use super::discord_auth::managed_ai_session_cookie;
 use super::hashutil::sha256_hex;
 use super::placeholder;
 use super::secrets::MANAGED_BASE_URL;
 use super::translation_quality::is_usable_zh;
 use super::translation_scope::TranslationScope;
+use super::turnstile::MANAGED_AI_PROTOCOL;
 
 const MAX_ITEMS: usize = 3000;
 const MAX_SOURCE_LEN: usize = 160;
@@ -71,6 +74,7 @@ pub struct ContributeResult {
     pub accepted: usize,
     pub conflicts: usize,
     pub failed: bool,
+    pub status_note: Option<String>,
 }
 
 impl ContributeResult {
@@ -79,7 +83,20 @@ impl ContributeResult {
             return None;
         }
         if self.failed {
-            return Some("社群共享術語：貢獻失敗已略過".into());
+            return Some(
+                self.status_note
+                    .clone()
+                    .unwrap_or_else(|| "社群共享術語：貢獻失敗已略過".into()),
+            );
+        }
+        if let Some(note) = self.status_note.clone() {
+            return Some(note);
+        }
+        if self.accepted == 0 {
+            return Some(format!(
+                "社群共享術語：送出 {} 條，雲端未接受新項目（衝突 {}）",
+                self.attempted, self.conflicts
+            ));
         }
         Some(format!(
             "已匿名貢獻共享術語 accepted＝{}（衝突 {}，送出 {}）",
@@ -96,7 +113,13 @@ pub fn glossary_hash(source: &str, context: Option<&str>) -> String {
 }
 
 fn normalize(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+    use unicode_normalization::UnicodeNormalization;
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfc()
+        .collect::<String>()
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
@@ -109,6 +132,33 @@ fn client() -> Option<reqwest::blocking::Client> {
 
 fn base() -> String {
     MANAGED_BASE_URL.trim_end_matches('/').to_string()
+}
+
+fn apply_contribute_headers(
+    req: reqwest::blocking::RequestBuilder,
+    session: Option<String>,
+) -> reqwest::blocking::RequestBuilder {
+    let req = req
+        .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
+        .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"));
+    if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
+        req.header("X-Zeitfrei-Session", session)
+    } else {
+        req
+    }
+}
+
+fn optional_session_cookie() -> Option<String> {
+    managed_ai_session_cookie().ok()
+}
+
+fn glossary_http_note(status: u16) -> Option<String> {
+    match status {
+        401 => Some("社群共享術語：雲端尚未更新，貢獻暫時略過".into()),
+        426 => Some("社群共享術語：雲端要求新版協定，請更新工具後再貢獻".into()),
+        429 => Some("社群共享術語：雲端忙碌或速率限制（429），本次暫時略過".into()),
+        _ => None,
+    }
 }
 
 #[allow(dead_code)]
@@ -146,6 +196,7 @@ pub fn lookup_detailed(jobs: &[SharedGlossaryJob]) -> LookupResult {
         });
         if let Some(scope) = &job.scope {
             item["pk"] = json!(scope.pack_key.clone());
+            item["pks"] = json!(scope.lookup_pack_keys());
             item["pn"] = json!(scope.pack_name.clone());
         }
         items.push(item);
@@ -234,8 +285,9 @@ pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
                 "gh": glossary_hash(&entry.source, entry.context.as_deref()),
                 "ctx": entry.context,
                 "zh": entry.translated.trim(),
-                "pk": entry.scope.pack_key,
-                "pn": entry.scope.pack_name,
+                "pk": entry.scope.pack_key.clone(),
+                "pks": entry.scope.lookup_pack_keys(),
+                "pn": entry.scope.pack_name.clone(),
             })
         })
         .collect();
@@ -247,12 +299,12 @@ pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
     let mut conflicts = 0usize;
     let mut any_ok = false;
     let mut any_fail = false;
+    let mut status_note: Option<String> = None;
     for chunk in items.chunks(MAX_ITEMS) {
-        match client
+        let req = client
             .post(format!("{}/glossary/contribute", base()))
-            .json(&json!({ "items": chunk }))
-            .send()
-        {
+            .json(&json!({ "items": chunk }));
+        match apply_contribute_headers(req, optional_session_cookie()).send() {
             Ok(response) if response.status().is_success() => {
                 any_ok = true;
                 if let Ok(value) = response.json::<Value>() {
@@ -266,7 +318,20 @@ pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
                         .unwrap_or(0) as usize;
                 }
             }
-            _ => any_fail = true,
+            Ok(response) => {
+                any_fail = true;
+                let code = response.status().as_u16();
+                if code == 426 || status_note.is_none() {
+                    status_note = glossary_http_note(code)
+                        .or_else(|| Some("社群共享術語：貢獻失敗已略過".into()));
+                }
+            }
+            Err(_) => {
+                any_fail = true;
+                if status_note.is_none() {
+                    status_note = Some("社群共享術語：貢獻失敗已略過".into());
+                }
+            }
         }
     }
     ContributeResult {
@@ -274,6 +339,7 @@ pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
         accepted,
         conflicts,
         failed: any_fail && !any_ok,
+        status_note,
     }
 }
 
@@ -290,6 +356,18 @@ mod tests {
         assert_ne!(
             glossary_hash("Diamond Sword", Some("物品名")),
             glossary_hash("Diamond Sword", Some("提示說明"))
+        );
+    }
+
+    #[test]
+    fn glossary_hash_empty_context_is_stable() {
+        assert_eq!(
+            glossary_hash("Cogwheel", None),
+            glossary_hash("Cogwheel", Some(""))
+        );
+        assert_eq!(
+            glossary_hash("  Cogwheel  ", None),
+            glossary_hash("Cogwheel", None)
         );
     }
 

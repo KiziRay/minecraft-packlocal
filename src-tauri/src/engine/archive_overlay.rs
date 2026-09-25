@@ -29,7 +29,12 @@ pub struct ArchiveOverlayReport {
     pub archives_rewritten: usize,
     pub entries_rewritten: usize,
     pub strings_translated: usize,
+    /// 只放「需要人看」的問題；設計上就會略過的正常情況不進這裡。
     pub skipped: Vec<String>,
+    /// resourcepacks 內的 ZIP 依設計不重建（語言檔已併入主資源包）。
+    /// 這是正常行為，早期逐一寫進 `skipped` 會在錯誤日誌灌進上百行雜訊，
+    /// 把真正需要處理的解析失敗淹沒，所以改成只記數量。
+    pub skipped_resourcepack_zips: usize,
 }
 
 /// 掃描 datapack／global_packs／openloader／resourcepacks 中的 ZIP 文字。
@@ -69,9 +74,8 @@ where
         );
         if is_under_resourcepacks(minecraft_dir, archive) {
             // 語言檔已併入主資源包；不再複製 resourcepacks/*.zip 到 resourcepacks-extra。
-            report.skipped.push(format!(
-                "{name}：略過 resourcepacks 內 ZIP（語言檔會寫入主資源包，不另產 resourcepacks-extra 副本）"
-            ));
+            // 這是設計上的正常略過，只計數不逐檔寫進錯誤日誌（實測會多出 162 行雜訊）。
+            report.skipped_resourcepack_zips += 1;
             continue;
         }
         match process_archive(

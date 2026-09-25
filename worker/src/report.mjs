@@ -38,6 +38,7 @@ export const REPORT_CATEGORIES = new Set([
   "tool_share_fail",
   "tool_ai_managed",
   "tool_ai_custom",
+  "tool_ai_gpt",
   "tool_ui",
   "other_feature",
   "other_docs",
@@ -326,13 +327,17 @@ export async function reportMpuCreate(request, env, userId, nowSec = Math.floor(
   });
 }
 
-export async function reportMpuPart(request, env, url) {
+export async function reportMpuPart(request, env, url, userId) {
   if (!env.SHARES) return reportJson({ error: "report storage not configured" }, 503);
   const key = String(url.searchParams.get("key") || "");
   const uploadId = String(url.searchParams.get("uploadId") || "");
   const partNumber = Number(url.searchParams.get("partNumber") || 0);
   if (!key.startsWith(REPORT_PREFIX) || key.includes("..") || !uploadId || !Number.isFinite(partNumber) || partNumber < 1) {
     return reportJson({ error: "bad multipart part" }, 400);
+  }
+  const tracked = env.USAGE ? parseJson(await env.USAGE.get(reportMpuKey(uploadId)), null) : null;
+  if (env.USAGE && (!tracked || tracked.userId !== userId || tracked.key !== key)) {
+    return reportJson({ error: "forbidden" }, 403);
   }
   const declared = parseInt(request.headers.get("content-length") || "0", 10);
   if (!Number.isFinite(declared) || declared <= 0 || declared > REPORT_MAX_BYTES) {

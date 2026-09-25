@@ -7,6 +7,8 @@ use engine::{
     apply_font_pack_to_instance, apply_to_instance, build_font_pack_str_with_options,
     read_font_preview_base64,
     build_resource_pack, cancel_discord_login, build_pack_name, resolve_output_pack_name,
+    detect_pack_version,
+    cancel_gpt_login,
     cancel_turnstile_verification, check_cancelled, is_cancelled, check_discord_auth_status,
     classify_diagnosis, clear_turnstile_proof,
     convert_langmap_s2tw_selective, convert_langmap_s2tw_with_progress,
@@ -16,35 +18,42 @@ use engine::{
     diagnose_pack_dir, discover_default_reference,
     try_download_cfpa_pack,
     cleanup_transient_work, ensure_result_layout, ensure_ready_to_write, ensure_space, ensure_user_glossary_template,
+    prune_empty_result_dirs,
     ensure_minecraft_version_for_translate,
     extract_jar_documentation,
     rewrite_translated_jars, translate_jar_display_texts, translate_jar_patchouli,
-    fill_missing_with_mode, seed_tm_from_langmaps, verify_custom_api,
+    fill_missing_with_mode, seed_tm_from_langmaps, verify_ai_assistance, verify_custom_api, AiFillReport,
+    contribute_shared_glossary_from_langmaps,
     find_pack_near, find_session_file, get_ai_mode,
-    get_api_settings_public, get_minimize_on_close, has_session_file, load_pack_zh,
-    load_phrase_dict, load_reference_zh_tw, load_session, login_discord_blocking, logout_discord,
-    is_probably_network_path, managed_ai_available, merge_fill_missing, normalize_user_path,
+    is_tool_resource_pack,
+    get_api_settings_public, get_gpt_model, get_minimize_on_close, has_session_file, load_pack_zh,
+    discover_prior_zh_sources,
+    load_phrase_dict, load_reference_zh_tw, load_session, login_discord_blocking, gpt_login_blocking,
+    gpt_auth_status, gpt_logout, logout_discord,
+    is_probably_network_path, merge_fill_missing, normalize_user_path,
     package_translation, has_shareable_content,
     upload_share_package,
     pack_format_for_version,
     probe_apply_targets,
-    remaining_pending, request_cancel, reset_cancel, resolve_minecraft_dir, restore_last_apply_in,
-    merge_pending, rework_unusable_zh,
+    remaining_pending, request_cancel, reset_cancel, resolve_canonical_tool_zip,
+    resolve_minecraft_dir, restore_last_apply_in,
+    filter_quality_deferred, merge_pending, prune_quality_deferred, rework_unusable_zh,
     delete_apply_backups_in, has_apply_backups_in,
     save_api_settings, save_api_settings_with_provider, save_session,
-    scan_instance, set_ai_mode,
+    scan_instance, set_ai_mode, set_gpt_model,
     run_search_pipeline, write_search_artifacts,
     set_minimize_on_close, subtract_covered, suggest_output_base, translate_ftbquests,
-    translate_archive_overlays, translate_kubejs_literals, translate_minemenu, translate_origins,
+    translate_archive_overlays, translate_jar_origins, translate_kubejs_literals, translate_minemenu, translate_origins,
     translate_quests_books, translate_text_overlays,
     mode_note, skip_complete_namespaces_with_provenance, TranslationMode, TranslationQuality,
-    user_glossary_path, validate_instance_path, validate_open_url, verify_turnstile_blocking, write_consistency_hints, write_coverage_report,
+    user_glossary_path, validate_instance_path, validate_open_url, verify_turnstile_blocking, consistency_suggestions_path, consistency_suggestions_status, merge_consistency_suggestions, write_consistency_hints, write_coverage_report,
     write_gap_summary_file,
-    map_stage_progress, CoverageSourceFlags, CoverageTier,
+    map_stage_progress, CoverageSourceFlags,
     ApiSettingsPublic, ApplyResult, BuildOptions, PackVersionInfo,
     CoverageStats, DiscordAuthStatus, FontPackApplyResult, FontPackOptions, FontPackResult,
     InstanceValidation, JarDocumentationReport, JarTranslationReport,
     LangMap, LaunchDiagnosis, ShareUploadResult, LangSource, ProvenanceMap,
+    GptAuthStatus,
     DeleteBackupResult, RestoreResult, ScanReport, TranslateSession, UpdateCheck, CANCEL_MESSAGE, DISCORD_INVITE_URL,
     MIN_FREE_BYTES, RESULT_DIR_NAME, SESSION_FILE,
     TranslationScope,
@@ -54,10 +63,9 @@ use engine::{
     filter_local_untranslatable, flush_shared_contribute_queue,
     reset_contribute_tracker, SkipSharedLookupGuard,
     submit_diagnose_report, DiagnoseReportRequest, DiagnoseReportResult,
-    managed_ai_gp_reward_cmd as managed_ai_gp_reward_impl,
-    managed_ai_usage_cmd as managed_ai_usage_impl,
+    submit_issue_report, SubmitIssueReportResult,
     submit_usage_feedback_cmd as submit_usage_feedback_impl,
-    ManagedAiGpRewardCmdResult, ManagedAiUsageCmdResult, SubmitUsageFeedbackCmdResult,
+    SubmitUsageFeedbackCmdResult,
     dev_progress,
 };
 use engine::{check_update_engine, cleanup_update_residuals, download_and_launch};
@@ -77,6 +85,15 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 static MINIMIZE_ON_CLOSE: AtomicBool = AtomicBool::new(true);
 /// 正在套用更新並即將 exit：關閉視窗時不可改成「縮到背景」。
 static UPDATE_EXITING: AtomicBool = AtomicBool::new(false);
+/// 翻譯（含補翻／修復）是否正在跑。
+///
+/// 使用者實測：翻到一半把工具關掉，重開續翻時前一小時的紀錄被蓋掉、
+/// 「不備份直接覆蓋」的選擇也不見了。上一輪已經把紀錄與偏好做成可持久化，
+/// 但**關閉的那一刻沒有任何保護**——沒有警告、也沒有把當下狀態寫出去。
+/// 有了這個旗標，關閉流程才能先問過使用者、並讓前端把進度落檔再退出。
+static TRANSLATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 「已縮到背景」的解釋只講一次；每次都彈 blocking 對話框等於擋路。
+static MINIMIZE_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 const STATE_RUNNING: &str = "running";
 const STATE_WAITING: &str = "waiting";
@@ -84,6 +101,8 @@ const STATE_RETRYING: &str = "retrying";
 const STATE_THROTTLED: &str = "throttled";
 const STATE_DEGRADED: &str = "degraded";
 const STATE_CANCELLING: &str = "cancelling";
+const STATE_COMPLETED: &str = "completed";
+const STATE_COMPLETED_WITH_PENDING: &str = "completed_with_pending";
 const PROGRESS_THROTTLE_MS: u64 = 110;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -99,8 +118,17 @@ struct ProgressMetricsPayload {
     ai: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skipped: Option<u64>,
+    /// 品質閘略過（保留英文），與完整度略過分開。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_skipped: Option<u64>,
+    /// 同包接續併入條數。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending: Option<u64>,
+    /// 全包仍缺（覆蓋報告軌），與本輪 AI 佇列 pending 分開。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_pending: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_done: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +147,8 @@ struct ProgressMetricsPayload {
     completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_hit_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,7 +174,18 @@ struct ProgressPayload {
     state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<ProgressMetricsPayload>,
+    /// 子階段：讓「補充」這種長步驟看得出裡面跑到哪一段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substage_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substage_total: Option<u8>,
 }
+
+/// 「補充」步驟底下的子階段數。使用者反映補充階段長時間卡在 95%，
+/// 卻看不出裡面到底在做什麼——拆成具名的子階段後，畫面能顯示「第 N / M 段」。
+const SUPPLEMENT_SUBSTAGES: u8 = 5;
 
 #[derive(Debug, Clone, Default)]
 struct ProgressHint {
@@ -157,6 +198,11 @@ struct ProgressHint {
     detail: Option<String>,
     state: Option<&'static str>,
     metrics: Option<ProgressMetricsPayload>,
+    /// 子階段名稱。像「補充」這種長步驟其實包含好幾段（補語言檔→重建 JAR→
+    /// 覆寫文字→ZIP 文字→品質重試），使用者只看到一個不動的 95% 會以為卡住。
+    substage: Option<&'static str>,
+    substage_index: Option<u8>,
+    substage_total: Option<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -189,7 +235,7 @@ fn regex_pair() -> &'static Regex {
 fn regex_ai_prehits() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"免費命中\s+(\d+)\s+句（術語表\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)），只剩\s+(\d+)\s+句")
+        Regex::new(r"免費命中\s+(\d+)\s+句（本機術語\s+(\d+)、共享術語\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)），只剩\s+(\d+)\s+句")
             .unwrap()
     })
 }
@@ -197,9 +243,28 @@ fn regex_ai_prehits() -> &'static Regex {
 fn regex_ai_final_hits() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"補譯\s+(\d+)\s+條（術語表\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)、AI\s+(\d+)）")
-            .unwrap()
+        Regex::new(
+            r"補譯\s+(\d+)\s+條（術語\s+(\d+)、共享術語\s+(\d+)、共享庫\s+(\d+)、翻譯記憶\s+(\d+)、AI\s+(\d+)）",
+        )
+        .unwrap()
     })
+}
+
+fn regex_quality_skipped() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"品質未過略過\s*(\d+)\s*句|(\d+)\s*條因品質未過保留英文").unwrap()
+    })
+}
+
+fn regex_prior_merged() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:接續上次|累計併入|併入)\s*(\d+)\s*條").unwrap())
+}
+
+fn regex_pack_pending() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"【仍待譯】約\s*(\d+)\s*條").unwrap())
 }
 
 fn regex_ai_batches() -> &'static Regex {
@@ -259,7 +324,10 @@ fn metrics_has_value(metrics: &ProgressMetricsPayload) -> bool {
         || metrics.shared.is_some()
         || metrics.ai.is_some()
         || metrics.skipped.is_some()
+        || metrics.quality_skipped.is_some()
+        || metrics.prior.is_some()
         || metrics.pending.is_some()
+        || metrics.pack_pending.is_some()
         || metrics.batch_done.is_some()
         || metrics.batch_total.is_some()
         || metrics.batch_retry.is_some()
@@ -291,8 +359,17 @@ fn merge_metrics(base: &mut Option<ProgressMetricsPayload>, extra: Option<Progre
     if metrics.skipped.is_none() {
         metrics.skipped = extra.skipped;
     }
+    if metrics.quality_skipped.is_none() {
+        metrics.quality_skipped = extra.quality_skipped;
+    }
+    if metrics.prior.is_none() {
+        metrics.prior = extra.prior;
+    }
     if metrics.pending.is_none() {
         metrics.pending = extra.pending;
+    }
+    if metrics.pack_pending.is_none() {
+        metrics.pack_pending = extra.pack_pending;
     }
     if metrics.batch_done.is_none() {
         metrics.batch_done = extra.batch_done;
@@ -321,6 +398,32 @@ fn merge_metrics(base: &mut Option<ProgressMetricsPayload>, extra: Option<Progre
     if metrics.cache_hit_percent.is_none() {
         metrics.cache_hit_percent = extra.cache_hit_percent;
     }
+}
+
+fn metrics_from_ai_fill(report: &AiFillReport) -> ProgressMetricsPayload {
+    let mut metrics = ProgressMetricsPayload {
+        glossary: Some(report.glossary_hits as u64),
+        tm: Some(report.tm_hits as u64),
+        shared: Some((report.shared_hits + report.shared_glossary_hits) as u64),
+        ai: Some(report.ai_translated as u64),
+        ..Default::default()
+    };
+    if report.quality_skipped > 0 {
+        metrics.quality_skipped = Some(report.quality_skipped as u64);
+    }
+    let hit = report.usage.prompt_cache_hit_tokens as u64;
+    let miss = report.usage.prompt_cache_miss_tokens as u64;
+    let completion = report.usage.completion_tokens as u64;
+    if hit > 0 || miss > 0 || completion > 0 {
+        metrics.cache_hit_tokens = Some(hit);
+        metrics.cache_miss_tokens = Some(miss);
+        metrics.completion_tokens = Some(completion);
+        let denom = hit.saturating_add(miss);
+        if denom > 0 {
+            metrics.cache_hit_percent = Some(((hit * 100) / denom) as u8);
+        }
+    }
+    metrics
 }
 
 fn infer_progress_unit(message: &str) -> Option<&'static str> {
@@ -359,15 +462,43 @@ fn infer_progress_hint(message: &str) -> ProgressHint {
 
     if let Some(caps) = regex_ai_prehits().captures(message) {
         metrics.glossary = caps.get(2).and_then(|m| m.as_str().parse().ok());
-        metrics.shared = caps.get(3).and_then(|m| m.as_str().parse().ok());
-        metrics.tm = caps.get(4).and_then(|m| m.as_str().parse().ok());
-        metrics.pending = caps.get(5).and_then(|m| m.as_str().parse().ok());
+        metrics.shared = Some(
+            caps.get(3)
+                .and_then(|m| m.as_str().parse::<u64>().ok())
+                .unwrap_or(0)
+                + caps
+                    .get(4)
+                    .and_then(|m| m.as_str().parse::<u64>().ok())
+                    .unwrap_or(0),
+        );
+        metrics.tm = caps.get(5).and_then(|m| m.as_str().parse().ok());
+        metrics.pending = caps.get(6).and_then(|m| m.as_str().parse().ok());
     }
     if let Some(caps) = regex_ai_final_hits().captures(message) {
         metrics.glossary = caps.get(2).and_then(|m| m.as_str().parse().ok());
-        metrics.shared = caps.get(3).and_then(|m| m.as_str().parse().ok());
-        metrics.tm = caps.get(4).and_then(|m| m.as_str().parse().ok());
-        metrics.ai = caps.get(5).and_then(|m| m.as_str().parse().ok());
+        metrics.shared = Some(
+            caps.get(3)
+                .and_then(|m| m.as_str().parse::<u64>().ok())
+                .unwrap_or(0)
+                + caps
+                    .get(4)
+                    .and_then(|m| m.as_str().parse::<u64>().ok())
+                    .unwrap_or(0),
+        );
+        metrics.tm = caps.get(5).and_then(|m| m.as_str().parse().ok());
+        metrics.ai = caps.get(6).and_then(|m| m.as_str().parse().ok());
+    }
+    if let Some(caps) = regex_quality_skipped().captures(message) {
+        metrics.quality_skipped = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .and_then(|m| m.as_str().parse().ok());
+    }
+    if let Some(caps) = regex_prior_merged().captures(message) {
+        metrics.prior = caps.get(1).and_then(|m| m.as_str().parse().ok());
+    }
+    if let Some(caps) = regex_pack_pending().captures(message) {
+        metrics.pack_pending = caps.get(1).and_then(|m| m.as_str().parse().ok());
     }
     if let Some(caps) = regex_ai_batches().captures(message) {
         metrics.batch_done = caps.get(1).and_then(|m| m.as_str().parse().ok());
@@ -485,6 +616,9 @@ fn emit_progress_ex(app: &AppHandle, percent: Option<u8>, message: &str, mut hin
         detail: hint.detail.filter(|s| !s.trim().is_empty()),
         state: hint.state.map(str::to_string),
         metrics: hint.metrics.filter(metrics_has_value),
+        substage: hint.substage.map(str::to_string),
+        substage_index: hint.substage_index,
+        substage_total: hint.substage_total,
     };
 
     let mut guard = progress_emit_state()
@@ -540,6 +674,21 @@ fn emit_log(app: &AppHandle, level: &str, message: &str) {
             level: level.to_string(),
             message: message.to_string(),
         },
+    );
+}
+
+fn emit_pruned_tool_pack_log(app: &AppHandle, pruned: &[String]) {
+    if pruned.is_empty() {
+        return;
+    }
+    emit_log(
+        app,
+        "info",
+        &format!(
+            "已移除 {} 個舊版工具資源包：{}",
+            pruned.len(),
+            pruned.join("、")
+        ),
     );
 }
 
@@ -616,9 +765,47 @@ struct OneClickResult {
     files_written: usize,
     keys_total: usize,
     ai_filled: usize,
+    pending_count: usize,
+    coverage_percent: u8,
+    completed_with_pending: bool,
     jar_translation: JarTranslationReport,
     minemenu_msg: Option<String>,
     player_summary: String,
+    /// 套用完成後，若在同一個上層資料夾（例如 PrismLauncher 的 `instances\`）
+    /// 找到模組內容跟這次套用對象一模一樣的其他資料夾，提醒使用者確認
+    /// 有沒有選錯／實例被改名或複製過，避免以為套用失敗。
+    sibling_instance_warning: Option<String>,
+    /// 本來就不該翻、已原樣保留的項目數（附魔等級的羅馬數字、單位符號、
+    /// 字型圖示、品牌名、註解鍵等）。跟「待補」分開報，避免使用者把
+    /// 「維持原文才正確」的東西誤會成工具漏翻。
+    stays_unchanged: usize,
+    /// 這次**實際採用**的設定，以及每個與使用者選擇不同的欄位的原因（P0-01）。
+    /// 前端照這份顯示，不自己推測後端做了什麼。
+    run_plan: engine::run_plan::RunPlan,
+    /// 是否有任何欄位與使用者的選擇不同。UI 用它決定要不要顯示說明區塊。
+    run_plan_has_overrides: bool,
+}
+
+/// 套用成功後順手檢查一次：同一個上層資料夾底下有沒有其他資料夾的模組內容
+/// 跟這次套用對象一模一樣。找到就回一句可以直接顯示給玩家看的提醒；沒找到、
+/// 或掃描失敗都回 None——這是提醒用，不影響套用流程本身是否成功。
+fn detect_sibling_instance_warning(instance: &Path) -> Option<String> {
+    let siblings = engine::find_sibling_instances_with_same_mods(instance);
+    if siblings.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = siblings
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "偵測到 {} 個資料夾的模組內容跟這次套用的一模一樣：{}。如果你實際遊玩的是其中一個，翻譯不會出現在裡面，請改選該資料夾重新套用。",
+        names.len(),
+        names.join("、")
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -643,6 +830,11 @@ struct ExtraSourceTask {
 struct ExtraSourceOutcome {
     note: String,
     errors: Vec<String>,
+    /// 這個階段掃到幾個可處理單位、實際做成幾個。
+    ///
+    /// 用來判斷「找到東西卻一個都沒做成」——那種情況結尾不准說「完成」。
+    /// `None` 代表這個階段還沒提供計數（過渡期），帳本會當成未知而不是 0。
+    counts: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -651,6 +843,8 @@ struct ExtraSourceSummary {
     skipped: Vec<String>,
     errors: Vec<String>,
     cancelled: bool,
+    /// 各階段的完整性帳本（見 engine/coverage_ledger.rs）。
+    ledger: engine::CoverageLedger,
 }
 
 impl ExtraSourceKind {
@@ -800,20 +994,29 @@ fn run_one_extra_source(
                     msg,
                 );
             })?;
+            // resourcepacks 內的 ZIP 是設計上的正常略過，只在摘要裡帶一句，
+            // 不進錯誤日誌（實測會多出 162 行雜訊，把真正的解析失敗淹沒）。
+            let normal_skip_note = if a.skipped_resourcepack_zips > 0 {
+                format!(
+                    "；另有 {} 個 resourcepacks 內的 ZIP 依設計不重建（語言檔已併入主資源包，屬正常）",
+                    a.skipped_resourcepack_zips
+                )
+            } else {
+                String::new()
+            };
             outcome.note = if a.skipped.is_empty() {
                 format!(
-                    "ZIP 文字：掃描 {} 個、重建 {} 個、寫入 {} 個項目",
+                    "ZIP 文字：掃描 {} 個、重建 {} 個、寫入 {} 個項目{normal_skip_note}",
                     a.archives_scanned, a.archives_rewritten, a.entries_rewritten
                 )
             } else {
+                let problem_count = a.skipped.len();
                 for skipped in a.skipped {
                     outcome.errors.push(format!("ZIP 文字：{skipped}"));
                 }
                 format!(
-                    "ZIP 文字：掃描 {} 個、重建 {} 個；{} 個略過（詳見錯誤日誌）",
-                    a.archives_scanned,
-                    a.archives_rewritten,
-                    outcome.errors.len()
+                    "ZIP 文字：掃描 {} 個、重建 {} 個；{} 個因問題略過（詳見錯誤日誌）{normal_skip_note}",
+                    a.archives_scanned, a.archives_rewritten, problem_count
                 )
             };
         }
@@ -835,7 +1038,35 @@ fn run_one_extra_source(
                     &format!("Origins 能力已寫出 {} 個檔", o.files_written),
                 );
             }
-            outcome.note = o.note;
+            // 鬆散資料包掃完，再掃 JAR 內的能力檔。
+            //
+            // Origins 系整合包通常把 powers 打包在模組自己的 JAR 裡，
+            // 只掃資料夾會整片漏掉（能力名稱與說明全留英文）。
+            let app_jo = app.clone();
+            match translate_jar_origins(mc, work, use_ai, scope, move |pct, msg| {
+                emit_progress_stage(
+                    &app_jo,
+                    dev_progress::STAGE_EXTRAS,
+                    Some(map_stage_progress(task.base, task.span, pct)),
+                    msg,
+                );
+            }) {
+                Ok(j) => {
+                    if j.strings_translated > 0 {
+                        outcome.note = format!("{}；{}", o.note, j.note);
+                    } else {
+                        outcome.note = o.note;
+                    }
+                    for skipped in j.skipped {
+                        outcome.errors.push(format!("JAR 能力檔：{skipped}"));
+                    }
+                }
+                Err(error) => {
+                    // JAR 內能力檔翻不了不該讓整輪失敗——鬆散資料包那部分已經完成
+                    outcome.errors.push(format!("JAR 內 Origins 略過：{error}"));
+                    outcome.note = o.note;
+                }
+            }
         }
         ExtraSourceKind::QuestsBooks => {
             let app_qb = app.clone();
@@ -909,6 +1140,11 @@ fn run_extra_sources(
     let mut collect = |task: ExtraSourceTask, result: std::thread::Result<Result<ExtraSourceOutcome, String>>| {
         match result {
             Ok(Ok(outcome)) => {
+                if let Some((found, done)) = outcome.counts {
+                    summary
+                        .ledger
+                        .record(engine::StageEntry::ok(task.kind.label(), found, done));
+                }
                 if !outcome.note.trim().is_empty() {
                     emit_log(app, "info", &outcome.note);
                     summary.notes.push(outcome.note);
@@ -916,6 +1152,13 @@ fn run_extra_sources(
                 summary.errors.extend(outcome.errors);
             }
             Ok(Err(error)) => {
+                // 這個階段整段失敗：記進帳本，結尾就不會謊報「完成」。
+                // found 取「至少 1」——我們知道它有東西要做（不然不會走到這裡），
+                // 精確數量由各階段自己回報。
+                summary.ledger.record(engine::StageEntry::failed_unknown_count(
+                    task.kind.label(),
+                    error.lines().next().unwrap_or("失敗").to_string(),
+                ));
                 let line = format!("{} 略過／失敗：{error}", task.kind.label());
                 if looks_like_cancel_message(&error) {
                     emit_warn(app, &line);
@@ -929,6 +1172,10 @@ fn run_extra_sources(
                 }
             }
             Err(_) => {
+                summary.ledger.record(engine::StageEntry::failed_unknown_count(
+                    task.kind.label(),
+                    "背景工作發生錯誤".to_string(),
+                ));
                 let line = format!("{} 略過／失敗：背景工作發生 panic", task.kind.label());
                 emit_error(app, &line);
                 summary.notes.push(line.clone());
@@ -937,43 +1184,36 @@ fn run_extra_sources(
         }
     };
 
-    if use_ai {
-        for (i, task) in tasks.into_iter().enumerate() {
-            if is_cancelled() {
-                summary.cancelled = true;
-                break;
-            }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_one_extra_source(app.clone(), mc, work, use_ai, scope, task, i, total)
-            }));
-            collect(task, result);
-            if is_cancelled() {
-                summary.cancelled = true;
-                break;
-            }
+    emit_log(
+        app,
+        "info",
+        if use_ai {
+            "AI 補充來源最多 3 路安全並行；寫入與翻譯記憶會自動合併。"
+        } else {
+            "未勾選 AI：額外來源最多 3 路並行整理。"
+        },
+    );
+    let indexed: Vec<(usize, ExtraSourceTask)> = tasks.into_iter().enumerate().collect();
+    for chunk in indexed.chunks(3) {
+        if is_cancelled() {
+            summary.cancelled = true;
+            break;
         }
-    } else {
-        emit_log(app, "info", "未勾選 AI：額外來源最多 3 路並行整理。");
-        let indexed: Vec<(usize, ExtraSourceTask)> = tasks.into_iter().enumerate().collect();
-        for chunk in indexed.chunks(3) {
-            std::thread::scope(|scope_thread| {
-                let mut handles = Vec::new();
-                for &(i, task) in chunk {
-                    let app_task = app.clone();
-                    handles.push((
-                        task,
-                        scope_thread.spawn(move || {
-                            run_one_extra_source(
-                                app_task, mc, work, use_ai, scope, task, i, total,
-                            )
-                        }),
-                    ));
-                }
-                for (task, handle) in handles {
-                    collect(task, handle.join());
-                }
-            });
-        }
+        std::thread::scope(|scope_thread| {
+            let mut handles = Vec::new();
+            for &(i, task) in chunk {
+                let app_task = app.clone();
+                handles.push((
+                    task,
+                    scope_thread.spawn(move || {
+                        run_one_extra_source(app_task, mc, work, use_ai, scope, task, i, total)
+                    }),
+                ));
+            }
+            for (task, handle) in handles {
+                collect(task, handle.join());
+            }
+        });
     }
 
     if !summary.cancelled {
@@ -989,6 +1229,27 @@ fn run_extra_sources(
 }
 
 /// 非同步 command：UI 不會卡住；進度用事件推送
+/// 背景工作整個掛掉（panic 或被取消）時，要對使用者說什麼。
+///
+/// 站長那份執行紀錄最後一行是：
+/// `工作中斷：task 203 panicked with message "byte index 2 is not a char boundary…"`
+/// ——把 Rust 的內部錯誤原封不動丟給玩家，他既看不懂、也不知道該做什麼，
+/// 只知道等了三小時的翻譯沒了。
+///
+/// 技術細節仍然要留（寫進日誌檔給我們除錯），但畫面上要講人話：
+/// 這不是他的錯、他可以做什麼。
+fn describe_worker_failure<E: std::fmt::Display>(e: &E) -> String {
+    let detail = e.to_string();
+    if detail.contains("panicked") {
+        format!(
+            "翻譯中途發生程式錯誤，已經停在這裡。這不是你的操作問題，已完成的部分都有保留，可以直接再按一次「開始翻譯」接續。方便的話請用頁尾的「回報」告訴我們，我們會修。
+（技術細節：{detail}）"
+        )
+    } else {
+        format!("工作中斷：{detail}")
+    }
+}
+
 #[tauri::command]
 async fn one_click_translate(
     app: AppHandle,
@@ -1065,7 +1326,7 @@ async fn one_click_translate(
         )
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?;
+    .map_err(|e| describe_worker_failure(&e))?;
     match result {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -1084,6 +1345,8 @@ struct OnCancelShare {
     en: *const LangMap,
     zh: *const LangMap,
     scope: *const TranslationScope,
+    /// 用來認出「哪些譯文是從本機參考包合併進來的」——那些不上傳
+    provenance: *const ProvenanceMap,
 }
 
 // Safety: 指標在 one_click 內指向同函數棧上的 zh／en／scope／app，
@@ -1102,12 +1365,13 @@ impl Drop for OnCancelShare {
             return;
         }
         // Safety: 見 struct 註解
-        let (app, en, zh, scope) = unsafe {
+        let (app, en, zh, scope, provenance) = unsafe {
             (
                 &*self.app,
                 &*self.en,
                 &*self.zh,
                 &*self.scope,
+                &*self.provenance,
             )
         };
         emit_progress_stage(
@@ -1121,6 +1385,7 @@ impl Drop for OnCancelShare {
             en,
             zh,
             scope,
+            Some(provenance),
             ContributeLangMapsOpts::cancel_sweep(),
         );
         let mut detail = format!(
@@ -1269,7 +1534,7 @@ async fn diagnose_launch_failure(instance_path: String) -> Result<LaunchDiagnosi
     let inst = normalize_path_strict(&instance_path)?;
     tauri::async_runtime::spawn_blocking(move || diagnose_launch(&inst))
         .await
-        .map_err(|e| format!("工作中斷：{e}"))
+        .map_err(|e| describe_worker_failure(&e))
 }
 
 /// 明確以整合包／實例目錄做記錄＋ mods 交叉驗證。
@@ -1278,7 +1543,7 @@ async fn diagnose_pack_dir_cmd(path: String) -> Result<LaunchDiagnosis, String> 
     let pack = normalize_path_strict(&path)?;
     tauri::async_runtime::spawn_blocking(move || diagnose_pack_dir(&pack))
         .await
-        .map_err(|e| format!("工作中斷：{e}"))
+        .map_err(|e| describe_worker_failure(&e))
 }
 
 #[tauri::command]
@@ -1314,7 +1579,7 @@ async fn restore_last_apply_cmd(
         r
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?;
+    .map_err(|e| describe_worker_failure(&e))?;
     if let Err(e) = &r {
         emit_error(&app, e);
     }
@@ -1337,11 +1602,32 @@ async fn submit_diagnose_report_cmd(
         r
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?;
+    .map_err(|e| describe_worker_failure(&e))?;
     if let Err(e) = &r {
         emit_error(&app, e);
     }
     r
+}
+
+#[tauri::command]
+async fn submit_issue_report_cmd(
+    summary: String,
+    cause: String,
+    detail: Option<String>,
+    idempotency_key: Option<String>,
+) -> SubmitIssueReportResult {
+    let r = tauri::async_runtime::spawn_blocking(move || submit_issue_report(summary, cause, detail, idempotency_key))
+        .await;
+    match r {
+        Ok(v) => v,
+        Err(_) => SubmitIssueReportResult {
+            ok: false,
+            case_id: None,
+            delivery: None,
+            error_type: Some("request_failed".into()),
+            message: Some("站長聯絡通道暫時離線，請稍後再試，或直接到官方 Discord 告訴我們".into()),
+        },
+    }
 }
 
 /// 刪除目前實例旁所有由工具建立的翻譯套用備份。
@@ -1392,6 +1678,37 @@ fn resolve_translation_mode(override_mode: Option<&str>, session_mode: &str) -> 
     }
 }
 
+/// 遊戲內既有的「繁體中文翻譯」zip／資料夾是不是這個整合包產生的。
+///
+/// 判準：`{pack}.meta.json`（跟 zip／資料夾同層、由 apply_instance 套用時寫入）裡的
+/// `modsFingerprint` 是否等於目前這個實例的 `mods_fingerprint`。任何一邊拿不到指紋
+/// （沒有標記檔、標記檔壞掉、或現在讀不到 `mods/`）一律回 false——這裡跟 probe_cache_at
+/// 的「0 一律不擋」刻意相反，因為誤合併會把不相干整合包的翻譯內容混進來，
+/// 錯誤代價比保守略過大得多。
+fn existing_pack_matches_current_mods(mc: &Path, pack_path: &Path, instance: &Path) -> bool {
+    let stem = pack_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("繁體中文翻譯");
+    let meta_path = mc
+        .join("resourcepacks")
+        .join(format!("{stem}.meta.json"));
+    let Ok(text) = fs::read_to_string(&meta_path) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(recorded) = meta.get("modsFingerprint").and_then(|v| v.as_u64()) else {
+        return false;
+    };
+    if recorded == 0 {
+        return false;
+    }
+    let live = engine::mods_fingerprint(instance);
+    live != 0 && live == recorded
+}
+
 fn run_one_click(
     app: &AppHandle,
     instance: PathBuf,
@@ -1406,69 +1723,53 @@ fn run_one_click(
     coverage_tier: Option<String>,
     _advanced_unpack: bool,
 ) -> Result<OneClickResult, String> {
-    let _ = flush_shared_contribute_queue();
+    preflight_selected_ai(app, use_ai, "開始掃描整合包")?;
+    // 上次沒送成功的社群共享庫貢獻，開工前先補送一次。
+    // 這件事本來就會做，但過去完全不出聲，使用者看到「859 條暫存稍後再送」之後
+    // 就再也沒有下文，無從判斷到底送出去了沒有。共享庫愈大，所有人免 AI 的
+    // 命中率就愈高（這次 99% 免 AI 就是靠它），值得讓使用者看見它在運作。
+    let queued = flush_shared_contribute_queue();
+    if queued.accepted > 0 {
+        emit_log(
+            app,
+            "info",
+            &format!("已把上次暫存的 {} 條譯文送進社群共享庫（讓下次翻譯更少需要 AI）", queued.accepted),
+        );
+    } else if queued.deferred > 0 {
+        emit_log(
+            app,
+            "info",
+            // 講清楚那 N 條是「你已經翻好的」，不然玩家會以為這次少翻了 N 條
+            &format!(
+                "共享庫暫時連不上，{} 條**你已經翻好的**譯文會下次再上傳分享（這次的翻譯結果不受影響）",
+                queued.deferred
+            ),
+        );
+    }
     reset_contribute_tracker();
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(2), "檢查資料夾…");
-    let mode = TranslationMode::Append;
-    let quality = TranslationQuality::Thorough;
-    let advanced_unpack = true;
-    // 主路徑固定完整挑戰；舊 UI 若仍傳 quick／standard 僅記一筆日誌。
-    let requested = CoverageTier::parse(coverage_tier.as_deref());
-    let tier = CoverageTier::Max;
+
+    // 這次實際會用的設定，由 run_plan 這唯一一處決定（P0-01）。
+    // 舊版在這裡直接寫死三個值、把 UI 傳來的選擇丟掉，只留一行日誌——
+    // 於是設定畫面看起來可選、實際行為卻固定，而且沒有任何結構化資料能回給前端顯示。
+    let plan = engine::run_plan::resolve(
+        engine::run_plan::RunIntent::OneClick,
+        &engine::run_plan::RunPlanRequest {
+            mode: translation_mode.clone(),
+            quality: translation_quality.clone(),
+            tier: coverage_tier.clone(),
+            advanced_unpack: Some(_advanced_unpack),
+        },
+    );
+    let mode = plan.translation_mode();
+    let quality = plan.translation_quality();
+    let advanced_unpack = plan.advanced_unpack;
+    let tier = plan.coverage_tier();
     let sources: CoverageSourceFlags = tier.sources();
     emit_log(app, "info", &tier.note());
-    if requested != CoverageTier::Max {
-        emit_log(
-            app,
-            "info",
-            &format!("已忽略舊完整度選項「{}」，固定使用盡量完整。", requested.label()),
-        );
-    }
-    let ui_mode = TranslationMode::parse(translation_mode.as_deref());
-    if ui_mode != TranslationMode::Append {
-        emit_log(
-            app,
-            "info",
-            &format!(
-                "一鍵翻譯固定「{}」，已忽略舊翻譯模式「{}」。",
-                mode.label(),
-                ui_mode.label()
-            ),
-        );
-    }
-    let ui_quality = if translation_quality
-        .as_deref()
-        .map(|s| s.trim().is_empty())
-        .unwrap_or(true)
-    {
-        tier.default_quality()
-    } else {
-        TranslationQuality::parse(translation_quality.as_deref())
-    };
-    if ui_quality != TranslationQuality::Thorough {
-        emit_log(
-            app,
-            "info",
-            &format!(
-                "一鍵翻譯固定「{}」，已忽略舊翻譯品質「{}」。",
-                quality.label(),
-                ui_quality.label()
-            ),
-        );
-    }
-    emit_log(
-        app,
-        "info",
-        "一鍵翻譯固定：進階解包開啟、接續翻譯、劇情與書本優先。Force／Skip 僅補翻或修復可選。",
-    );
-    if use_ai && get_ai_mode() == "custom" {
-        emit_progress_stage(app, dev_progress::STAGE_PREP, Some(4), "測試自訂 API 金鑰…");
-        emit_log(app, "info", "自訂 API：開工前探測金鑰…");
-        if let Err(e) = verify_custom_api() {
-            emit_error(app, &e);
-            return Err(e);
-        }
-        emit_log(app, "info", "自訂 API 金鑰探測通過。");
+    // 被改掉的欄位逐項說明「你選什麼、實際用什麼、為什麼」，不再只講「已忽略」。
+    if let Some(summary) = plan.override_summary() {
+        emit_log(app, "info", &summary);
     }
     let validation = validate_instance_path(&instance);
     if !validation.ok {
@@ -1546,12 +1847,13 @@ fn run_one_click(
         app,
         "info",
         &format!(
-            "共享翻譯分類：{}",
+            "共享翻譯分類：{}（pk={}）",
             if translation_scope.is_known() {
                 translation_scope.pack_name.as_str()
             } else {
                 "未命名整合包"
-            }
+            },
+            translation_scope.pack_key
         ),
     );
 
@@ -1594,13 +1896,16 @@ fn run_one_click(
         scan_instance(&instance, &dict, true, true, move |pct, msg| {
             emit_progress_stage(&app_scan, dev_progress::STAGE_SCAN, Some(pct), msg);
         })?;
+    // 掃描當下的英文目錄：供收尾貢獻／seed（subtract 後 pending 會少掉已併入鍵）
+    let en_catalog = en_only.clone();
     // 停止時把當下有效譯文掃尾進共享庫（成功路徑會 disarm）
     let mut stop_share = OnCancelShare {
         active: true,
         app,
-        en: &en_only as *const _,
+        en: &en_catalog as *const _,
         zh: &zh as *const _,
         scope: &translation_scope as *const _,
+        provenance: &provenance as *const _,
     };
     if !sources.jar_documentation {
         emit_log(
@@ -1674,6 +1979,27 @@ fn run_one_click(
         } else {
             None
         };
+        // 這個 zip／資料夾只認固定檔名，不代表它一定屬於「這個」整合包：同一個實例
+        // 路徑換過完全不同的整合包時，resourcepacks 裡的舊翻譯包不會自動消失。
+        // 這裡跟 mods_fingerprint 比對——注意方向刻意跟 probe_cache_at 那個「0 一律
+        // 不擋」相反：這裡任何一邊看不到指紋（沒有標記檔／讀不到 mods/）就當作
+        // 「無法確認」而跳過合併，因為錯誤方向是「把不相干的舊翻譯塞進新包」，
+        // 比「少合併一次本機既有翻譯」嚴重得多，寧可保守。
+        let cand = match cand {
+            Some(p) if existing_pack_matches_current_mods(&mc, &p, &instance) => Some(p),
+            Some(p) => {
+                emit_log(
+                    app,
+                    "info",
+                    &format!(
+                        "遊戲內既有「{}」與目前整合包內容對不上（或無法確認），略過合併，避免混入其他整合包的翻譯。",
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or("繁體中文翻譯")
+                    ),
+                );
+                None
+            }
+            None => None,
+        };
         if let Some(p) = cand {
             if let Ok((ex_zh, _)) = load_reference_zh_tw(&p) {
                 let n = merge_fill_missing(&mut zh, &ex_zh);
@@ -1692,34 +2018,58 @@ fn run_one_click(
         }
     }
 
-    // 接續工作目錄內上次產出的資源包（若有）— 仍本機
+    // 接續先前譯文（同機）：精確名／同 version 工具產物／session／遊戲內已套用
+    let mut prior_merged = 0usize;
     {
-        let prior_pack = layout
-            .resourcepacks
-            .join(format!("{pack_name}.zip"));
-        if prior_pack.is_file() {
+        let pack_version = detect_pack_version(&instance).version;
+        let sources = discover_prior_zh_sources(&work, &pack_name, &pack_version, &instance);
+        for prior_pack in sources {
             match load_pack_zh(&prior_pack) {
                 Ok(prior) => {
                     let n = merge_fill_missing(&mut zh, &prior);
+                    if n == 0 {
+                        continue;
+                    }
+                    prior_merged = prior_merged.saturating_add(n);
                     stamp_missing_provenance(&mut provenance, &zh, LangSource::RefPack);
                     subtract_covered(&mut en_only, &zh);
-                    if n > 0 {
-                        postprocess_lang_values(&mut zh, &dict);
-                        convert_langmap_s2tw_selective(&mut zh, &|ns, k| {
-                            needs_s2tw_key(&provenance, ns, k)
-                        });
-                        report.keys_zh = count_map(&zh);
-                    }
+                    postprocess_lang_values(&mut zh, &dict);
+                    convert_langmap_s2tw_selective(&mut zh, &|ns, k| {
+                        needs_s2tw_key(&provenance, ns, k)
+                    });
+                    report.keys_zh = count_map(&zh);
                     emit_log(
                         app,
                         "info",
-                        &format!("接續上次翻譯結果：本機併入 {n} 條"),
+                        &format!(
+                            "接續來源：{} 併入 {n} 條（累計 {prior_merged}）",
+                            prior_pack.display()
+                        ),
                     );
                 }
                 Err(e) => {
-                    emit_warn(app, &format!("接續上次翻譯結果失敗：{e}"));
+                    emit_warn(
+                        app,
+                        &format!("接續來源略過 {}：{e}", prior_pack.display()),
+                    );
                 }
             }
+        }
+        if prior_merged > 0 {
+            emit_progress_ex(
+                app,
+                Some(43),
+                &format!("接續上次：本機累計併入 {prior_merged} 條"),
+                ProgressHint {
+                    stage: Some(dev_progress::STAGE_LOCAL),
+                    metrics: Some(ProgressMetricsPayload {
+                        prior: Some(prior_merged as u64),
+                        ..Default::default()
+                    }),
+                    state: Some(STATE_RUNNING),
+                    ..Default::default()
+                },
+            );
         }
     }
 
@@ -1735,15 +2085,62 @@ fn run_one_click(
     // AI 只翻字：待補清單
     let mut pending_before = remaining_pending(&en_only, &zh);
     let en_consistency = pending_before.clone();
+    // 保留判定前先留一份，才有辦法說明「保留的那些是什麼」。
+    let before_filter: Vec<(String, String)> = pending_before
+        .iter()
+        .flat_map(|(_, m)| m.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect();
     let skipped_untranslatable = filter_local_untranslatable(&mut pending_before);
     if skipped_untranslatable > 0 {
+        // 逐類說明，不再只丟一個數字加一串舉例。
+        // 使用者要能分辨「工具在保護我」與「工具漏翻了」。
+        let breakdown = engine::eligibility::summarize_keep_reasons(&before_filter, "lang");
+        let detail = breakdown
+            .iter()
+            .map(|(reason, n)| format!("　• {reason}：{n} 項"))
+            .collect::<Vec<_>>()
+            .join("\n");
         emit_log(
             app,
             "info",
-            &format!("本機略過免譯字串 {skipped_untranslatable} 條"),
+            &format!(
+                "原樣保留 {skipped_untranslatable} 項（這些翻了反而會出錯，不算漏翻）：\n{detail}"
+            ),
         );
     }
     let pending_before_n = count_map(&pending_before);
+
+    // ── per-candidate outcome ledger ──
+    //
+    // 這是「已寫入／沿用既有／刻意保留／待人工／可重試」五種終局的逐筆帳本。
+    // 舊有的 CoverageLedger 只數階段，回答不了「這一句為什麼沒翻」。
+    // 兩條軸刻意分開：shared_sync 不參與任何缺口計算——共享同步失敗
+    // 不是翻譯失敗，否則已經翻好的東西會被要求再補翻一次、再花一次 AI 的錢。
+    let mut ledger = build_outcome_ledger(&zh, &provenance, &before_filter, &pending_before);
+    // 共享同步狀態只寫這一條軸，不影響任何缺口計算。
+    //
+    // 目前貢獻是「完全隱藏、無勾選、預設開」（見 shared_tm.rs 模組說明），
+    // 所以這裡固定為 true。`SkipSharedLookupGuard` 只影響**查找**，不影響貢獻。
+    // 總規劃 §6 要把共享治理改成 opt-in——改的時候這裡是唯一要動的地方。
+    ledger.mark_sharing(true);
+    let reconciliation = ledger.reconcile();
+    emit_log(app, "info", &reconciliation.player_summary());
+    if !reconciliation.balanced {
+        // 對不起來就是帳本本身有問題，不得顯示 completed（總規劃 §5.6）。
+        emit_log(
+            app,
+            "warn",
+            &format!(
+                "結果對帳不平衡（候選 {} 筆、各終局合計 {} 筆），本次不宣稱完整完成。",
+                reconciliation.total_candidates,
+                reconciliation.totals.sum()
+            ),
+        );
+    }
+    // 兩份：機器讀的逐筆帳本，與人看的明細報告。
+    let _ = fs::write(work.join("翻譯結果明細.jsonl"), ledger.to_jsonl());
+    let _ = fs::write(work.join("翻譯結果明細.txt"), ledger.to_player_report());
+
     let _ = save_pending_manifest(&work, &pending_before, pending_before_n, use_ai);
     let _ = save_session(
         &work,
@@ -1760,7 +2157,9 @@ fn run_one_click(
                 .to_string(),
             pending_en: pending_before.clone(),
             pending_count: pending_before_n,
+            quality_deferred: HashMap::new(),
             keys_zh: zh.values().map(|m| m.len()).sum(),
+            keys_hk_hint: report.keys_from_zh_hk_hint,
             note: if use_ai {
                 format!("本地+參考包整理完成，待 AI 僅 {} 條。{} {}", pending_before_n, mode_note(mode, skipped_complete), ref_note)
             } else {
@@ -1770,6 +2169,19 @@ fn run_one_click(
             translation_mode: mode.value().into(),
             translation_quality: quality.value().into(),
             coverage_tier: tier.value().into(),
+            mods_fingerprint: engine::mods_fingerprint(&instance),
+            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇，
+            // 不能退回設定裡的預設值（使用者選了不備份，續翻卻又備份出檔案）。
+            run_preferences: engine::RunPreferences {
+                skip_result_folder: !backup_before_apply,
+                backup_before_apply,
+                ai_mode: if use_ai { get_ai_mode() } else { String::new() },
+                ..Default::default()
+            },
+            // 這只是「本地整理完成」的中途快照，AI 與共享庫都還沒跑。
+            // 標成 Crashed：真的跑完會在結尾覆寫成 Completed；
+            // 中途崩潰或被關掉就停在這裡，計數不可信也不會被拿去講缺漏。
+            last_run_outcome: engine::RunOutcome::Crashed,
         },
     );
 
@@ -1794,20 +2206,25 @@ fn run_one_click(
     };
     emit_progress_stage(app, dev_progress::STAGE_LOCAL, Some(41), &pending_progress);
 
-    // 掃描階段錯誤全部進日誌與錯誤檔
+    // 掃描階段的問題：**細節只進錯誤日誌檔，畫面上只講一句話**。
+    //
+    // 實測站長那一包：4 筆全是「別的語系的語言檔本身格式壞掉」（`lambdynlights`
+    // 的 zh_tw、某個 mod 的空 en_us…），對繁中翻譯完全沒有影響，但舊版用
+    // 【警告】＋四行【錯誤】列出來，看起來像翻譯出了大事。
+    // 玩家在意的只有「這會不會影響我的翻譯」——不會，那就用一句話講完。
     let mut error_lines: Vec<String> = Vec::new();
     if !report.errors.is_empty() {
-        emit_warn(
+        emit_log(
             app,
+            "info",
             &format!(
-                "掃描時有 {} 筆問題（詳見下方與錯誤日誌檔）",
+                "有 {} 個語言檔本身格式壞掉，已跳過（不影響這次翻譯；細節寫在「翻譯錯誤日誌.txt」）",
                 report.errors.len()
             ),
         );
         for (i, e) in report.errors.iter().enumerate() {
-            let line = format!("掃描問題 [{}/{}]：{}", i + 1, report.errors.len(), e);
-            emit_error(app, &line);
-            error_lines.push(line);
+            // 只寫檔案，不往畫面上丟
+            error_lines.push(format!("掃描問題 [{}/{}]：{}", i + 1, report.errors.len(), e));
         }
     }
 
@@ -1818,10 +2235,21 @@ fn run_one_click(
     let mut glossary_hits = 0usize;
     let mut tm_hits = 0usize;
     let mut shared_hits = 0usize;
+    let mut shared_glossary_hits = 0usize;
+    let mut quality_deferred: LangMap = HashMap::new();
     let mut ai_note = String::new();
     let mut ai_usage_note = String::new();
+    let mut langmap_stage: Option<engine::StageEntry> = None;
     {
         if pending_before_n > 0 {
+            let seeded_early = seed_tm_from_langmaps(&en_catalog, &zh);
+            if seeded_early > 0 {
+                emit_log(
+                    app,
+                    "info",
+                    &format!("補譯前：已把本包已有譯文寫入翻譯記憶 {seeded_early} 條"),
+                );
+            }
             dev_progress::enter("ai_fill");
             let app_ai = app.clone();
             match fill_missing_with_mode(&mut zh, &pending_before, use_ai, mode == TranslationMode::Force, quality, Some(&translation_scope), move |pct, msg| {
@@ -1834,10 +2262,22 @@ fn run_one_click(
                 // 進度字可能含「批失敗」計數，不得當成真正錯誤刷日誌
             }) {
                 Ok(r) => {
+                    // 語言表也要進帳本：舊版只有「額外來源」進帳，
+                    // 所以語言表補譯失敗時結尾照樣說「完成」。
+                    let mut entry =
+                        engine::StageEntry::ok("語言表", pending_before_n, r.filled);
+                    if let Some(reason) = &r.ai_unavailable {
+                        entry.reason = Some(
+                            reason.lines().next().unwrap_or("AI 不可用").to_string(),
+                        );
+                    }
+                    langmap_stage = Some(entry);
+                    merge_pending(&mut quality_deferred, &r.quality_deferred);
                     ai_filled = r.filled;
                     glossary_hits = r.glossary_hits;
                     tm_hits = r.tm_hits;
                     shared_hits = r.shared_hits;
+                    shared_glossary_hits = r.shared_glossary_hits;
                     ai_note = if use_ai {
                         r.note()
                     } else {
@@ -1845,8 +2285,34 @@ fn run_one_click(
                     };
                     ai_usage_note = r.usage_note().unwrap_or_default();
                     emit_log(app, "info", &format!("補譯結束：{ai_note}"));
+                    let deferred_count = count_map(&r.quality_deferred);
+                    if deferred_count > 0 {
+                        emit_log(
+                            app,
+                            "info",
+                            &format!("品質暫緩：{deferred_count} 條，本次不重送"),
+                        );
+                    }
+                    let mut fill_metrics = metrics_from_ai_fill(&r);
+                    if prior_merged > 0 {
+                        fill_metrics.prior = Some(prior_merged as u64);
+                    }
+                    emit_progress_ex(
+                        app,
+                        Some(map_stage_progress(55, 20, 100)),
+                        &format!("補譯結束：{ai_note}"),
+                        ProgressHint {
+                            stage: Some(dev_progress::STAGE_TRANSLATE),
+                            metrics: Some(fill_metrics),
+                            state: Some(STATE_RUNNING),
+                            ..Default::default()
+                        },
+                    );
                     for note in &r.notes {
                         if note.contains("批失敗摘要") || note.contains("批失敗（已去重") {
+                            error_lines.push(note.clone());
+                        }
+                        if note.contains("品質未過") {
                             error_lines.push(note.clone());
                         }
                         if note.contains("提前結束") || note.contains("已保留已成功譯文") {
@@ -2041,6 +2507,7 @@ fn run_one_click(
             target_version: resolved_version.clone(),
         },
     )?;
+    emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
 
     // ═══ 階段 D–E4：獨立額外來源（進度 82–97）═══
     // use_ai=true 時維持序列，避免多個來源同時打 AI；use_ai=false 時最多 3 路並行。
@@ -2065,6 +2532,12 @@ fn run_one_click(
         emit_log(app, "info", note);
     }
     let mut quest_note = extra_summary.combined_note();
+    // 階段帳本要留到結尾判斷「能不能說完成」；errors 會被 extend 消耗掉，
+    // 所以先把帳本取出來。
+    let mut stage_ledger = extra_summary.ledger.clone();
+    if let Some(entry) = langmap_stage.take() {
+        stage_ledger.record(entry);
+    }
     error_lines.extend(extra_summary.errors);
     if let Some(note) = extra_summary
         .notes
@@ -2090,7 +2563,7 @@ fn run_one_click(
 
     // ═══ 步驟 4：補充仍缺（語言表＋extras，非 Force；已譯不重送）═══
     check_cancelled()?;
-    let seeded = seed_tm_from_langmaps(&en_only, &zh);
+    let seeded = seed_tm_from_langmaps(&en_catalog, &zh);
     if seeded > 0 {
         emit_log(
             app,
@@ -2099,6 +2572,16 @@ fn run_one_click(
         );
     }
     let mut remaining = remaining_pending(&en_only, &zh);
+    let deferred_in_same_run = filter_quality_deferred(&mut remaining, &quality_deferred);
+    if deferred_in_same_run > 0 {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "補充：已排除本輪品質暫緩的 {deferred_in_same_run} 條，避免重複送出"
+            ),
+        );
+    }
     let rem_n = count_map(&remaining);
     let mut supplement_filled = 0usize;
     if rem_n > 0 {
@@ -2111,6 +2594,9 @@ fn run_one_click(
                 step: Some(4),
                 step_total: Some(dev_progress::UI_STEP_TOTAL),
                 state: Some(STATE_RUNNING),
+                substage: Some("補語言檔"),
+                substage_index: Some(1),
+                substage_total: Some(SUPPLEMENT_SUBSTAGES),
                 ..Default::default()
             },
         );
@@ -2132,6 +2618,9 @@ fn run_one_click(
                         step: Some(4),
                         step_total: Some(dev_progress::UI_STEP_TOTAL),
                         state: Some(STATE_RUNNING),
+                        substage: Some("補語言檔"),
+                        substage_index: Some(1),
+                        substage_total: Some(SUPPLEMENT_SUBSTAGES),
                         ..Default::default()
                     },
                 );
@@ -2139,16 +2628,26 @@ fn run_one_click(
             },
         ) {
             Ok(r) => {
+                merge_pending(&mut quality_deferred, &r.quality_deferred);
                 supplement_filled = r.filled;
                 ai_filled = ai_filled.saturating_add(r.filled);
                 glossary_hits = glossary_hits.saturating_add(r.glossary_hits);
                 tm_hits = tm_hits.saturating_add(r.tm_hits);
                 shared_hits = shared_hits.saturating_add(r.shared_hits);
+                shared_glossary_hits = shared_glossary_hits.saturating_add(r.shared_glossary_hits);
                 emit_log(
                     app,
                     "info",
                     &format!("補充：語言表再補 {} 條（{}）", r.filled, r.note()),
                 );
+                let deferred_count = count_map(&r.quality_deferred);
+                if deferred_count > 0 {
+                    emit_log(
+                        app,
+                        "info",
+                        &format!("品質暫緩：{deferred_count} 條，本次不重送"),
+                    );
+                }
                 if r.rejected > 0 {
                     let line = format!(
                         "補充：有 {} 條譯文佔位符不符已退回原文",
@@ -2161,7 +2660,7 @@ fn run_one_click(
                 stamp_ai_filled(&mut provenance, &zh, &en_only);
                 convert_langmap_s2tw_selective(&mut zh, &|ns, k| needs_s2tw_key(&provenance, ns, k));
                 postprocess_lang_values(&mut zh, &dict);
-                let _ = seed_tm_from_langmaps(&en_only, &zh);
+                let _ = seed_tm_from_langmaps(&en_catalog, &zh);
                 if supplement_filled > 0 {
                     emit_progress_stage(
                         app,
@@ -2204,6 +2703,113 @@ fn run_one_click(
         );
     }
 
+    // ═══ 步驟 4.5：自動重試品質暫緩（同一輪內完成，不必使用者再按一次）═══
+    //
+    // 過去暫緩的句子只有在使用者自己勾「重新翻譯缺漏」才會重試，否則永遠躺著。
+    // 但暫緩多半是當下 AI 狀態不好造成的，隔一批通常就過了——要求使用者去勾一個
+    // 他不知道意義的選項，只會讓人以為工具沒做完。這裡在同一輪內自動再試一次，
+    // 失敗的仍然留在暫緩（不會無限重試），並設上限避免大整合包爆量。
+    const AUTO_RETRY_CAP: usize = 400;
+    let deferred_total = count_map(&quality_deferred);
+    if use_ai && deferred_total > 0 {
+        let retry_set = take_capped_langmap(&quality_deferred, AUTO_RETRY_CAP);
+        let retry_n = count_map(&retry_set);
+        emit_progress_ex(
+            app,
+            Some(map_stage_progress(94, 3, 0)),
+            &format!("補強：自動重試先前暫緩的 {retry_n} 條…"),
+            ProgressHint {
+                stage: Some(dev_progress::STAGE_TRANSLATE),
+                step: Some(4),
+                step_total: Some(dev_progress::UI_STEP_TOTAL),
+                state: Some(STATE_RUNNING),
+                substage: Some("重試沒通過的句子"),
+                substage_index: Some(SUPPLEMENT_SUBSTAGES),
+                substage_total: Some(SUPPLEMENT_SUBSTAGES),
+                ..Default::default()
+            },
+        );
+        emit_log(
+            app,
+            "info",
+            &if deferred_total > retry_n {
+                format!(
+                    "補強：自動重試品質暫緩 {retry_n} 條（本輪上限；另有 {} 條留待下次）",
+                    deferred_total - retry_n
+                )
+            } else {
+                format!("補強：自動重試品質暫緩 {retry_n} 條")
+            },
+        );
+        let app_retry = app.clone();
+        match fill_missing_with_mode(
+            &mut zh,
+            &retry_set,
+            use_ai,
+            false,
+            quality,
+            Some(&translation_scope),
+            move |pct, msg| {
+                emit_progress_ex(
+                    &app_retry,
+                    Some(map_stage_progress(94, 3, pct)),
+                    &format!("補強：{msg}"),
+                    ProgressHint {
+                        stage: Some(dev_progress::STAGE_TRANSLATE),
+                        step: Some(4),
+                        step_total: Some(dev_progress::UI_STEP_TOTAL),
+                        state: Some(STATE_RUNNING),
+                        ..Default::default()
+                    },
+                );
+            },
+        ) {
+            Ok(r) => {
+                ai_filled = ai_filled.saturating_add(r.filled);
+                glossary_hits = glossary_hits.saturating_add(r.glossary_hits);
+                tm_hits = tm_hits.saturating_add(r.tm_hits);
+                shared_hits = shared_hits.saturating_add(r.shared_hits);
+                shared_glossary_hits = shared_glossary_hits.saturating_add(r.shared_glossary_hits);
+                if r.filled > 0 {
+                    supplement_filled = supplement_filled.saturating_add(r.filled);
+                    postprocess_lang_values(&mut zh, &dict);
+                    stamp_ai_filled(&mut provenance, &zh, &en_only);
+                    convert_langmap_s2tw_selective(&mut zh, &|ns, k| {
+                        needs_s2tw_key(&provenance, ns, k)
+                    });
+                    postprocess_lang_values(&mut zh, &dict);
+                    let _ = seed_tm_from_langmaps(&en_catalog, &zh);
+                    emit_log(
+                        app,
+                        "info",
+                        &format!("補強：暫緩項目再補回 {} 條", r.filled),
+                    );
+                    emit_progress_stage(
+                        app,
+                        dev_progress::STAGE_PACKAGE,
+                        Some(map_stage_progress(94, 3, 80)),
+                        "補強：重建 JAR 翻譯副本…",
+                    );
+                    let _ = rewrite_jars_and_log(&app, &instance, &work, &zh, &en_only)?;
+                } else {
+                    emit_log(app, "info", "補強：暫緩項目這次仍未通過品質檢查，維持原文。");
+                }
+                // 這次過關的從暫緩清單移除；沒過的留著，下次再說
+                prune_quality_deferred(&mut quality_deferred, &zh);
+            }
+            Err(e) => {
+                if looks_like_cancel_message(&e) {
+                    let line = format!("補強：自動重試中止：{e}");
+                    error_lines.push(line.clone());
+                    append_error_file(&work, &error_lines);
+                    return Err(line);
+                }
+                // 自動重試失敗不該讓整輪翻譯失敗——原本的成果都還在
+                emit_log(app, "warn", &format!("補強：自動重試未完成（{e}），不影響已完成的翻譯。"));
+            }
+        }
+    }
+
     emit_progress_stage(
         app,
         dev_progress::STAGE_EXTRAS,
@@ -2212,7 +2818,6 @@ fn run_one_click(
     );
 
     // 步驟 4 後重建 zip（含補充寫入）
-    remaining = remaining_pending(&en_only, &zh);
     if rem_n > 0 || supplement_filled > 0 {
         built = build_resource_pack(
             &zh,
@@ -2224,6 +2829,7 @@ fn run_one_click(
                 target_version: resolved_version.clone(),
             },
         )?;
+        emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
     }
     report.keys_zh = built.keys_total;
 
@@ -2239,8 +2845,11 @@ fn run_one_click(
         );
     }
 
-    let pending = remaining;
+    let pending = remaining_pending(&en_only, &zh);
     let pending_count = count_map(&pending);
+    // 先算好「補得動的缺口」——下面 pending 會被移進工作階段
+    let gaps = engine::count_gaps(&pending);
+    prune_quality_deferred(&mut quality_deferred, &zh);
     stop_share.disarm();
     emit_progress_stage(
         app,
@@ -2249,13 +2858,15 @@ fn run_one_click(
         "共享庫掃尾…",
     );
     {
-        let contrib = contribute_lang_maps(&en_only, &zh, &translation_scope);
+        // 帶上 provenance：本機參考包合併進來的內容不上傳（站長選定）
+        let contrib =
+            contribute_lang_maps(&en_catalog, &zh, &translation_scope, Some(&provenance));
         if contrib.attempted > 0 || contrib.failed || contrib.deferred > 0 {
             emit_log(
                 app,
                 "info",
                 &format!(
-                    "共享庫掃尾：accepted={}／衝突 {}／送出 {}{}{}",
+                    "共享庫掃尾：accepted={}／衝突 {}／送出 {}{}{}（可供其他裝置／玩家重用）",
                     contrib.accepted,
                     contrib.conflicts,
                     contrib.attempted,
@@ -2271,6 +2882,11 @@ fn run_one_click(
                     }
                 ),
             );
+        }
+        if let Some(note) =
+            contribute_shared_glossary_from_langmaps(&en_catalog, &zh, &translation_scope)
+        {
+            emit_log(app, "info", &format!("{note}（可供其他裝置／玩家重用）"));
         }
     }
     emit_progress_stage(
@@ -2288,6 +2904,21 @@ fn run_one_click(
             ),
             Err(e) => emit_warn(app, &format!("待補缺口摘要寫入失敗：{e}")),
         }
+        // 完整的一張表（不是樣本），可直接貼給線上 AI 翻完再匯回來。
+        // 使用者反映舊做法只能一個一個開檔案複製「有點慘」。
+        if count_map(&pending) > 0 {
+            match engine::write_failed_items_csv(&work, &pending, "尚未翻譯或品質未通過") {
+                Ok(p) => emit_log(
+                    app,
+                    "info",
+                    &format!(
+                        "已寫失敗項目表（可用「複製沒翻到的」整批處理）：{}",
+                        p.display()
+                    ),
+                ),
+                Err(e) => emit_warn(app, &format!("失敗項目表寫入失敗：{e}")),
+            }
+        }
     }
     let _ = save_session(
         &work,
@@ -2300,7 +2931,9 @@ fn run_one_click(
             pack_path: built.pack_path.clone(),
             pending_en: pending,
             pending_count,
+            quality_deferred,
             keys_zh: built.keys_total,
+            keys_hk_hint: report.keys_from_zh_hk_hint,
             note: format!(
                 "完整流程後產生。可「只補缺漏」續翻。剩餘約 {} 條。{}",
                 pending_count, quest_note
@@ -2309,6 +2942,18 @@ fn run_one_click(
             translation_mode: mode.value().into(),
             translation_quality: quality.value().into(),
             coverage_tier: tier.value().into(),
+            mods_fingerprint: engine::mods_fingerprint(&instance),
+            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇，
+            // 不能退回設定裡的預設值（使用者選了不備份，續翻卻又備份出檔案）。
+            run_preferences: engine::RunPreferences {
+                skip_result_folder: !backup_before_apply,
+                backup_before_apply,
+                ai_mode: if use_ai { get_ai_mode() } else { String::new() },
+                ..Default::default()
+            },
+            // 走到這裡代表整條流程真的跑完了，計數是新鮮的——
+            // 只有這種狀態的數字可以拿來對使用者講「還缺幾條」。
+            last_run_outcome: engine::RunOutcome::Completed,
         },
     );
 
@@ -2348,8 +2993,12 @@ fn run_one_click(
                     format!("掃描快取：本次重用 {} 個未變語言檔", report.scan_cache_hits),
                     format!("JAR 翻譯副本：重建 {} 個、寫入 {} 個語言檔", jar_translation.jars_rewritten, jar_translation.lang_files_written),
                     format!(
-                        "補譯命中：術語表 {}／翻譯記憶 {}／共享庫 {}",
-                        glossary_hits, tm_hits, shared_hits
+                        "命中拆分：接續 {}／本機術語 {}／共享術語 {}／共享庫 {}／翻譯記憶 {}",
+                        prior_merged,
+                        glossary_hits,
+                        shared_glossary_hits,
+                        shared_hits,
+                        tm_hits
                     ),
                     quest_note.clone(),
                 ];
@@ -2363,14 +3012,43 @@ fn run_one_click(
             glossary_hits,
             tm_hits,
             shared_hits,
+            shared_glossary_hits,
+            prior_merged,
             coverage_tier: tier.value().into(),
+        },
+    );
+    emit_progress_ex(
+        app,
+        Some(97),
+        &format!("【仍待譯】約 {pending_count} 條"),
+        ProgressHint {
+            stage: Some(dev_progress::STAGE_PACKAGE),
+            metrics: Some(ProgressMetricsPayload {
+                pack_pending: Some(pending_count as u64),
+                prior: if prior_merged > 0 {
+                    Some(prior_merged as u64)
+                } else {
+                    None
+                },
+                glossary: Some(glossary_hits as u64),
+                tm: Some(tm_hits as u64),
+                shared: Some((shared_hits + shared_glossary_hits) as u64),
+                ai: Some(ai_filled as u64),
+                ..Default::default()
+            }),
+            state: Some(STATE_RUNNING),
+            ..Default::default()
         },
     );
     if let Some(path) = write_consistency_hints(&layout, &en_consistency, &zh) {
         emit_log(
             app,
             "info",
-            &format!("已寫用詞不一致提示（僅供校對）：{}", path.display()),
+            &format!(
+                "已寫用詞不一致提示（僅供校對）：{}；建議檔：{}",
+                path.display(),
+                path.with_file_name("用詞不一致建議.json").display()
+            ),
         );
     }
 
@@ -2390,6 +3068,20 @@ fn run_one_click(
     dev_progress::enter("apply");
     probe_apply_targets(&instance)?;
     let applied = apply_to_instance(&instance, &work, Some(&pack_name), backup_before_apply)?;
+    // 套用完才清空資料夾：套用要從 config／minemenu 讀來源，清早了會少複製東西。
+    // 這裡只刪「整個流程跑完仍然一個檔案都沒有」的目錄，避免使用者看到空資料夾
+    // 以為「這裡本來該有東西卻沒產出」。
+    let pruned_dirs = prune_empty_result_dirs(&work);
+    if !pruned_dirs.is_empty() {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "已移除沒有內容的資料夾：{}（這個整合包沒有對應的可翻內容，屬正常）",
+                pruned_dirs.join("、")
+            ),
+        );
+    }
     emit_log(
         app,
         "info",
@@ -2400,7 +3092,41 @@ fn run_one_click(
             backup_status(&applied)
         ),
     );
-    emit_progress_stage(app, dev_progress::STAGE_APPLY, Some(100), "全部完成！");
+    let sibling_instance_warning = detect_sibling_instance_warning(&instance);
+    if let Some(ref w) = sibling_instance_warning {
+        emit_warn(app, w);
+    }
+    let coverage_percent = if built.keys_total.saturating_add(pending_count) == 0 {
+        100
+    } else {
+        ((built.keys_total.saturating_mul(100))
+            / built.keys_total.saturating_add(pending_count))
+            .min(100) as u8
+    };
+    let completed_with_pending = pending_count > 0;
+    emit_progress_ex(
+        app,
+        Some(100),
+        if completed_with_pending {
+            "本輪流程完成，仍有內容待補"
+        } else {
+            "翻譯流程完成"
+        },
+        ProgressHint {
+            stage: Some(dev_progress::STAGE_APPLY),
+            state: Some(if completed_with_pending {
+                STATE_COMPLETED_WITH_PENDING
+            } else {
+                STATE_COMPLETED
+            }),
+            metrics: Some(ProgressMetricsPayload {
+                pack_pending: Some(pending_count as u64),
+                coverage_percent: Some(coverage_percent),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
     dev_progress::leave("apply");
     dev_progress::finish("ok");
 
@@ -2414,19 +3140,42 @@ fn run_one_click(
     } else {
         format!("• 中文總計約 {} 條", built.keys_total)
     };
-    let pending_note = if pending_count > 0 {
-        if use_ai {
-            format!("• 仍有約 {pending_count} 條待補（可按「補充漏翻」再試；不宣稱 100%）")
-        } else {
-            format!("• 尚待本機資料或手動翻譯約 {pending_count} 條")
-        }
-    } else if use_ai {
-        "• 語言表目前無待補條目（覆寫／硬編碼仍可能有英文）".to_string()
+    // 只講「補得動的」。羅馬數字、圖示、單位、品牌名本來就不該翻，
+    // 把它們算進待補，使用者永遠看到一個補不完的數字（見 engine/gap_model.rs）。
+    // 缺口數字要涵蓋**所有階段**，不能只報語言表。
+    // 舊版說「還有 525 條可以再補翻」，但那只算語言表——同一次任務書
+    // 46 個檔案與整個選單完全沒翻，數字卻讓人以為只差一點。
+    let stage_outstanding = stage_ledger.outstanding();
+    let pending_note = if stage_outstanding > 0 {
+        format!(
+            "• {}（另有其他內容整段沒翻到，見上方）",
+            engine::describe_gaps(gaps)
+        )
     } else {
-        "• 語言表目前無待補條目".to_string()
+        format!("• {}", engine::describe_gaps(gaps))
+    };
+    // 「完成」這兩個字是有條件的。
+    //
+    // 實測 2026-09-02：GPT 額度用盡讓任務書（46 個檔案）與選單文字整段沒翻，
+    // 工具卻照樣說「完成！可以直接開遊戲了，主要遊戲文字都已是繁體中文」。
+    // 使用者拿到半成品還以為好了——這比翻不完更糟。
+    //
+    // 有任何階段「找到東西卻一個都沒做成」，開頭就要先講那件事。
+    // 開發人員模式印出完整帳本並驗算。帳不平＝有單位在中途悄悄消失，
+    // 那就是還沒被發現的漏翻來源（站長提醒過「可能還有其他來源」）。
+    crate::dev_log!("ledger", "{}", stage_ledger.dev_report());
+    for line in stage_ledger.imbalances() {
+        emit_log(app, "warn", &format!("完整性檢查：{line}"));
+    }
+    let stage_failures = stage_ledger.player_summary();
+    let headline = if !stage_ledger.has_total_failure() {
+        "完成！目標＝整合包可遊玩文字→台灣繁中（除圖片）；原始 JAR 只讀，翻譯副本已套用。"
+    } else {
+        "這一輪沒有全部完成。已完成的部分都已套用，但有內容完全沒翻到（見下方）。"
     };
     let player_summary = format!(
-        "完成！目標＝整合包可遊玩文字→台灣繁中（除圖片）；原始 JAR 只讀，翻譯副本已套用。\n\
+        "{headline}\n\
+{stage_failures}\
 {}\n\
 {}\n\
 {}\n\
@@ -2458,6 +3207,8 @@ fn run_one_click(
     );
 
     Ok(OneClickResult {
+        run_plan: plan.clone(),
+        run_plan_has_overrides: plan.has_overrides(),
         report,
         pack_path: built.pack_path,
         work_root: work.display().to_string(),
@@ -2465,10 +3216,77 @@ fn run_one_click(
         files_written: built.files_written,
         keys_total: built.keys_total,
         ai_filled,
+        pending_count,
+        coverage_percent,
+        completed_with_pending,
         jar_translation,
         minemenu_msg,
         player_summary,
+        sibling_instance_warning,
+        stays_unchanged: skipped_untranslatable,
     })
+}
+
+/// AI 是本次翻譯的明確選項時，所有入口都必須先做和正式批次相同的真實請求。
+///
+/// 登入、帳號資料、餘額端點與本地 `/health` 都只是前置狀態；它們不能保證 GPT、
+/// 自訂 API 或本地模型真的能輸出譯文。反過來說，使用者明確選「不使用 AI」時，
+/// 不能因為 AI 壞掉而阻擋共享庫／本機記憶的離線流程。
+fn preflight_selected_ai(app: &AppHandle, use_ai: bool, next_step: &str) -> Result<(), String> {
+    if !use_ai {
+        return Ok(());
+    }
+    let mode = get_ai_mode();
+    emit_progress_stage(app, dev_progress::STAGE_PREP, Some(1), "確認 AI 能否實際翻譯…");
+    emit_log(
+        app,
+        "info",
+        &format!(
+            "{mode}：開始前以實際翻譯測試 AI（此測試不會寫入翻譯結果、翻譯記憶或共享庫）…"
+        ),
+    );
+    if let Err(e) = verify_ai_assistance() {
+        let message = format!("AI 無法協助翻譯，已停止本次翻譯：{e}");
+        emit_error(app, &message);
+        return Err(message);
+    }
+    emit_log(
+        app,
+        "info",
+        &format!("AI 實際翻譯測試通過（未寫入任何翻譯資料），{next_step}。"),
+    );
+    Ok(())
+}
+
+/// 從 LangMap 取出最多 `cap` 條，用於「自動重試」這類需要設上限的批次。
+///
+/// 命名空間依字典序、鍵依字典序取，讓同一份輸入每次取到同一批——重試的對象
+/// 可預測，使用者連跑兩次不會看到忽多忽少的數字。
+fn take_capped_langmap(source: &LangMap, cap: usize) -> LangMap {
+    let mut out: LangMap = HashMap::new();
+    if cap == 0 {
+        return out;
+    }
+    let mut taken = 0usize;
+    let mut namespaces: Vec<&String> = source.keys().collect();
+    namespaces.sort();
+    for ns in namespaces {
+        let Some(map) = source.get(ns) else { continue };
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for k in keys {
+            if taken >= cap {
+                return out;
+            }
+            if let Some(v) = map.get(k) {
+                out.entry(ns.clone())
+                    .or_default()
+                    .insert(k.clone(), v.clone());
+                taken += 1;
+            }
+        }
+    }
+    out
 }
 
 /// 補翻／修復時沿用同一個 pack_format，否則重建出來的 zip 會被遊戲標成「不相容」。
@@ -2490,6 +3308,99 @@ fn session_pack_format(session: &TranslateSession) -> u32 {
 }
 
 /// 寫出本機整理後的待處理清單，讓使用者知道工具實際掃過哪些內容。
+/// 由本次結果組出 per-candidate 帳本。
+///
+/// 三個來源合起來就是完整候選集合，彼此不重疊：
+/// - `zh`：已經有繁中的（本次新翻或沿用既有）
+/// - `kept`：判定為刻意保留的（過濾前的快照，扣掉仍在 pending 的）
+/// - `pending`：真正還沒翻好的
+///
+/// 刻意不在這裡碰 `shared_sync`：帳本建立時同步還沒發生，
+/// 而且同步狀態永遠不該影響缺口計算。
+fn build_outcome_ledger(
+    zh: &LangMap,
+    provenance: &ProvenanceMap,
+    before_filter: &[(String, String)],
+    pending: &LangMap,
+) -> engine::outcome_ledger::OutcomeLedger {
+    use engine::eligibility::{classify, Candidate};
+    use engine::outcome_ledger::{
+        CandidateOutcome, OutcomeLedger, ResolutionSource, TranslationOutcome,
+    };
+
+    let mut ledger = OutcomeLedger::default();
+
+    // 1) 已有繁中：依來源分「本次新翻」與「沿用既有」。
+    //    兩者都可套用，但報告要分開講——玩家想知道這次到底做了什麼。
+    for (ns, map) in zh {
+        for key in map.keys() {
+            let source = engine::get_lang_source(provenance, ns, key);
+            let (outcome, resolution) = match source {
+                Some(LangSource::Ai) => (TranslationOutcome::Written, Some(ResolutionSource::Provider)),
+                Some(LangSource::Glossary) => (TranslationOutcome::Written, Some(ResolutionSource::Glossary)),
+                Some(LangSource::Tm) => (TranslationOutcome::Written, Some(ResolutionSource::LocalTm)),
+                // 原生繁中、簡繁轉換、港繁提示、參考包都屬於「沿用既有」
+                Some(_) => (TranslationOutcome::ReusedExistingZh, None),
+                None => (TranslationOutcome::Written, None),
+            };
+            let mut entry = CandidateOutcome::new(ns, key, "lang", outcome);
+            if let Some(r) = resolution {
+                entry = entry.with_resolution(r);
+            }
+            ledger.record(entry);
+        }
+    }
+
+    // 2) 仍在 pending 的 → 依 eligibility 分成待人工或可重試
+    let mut pending_keys: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for (ns, map) in pending {
+        for (key, source) in map {
+            pending_keys.insert((ns.as_str(), key.as_str()));
+            let verdict = classify(Candidate {
+                source_kind: "lang",
+                logical_key: key,
+                text: source,
+            });
+            let outcome = engine::outcome_ledger::outcome_for_eligibility(&verdict);
+            let mut entry = CandidateOutcome::new(ns, key, "lang", outcome);
+            if let Some(reason) = verdict.player_reason() {
+                entry = entry.with_reason(reason);
+            }
+            ledger.record(entry);
+        }
+    }
+
+    // 3) 過濾前有、過濾後沒有、也還沒有繁中的 → 刻意保留
+    //    （`before_filter` 沒有 namespace，用 key 比對即可——同一個 key
+    //      在不同 namespace 的保留原因相同，不影響計數正確性）
+    let pending_only_keys: std::collections::HashSet<&str> =
+        pending_keys.iter().map(|(_, k)| *k).collect();
+    let zh_keys: std::collections::HashSet<&str> =
+        zh.values().flat_map(|m| m.keys().map(String::as_str)).collect();
+    for (key, source) in before_filter {
+        if pending_only_keys.contains(key.as_str()) || zh_keys.contains(key.as_str()) {
+            continue;
+        }
+        let verdict = classify(Candidate {
+            source_kind: "lang",
+            logical_key: key,
+            text: source,
+        });
+        let mut entry = CandidateOutcome::new(
+            "",
+            key,
+            "lang",
+            TranslationOutcome::IntentionallyUnchanged,
+        );
+        if let Some(reason) = verdict.player_reason() {
+            entry = entry.with_reason(reason);
+        }
+        ledger.record(entry);
+    }
+
+    ledger
+}
+
 fn save_pending_manifest(
     out: &Path,
     pending: &LangMap,
@@ -2537,7 +3448,7 @@ async fn supplement_translate(
         )
     })
         .await
-        .map_err(|e| format!("工作中斷：{e}"))?;
+        .map_err(|e| describe_worker_failure(&e))?;
     if let Err(e) = &r {
         report_failure(&app, e);
     }
@@ -2552,6 +3463,7 @@ fn run_supplement(
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_contribute_tracker();
+    preflight_selected_ai(app, use_ai, "開始讀取上次的翻譯工作階段")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(5), "正在讀取上次的翻譯工作階段…");
     if !out.exists() {
         return Err("輸出資料夾不存在。請選與上次相同的「結果存哪」。".into());
@@ -2576,13 +3488,27 @@ fn run_supplement(
     }
     let mode = resolve_translation_mode(translation_mode_override.as_deref(), &session.translation_mode);
     let _skip_shared = SkipSharedLookupGuard::enter(mode == TranslationMode::Force);
-    let quality = TranslationQuality::parse(Some(&session.translation_quality));
-    let tier = CoverageTier::Max;
+    // 補翻／修復走 Supplement：使用者已經看過一次結果才按這顆，
+    // 不該再替他決定範圍。設定沿用工作階段裡記著的值（也就是他自己選過的）。
+    let supplement_plan = engine::run_plan::resolve(
+        engine::run_plan::RunIntent::Supplement,
+        &engine::run_plan::RunPlanRequest {
+            mode: Some(mode.value().to_string()),
+            quality: Some(session.translation_quality.clone()),
+            tier: Some(session.coverage_tier.clone()),
+            advanced_unpack: Some(true),
+        },
+    );
+    let quality = supplement_plan.translation_quality();
+    let tier = supplement_plan.coverage_tier();
     let sources: CoverageSourceFlags = tier.sources();
     session.coverage_tier = tier.value().into();
     emit_log(app, "info", &mode_note(mode, 0));
     emit_log(app, "info", &format!("翻譯品質：{}", quality.label()));
     emit_log(app, "info", &tier.note());
+    if let Some(summary) = supplement_plan.override_summary() {
+        emit_log(app, "info", &summary);
+    }
     session.review_pass = session.review_pass.saturating_add(1);
     emit_progress_stage(
         app,
@@ -2653,6 +3579,20 @@ fn run_supplement(
                 slot.remove(k);
             }
         }
+    }
+    let deferred_skipped = if mode == TranslationMode::Force {
+        0
+    } else {
+        filter_quality_deferred(&mut pending, &session.quality_deferred)
+    };
+    if deferred_skipped > 0 {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "品質暫緩：跳過 {deferred_skipped} 條（這些在翻譯時已自動重試過一次仍未通過）；要再試一次請勾「重新翻譯缺漏」"
+            ),
+        );
     }
     let need = count_map(&pending);
     if need == 0 {
@@ -2731,18 +3671,23 @@ fn run_supplement(
                 target_version: session.target_version.clone(),
             },
         )?;
+        emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
         session.pack_path = built.pack_path.clone();
         session.output_dir = work.display().to_string();
         session.keys_zh = built.keys_total;
-        session.pending_count = 0;
+        let still = remaining_pending(&session.pending_en, &zh);
+        let still_n = count_map(&still);
+        prune_quality_deferred(&mut session.quality_deferred, &zh);
+        session.pending_en = still;
+        session.pending_count = still_n;
         let _ = save_session(&work, &session);
         let _ = write_coverage_report(
             &layout,
             &CoverageStats {
                 keys_zh: built.keys_total,
-                keys_pending: 0,
-                keys_tw_playable: built.keys_total,
-                keys_hk_hint: 0,
+                 keys_pending: still_n,
+                 keys_tw_playable: built.keys_total.saturating_sub(still_n),
+                keys_hk_hint: session.keys_hk_hint,
                 ai_filled: 0,
                 ai_enabled: use_ai,
                 jars_scanned: jar_translation.jars_scanned,
@@ -2755,7 +3700,11 @@ fn run_supplement(
                 pack_format: session_pack_format(&session),
                 source_notes: {
                     let mut notes = vec![
-                        "複查：語言表 pending=0，略過 AI fill".into(),
+                         if still_n > 0 {
+                             format!("補充：沒有新的可補譯項目，已略過重複 AI 請求；仍待 {} 條", still_n)
+                         } else {
+                             "複查：語言表 pending=0，略過 AI fill".into()
+                         },
                         "額外來源：僅補仍為英文的顯示字串（FTB／書本／覆寫等）".into(),
                     ];
                     if !quest_note.is_empty() {
@@ -2768,6 +3717,8 @@ fn run_supplement(
                 glossary_hits: 0,
                 tm_hits: 0,
                 shared_hits: 0,
+                shared_glossary_hits: 0,
+                prior_merged: 0,
                 coverage_tier: tier.value().into(),
             },
         );
@@ -2786,12 +3737,18 @@ fn run_supplement(
                 backup_status(&applied)
             ),
         );
+        let sibling_instance_warning = detect_sibling_instance_warning(&instance);
+        if let Some(ref w) = sibling_instance_warning {
+            emit_warn(app, w);
+        }
         return Ok(OneClickResult {
-            report: empty_report(
+             run_plan: supplement_plan.clone(),
+             run_plan_has_overrides: supplement_plan.has_overrides(),
+             report: empty_report(
                 &session.instance_path,
                 built.keys_total,
                 built.namespaces,
-                0,
+                still_n,
             ),
             pack_path: built.pack_path.clone(),
             work_root: work.display().to_string(),
@@ -2799,22 +3756,48 @@ fn run_supplement(
             files_written: built.files_written,
             keys_total: built.keys_total,
             ai_filled: 0,
+             pending_count: still_n,
+             coverage_percent: if built.keys_total.saturating_add(still_n) == 0 {
+                 100
+             } else {
+                 ((built.keys_total.saturating_mul(100))
+                     / built.keys_total.saturating_add(still_n))
+                     .min(100) as u8
+             },
+             completed_with_pending: still_n > 0,
             jar_translation,
             minemenu_msg: None,
-            player_summary: format!(
-                "沒有還能補的缺漏了。\n目前資源包約有 {} 條中文。\n位置：\n{}{}",
-                built.keys_total,
-                built.pack_path,
-                if recovered {
-                    "\n（已因遺失資源包而重建 zip）"
-                } else {
-                    ""
-                },
-            ),
+             player_summary: if still_n > 0 {
+                 format!(
+                         "本輪沒有新的可補譯項目，已略過重複 AI 請求。\n仍有 {} 條未完成，其中 {} 條已暫緩；勾選「重新翻譯缺漏」才會再次嘗試。\n目前資源包約有 {} 條中文。\n位置：\n{}{}",
+                         still_n,
+                         count_map(&session.quality_deferred),
+                         built.keys_total,
+                         built.pack_path,
+                         if recovered {
+                             "\n（已因遺失資源包而重建 zip）"
+                         } else {
+                             ""
+                         },
+                     )
+             } else {
+                 format!(
+                         "沒有還能補的缺漏了。\n目前資源包約有 {} 條中文。\n位置：\n{}{}",
+                         built.keys_total,
+                         built.pack_path,
+                         if recovered {
+                             "\n（已因遺失資源包而重建 zip）"
+                         } else {
+                             ""
+                         },
+                     )
+              },
+            sibling_instance_warning,
+            stays_unchanged: 0,
         });
     }
 
-    // 代管 AI 一律可用，補翻不再需要使用者先設金鑰。
+    // 補翻使用目前選擇的 AI 來源（自訂 API／GPT）；翻譯前已另閘 Discord。
     emit_progress_ex(
         app,
         Some(25),
@@ -2837,6 +3820,14 @@ fn run_supplement(
     );
     let app_ai = app.clone();
     let supplement_scope = TranslationScope::from_instance(Path::new(session.instance_path.trim()));
+    let seeded_sup = seed_tm_from_langmaps(&session.pending_en, &zh);
+    if seeded_sup > 0 {
+        emit_log(
+            app,
+            "info",
+            &format!("補充前：已把本包已有譯文寫入翻譯記憶 {seeded_sup} 條"),
+        );
+    }
     let ai_report = fill_missing_with_mode(&mut zh, &pending, use_ai, mode == TranslationMode::Force, quality, Some(&supplement_scope), move |pct, msg| {
         let mapped = 25 + (pct as u16 * 55 / 100) as u8;
         emit_progress_ex(
@@ -2852,6 +3843,24 @@ fn run_supplement(
             },
         );
     })?;
+    merge_pending(&mut session.quality_deferred, &ai_report.quality_deferred);
+    let deferred_after_ai = count_map(&ai_report.quality_deferred);
+    if deferred_after_ai > 0 {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "品質暫緩：{deferred_after_ai} 條，本次不重送{}",
+                if mode == TranslationMode::Force {
+                    "；強制模式複查後仍未通過"
+                } else {
+                    ""
+                }
+            ),
+        );
+    } else if mode == TranslationMode::Force && deferred_skipped > 0 {
+        emit_log(app, "info", "品質複查完成：已處理先前暫緩項目");
+    }
     let ai_filled = ai_report.filled;
     emit_log(app, "info", &ai_report.note());
     postprocess_lang_values(&mut zh, &dict);
@@ -2914,6 +3923,7 @@ fn run_supplement(
             target_version: session.target_version.clone(),
         },
     )?;
+    emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
 
     // 補翻：額外來源只補仍為英文的顯示字串（已譯不重送）
     let mut skipped_by_tier: Vec<String> = Vec::new();
@@ -2964,7 +3974,9 @@ fn run_supplement(
         );
     }
     {
-        let contrib = contribute_lang_maps(&session.pending_en, &zh, &supplement_scope);
+        // 這裡不需要 provenance：`pending_en` 是主流程「參考包合併之後」還缺中文的
+        // 鍵，參考包填掉的鍵根本不在裡面，所以這條路上傳不到參考包的內容。
+        let contrib = contribute_lang_maps(&session.pending_en, &zh, &supplement_scope, None);
         if contrib.attempted > 0 || contrib.failed || contrib.deferred > 0 {
             emit_log(
                 app,
@@ -2979,6 +3991,7 @@ fn run_supplement(
 
     let still = remaining_pending(&session.pending_en, &zh);
     let still_n = count_map(&still);
+    prune_quality_deferred(&mut session.quality_deferred, &zh);
     if sources.write_gap_summary {
         match write_gap_summary_file(&work, &still, 120) {
             Ok(p) => emit_log(
@@ -3003,8 +4016,8 @@ fn run_supplement(
         &CoverageStats {
             keys_zh: built.keys_total,
             keys_pending: still_n,
-            keys_tw_playable: built.keys_total,
-            keys_hk_hint: 0,
+            keys_tw_playable: built.keys_total.saturating_sub(still_n),
+            keys_hk_hint: session.keys_hk_hint,
             ai_filled,
             ai_enabled: use_ai,
             jars_scanned: jar_translation.jars_scanned,
@@ -3014,7 +4027,7 @@ fn run_supplement(
             quests_note: quest_note.clone(),
             ref_note: "補翻流程".into(),
             pack_path: built.pack_path.clone(),
-            pack_format: 15,
+            pack_format: session_pack_format(&session),
             source_notes: {
                 let mut notes = vec![
                     format!("完整度：{}（{}）", tier.label(), tier.value()),
@@ -3031,6 +4044,8 @@ fn run_supplement(
             glossary_hits: ai_report.glossary_hits,
             tm_hits: ai_report.tm_hits,
             shared_hits: ai_report.shared_hits,
+            shared_glossary_hits: ai_report.shared_glossary_hits,
+            prior_merged: 0,
             coverage_tier: tier.value().into(),
         },
     );
@@ -3050,6 +4065,10 @@ fn run_supplement(
             backup_status(&applied)
         ),
     );
+    let sibling_instance_warning = detect_sibling_instance_warning(&instance);
+    if let Some(ref w) = sibling_instance_warning {
+        emit_warn(app, w);
+    }
     emit_progress_stage(app, dev_progress::STAGE_APPLY, Some(100), "補翻完成！");
 
     let ai_result_line = if use_ai {
@@ -3063,6 +4082,8 @@ fn run_supplement(
     };
 
     Ok(OneClickResult {
+        run_plan: supplement_plan.clone(),
+        run_plan_has_overrides: supplement_plan.has_overrides(),
         report: empty_report(
             &session.instance_path,
             built.keys_total,
@@ -3075,6 +4096,15 @@ fn run_supplement(
         files_written: built.files_written,
         keys_total: built.keys_total,
         ai_filled,
+        pending_count: still_n,
+        coverage_percent: if built.keys_total.saturating_add(still_n) == 0 {
+            100
+        } else {
+            ((built.keys_total.saturating_mul(100))
+                / built.keys_total.saturating_add(still_n))
+                .min(100) as u8
+        },
+        completed_with_pending: still_n > 0,
         jar_translation,
         minemenu_msg: None,
         player_summary: format!(
@@ -3098,6 +4128,8 @@ fn run_supplement(
                 quest_note
             },
         ),
+        sibling_instance_warning,
+        stays_unchanged: 0,
     })
 }
 
@@ -3128,7 +4160,7 @@ async fn repair_translation_pack(
         )
     })
         .await
-        .map_err(|e| format!("工作中斷：{e}"))?;
+        .map_err(|e| describe_worker_failure(&e))?;
     if let Err(e) = &r {
         report_failure(&app, e);
     }
@@ -3143,6 +4175,7 @@ fn run_repair(
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_contribute_tracker();
+    preflight_selected_ai(app, use_ai, "開始修復翻譯結果")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(3), "修復：尋找工作階段…");
     if !out.exists() {
         return Err("輸出資料夾不存在。".into());
@@ -3212,11 +4245,31 @@ fn run_repair(
 
     // 2) 可選：AI 補缺
     let mut ai_filled = 0usize;
-    let pending = remaining_pending(&session.pending_en, &zh);
-    let need = count_map(&pending);
+    let mut pending = remaining_pending(&session.pending_en, &zh);
     let repair_mode =
         resolve_translation_mode(translation_mode_override.as_deref(), &session.translation_mode);
+    // 修復與補翻同屬 Supplement：沿用工作階段裡使用者自己選過的設定，不再覆寫。
+    let repair_plan = engine::run_plan::resolve(
+        engine::run_plan::RunIntent::Supplement,
+        &engine::run_plan::RunPlanRequest {
+            mode: Some(repair_mode.value().to_string()),
+            quality: Some(session.translation_quality.clone()),
+            tier: Some(session.coverage_tier.clone()),
+            advanced_unpack: Some(true),
+        },
+    );
     let _skip_shared = SkipSharedLookupGuard::enter(repair_mode == TranslationMode::Force);
+    let repair_deferred_skipped = if repair_mode == TranslationMode::Force {
+        0
+    } else {
+        filter_quality_deferred(&mut pending, &session.quality_deferred)
+    };
+    let need = count_map(&pending);
+    if repair_deferred_skipped > 0 {
+        actions.push(format!(
+            "品質暫緩：跳過 {repair_deferred_skipped} 條（這些在翻譯時已自動重試過一次仍未通過）；要再試一次請勾「重新翻譯缺漏」"
+        ));
+    }
     let repair_quality = TranslationQuality::parse(Some(session.translation_quality.as_str()));
     emit_log(app, "info", &mode_note(repair_mode, 0));
     emit_log(
@@ -3263,6 +4316,13 @@ fn run_repair(
             },
         )?;
         ai_filled = r.filled;
+        merge_pending(&mut session.quality_deferred, &r.quality_deferred);
+        if !r.quality_deferred.is_empty() {
+            actions.push(format!(
+                "品質暫緩：{} 條，本次不重送",
+                count_map(&r.quality_deferred)
+            ));
+        }
         postprocess_lang_values(&mut zh, &dict);
         actions.push(r.note());
     } else if need > 0 {
@@ -3335,7 +4395,8 @@ fn run_repair(
         }
     }
     {
-        let contrib = contribute_lang_maps(&session.pending_en, &zh, &repair_scope);
+        // 同補充漏翻：`pending_en` 不含參考包填掉的鍵（見該處註解）
+        let contrib = contribute_lang_maps(&session.pending_en, &zh, &repair_scope, None);
         if contrib.attempted > 0 || contrib.failed || contrib.deferred > 0 {
             actions.push(format!(
                 "共享庫掃尾：accepted={}／衝突 {}／送出 {}",
@@ -3359,10 +4420,12 @@ fn run_repair(
             target_version: session.target_version.clone(),
         },
     )?;
+    emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
     actions.push(format!("已寫入 zip：{}", built.pack_path));
 
     let still = remaining_pending(&session.pending_en, &zh);
     let still_n = count_map(&still);
+    prune_quality_deferred(&mut session.quality_deferred, &zh);
     session.pack_name = pack_name;
     session.pack_path = built.pack_path.clone();
     session.output_dir = work.display().to_string();
@@ -3398,6 +4461,10 @@ fn run_repair(
             backup_status(&applied)
         ),
     );
+    let sibling_instance_warning = detect_sibling_instance_warning(&instance);
+    if let Some(ref w) = sibling_instance_warning {
+        emit_warn(app, w);
+    }
     emit_progress_stage(app, dev_progress::STAGE_APPLY, Some(100), "修復完成！");
 
     let repair_translation_line = if use_ai {
@@ -3431,6 +4498,8 @@ fn run_repair(
     );
 
     Ok(OneClickResult {
+        run_plan: repair_plan.clone(),
+        run_plan_has_overrides: repair_plan.has_overrides(),
         report: empty_report(
             &session.instance_path,
             built.keys_total,
@@ -3443,9 +4512,20 @@ fn run_repair(
         files_written: built.files_written,
         keys_total: built.keys_total,
         ai_filled,
+        pending_count: still_n,
+        coverage_percent: if built.keys_total.saturating_add(still_n) == 0 {
+            100
+        } else {
+            ((built.keys_total.saturating_mul(100))
+                / built.keys_total.saturating_add(still_n))
+                .min(100) as u8
+        },
+        completed_with_pending: still_n > 0,
         minemenu_msg,
         jar_translation,
         player_summary,
+        sibling_instance_warning,
+        stays_unchanged: 0,
     })
 }
 
@@ -3488,6 +4568,11 @@ fn suggest_resourcepacks_dir(instance_path: String) -> Result<String, String> {
     Ok(base.display().to_string())
 }
 
+/// 「整合包旁『繁中翻譯輸出』」模式要用的路徑。
+///
+/// 這個指令一直存在，但**從來沒有被加進 `generate_handler!` 清單**——前端呼叫必定失敗、
+/// 被 `.catch(() => "")` 吞掉，於是設定裡那個選項按了等於沒按，一律靜默落回 AppData 管理模式。
+/// 漏註冊比漏寫更難發現，因為程式碼看起來完全正常；`npm run check:ui` 現在會擋這種漏接。
 #[tauri::command]
 fn suggest_output_dir(instance_path: String) -> Result<String, String> {
     suggest_resourcepacks_dir(instance_path)
@@ -3599,9 +4684,9 @@ fn scan_only(instance_path: String) -> Result<ScanReport, String> {
 fn open_path(path: String) -> Result<bool, String> {
     let p = normalize_path(&path);
     if !p.exists() {
-        return Err("路徑不存在（可含空白，請確認有沒有打錯）".into());
+        fs::create_dir_all(&p).map_err(|_| "無法建立這個資料夾。".to_string())?;
     }
-    open::that(&p).map_err(|e| e.to_string())?;
+    open::that(&p).map_err(|_| "暫時無法開啟這個資料夾。".to_string())?;
     Ok(true)
 }
 
@@ -3644,12 +4729,11 @@ fn open_url(url: String) -> Result<bool, String> {
     Ok(true)
 }
 
-/// 工具自管的隱藏工作目錄（`%APPDATA%\modpack-i18n-tool\work`）。
+/// 工具自管的隱藏工作目錄（可攜式根優先，見 `default_managed_work_root`）。
 /// 僅供偵測／遷移；一鍵翻譯請用 `managed_output_for_instance`。
 #[tauri::command]
 fn managed_output_base() -> String {
-    dirs::data_dir()
-        .map(|d| d.join("modpack-i18n-tool").join("work"))
+    default_managed_work_root()
         .map(|p| p.display().to_string())
         .unwrap_or_default()
 }
@@ -3678,30 +4762,50 @@ fn sanitize_pack_folder_name(raw: &str) -> String {
     s
 }
 
-/// 每個整合包獨立結果根：`work/packs/{安全名}-{hash8}`。
-/// 若舊路徑 `work/instance-{hash16}` 已有工作階段／說明檔則優先沿用。
-#[tauri::command]
-fn managed_output_for_instance(instance_path: String) -> String {
+fn instance_path_key(instance_path: &Path) -> (PathBuf, String, String) {
     use std::hash::{Hash, Hasher};
-    let path = normalize_path(&instance_path);
-    let stable = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let stable = fs::canonicalize(instance_path).unwrap_or_else(|_| instance_path.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     stable.to_string_lossy().to_ascii_lowercase().hash(&mut hasher);
     let hash = hasher.finish();
     let hash16 = format!("{hash:016x}");
     let hash8 = format!("{hash:016x}")[..8].to_string();
+    (stable, hash16, hash8)
+}
 
-    let Some(data) = dirs::data_dir() else {
+fn default_managed_work_root() -> Option<PathBuf> {
+    Some(engine::paths::resolve_file(Path::new("work")))
+}
+
+/// 每個整合包獨立結果根：`{work_base}/packs/{安全名}-{hash8}`。
+/// 預設 work_base＝`%APPDATA%\modpack-i18n-tool\work`；可改成使用者自訂根。
+/// 僅在預設 work 下，若舊路徑 `instance-{hash16}` 已有工作階段／說明檔則優先沿用。
+fn managed_output_for_instance_at(instance_path: &Path, work_base: Option<&Path>) -> String {
+    let (stable, hash16, hash8) = instance_path_key(instance_path);
+    let Some(default_work) = default_managed_work_root() else {
         return String::new();
     };
-    let work = data.join("modpack-i18n-tool").join("work");
-    let legacy = work.join(format!("instance-{hash16}"));
-    let legacy_has_work = legacy.join(SESSION_FILE).is_file()
-        || legacy.join(RESULT_DIR_NAME).join(SESSION_FILE).is_file()
-        || legacy.join("【請閱讀】輸出說明.txt").is_file()
-        || legacy.join(RESULT_DIR_NAME).join("【請閱讀】輸出說明.txt").is_file();
-    if legacy_has_work {
-        return legacy.display().to_string();
+    let using_default = work_base
+        .map(|b| {
+            let nb = fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+            let nd = fs::canonicalize(&default_work).unwrap_or_else(|_| default_work.clone());
+            path_keys_equal(&nb, &nd)
+        })
+        .unwrap_or(true);
+    let work = work_base
+        .filter(|b| !b.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or(default_work);
+
+    if using_default {
+        let legacy = work.join(format!("instance-{hash16}"));
+        let legacy_has_work = legacy.join(SESSION_FILE).is_file()
+            || legacy.join(RESULT_DIR_NAME).join(SESSION_FILE).is_file()
+            || legacy.join("【請閱讀】輸出說明.txt").is_file()
+            || legacy.join(RESULT_DIR_NAME).join("【請閱讀】輸出說明.txt").is_file();
+        if legacy_has_work {
+            return legacy.display().to_string();
+        }
     }
 
     let name = stable
@@ -3710,6 +4814,37 @@ fn managed_output_for_instance(instance_path: String) -> String {
         .unwrap_or("pack");
     let folder = format!("{}-{}", sanitize_pack_folder_name(name), hash8);
     work.join("packs").join(folder).display().to_string()
+}
+
+/// 每個整合包獨立結果根：`work/packs/{安全名}-{hash8}`。
+/// 若舊路徑 `work/instance-{hash16}` 已有工作階段／說明檔則優先沿用。
+#[tauri::command]
+fn managed_output_for_instance(instance_path: String) -> String {
+    let path = normalize_path(&instance_path);
+    managed_output_for_instance_at(&path, None)
+}
+
+/// 在指定根目錄下為整合包配置獨立結果資料夾（設定「自訂已翻譯儲存位置」用）。
+#[tauri::command]
+fn managed_output_for_instance_with_base(instance_path: String, base_dir: String) -> String {
+    let path = normalize_path(&instance_path);
+    let base = normalize_path(&base_dir);
+    if base.as_os_str().is_empty() {
+        return managed_output_for_instance_at(&path, None);
+    }
+    managed_output_for_instance_at(&path, Some(&base))
+}
+
+fn path_keys_equal(a: &Path, b: &Path) -> bool {
+    let na = fs::canonicalize(a)
+        .unwrap_or_else(|_| a.to_path_buf())
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let nb = fs::canonicalize(b)
+        .unwrap_or_else(|_| b.to_path_buf())
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    na.trim_end_matches(['/', '\\']) == nb.trim_end_matches(['/', '\\'])
 }
 
 #[cfg(test)]
@@ -3722,6 +4857,197 @@ mod managed_output_tests {
         assert!(s.contains("Prominence"));
         assert!(!s.contains('™'));
         assert!(!s.contains('('));
+    }
+}
+
+#[cfg(test)]
+mod local_cache_probe_tests {
+    use super::*;
+    use engine::{save_session, TranslateSession};
+
+    fn base_session(instance: &Path, pending_count: usize, keys_zh: usize) -> TranslateSession {
+        // 缺口數量現在是從 `pending_en` 實際算出來的，不是讀那個可能過期的
+        // `pending_count` 純量——所以測試也要放進對應數量的**真的可翻**的條目，
+        // 否則測到的是「空清單」而不是「還有 N 條沒翻」。
+        let mut ns: std::collections::HashMap<String, String> = Default::default();
+        for i in 0..pending_count {
+            ns.insert(format!("item.test{i}"), format!("Untranslated item {i}"));
+        }
+        let mut pending_en: engine::LangMap = Default::default();
+        if pending_count > 0 {
+            pending_en.insert("test".into(), ns);
+        }
+        TranslateSession {
+            version: 1,
+            review_pass: 0,
+            instance_path: instance.display().to_string(),
+            output_dir: String::new(),
+            pack_name: "測試包".into(),
+            pack_path: String::new(),
+            pending_en,
+            pending_count,
+            quality_deferred: Default::default(),
+            keys_zh,
+            keys_hk_hint: 0,
+            note: String::new(),
+            target_version: None,
+            translation_mode: "append".into(),
+            translation_quality: "balanced".into(),
+            coverage_tier: "max".into(),
+            mods_fingerprint: 0,
+            run_preferences: engine::RunPreferences::default(),
+            last_run_outcome: engine::RunOutcome::Completed,
+        }
+    }
+
+    fn scratch(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("mcpl-cache-probe-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let instance = root.join("instance");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(&instance).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        (instance, work)
+    }
+
+    /// 這幾條釘死本輪的分級訊息：同樣是「partial」，剩 1% 跟剩 60% 跟剩大半，
+    /// 講的話要不一樣，不能一律「尚有約 X 條可接續補翻」。
+    #[test]
+    fn near_complete_says_almost_done_not_still_pending() {
+        let (instance, work) = scratch("near-complete");
+        // 99% 完成：keys_zh=9900, pending=100
+        save_session(&work, &base_session(&instance, 100, 9900)).unwrap();
+        let probe = probe_cache_at(&instance, &work).expect("should find a partial probe");
+        assert_eq!(probe.status, "partial");
+        assert_eq!(probe.completion_percent, Some(99));
+        assert!(probe.message.contains("幾乎全部翻完"), "{}", probe.message);
+        assert!(!probe.message.contains("尚有約"), "{}", probe.message);
+        let _ = fs::remove_dir_all(work.parent().unwrap());
+    }
+
+    #[test]
+    fn majority_done_says_completed_most_not_almost_done() {
+        let (instance, work) = scratch("majority");
+        // 70% 完成
+        save_session(&work, &base_session(&instance, 300, 700)).unwrap();
+        let probe = probe_cache_at(&instance, &work).unwrap();
+        assert_eq!(probe.completion_percent, Some(70));
+        assert!(probe.message.contains("已完成大半"), "{}", probe.message);
+        assert!(!probe.message.contains("幾乎全部翻完"), "{}", probe.message);
+        let _ = fs::remove_dir_all(work.parent().unwrap());
+    }
+
+    /// 站長實測的情境：翻譯在 63% 崩潰，工作階段留下 `pendingCount=33233`
+    /// 這個「本地整理完成當下」的舊快照。但那一次的日誌顯示其中 32151 條
+    /// 早就被共享庫補上了——重開工具卻說「還有三萬多條缺漏」。
+    ///
+    /// 沒跑完的計數一律不可信，這張卡就不該拿它嚇人。
+    #[test]
+    fn a_crashed_run_does_not_report_phantom_gaps() {
+        let (instance, work) = scratch("crashed");
+        let mut session = base_session(&instance, 33233, 75141);
+        session.last_run_outcome = engine::RunOutcome::Crashed;
+        save_session(&work, &session).unwrap();
+        // 有可分享的成品在（跟站長那份一樣）
+        let rp = work.join("resourcepacks");
+        fs::create_dir_all(&rp).unwrap();
+        fs::write(rp.join("模組包翻譯工具+0902+R1.zip"), b"pack").unwrap();
+
+        let probe = probe_cache_at(&instance, &work).unwrap();
+        assert_eq!(probe.status, "ready", "有成品就講成品，別拿過期計數判成 partial");
+        assert!(
+            !probe.message.contains("33233"),
+            "不可以把崩潰前的舊數字丟給使用者：{}",
+            probe.message
+        );
+        assert!(
+            !probe.message.contains("缺") && !probe.message.contains("還有約"),
+            "沒跑完的情況交給接續卡講，這張卡只講有結果可用：{}",
+            probe.message
+        );
+        let _ = fs::remove_dir_all(work.parent().unwrap());
+    }
+
+    /// 跑完了、而且剩下的全是「本來就不該翻」的東西 → 就是已完成。
+    #[test]
+    fn untranslatable_leftovers_do_not_keep_the_card_in_partial_forever() {
+        let (instance, work) = scratch("untranslatable");
+        let mut session = base_session(&instance, 0, 9000);
+        let mut ns: std::collections::HashMap<String, String> = Default::default();
+        ns.insert("enchantment.level.9".into(), "IX".into());
+        ns.insert("icon.star".into(), "§f".into());
+        ns.insert("mod.optifine".into(), "OptiFine".into());
+        session.pending_en.insert("test".into(), ns);
+        session.pending_count = 3;
+        session.last_run_outcome = engine::RunOutcome::Completed;
+        save_session(&work, &session).unwrap();
+        let rp = work.join("resourcepacks");
+        fs::create_dir_all(&rp).unwrap();
+        fs::write(rp.join("模組包翻譯工具+0902+R1.zip"), b"pack").unwrap();
+
+        let probe = probe_cache_at(&instance, &work).unwrap();
+        assert_eq!(probe.pending_count, 0, "羅馬數字／圖示／品牌名不算缺漏");
+        assert_eq!(probe.status, "ready");
+        let _ = fs::remove_dir_all(work.parent().unwrap());
+    }
+
+    #[test]
+    fn low_completion_keeps_original_wording() {
+        let (instance, work) = scratch("low");
+        // 20% 完成
+        save_session(&work, &base_session(&instance, 800, 200)).unwrap();
+        let probe = probe_cache_at(&instance, &work).unwrap();
+        assert_eq!(probe.completion_percent, Some(20));
+        // 這條守的是「分級」：才 20% 完成時不可以講得像快翻完了
+        assert!(probe.message.contains("還有約"), "{}", probe.message);
+        assert!(!probe.message.contains("幾乎") && !probe.message.contains("大半"), "{}", probe.message);
+        let _ = fs::remove_dir_all(work.parent().unwrap());
+    }
+
+    #[test]
+    fn take_capped_langmap_is_bounded_and_deterministic() {
+        let mut src: LangMap = HashMap::new();
+        for ns in ["bbb", "aaa", "ccc"] {
+            let m = src.entry(ns.into()).or_default();
+            for i in 0..10 {
+                m.insert(format!("key{i:02}"), format!("val{i}"));
+            }
+        }
+        assert_eq!(count_map(&src), 30);
+
+        let taken = take_capped_langmap(&src, 12);
+        assert_eq!(count_map(&taken), 12, "必須剛好取到上限");
+        // 同一份輸入要每次取到同一批，使用者連跑兩次看到的數字才一致
+        assert_eq!(taken, take_capped_langmap(&src, 12));
+        // 依命名空間字典序，前 10 條應該全部來自 aaa
+        assert_eq!(taken["aaa"].len(), 10);
+        assert_eq!(taken["bbb"].len(), 2);
+        assert!(!taken.contains_key("ccc"));
+
+        assert!(take_capped_langmap(&src, 0).is_empty());
+        assert_eq!(count_map(&take_capped_langmap(&src, 999)), 30);
+    }
+
+    #[test]
+    fn different_mods_under_same_path_is_not_treated_as_cached() {
+        // 這條釘死上一輪加的防呆：同一個 instance 路徑，換了完全不同的 mods，
+        // 不該被當成「同一包」而顯示已有翻譯。
+        let (instance, work) = scratch("mods-changed");
+        let mods = instance.join("mods");
+        fs::create_dir_all(&mods).unwrap();
+        fs::write(mods.join("jei.jar"), vec![0u8; 1000]).unwrap();
+        let mut session = base_session(&instance, 100, 900);
+        session.mods_fingerprint = engine::mods_fingerprint(&instance);
+        save_session(&work, &session).unwrap();
+
+        // 換掉整批 mods（同一個 instance 路徑）
+        let _ = fs::remove_dir_all(&mods);
+        fs::create_dir_all(&mods).unwrap();
+        fs::write(mods.join("totally-different-pack.jar"), vec![0u8; 9999]).unwrap();
+
+        let probe = probe_cache_at(&instance, &work);
+        assert!(probe.is_none(), "mods 換了應該視為不同整合包，不該回報已有翻譯");
+        let _ = fs::remove_dir_all(work.parent().unwrap());
     }
 }
 
@@ -3763,7 +5089,11 @@ fn delete_result_folder_cmd(output_dir: String) -> Result<DeleteResultFolderResu
         || target.join("【請閱讀】輸出說明.txt").is_file()
         || target.join("resourcepacks").is_dir();
     if !looks_like_result {
-        return Err("這個資料夾不像是本工具建立的翻譯結果，為了安全沒有刪除。".into());
+        return Ok(DeleteResultFolderResult {
+            deleted: false,
+            path: target.display().to_string(),
+            player_summary: "這個位置沒有本工具的翻譯結果，沒有刪除任何檔案。".into(),
+        });
     }
     fs::remove_dir_all(&target).map_err(|e| format!("刪除翻譯結果資料夾失敗：{e}"))?;
     Ok(DeleteResultFolderResult {
@@ -3771,6 +5101,295 @@ fn delete_result_folder_cmd(output_dir: String) -> Result<DeleteResultFolderResu
         path: target.display().to_string(),
         player_summary: format!("已完整刪除翻譯結果資料夾：{}", target.display()),
     })
+}
+
+/// 找一個還沒被用過的結果資料夾（`{原本位置}-2`、`-3`…），供「另存一份新的」。
+///
+/// 使用者想比較兩次翻譯（例如換了 AI 來源）時，舊結果必須完整保留。
+/// 從 2 開始找，最多找到 99；都被占用就回錯誤讓呼叫端退回覆蓋行為。
+#[tauri::command]
+fn next_result_dir_cmd(output_dir: String) -> Result<String, String> {
+    let base = normalize_path_strict(&output_dir)?;
+    let parent = base
+        .parent()
+        .ok_or_else(|| "這個位置太接近磁碟根目錄，無法另存新資料夾。".to_string())?;
+    let stem = base
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "無法解析結果資料夾名稱。".to_string())?;
+    for n in 2..=99u32 {
+        let candidate = parent.join(format!("{stem}-{n}"));
+        if !candidate.exists() {
+            fs::create_dir_all(&candidate)
+                .map_err(|e| format!("無法建立新的結果資料夾：{e}"))?;
+            return Ok(candidate.display().to_string());
+        }
+    }
+    Err("已經有太多份結果資料夾（-2 到 -99 都被占用），請先整理舊的。".into())
+}
+
+/// 寫入本次執行紀錄（不覆寫舊的），同時維持舊的 `執行日誌.txt` 相容行為。
+///
+/// 使用者實測遇到「翻到一半被關掉、重開續翻，前一小時的紀錄整個被蓋掉」——
+/// 執行紀錄改成每次一個檔，出問題時才有東西可查。
+#[tauri::command]
+fn write_run_journal_cmd(
+    work_root: String,
+    stamp: String,
+    content: String,
+) -> Result<String, String> {
+    let root = normalize_path(&work_root);
+    let safe_stamp: String = stamp
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    let stamp = if safe_stamp.is_empty() {
+        "run".to_string()
+    } else {
+        safe_stamp
+    };
+    engine::write_run_log(&root, &stamp, &content).map(|p| p.display().to_string())
+}
+
+/// 列出既有的執行紀錄（新到舊），供診斷與回報取用。
+#[tauri::command]
+fn list_run_journals_cmd(work_root: String) -> Vec<String> {
+    engine::list_runs(&normalize_path(&work_root))
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// 讀出待補項目的 CSV 文字，供「複製失敗項目」直接進剪貼簿。
+///
+/// 使用者反映：想把沒翻到的拿去線上 AI 翻，但只能一個一個開檔案複製「有點慘」。
+#[tauri::command]
+fn failed_items_csv_cmd(output_dir: String) -> Result<String, String> {
+    let work = result_work_root(&normalize_path_strict(&output_dir)?);
+    let (session, _) = load_session(&work)?;
+    Ok(engine::build_failed_items_csv(
+        &session.pending_en,
+        "尚未翻譯或品質未通過",
+    ))
+}
+
+/// 把使用者在線上翻好、貼回來的內容併入翻譯結果並重建資源包。
+///
+/// 一定會逐條驗證佔位符——線上 AI 很容易把 `%s`／`§a` 弄丟，直接寫進遊戲
+/// 會讓文字格式錯亂。沒過的原樣退回並列出來，不靜默吞掉。
+#[tauri::command]
+async fn import_translations_cmd(
+    app: AppHandle,
+    output_dir: String,
+    text: String,
+) -> Result<engine::ImportReport, String> {
+    let out = normalize_path_strict(&output_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let work = result_work_root(&out);
+        let (mut session, _) = load_session(&work)?;
+        let entries = engine::parse_import_text(&text);
+        if entries.is_empty() {
+            return Err("看不出可匯入的內容。請貼「鍵<Tab>譯文」每行一條，或直接貼回匯出的那張表。".into());
+        }
+        let mut zh = load_pack_zh(&work).unwrap_or_default();
+        let report = engine::merge_imported(&mut zh, &session.pending_en, &entries);
+        if report.accepted == 0 {
+            return Ok(report);
+        }
+        // 併入後把已完成的從待補移除，並重建資源包
+        for (ns, map) in &zh {
+            if let Some(pending_ns) = session.pending_en.get_mut(ns) {
+                for key in map.keys() {
+                    pending_ns.remove(key);
+                }
+            }
+        }
+        session.pending_en.retain(|_, m| !m.is_empty());
+        session.pending_count = count_map(&session.pending_en);
+        let pack_format = session_pack_format(&session);
+        let built = build_resource_pack(
+            &zh,
+            &BuildOptions {
+                pack_folder_name: session.pack_name.clone(),
+                pack_description: "台灣用語繁體中文翻譯資源包".into(),
+                output_dir: work.display().to_string(),
+                pack_format,
+                target_version: session.target_version.clone(),
+            },
+        )?;
+        session.keys_zh = built.keys_total;
+        let _ = save_session(&work, &session);
+        emit_log(
+            &app,
+            "info",
+            &format!("匯入完成：{}。資源包已重建，請重新套用或啟動遊戲。", report.summary),
+        );
+        Ok(report)
+    })
+    .await
+    .map_err(|e| format!("匯入工作中斷：{e}"))?
+}
+
+/// 檢查這個實例的資源包清單是否健康（是否有檔案在但沒啟用、或整個清單空掉）。
+#[tauri::command]
+fn verify_resource_packs_cmd(instance_path: String) -> Result<engine::PackHealthReport, String> {
+    let instance = normalize_path_strict(&instance_path)?;
+    let mc = resolve_minecraft_dir(&instance).unwrap_or(instance);
+    Ok(engine::check_pack_health(&mc))
+}
+
+/// 把資料夾裡有、但 options.txt 沒啟用的資源包加回清單。
+///
+/// 使用者的實例被清成 `resourcePacks:[]` 之後遊戲直接閃退（字體找不到材質 →
+/// 資源重載失敗 → 模型沒烘焙 → 標題畫面空指標）。這個指令把它救回來。
+#[tauri::command]
+fn repair_resource_packs_cmd(instance_path: String) -> Result<serde_json::Value, String> {
+    let instance = normalize_path_strict(&instance_path)?;
+    let mc = resolve_minecraft_dir(&instance).unwrap_or(instance);
+    let added = engine::repair_pack_list(&mc)?;
+    let after = engine::check_pack_health(&mc);
+    Ok(serde_json::json!({
+        "added": added,
+        "enabledCount": after.enabled_count,
+        "summary": if added == 0 {
+            "資源包清單本來就是完整的，沒有做任何修改。".to_string()
+        } else {
+            format!("已把 {added} 個資源包加回清單，請重新啟動遊戲確認。")
+        },
+    }))
+}
+
+/// 目前資料存放位置的實況，供設定頁顯示與判斷要不要提供搬移。
+#[tauri::command]
+fn data_root_info_cmd() -> serde_json::Value {
+    let portable = engine::paths::portable_root();
+    let legacy = engine::paths::legacy_roaming_root();
+    let active = engine::paths::active_root();
+    let using_portable = engine::paths::is_using_portable_root();
+    serde_json::json!({
+        "activeRoot": active.display().to_string(),
+        "portableRoot": portable.display().to_string(),
+        "legacyRoot": legacy.display().to_string(),
+        "usingPortable": using_portable,
+        // 只有「還在用舊位置、而且舊位置真的有東西」時才值得提供搬移
+        "canMigrate": !using_portable && legacy.is_dir(),
+        "legacySizeBytes": engine::paths::dir_size_bytes(&legacy),
+    })
+}
+
+/// 把舊資料（%APPDATA%）複製到工具旁的資料夾。舊的原地保留當備份。
+#[tauri::command]
+async fn migrate_data_root_cmd() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        engine::paths::migrate_legacy_to_portable().map(|(files, bytes)| {
+            serde_json::json!({
+                "files": files,
+                "bytes": bytes,
+                "newRoot": engine::paths::portable_root().display().to_string(),
+                "oldRoot": engine::paths::legacy_roaming_root().display().to_string(),
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("搬移工作中斷：{e}"))?
+}
+
+/// 設定「要不要把 API 金鑰存到這台電腦」。
+///
+/// 預設 false＝不落地：金鑰只放在記憶體，工具關掉就沒了，下次要重新輸入。
+/// 使用者要求「本地永不儲存 apikey」，但既有已存金鑰的人直接改掉會突然不能用，
+/// 所以做成可選，由前端在啟動時把設定推下來。
+#[tauri::command]
+fn set_remember_api_key_cmd(remember: bool) -> bool {
+    engine::set_remember_api_key(remember);
+    engine::remember_api_key()
+}
+
+/// 讀取工具設定檔。沒有檔案／檔案壞掉都回 null（不是錯誤），
+/// 讓前端知道要走 localStorage 遷移路徑。
+#[tauri::command]
+fn read_app_settings_cmd() -> serde_json::Value {
+    engine::read_settings()
+}
+
+/// 讀取工具設定檔，附帶健康狀態。
+///
+/// 回 `{ settings, status, path, backup, detail }`。`status` 為 `corrupt`／`unreadable`
+/// 時前端必須明講——舊版讀壞檔只回 null，接著就被當成「還沒有設定檔」把偏好全部
+/// 蓋回預設值，使用者完全不知道發生什麼事。
+#[tauri::command]
+fn read_app_settings_report_cmd() -> serde_json::Value {
+    engine::read_settings_report()
+}
+
+/// 依路徑合併寫入工具設定檔：`[{ path, value }]` 設值、`[{ path, delete: true }]` 刪除。
+/// 值是 null 的項目不會寫入。回 `{ path, settings }`（合併後的整份設定）。
+#[tauri::command]
+fn patch_app_settings_cmd(ops: Vec<engine::SettingsPatchOp>) -> Result<serde_json::Value, String> {
+    let (path, settings) = engine::patch_settings(&ops)?;
+    Ok(serde_json::json!({ "path": path.display().to_string(), "settings": settings }))
+}
+
+/// 清除已記住的自訂 API 金鑰（記憶體與設定檔都清）。
+#[tauri::command]
+fn clear_api_key_cmd() -> Result<(), String> {
+    engine::clear_api_key()
+}
+
+/// 設定檔路徑（即使檔案還不存在也回傳預期位置，供設定頁顯示與「開啟資料夾」）。
+#[tauri::command]
+fn app_settings_path_cmd() -> String {
+    engine::settings_path().display().to_string()
+}
+
+/// 這個遊戲資料夾寫得進去嗎？**選完資料夾就問**，不要等翻完三小時才失敗。
+#[tauri::command]
+fn check_write_access_cmd(instance_path: String) -> serde_json::Value {
+    let path = normalize_path(&instance_path);
+    serde_json::to_value(engine::check_write_access(&path))
+        .unwrap_or_else(|_| serde_json::json!({ "writable": true, "needsAdmin": false }))
+}
+
+/// 以系統管理員身分重新開啟工具。
+///
+/// 回 `{ relaunching }`：`false` 代表使用者在 UAC 按了取消——**那不是錯誤**，
+/// 前端只要回到原畫面，讓他改選別的資料夾就好。
+#[tauri::command]
+fn relaunch_as_admin_cmd(app: AppHandle, instance_path: String) -> Result<serde_json::Value, String> {
+    let relaunching = engine::relaunch_as_admin(&instance_path)?;
+    if relaunching {
+        shutdown_side_processes();
+        let exit_app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            exit_app.exit(0);
+        });
+    }
+    Ok(serde_json::json!({ "relaunching": relaunching }))
+}
+
+/// 開發人員測試模式的現況。
+///
+/// 回 `{ eligible, enabled, logPath }`。`eligible` 為 false 時前端**完全不顯示**
+/// 這個選項——詳細紀錄會拖慢速度、產生大量檔案，對一般玩家有害無益。
+#[tauri::command]
+fn dev_mode_status_cmd() -> serde_json::Value {
+    serde_json::json!({
+        "eligible": engine::dev_mode_eligible(),
+        "enabled": engine::dev_mode_enabled(),
+        "logPath": engine::dev_mode_log_path().display().to_string(),
+    })
+}
+
+/// 開關開發人員測試模式。沒有資格時回錯誤，不是靜默忽略。
+#[tauri::command]
+fn dev_mode_set_cmd(enabled: bool) -> Result<serde_json::Value, String> {
+    let on = engine::dev_mode_set_enabled(enabled)?;
+    Ok(serde_json::json!({
+        "enabled": on,
+        "logPath": engine::dev_mode_log_path().display().to_string(),
+    }))
 }
 
 /// 檢查選取的位置是不是一個可直接安裝的遊戲實例（找得到 minecraft 目錄）。
@@ -3809,7 +5428,272 @@ fn create_share_package(work_root: String, dest_dir: String, name: String) -> Re
 #[tauri::command]
 fn has_shareable_translation_cmd(work_root: String) -> Result<bool, String> {
     let work = normalize_path_strict(&work_root)?;
-    Ok(has_shareable_content(&work))
+    if !has_shareable_content(&work) {
+        return Ok(false);
+    }
+    // 有工具資源包時須能解析出 canonical zip，避免分享檔夾帶多版本。
+    let rp = work.join("resourcepacks");
+    if rp.is_dir() {
+        let has_tool = fs::read_dir(&rp)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let stem = name
+                    .trim_end_matches(".zip")
+                    .trim_end_matches(".ZIP");
+                is_tool_resource_pack(stem)
+            });
+        if has_tool && resolve_canonical_tool_zip(&work).is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPackCacheProbe {
+    /// ready＝可直接打開／套用／分享；partial＝有工作階段可補翻；none＝沒找到
+    status: String,
+    matched: bool,
+    output_dir: String,
+    work_root: String,
+    session_path: Option<String>,
+    pending_count: usize,
+    /// 已翻譯／（已翻譯＋待補）的粗估百分比；算不出來（沒有工作階段）時是 None。
+    completion_percent: Option<u8>,
+    shareable: bool,
+    applyable: bool,
+    updated_at_ms: Option<u64>,
+    message: String,
+    pack_name: Option<String>,
+    canonical_zip: Option<String>,
+}
+
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(dur.as_millis() as u64)
+}
+
+fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCacheProbe> {
+    if output_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let work = result_work_root(output_dir);
+    let session_path = find_session_file(&work).or_else(|| find_session_file(output_dir));
+    let canonical = resolve_canonical_tool_zip(&work);
+    let canonical_zip = canonical.as_ref().and_then(|p| {
+        p.file_name().map(|s| {
+            let n = s.to_string_lossy();
+            if p.is_dir() {
+                format!("{n}.zip")
+            } else {
+                n.to_string()
+            }
+        })
+    });
+    let mut pack_name = None::<String>;
+    if let Ok((session, _)) = load_session(&work) {
+        let name = session.pack_name.trim();
+        if !name.is_empty() {
+            pack_name = Some(name.to_string());
+        }
+    }
+    let shareable = has_shareable_content(&work) || has_shareable_content(output_dir);
+    // 上一次到底有沒有跑完？沒跑完的計數一律不可信（見 gap_model 的說明）。
+    let mut counts_fresh = false;
+    let (matched, pending_count, session_path_str, updated_at_ms, keys_zh) =
+        if let Some(ref sp) = session_path {
+            match load_session(sp.parent().unwrap_or(&work)) {
+                Ok((session, path)) => {
+                    let path_matched = path_keys_equal(
+                        Path::new(session.instance_path.trim()),
+                        instance,
+                    );
+                    // 路徑相同不代表還是同一包：啟動器常見操作是沿用同一個 instance
+                    // 資料夾、換掉整個 mods/。只在兩邊都「有記錄」時才拿來否決——
+                    // 0 代表舊工作階段（遷移前）或當下讀不到 mods/，一律不擋。
+                    let live_fingerprint = engine::mods_fingerprint(instance);
+                    let mods_changed = session.mods_fingerprint != 0
+                        && live_fingerprint != 0
+                        && session.mods_fingerprint != live_fingerprint;
+                    let matched = path_matched && !mods_changed;
+                    counts_fresh = session.last_run_outcome.counts_are_trustworthy();
+                    // 只算「補得動」的缺口：羅馬數字、圖示、單位、品牌名本來就
+                    // 不該翻，算進去的話使用者永遠看到一個補不完的數字。
+                    let actionable = engine::count_gaps(&session.pending_en).actionable;
+                    (
+                        matched,
+                        actionable,
+                        Some(path.display().to_string()),
+                        file_mtime_ms(&path),
+                        session.keys_zh,
+                    )
+                }
+                Err(_) => (false, 0, Some(sp.display().to_string()), file_mtime_ms(sp), 0),
+            }
+        } else {
+            // 沒有工作階段但仍有可分享產物：視為同路徑結果（輸出根對得上）
+            (shareable, 0, None, file_mtime_ms(&work), 0)
+        };
+    // 完成度＝已翻譯／（已翻譯＋待補）。0＝算不出來（沒有工作階段），前端不顯示百分比。
+    let completion_percent: Option<u8> = if keys_zh + pending_count > 0 {
+        Some(((keys_zh * 100) / (keys_zh + pending_count)).min(100) as u8)
+    } else {
+        None
+    };
+
+    if !matched && !shareable {
+        return None;
+    }
+    // 工作階段屬於別的實例 → 略過
+    if session_path.is_some() && !matched {
+        return None;
+    }
+
+    let applyable = shareable
+        || work.join("resourcepacks").is_dir()
+        || output_dir.join(RESULT_DIR_NAME).join("resourcepacks").is_dir();
+    // 沒跑完的那一次留下的計數是過期的（AI 與共享庫都還沒把它補掉），
+    // 拿來對使用者講缺漏就會出現「還有三萬多條」這種假數字。
+    // 那種情況交給「上次的翻譯沒有做完」接續卡處理，這張卡只講「有結果可以用」。
+    let trust_counts = counts_fresh || session_path.is_none();
+    let status = if shareable && (pending_count == 0 || !trust_counts) {
+        "ready"
+    } else if shareable || session_path.is_some() {
+        "partial"
+    } else {
+        "none"
+    };
+    if status == "none" {
+        return None;
+    }
+    // 訊息依完成度分級：同樣是「partial」，剩 5 條跟剩 5000 條給使用者的感受完全不同——
+    // 舊版一律講「尚有約 X 條可接續補翻」，99% 完成時這句話讀起來像還差很多。
+    let message = match status {
+        "ready" if shareable && !trust_counts => {
+            // 有可用的成品，但計數不新鮮：講成品，不講數字
+            "這個整合包在你的電腦已經有翻譯結果，可以直接套用、打開或打包分享。".into()
+        }
+        "ready" => "這個整合包在你的電腦已經有翻譯結果，可以直接套用、打開或打包分享，不必重跑一次。"
+            .into(),
+        "partial" if pending_count > 0 => match completion_percent {
+            Some(p) if p >= 98 => format!(
+                "幾乎全部翻完了（約 {p}%），只剩約 {pending_count} 條可以再補一點細節。"
+            ),
+            Some(p) if p >= 50 => format!(
+                "已完成大半（約 {p}%），還有約 {pending_count} 條可接續補翻。"
+            ),
+            _ => format!(
+                "已經有部分翻譯結果，還有約 {pending_count} 條可以接著補；也可以先打開結果或分享已完成的部分。"
+            ),
+        },
+        "partial" => "已經有部分翻譯結果，可以打開結果資料夾或接著補翻。".into(),
+        _ => "未找到可用的本機翻譯快取。".into(),
+    };
+    Some(LocalPackCacheProbe {
+        status: status.into(),
+        matched,
+        output_dir: output_dir.display().to_string(),
+        work_root: work.display().to_string(),
+        session_path: session_path_str,
+        pending_count,
+        completion_percent,
+        shareable,
+        applyable,
+        updated_at_ms,
+        message,
+        pack_name,
+        canonical_zip,
+    })
+}
+
+/// 探測同整合包本機是否已有翻譯結果／工作階段，避免重開工具只為分享又重翻一次。
+#[tauri::command]
+fn probe_local_pack_cache_cmd(
+    instance_path: String,
+    output_dir: Option<String>,
+    custom_base_dir: Option<String>,
+) -> Result<LocalPackCacheProbe, String> {
+    let instance = normalize_path_strict(&instance_path)?;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let push = |v: &mut Vec<PathBuf>, p: PathBuf| {
+        if p.as_os_str().is_empty() {
+            return;
+        }
+        if !v.iter().any(|x| path_keys_equal(x, &p)) {
+            v.push(p);
+        }
+    };
+
+    if let Some(hint) = output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        push(&mut candidates, normalize_path(hint));
+    }
+    let managed = managed_output_for_instance_at(&instance, None);
+    if !managed.is_empty() {
+        push(&mut candidates, PathBuf::from(managed));
+    }
+    if let Some(base) = custom_base_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let custom = managed_output_for_instance_at(&instance, Some(&normalize_path(base)));
+        if !custom.is_empty() {
+            push(&mut candidates, PathBuf::from(custom));
+        }
+    }
+    if let Ok(beside) = suggest_output_base(&instance) {
+        push(&mut candidates, beside);
+    }
+
+    let mut best: Option<LocalPackCacheProbe> = None;
+    for cand in candidates {
+        if let Some(probe) = probe_cache_at(&instance, &cand) {
+            let take = match (&best, probe.status.as_str()) {
+                (None, _) => true,
+                (Some(prev), "ready") if prev.status != "ready" => true,
+                (Some(prev), "ready") if prev.status == "ready" => {
+                    probe.updated_at_ms.unwrap_or(0) > prev.updated_at_ms.unwrap_or(0)
+                }
+                (Some(prev), "partial") if prev.status == "none" => true,
+                (Some(prev), "partial") if prev.status == "partial" => {
+                    probe.updated_at_ms.unwrap_or(0) > prev.updated_at_ms.unwrap_or(0)
+                }
+                _ => false,
+            };
+            if take {
+                best = Some(probe);
+            }
+        }
+    }
+
+    Ok(best.unwrap_or(LocalPackCacheProbe {
+        status: "none".into(),
+        matched: false,
+        output_dir: String::new(),
+        work_root: String::new(),
+        session_path: None,
+        pending_count: 0,
+        completion_percent: None,
+        shareable: false,
+        applyable: false,
+        updated_at_ms: None,
+        message: "此整合包尚未找到本機翻譯結果。完成一次翻譯後，重開工具即可直接分享。".into(),
+        pack_name: None,
+        canonical_zip: None,
+    }))
 }
 
 #[tauri::command]
@@ -3862,21 +5746,76 @@ fn cleanup_translation_helper_cmd(
     cleanup_translation_helper(&instance, &output)
 }
 
-/// Notion 風格完整說明（獨立視窗）
+/// 使用說明與免責條款和設定共用同一個獨立視窗的「說明」分頁。
 #[tauri::command]
-fn open_guide_window(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("guide") {
+async fn open_guide_window(app: AppHandle) -> Result<(), String> {
+    open_settings_window(app, Some("help".into()), None).await
+}
+
+/// 設定／使用說明——真正的第二個系統視窗。本包選項留在主工具的 modal，不跨視窗。
+///
+///
+/// ZeitFrei 的穩定做法是讓第二個 WebView 載入專用的靜態頁，而非再載入完整工作台
+/// `index.html`。後者會再次初始化工作台、事件和 overlay；任一初始化問題都能讓獨立
+/// 視窗白畫面。`settings.html` 的 HTML 先天可讀，JS 只負責互動，因此 JS 失敗也不會
+/// 把整個設定頁變空白。
+#[tauri::command]
+async fn open_settings_window(
+    app: AppHandle,
+    pane: Option<String>,
+    theme: Option<String>,
+) -> Result<(), String> {
+    // 只接受已知的分頁名，不讓外面的字串直接流進 UI
+    let pane = match pane.as_deref().unwrap_or("general") {
+        "help" | "guide" | "legal" => "help",
+        _ => "general",
+    };
+    let theme = if theme.as_deref() == Some("light") {
+        "light"
+    } else {
+        "dark"
+    };
+    if let Some(w) = app.get_webview_window("settings") {
+        // 已經開著就聚焦，不開第二個
+        let _ = w.emit("settings-pane", serde_json::json!({
+            "pane": pane,
+            "theme": theme,
+        }));
+        let _ = w.unminimize();
+        let _ = w.show();
         let _ = w.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, "guide", WebviewUrl::App("guide.html".into()))
-        .title("使用說明與免責條款")
-        .inner_size(720.0, 780.0)
-        .min_inner_size(480.0, 520.0)
+    let boot = serde_json::json!({ "pane": pane, "theme": theme }).to_string();
+    WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("settings.html".into()))
+        .title("設定")
+        .inner_size(900.0, 780.0)
+        .min_inner_size(600.0, 500.0)
+        .decorations(true)
+        .theme(Some(if theme == "light" {
+            tauri::Theme::Light
+        } else {
+            tauri::Theme::Dark
+        }))
+        .initialization_script(&format!("window.__MCPL_SETTINGS_BOOT={boot};"))
         .center()
         .build()
-        .map_err(|e| format!("無法開啟說明視窗：{e}"))?;
+        .map_err(|e| format!("無法開啟設定視窗：{e}"))?;
     Ok(())
+}
+
+/// 獨立設定頁要求回到主工具調整 AI 時，只聚焦主視窗；實際的 AI 選項仍在主工作台，
+/// 避免「每個整合包的翻譯選項」被拆到不帶整合包狀態的第二個視窗。
+#[tauri::command]
+fn focus_main_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主工具視窗。".to_string())?;
+    let _ = window.unminimize();
+    let _ = window.show();
+    window
+        .set_focus()
+        .map_err(|e| format!("無法聚焦主工具視窗：{e}"))
 }
 
 /// 用你喜歡的字體檔建立遊戲字體資源包
@@ -3916,7 +5855,7 @@ async fn create_font_pack(
         )
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?
+    .map_err(|e| describe_worker_failure(&e))?
 }
 
 #[tauri::command]
@@ -3946,7 +5885,7 @@ async fn apply_font_pack_to_current_instance(
         result
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?;
+    .map_err(|e| describe_worker_failure(&e))?;
     result
 }
 
@@ -3978,12 +5917,15 @@ async fn test_custom_api_key_cmd() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn set_ai_mode_cmd(ai_mode: String) -> Result<String, String> {
-    let mode = set_ai_mode(&ai_mode)?;
-    Ok(if mode == "custom" {
-        "已切換為自訂 API".into()
-    } else {
-        "已切換為開發者代管 AI".into()
+async fn set_ai_mode_cmd(ai_mode: String) -> Result<String, String> {
+    let mode = tauri::async_runtime::spawn_blocking(move || set_ai_mode(&ai_mode))
+        .await
+        .map_err(|e| format!("切換執行緒失敗：{e}"))??;
+    Ok(match mode.as_str() {
+        "custom" => "已切換為自訂 API".into(),
+        "gpt" => "已切換為 GPT".into(),
+        "local" => "已切換為本地模型".into(),
+        _ => "已切換 AI 來源".into(),
     })
 }
 
@@ -4002,6 +5944,43 @@ async fn discord_login(app: AppHandle) -> serde_json::Value {
 fn cancel_discord_login_cmd() -> bool {
     cancel_discord_login();
     true
+}
+
+#[tauri::command]
+async fn gpt_login(app: AppHandle) -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(move || gpt_login_blocking(app))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "error": "GPT 登入流程發生問題" }))
+}
+
+#[tauri::command]
+fn cancel_gpt_login_cmd() -> bool {
+    cancel_gpt_login();
+    true
+}
+
+#[tauri::command]
+async fn gpt_auth_status_cmd() -> Result<GptAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(gpt_auth_status)
+        .await
+        .map_err(|e| format!("GPT 登入狀態檢查中斷：{e}"))
+}
+
+#[tauri::command]
+fn gpt_logout_cmd() -> Result<String, String> {
+    gpt_logout()?;
+    Ok("已登出 GPT".into())
+}
+
+#[tauri::command]
+fn get_gpt_model_cmd() -> String {
+    get_gpt_model()
+}
+
+#[tauri::command]
+fn set_gpt_model_cmd(model: String) -> Result<String, String> {
+    let model = set_gpt_model(&model)?;
+    Ok(format!("已切換 GPT 模型：{model}"))
 }
 
 #[tauri::command]
@@ -4031,78 +6010,226 @@ fn cancel_turnstile_verification_cmd() -> bool {
     true
 }
 
-/// 是否已儲存自訂 API 金鑰；代管模式的可用性由 `ai_status` 判斷。
+/// 是否已儲存自訂 API 金鑰。
 #[tauri::command]
 fn has_api_key() -> bool {
     get_api_settings_public().has_key
 }
 
-/// 給 UI 顯示 AI 來源狀態。
-/// 自訂 API 只檢查本機是否有金鑰；代管 AI 需要 Discord 會員資格（不再要求 Turnstile）。
+/// 給 UI 顯示 AI 來源狀態。自訂 API／GPT 都要 Discord 會籍才能翻譯。
 #[tauri::command]
 async fn ai_status() -> serde_json::Value {
     let settings = get_api_settings_public();
     let mode = get_ai_mode();
-    if mode == "custom" {
-        return serde_json::json!({
-            "ready": settings.has_key,
+    let discord = tauri::async_runtime::spawn_blocking(check_discord_auth_status)
+        .await
+        .ok();
+    let logged_in = discord.as_ref().map(|s| s.logged_in).unwrap_or(false);
+    let in_guild = discord.as_ref().map(|s| s.in_guild).unwrap_or(false);
+    let service_available = discord
+        .as_ref()
+        .map(|s| s.service_available)
+        .unwrap_or(false);
+    let discord_message = discord
+        .as_ref()
+        .map(|s| s.message.clone())
+        .unwrap_or_else(|| "目前無法確認 Discord 登入狀態。".into());
+    let discord_ready = logged_in && in_guild && service_available;
+    let discord_display = discord
+        .as_ref()
+        .map(|s| s.nickname.clone())
+        .unwrap_or_default();
+
+    let mut payload = if mode == "custom" {
+        serde_json::json!({
             "aiMode": "custom",
             "usingOwnKey": settings.has_key,
-            "managedFree": false,
-            "loggedIn": false,
-            "inGuild": false,
+            "providerReady": settings.has_key,
             "message": if settings.has_key {
                 "自訂 API 金鑰已存本機（畫面 # 只是遮罩），翻譯時會用真金鑰連線。"
             } else {
                 "尚未儲存自訂 API 金鑰。"
             }
-        });
-    }
-
-    let status = tauri::async_runtime::spawn_blocking(check_discord_auth_status)
-        .await
-        .ok();
-    let logged_in = status.as_ref().map(|s| s.logged_in).unwrap_or(false);
-    let in_guild = status.as_ref().map(|s| s.in_guild).unwrap_or(false);
-    let service_available = status
-        .as_ref()
-        .map(|s| s.service_available)
-        .unwrap_or(false);
-    let message = status
-        .as_ref()
-        .map(|s| s.message.clone())
-        .unwrap_or_else(|| "目前無法確認 Discord 登入狀態。".into());
-    let identity_ready = logged_in && in_guild && service_available;
-    let ready = managed_ai_available() && identity_ready;
-    let status_message = if !service_available {
-        message
-    } else if identity_ready {
-        "免費代管翻譯已可使用。".to_string()
+        })
+    } else if mode == "gpt" {
+        let status = tauri::async_runtime::spawn_blocking(gpt_auth_status)
+            .await
+            .ok();
+        let gpt_logged_in = status.as_ref().map(|s| s.logged_in).unwrap_or(false);
+        let expired = status.as_ref().map(|s| s.expired).unwrap_or(true);
+        let email = status
+            .as_ref()
+            .map(|s| s.email.clone())
+            .unwrap_or_default();
+        let account_id = status
+            .as_ref()
+            .map(|s| s.account_id.clone())
+            .unwrap_or_default();
+        let gpt_message = status
+            .as_ref()
+            .map(|s| s.message.clone())
+            .unwrap_or_else(|| "目前無法確認 GPT 登入狀態。".into());
+        serde_json::json!({
+            "aiMode": "gpt",
+            "usingOwnKey": false,
+            "providerReady": gpt_logged_in,
+            "gptLoggedIn": gpt_logged_in,
+            "expired": expired,
+            "email": email.clone(),
+            "accountId": account_id,
+            "model": get_gpt_model(),
+            "displayName": email,
+            "message": gpt_message,
+        })
+    } else if mode == "local" {
+        let local = engine::local_llm::status_view();
+        let installed = local.get("installed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let local_ready = local.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+        serde_json::json!({
+            "aiMode": "local",
+            "usingOwnKey": false,
+            "providerReady": local_ready,
+            "localInstalled": installed,
+            "localReady": local_ready,
+            "installDir": local.get("installDir").cloned().unwrap_or(serde_json::Value::String(String::new())),
+            "message": local.get("message").and_then(|v| v.as_str()).unwrap_or("尚未安裝本地模型。"),
+        })
     } else {
-        message
+        serde_json::json!({
+            "aiMode": "custom",
+            "usingOwnKey": false,
+            "providerReady": false,
+            "message": "請選擇自訂 API、GPT 或本地模型。",
+        })
     };
-    serde_json::json!({
-        "ready": ready,
-        "aiMode": "managed",
-        "usingOwnKey": false,
-        "managedFree": true,
-        "loggedIn": logged_in,
-        "inGuild": in_guild,
-        "serviceAvailable": service_available,
-        "turnstileRequired": false,
-        "turnstileVerified": true,
-        "turnstileExpiresAt": 0,
-        "turnstileServiceReady": true,
-        "turnstileHealthError": null,
-        "inviteUrl": DISCORD_INVITE_URL,
-        "displayName": status.as_ref().map(|s| s.nickname.clone()).unwrap_or_default(),
-        "message": status_message
-    })
+
+    let provider_ready = payload
+        .get("providerReady")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let ready = discord_ready && provider_ready;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("ready".into(), serde_json::json!(ready));
+        obj.insert("discordReady".into(), serde_json::json!(discord_ready));
+        obj.insert("managedFree".into(), serde_json::json!(false));
+        obj.insert("loggedIn".into(), serde_json::json!(logged_in));
+        obj.insert("inGuild".into(), serde_json::json!(in_guild));
+        obj.insert("serviceAvailable".into(), serde_json::json!(service_available));
+        obj.insert("inviteUrl".into(), serde_json::json!(DISCORD_INVITE_URL));
+        obj.insert("discordDisplayName".into(), serde_json::json!(discord_display));
+        obj.insert("discordMessage".into(), serde_json::json!(discord_message));
+    }
+    payload
 }
 
 #[tauri::command]
 fn get_api_settings() -> ApiSettingsPublic {
     get_api_settings_public()
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalLlmProgressPayload {
+    percent: u8,
+    message: String,
+}
+
+#[tauri::command]
+async fn local_llm_probe_cmd(install_dir: Option<String>) -> Result<engine::local_llm::ProbeView, String> {
+    let dir = install_dir;
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::local_llm::probe_install(dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("偵測執行緒失敗：{e}"))?
+}
+
+#[tauri::command]
+async fn local_llm_install_cmd(
+    app: AppHandle,
+    install_dir: Option<String>,
+) -> Result<engine::local_llm::ProbeView, String> {
+    reset_cancel();
+    let dir = install_dir;
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::local_llm::install_and_start(dir.as_deref(), &mut |percent, message| {
+            let _ = app.emit(
+                "local-llm-progress",
+                LocalLlmProgressPayload {
+                    percent,
+                    message: message.to_string(),
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("安裝執行緒失敗：{e}"))?
+}
+
+#[tauri::command]
+fn local_llm_status_cmd() -> serde_json::Value {
+    engine::local_llm::status_view()
+}
+
+/// 檔案已經裝好、只是服務還沒啟動（工具剛重開）時，直接把服務叫起來，
+/// 不必再走一次「同意並偵測 → 開始下載」的完整流程——那套流程是為了「要不要
+/// 下載幾 GB 到這台電腦」設計的，跟「已經下載過，重開機器/工具後重新啟動一個
+/// 早就在的服務」是完全不同量級的動作，不該共用同一道確認關卡。
+/// `ensure_ready_for_translate` 本身已經處理好「檔案不齊就報錯」與「服務已在跑
+/// 就直接回傳」，這裡只是把它接上前端。
+#[tauri::command]
+async fn local_llm_ensure_ready_cmd(install_dir: Option<String>) -> Result<u16, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::local_llm::ensure_ready_for_translate(install_dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("啟動執行緒失敗：{e}"))?
+}
+
+/// 使用者對「本地翻不好時改用雲端 AI 補量」的選擇（P0-05）。
+///
+/// 回 `"enabled"`／`"disabled"`／`"not_chosen"`。前端只在 `not_chosen` 時徵詢一次：
+/// 這會把整合包文字送上網並花掉使用者自己的 API 額度，沒問過就不能算同意。
+/// 已經選過關的人不該被反覆詢問，所以三種狀態必須分得出來。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudTopUpView {
+    /// `enabled` / `disabled` / `not_chosen`
+    choice: String,
+    /// 這次是否真的會用到雲端補量
+    enabled: bool,
+    /// 是否該跳一次同意詢問。規則放後端，前端不重新推導。
+    needs_consent: bool,
+}
+
+#[tauri::command]
+fn cloud_topup_choice_cmd() -> CloudTopUpView {
+    let choice = engine::cloud_topup_choice();
+    CloudTopUpView {
+        choice: match choice {
+            engine::CloudTopUpChoice::Enabled => "enabled".into(),
+            engine::CloudTopUpChoice::Disabled => "disabled".into(),
+            engine::CloudTopUpChoice::NotChosen => "not_chosen".into(),
+        },
+        enabled: choice.is_enabled(),
+        needs_consent: choice.needs_consent_prompt(),
+    }
+}
+
+#[tauri::command]
+fn local_llm_stop_cmd() {
+    engine::local_llm::stop_own_server();
+}
+
+/// 手動刪除本地模型檔案（models／runtime 兩個子目錄）。這是同步阻塞的檔案 I/O，
+/// 放到背景執行緒跑，避免刪除大檔案時卡住 UI 執行緒。
+#[tauri::command]
+async fn local_llm_delete_cmd(install_dir: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::local_llm::delete_local_model(install_dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("刪除執行緒失敗：{e}"))?
 }
 
 /// 自動尋找本機 CTE2 全翻參考包路徑（給 UI 預填）
@@ -4124,10 +6251,10 @@ async fn download_cfpa_reference_pack(
     let dest = if let Some(d) = dest_dir.filter(|s| !s.trim().is_empty()) {
         normalize_path_strict(&d)?
     } else {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
-            .join("modpack-i18n-tool")
-            .join("cfpa-cache")
+        // 跟其餘子系統一樣統一走可攜式根（見 engine::paths）；這裡每次都用帶時間戳的
+        // 新檔名下載（見 try_download_cfpa_pack），本來就不重用舊檔，搬預設路徑沒有
+        // 殘留資料要顧慮。
+        engine::paths::resolve_file(Path::new("cfpa-cache"))
     };
     let path = tauri::async_runtime::spawn_blocking(move || try_download_cfpa_pack(&version, &dest))
         .await
@@ -4141,8 +6268,30 @@ async fn download_cfpa_reference_pack(
 #[tauri::command]
 fn get_ui_prefs() -> serde_json::Value {
     serde_json::json!({
-        "minimizeOnClose": get_minimize_on_close()
+        "minimizeOnClose": get_minimize_on_close(),
+        // 版本唯一真相源＝Cargo.toml。前端不得再硬編碼版本字串。
+        "appVersion": env!("CARGO_PKG_VERSION"),
     })
+}
+
+/// 套用前的前置檢查：這個實例的遊戲是不是還開著。
+///
+/// 回傳 `running`＝true 才擋；偵測不出來時 `known`＝false 且 `running`＝false（放行）。
+#[tauri::command]
+async fn is_game_running_cmd(instance_path: String) -> serde_json::Value {
+    let path = std::path::PathBuf::from(instance_path.trim());
+    let verdict = tauri::async_runtime::spawn_blocking(move || {
+        engine::game_process::is_game_running(&path)
+    })
+    .await
+    .unwrap_or(engine::game_process::GameRunning::Unknown);
+    let running = verdict.blocks_apply();
+    let (known, message) = match &verdict {
+        engine::game_process::GameRunning::Yes { detail } => (true, detail.clone()),
+        engine::game_process::GameRunning::No => (true, String::new()),
+        engine::game_process::GameRunning::Unknown => (false, String::new()),
+    };
+    serde_json::json!({ "running": running, "known": known, "message": message })
 }
 
 #[tauri::command]
@@ -4156,8 +6305,23 @@ fn set_ui_prefs(minimize_on_close: bool) -> Result<String, String> {
     })
 }
 
+/// 真正結束前必須做的收尾。
+///
+/// llama-server 是我們 spawn 出去的獨立行程，Windows 上不會隨父行程結束。舊版離開工具後
+/// 它會帶著數 GB 記憶體／VRAM 常駐，玩家回去玩遊戲會掉幀而且不知道原因。
+/// 前端在翻譯開始／結束時回報，讓關閉流程知道現在能不能直接退出。
+#[tauri::command]
+fn set_translation_active_cmd(active: bool) {
+    TRANSLATION_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+fn shutdown_side_processes() {
+    engine::local_llm::stop_own_server();
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    shutdown_side_processes();
     app.exit(0);
 }
 
@@ -4174,6 +6338,7 @@ async fn check_update() -> UpdateCheck {
             notes: String::new(),
             ok: false,
             message: "檢查更新時中斷。".into(),
+            test_build: false,
         })
 }
 
@@ -4182,7 +6347,7 @@ async fn check_update() -> UpdateCheck {
 async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
     let r = tauri::async_runtime::spawn_blocking(download_and_launch)
         .await
-        .map_err(|e| format!("工作中斷：{e}"))?;
+        .map_err(|e| describe_worker_failure(&e))?;
     match r {
         Ok(d) => {
             emit_log(&app, "info", &d.message);
@@ -4192,10 +6357,17 @@ async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
                 "launched": d.launched,
                 "automatic": d.automatic,
                 "shouldExit": should_exit,
+                "alreadyCurrent": d.already_current,
+                "current": d.current,
+                "latest": d.latest,
                 "message": d.message,
             });
             if should_exit {
                 UPDATE_EXITING.store(true, Ordering::SeqCst);
+                // 更新走 app.exit(0) 會繞過 quit_app，所以收尾要在這裡自己做一次：
+                // 不收的話舊版的 llama-server 變孤兒，繼續吃記憶體／顯示記憶體，
+                // 新版起來後還會跟它搶連接埠。
+                shutdown_side_processes();
                 let exit_app = app.clone();
                 std::thread::spawn(move || {
                     // ZeitFrei do_update：給 bat／子行程一點時間後 exit
@@ -4209,64 +6381,6 @@ async fn download_update(app: AppHandle) -> Result<serde_json::Value, String> {
             emit_error(&app, &e);
             Err(e)
         }
-    }
-}
-
-/// 回傳免費代管 AI 額度使用指示器所需資料（個人+共享）。
-#[tauri::command]
-async fn managed_ai_usage_cmd() -> ManagedAiUsageCmdResult {
-    let r = tauri::async_runtime::spawn_blocking(move || managed_ai_usage_impl()).await;
-    match r {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => ManagedAiUsageCmdResult {
-            ok: false,
-            error_type: Some("usage_request_failed".into()),
-            message: Some(e),
-            day: None,
-            user_spent: None,
-            user_budget: None,
-            shared_spent: None,
-            shared_budget: None,
-            reset_at_utc: None,
-            shared_period: None,
-            shared_reset_at_utc: None,
-        },
-        Err(e) => ManagedAiUsageCmdResult {
-            ok: false,
-            error_type: Some("usage_worker_join_failed".into()),
-            message: Some(format!("{e}")),
-            day: None,
-            user_spent: None,
-            user_budget: None,
-            shared_spent: None,
-            shared_budget: None,
-            reset_at_utc: None,
-            shared_period: None,
-            shared_reset_at_utc: None,
-        },
-    }
-}
-
-/// GP 點數獎勵 claim：回饋額度（若已領過會回 alreadyClaimed）。
-#[tauri::command]
-async fn managed_ai_gp_reward_cmd() -> ManagedAiGpRewardCmdResult {
-    let r = tauri::async_runtime::spawn_blocking(move || managed_ai_gp_reward_impl()).await;
-    match r {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => ManagedAiGpRewardCmdResult {
-            ok: false,
-            already_claimed: None,
-            granted: None,
-            error_type: Some("gp_reward_request_failed".into()),
-            message: Some(e),
-        },
-        Err(e) => ManagedAiGpRewardCmdResult {
-            ok: false,
-            already_claimed: None,
-            granted: None,
-            error_type: Some("gp_reward_worker_join_failed".into()),
-            message: Some(format!("{e}")),
-        },
     }
 }
 
@@ -4305,6 +6419,62 @@ fn open_glossary() -> Result<String, String> {
     let path = ensure_user_glossary_template().unwrap_or_else(user_glossary_path);
     open::that(&path).map_err(|e| format!("無法開啟術語表：{e}"))?;
     Ok(path.display().to_string())
+}
+
+/// 選用：把「用詞不一致建議.json」的 preferred 併入使用者術語表（預設不覆蓋既有鍵）。
+#[tauri::command]
+fn merge_consistency_suggestions_cmd(
+    suggestions_path: Option<String>,
+    work_root: Option<String>,
+    overwrite: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let path = if let Some(p) = suggestions_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        PathBuf::from(p)
+    } else if let Some(root) = work_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        consistency_suggestions_path(Path::new(root))
+    } else {
+        return Err("請提供建議檔路徑或翻譯結果資料夾。".into());
+    };
+    if !path.is_file() {
+        return Err("找不到用詞不一致建議檔。請先完成一輪翻譯／補翻，讓結果資料夾產生「用詞不一致建議.json」。".into());
+    }
+    let (added, glossary) =
+        merge_consistency_suggestions(&path, overwrite.unwrap_or(false))?;
+    Ok(serde_json::json!({
+        "added": added,
+        "glossaryPath": glossary.display().to_string(),
+        "suggestionsPath": path.display().to_string(),
+        "message": format!("已併入 {added} 條建議譯名到術語表（未自動改遊戲譯文）。"),
+    }))
+}
+
+/// 查結果資料夾是否有用詞不一致建議檔（供前端顯示按鈕）。
+#[tauri::command]
+fn consistency_suggestions_status_cmd(work_root: String) -> Result<serde_json::Value, String> {
+    let root = PathBuf::from(work_root.trim());
+    if root.as_os_str().is_empty() {
+        return Ok(serde_json::json!({ "exists": false, "count": 0, "path": "" }));
+    }
+    match consistency_suggestions_status(&root) {
+        Some((path, count)) => Ok(serde_json::json!({
+            "exists": true,
+            "count": count,
+            "path": path.display().to_string(),
+        })),
+        None => Ok(serde_json::json!({
+            "exists": false,
+            "count": 0,
+            "path": root.join("用詞不一致建議.json").display().to_string(),
+        })),
+    }
 }
 
 /// 舊版相容的一鍵套用命令：依玩家選擇備份後，再複製翻譯結果內容。
@@ -4369,7 +6539,7 @@ async fn apply_translation_to_game(
         r
     })
     .await
-    .map_err(|e| format!("工作中斷：{e}"))?;
+    .map_err(|e| describe_worker_failure(&e))?;
     result
 }
 
@@ -4378,6 +6548,9 @@ pub fn run() {
     // 啟動時載入偏好；清自動更新殘留（ZeitFrei run() 開頭同款）
     MINIMIZE_ON_CLOSE.store(get_minimize_on_close(), Ordering::Relaxed);
     cleanup_update_residuals();
+    // 舊版設定鍵升到新結構；可重入，已遷移就跳過，失敗不擋啟動
+    engine::migrate::run_startup_migration();
+    crate::engine::nanazip_ensure::ensure_in_background();
 
     let mut builder = tauri::Builder::default();
     // 單實例須最先註冊；第二次啟動會聚焦既有視窗（跨版本互斥由同一 identifier 達成）
@@ -4403,13 +6576,25 @@ pub fn run() {
                 }
                 if MINIMIZE_ON_CLOSE.load(Ordering::Relaxed) {
                     api.prevent_close();
-                    let _ = window
-                        .dialog()
-                        .message("工具已縮到背景，翻譯工作會繼續執行。要完全結束工具，請取消勾選「關閉視窗時縮到背景」後再關閉。")
-                        .title("模組包翻譯工具")
-                        .kind(MessageDialogKind::Info)
-                        .blocking_show();
+                    // 只在第一次縮到背景時解釋一次。舊版每按一次 X 就彈一個 blocking 對話框，
+                    // 使用者按第三次以後只覺得工具在擋路。
+                    if !MINIMIZE_HINT_SHOWN.swap(true, Ordering::Relaxed) {
+                        let _ = window
+                            .dialog()
+                            .message("工具已縮到背景，翻譯工作會繼續執行。要完全結束工具，請用畫面右下角的「離開」，或到設定取消勾選「關閉時縮到背景」。\n\n這個提醒只會出現這一次。")
+                            .title("模組包翻譯工具")
+                            .kind(MessageDialogKind::Info)
+                            .blocking_show();
+                    }
                     let _ = window.minimize();
+                } else if TRANSLATION_ACTIVE.load(Ordering::Relaxed) {
+                    // 翻譯進行中：不能說關就關。先擋下來，讓前端問使用者，
+                    // 並在使用者確認要離開時把進度與紀錄落檔後才呼叫 quit_app。
+                    api.prevent_close();
+                    let _ = window.emit("close-requested-while-busy", ());
+                } else {
+                    // 真的要關了：先收掉自己 spawn 的子行程。
+                    shutdown_side_processes();
                 }
             }
         })
@@ -4425,15 +6610,39 @@ pub fn run() {
             write_text_file,
             open_url,
             open_guide_window,
+            open_settings_window,
+            focus_main_window,
         create_share_package,
             has_shareable_translation_cmd,
+            probe_local_pack_cache_cmd,
             upload_share_package_cmd,
             inspect_translation_helper_cmd,
             prepare_translation_helper_cmd,
             cleanup_translation_helper_cmd,
             managed_output_base,
         managed_output_for_instance,
+        managed_output_for_instance_with_base,
         delete_result_folder_cmd,
+        failed_items_csv_cmd,
+        import_translations_cmd,
+        verify_resource_packs_cmd,
+        repair_resource_packs_cmd,
+        set_translation_active_cmd,
+        set_remember_api_key_cmd,
+        write_run_journal_cmd,
+        list_run_journals_cmd,
+        data_root_info_cmd,
+        migrate_data_root_cmd,
+        next_result_dir_cmd,
+        read_app_settings_cmd,
+        read_app_settings_report_cmd,
+        patch_app_settings_cmd,
+        clear_api_key_cmd,
+        app_settings_path_cmd,
+        dev_mode_status_cmd,
+        dev_mode_set_cmd,
+        check_write_access_cmd,
+        relaunch_as_admin_cmd,
             check_install_target,
             validate_instance_cmd,
             create_font_pack,
@@ -4445,6 +6654,21 @@ pub fn run() {
             set_ai_mode_cmd,
             has_api_key,
             ai_status,
+            local_llm_probe_cmd,
+            local_llm_install_cmd,
+            local_llm_status_cmd,
+            local_llm_ensure_ready_cmd,
+            cloud_topup_choice_cmd,
+            local_llm_stop_cmd,
+            local_llm_delete_cmd,
+            is_game_running_cmd,
+            suggest_output_dir,
+            gpt_login,
+            cancel_gpt_login_cmd,
+            gpt_auth_status_cmd,
+            gpt_logout_cmd,
+            get_gpt_model_cmd,
+            set_gpt_model_cmd,
             discord_login,
             cancel_discord_login_cmd,
             discord_auth_status,
@@ -4466,14 +6690,15 @@ pub fn run() {
             diagnose_error_text,
             restore_last_apply_cmd,
             submit_diagnose_report_cmd,
+            submit_issue_report_cmd,
             delete_apply_backups_cmd,
             has_apply_backups_cmd,
             check_update,
             download_update,
-            managed_ai_usage_cmd,
-            managed_ai_gp_reward_cmd,
             submit_usage_feedback_cmd,
             open_glossary,
+            merge_consistency_suggestions_cmd,
+            consistency_suggestions_status_cmd,
             suggest_resourcepacks_dir,
             suggest_output_dir
         ])

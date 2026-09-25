@@ -536,18 +536,12 @@ fn is_owned_mod_path(minecraft_dir: &Path, candidate: &Path) -> bool {
     }
 }
 
-fn app_data_root() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("modpack-i18n-tool"))
-}
-
 fn helper_state_path(output_dir: &Path) -> PathBuf {
     let key = output_dir
         .to_string_lossy()
         .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
-    app_data_root()
-        .unwrap_or_else(|| output_dir.to_path_buf())
-        .join("helper-state")
-        .join(format!("{key}.json"))
+    let rel = Path::new("helper-state").join(format!("{key}.json"));
+    super::paths::resolve_file(&rel)
 }
 
 fn state_paths(output_dir: &Path) -> Vec<PathBuf> {

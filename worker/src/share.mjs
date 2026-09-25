@@ -451,13 +451,24 @@ export async function shareMpuCreate(request, env, userId, nowSec = Math.floor(D
   });
 }
 
-export async function shareMpuPart(request, env, url) {
+async function verifyShareMpuOwner(env, uploadId, key, userId) {
+  if (!env?.USAGE) return { ok: true };
+  const tracked = parseJson(await env.USAGE.get(shareMpuKey(uploadId)), null);
+  if (!tracked || tracked.userId !== userId || tracked.key !== key) {
+    return { ok: false, status: 403, error: "forbidden" };
+  }
+  return { ok: true, tracked };
+}
+
+export async function shareMpuPart(request, env, url, userId) {
   const key = String(url.searchParams.get("key") || "");
   const uploadId = String(url.searchParams.get("uploadId") || "");
   const partNumber = parseInt(url.searchParams.get("partNumber") || "0", 10);
   if (!key.startsWith(SHARE_PREFIX) || !uploadId || !Number.isFinite(partNumber) || partNumber < 1 || partNumber > 10000) {
     return shareJson({ error: "bad multipart part params" }, 400);
   }
+  const owner = await verifyShareMpuOwner(env, uploadId, key, userId);
+  if (!owner.ok) return shareJson({ error: owner.error }, owner.status);
   const declared = parseInt(request.headers.get("content-length") || "0", 10);
   if (!Number.isFinite(declared) || declared <= 0) return shareJson({ error: "content length required" }, 411);
   if (declared > 90 * 1024 * 1024) return shareJson({ error: "part too large" }, 413);
@@ -489,6 +500,8 @@ export async function shareMpuComplete(request, env, userId, nowSec = Math.floor
     return shareJson({ error: "bad multipart complete params" }, 400);
   }
   if (!key.includes(token)) return shareJson({ error: "token/key mismatch" }, 400);
+  const owner = await verifyShareMpuOwner(env, uploadId, key, userId);
+  if (!owner.ok) return shareJson({ error: owner.error }, owner.status);
   if (parts.length < 1) return shareJson({ error: "parts required" }, 400);
   const normalized = [];
   for (const p of parts) {
@@ -592,7 +605,7 @@ export function renderShareLanding(url, env, token, object, expiresAt) {
     String(object.httpMetadata?.contentType || "").includes("executable");
   const password = String(object.customMetadata?.password || (isExe ? "cloud.zeitfrei.uk" : ""));
   const bodyCopy = isExe
-    ? "<p>這是帶密碼的自解 exe。下載後執行，輸入下方密碼解壓，並<strong>選擇 Minecraft 遊戲資料夾</strong>，翻譯會自動套用（對齊工具套用流程）。套用後請重開遊戲，語言選繁體中文（台灣）並啟用資源包。</p>" +
+    ? "<p>這是帶密碼的自解 exe。接收端請依序：</p><ol><li>下載並執行，輸入下方密碼解壓</li><li>選擇<strong>整合包實例根目錄</strong>（需含 <code>mods</code> 或 <code>resourcepacks</code>；Prism 多實例勿選錯）</li><li>完全關閉遊戲後重開，語言選繁體中文（台灣）</li><li>資源包列表<strong>只啟用包內一個</strong>「模組包翻譯工具+*」zip</li></ol><p>勿只手動拖 zip 到子資料夾；Flame 等啟動器可能還原 config，請以自解腳本套用為準。</p>" +
       "<p>解壓密碼：<strong>" +
       escapeHtml(password) +
       "</strong></p>"
@@ -621,7 +634,7 @@ export function renderShareLanding(url, env, token, object, expiresAt) {
     "<p>有效期限：<strong>" + escapeHtml(expires) + "</strong></p>",
     "<a class=\"button\" href=\"" + escapeHtml(downloadUrl) + "\">" + (isExe ? "下載自解翻譯檔" : "下載翻譯檔") + "</a>",
     "<div><a class=\"secondary\" href=\"https://discord.gg/zeitfrei\" target=\"_blank\" rel=\"noopener\">加入 Discord 官方伺服器</a>",
-    "<a class=\"secondary\" href=\"https://zeitfrei.bobaboba.me\" target=\"_blank\" rel=\"noopener\">支持開發 · 讓免費 AI 持續運作</a>",
+    "<a class=\"secondary\" href=\"https://zeitfrei.bobaboba.me\" target=\"_blank\" rel=\"noopener\">支持開發</a>",
     "<a class=\"secondary\" href=\"https://cloud.zeitfrei.uk/\" target=\"_blank\" rel=\"noopener\">ZeitFrei 雲端</a></div>",
     "<footer>模組包翻譯工具 · 24 小時分享連結</footer>",
     "</article></main></body></html>",

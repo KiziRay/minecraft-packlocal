@@ -17,6 +17,7 @@ import {
   shareDownload,
   shareMpuComplete,
   shareMpuCreate,
+  shareMpuPart,
   shareOgImage,
   shareUpload,
 } from "../src/share.mjs";
@@ -187,7 +188,7 @@ test("分享連結先顯示可嵌入的介紹頁，下載需明確指定", () =>
   assert.match(shareSource, /zeitfrei\.bobaboba\.me/);
   assert.match(shareSource, /cloud\.zeitfrei\.uk/);
   assert.match(shareSource, /解壓密碼/);
-  assert.match(shareSource, /選擇 Minecraft/);
+  assert.match(shareSource, /Minecraft 實例/);
   assert.match(shareSource, new RegExp(SHARE_OG_TITLE));
   assert.match(shareSource, new RegExp(SHARE_OG_DESCRIPTION));
 });
@@ -310,7 +311,7 @@ test("落地頁 OG 標題與副標固定，包名在次要列", async () => {
   assert.match(html, /讓模組包翻譯不再困難/);
   assert.match(html, /包名：測試包/);
   assert.match(html, /解壓密碼/);
-  assert.match(html, /選擇 Minecraft/);
+  assert.match(html, /整合包實例根目錄/);
 });
 
 test("OG 圖同步主標與副標", async () => {
@@ -351,6 +352,38 @@ test("有 USAGE 時 MPU 完成回短碼 URL", async () => {
   assert.equal(complete.status, 200);
   const done = await complete.json();
   assert.match(done.url, /^https:\/\/modpack-i18n\.jolin34563\.workers\.dev\/s\/[A-Za-z0-9]{8}$/);
+});
+
+test("MPU part 驗 upload 歸屬，其他 user 不能補片", async () => {
+  const now = 1_700_000_000;
+  const env = {
+    USAGE: mockUsage(),
+    SHARES: mockShares(),
+    SHARE_DAILY_LIMIT: "3",
+    SHARE_ACTIVE_LIMIT: "2",
+  };
+  const created = await shareMpuCreate(
+    jsonRequest("https://example/api/share/mpu-create", { name: "測", kind: "zip", size: 100, contentType: "application/zip" }),
+    env,
+    "user-owner",
+    now
+  );
+  const body = await created.json();
+  const url = new URL(`https://example/api/share/mpu-part?key=${encodeURIComponent(body.key)}&uploadId=${encodeURIComponent(body.uploadId)}&partNumber=1`);
+  const forbidden = await shareMpuPart(
+    jsonRequest(url.toString(), "PK", { "content-length": "2" }),
+    env,
+    url,
+    "user-other"
+  );
+  assert.equal(forbidden.status, 403);
+  const ok = await shareMpuPart(
+    jsonRequest(url.toString(), "PK", { "content-length": "2" }),
+    env,
+    url,
+    "user-owner"
+  );
+  assert.equal(ok.status, 200);
 });
 
 test("沒有 USAGE 時 MPU 完成仍回長 token URL", async () => {

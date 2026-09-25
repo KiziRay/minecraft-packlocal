@@ -62,25 +62,12 @@ test("tryIncrementUsageKv 寫前再讀，超過 maxTotal 拒絕", async () => {
   assert.equal(blocked.spent, 100);
 });
 
-test("proxyChat 使用 WEEKLY_SHARED_TOKEN_BUDGET 與 usage:shared key", () => {
+test("Worker 不再代理免費代管 chat 或額度 API", () => {
   const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
-  const start = src.indexOf("async function proxyChat");
-  const end = src.indexOf("async function authorizeManagedAi", start);
-  const body = src.slice(start, end);
-  assert.match(body, /WEEKLY_SHARED_TOKEN_BUDGET/);
-  assert.match(body, /sharedUsageKey\(week\)/);
-  assert.match(body, /managed shared weekly quota exhausted/);
-  assert.doesNotMatch(body, /env\.DAILY_TOKEN_BUDGET/);
-  assert.match(body, /tryIncrementUsageKv/);
-});
-
-test("managedUsage 回傳 sharedPeriod／sharedWeek／sharedResetAtUtc", () => {
-  const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
-  const start = src.indexOf("async function managedUsage");
-  const end = src.indexOf("/** 個人今日總額度", start);
-  const body = src.slice(start, end);
-  assert.match(body, /sharedPeriod:\s*"week"/);
-  assert.match(body, /sharedWeek:\s*week/);
-  assert.match(body, /sharedResetAtUtc/);
-  assert.match(body, /userPeriod:\s*"day"/);
+  assert.doesNotMatch(src, /async function proxyChat/);
+  assert.doesNotMatch(src, /async function managedUsage/);
+  assert.doesNotMatch(src, /\/v1\/chat\/completions/);
+  assert.doesNotMatch(src, /\/api\/managed\/usage/);
+  assert.match(src, /sharedUsageKey/);
+  assert.match(src, /tryIncrementUsageKv/);
 });

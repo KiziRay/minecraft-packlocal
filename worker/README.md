@@ -1,8 +1,8 @@
-# worker — AI 代理 + 免安裝版更新端點
+# worker — 更新、分享、共享庫
 
 Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 
-目前設定以工具 **0.3.0** 為目標。代管 AI 門檻為 **Discord 會員**（Turnstile 已停用）；協定 v3 標頭仍要，舊版會收到 426。
+免費代管 AI 已移除。Discord 會籍仍用於分享、診斷回報與後續本地模型檔下載。協定 v3 標頭仍要，舊版會收到 426。
 
 ## 端點
 
@@ -13,11 +13,9 @@ Cloudflare Worker，已部署：`https://modpack-i18n.jolin34563.workers.dev`
 | POST | `/api/turnstile/start` | 驗證 Discord 後簽發五分鐘挑戰網址 |
 | GET | `/turnstile` | 顯示 Cloudflare Turnstile widget |
 | POST | `/api/turnstile/verify` | 呼叫 Siteverify，成功後回傳短效 HMAC 憑證到本機 callback |
-| POST | `/v1/chat/completions` | AI 代理：驗證 Discord 後轉發上游 |
 | POST | `/tm/lookup` | 社群共享翻譯記憶查詢（精確鍵＋帶語境的跨模組候選） |
-| POST | `/tm/contribute` | 貢獻翻譯；存獨立 `TRANSLATIONS` R2 的 `tm/v1/<ns>.json.gz` 與 `tm/v2/global.json.gz` |
 | POST | `/glossary/lookup` | 查詢已確認、無衝突的共享術語 |
-| POST | `/glossary/contribute` | 貢獻依整合包分類的術語；重複去除、衝突停用 |
+| POST | `/glossary/contribute` | 貢獻依整合包分類的術語 |
 | POST | `/api/share/upload` | 登入 Discord 後上傳可安裝翻譯自解檔到獨立 `SHARES` bucket |
 | POST | `/api/share/mpu-create` | 大檔 multipart 初始化（需 Discord） |
 | PUT | `/api/share/mpu-part` | 上傳分塊 |

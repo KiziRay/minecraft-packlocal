@@ -1,4 +1,4 @@
-//! Uploads the NanaZip self-extracting share package to the isolated share API.
+//! Uploads the self-extracting share package to the isolated share API.
 //!
 //! 一律走 R2 multipart（create → part×N → complete），繞過 Worker 單次 body ≈100MB。
 //! 軟頂見 [`SHARE_MAX_UPLOAD_BYTES`]（4GiB）。

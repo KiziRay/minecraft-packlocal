@@ -1,15 +1,19 @@
-name = "modpack-i18n"
+﻿name = "modpack-i18n"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 
 # 桌面版更新資訊（非機密，改版時直接改這裡再 deploy）。
 # 客戶端打 /api/desktop/latest 比對版本。
 [vars]
-LATEST_VERSION = "1.0.5"
+LATEST_VERSION = "1.0.8.11"
 # 免安裝 EXE 直連。由本 Worker 的 /download 路由從 R2 串流。改版時同步更新。
-# SHA 等產 MCPL-1.0.5.exe 並上傳 R2 後再填 UPDATE_SHA256。
-DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.5.exe"
-RELEASE_NOTES = "只有港繁的模組不再被誤判已翻完；港繁會先轉成台灣用語再補缺；已是台灣繁中的字不再被重複轉換；術語表改為分級，減少誤改介面用語；覆蓋報告可分開看出完成、港繁提示與仍待譯；共享免費額度改為每週 1000 萬；個人每日額度維持 50 萬，按 GP 後 100 萬且不必看影片；回饋改成兩步短選擇題，較不打擾；筆電介面預設不再自動縮太小；右上「⋯」可調整外觀與介面大小；翻譯進行中按 F5 或 Ctrl+R 不會誤中斷；加強登入與免費額度防盜用防超用；更新檔驗證與本機設定保護更嚴；更新完成後會自動重新開啟（與 ZeitFrei 工具箱相同作法）；舊版 1.0.3 請改用本版更新"
+# SHA 等產 MCPL-1.0.8.exe 並上傳 R2 後再填 UPDATE_SHA256（檔名永遠三段式）。
+DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.8.exe"
+# 與 DOWNLOAD_URL 相同即可；resolveDesktopDownloadUrl 會強制使用三段式檔名。
+LEGACY_DOWNLOAD_URL = "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.8.exe"
+RELEASE_NOTES = "熱修：文件委派保底主按鈕；接線提前避開 syncUiState 中斷；清除 z-index 戰；縮放統一走 html zoom"
+RELEASE_NOTES_EXTRA = ""
+UPDATE_BUILD_ID = "1.0.8.11"
 # 上游 AI 服務（OpenAI 相容）。金鑰用 secret，不寫這裡。
 UPSTREAM_BASE = "https://api.deepseek.com"
 UPSTREAM_MODEL = "deepseek-v4-flash"
@@ -28,9 +32,14 @@ WEEKLY_SHARED_TOKEN_BUDGET = "10000000"
 PER_USER_DAILY_TOKEN_BUDGET = "500000"
 # 巴哈姆特 GP 加成：寫入 gp_reward:{userId} 後個人今日總額度 += 此值。
 GP_REWARD_BONUS = "500000"
+# 共享庫貢獻免 Discord；有有效 session 用 user 桶，否則用 IP 桶。
+CONTRIBUTE_USER_DAILY_LIMIT = "120"
+CONTRIBUTE_IP_DAILY_LIMIT = "40"
+# lookup 輕量節流（每 IP／分鐘）；只保護 R2/KV，不作身分門檻。
+LOOKUP_IP_MINUTE_LIMIT = "240"
 
 # 免安裝 EXE 的 sha256（建置並上傳後填；客戶端會驗證，不符或留空都不啟動）。
-UPDATE_SHA256 = "DFCDD88761B4B4B39EFB6D252F5AE2B9FEB416CE5848D94DD19E246640B98821"
+UPDATE_SHA256 = "c4c33ca3586f9e2a0ced727d3bd88f3b8890b8af7615c443cd7630caaae560cf"
 
 # 分享檔專用資料區。這個 bucket 不可與 DOWNLOADS 共用。
 SHARE_PUBLIC_URL = "https://modpack-i18n.jolin34563.workers.dev"
@@ -53,6 +62,11 @@ bucket_name = "modpack-i18n-shares"
 binding = "TRANSLATIONS"
 bucket_name = "modpack-i18n-translations"
 
+# 本地模型 GGUF／runtime zip。禁止與 SHARES（24h 清理）或 DOWNLOADS（正式 EXE）混放。
+[[r2_buckets]]
+binding = "LOCAL_LLM"
+bucket_name = "modpack-i18n-local-llm"
+
 [triggers]
 crons = ["0 * * * *"]
 
@@ -65,7 +79,15 @@ id = "9418f0bb99d94270a43c703a241ee227"
 # DEEPSEEK_KEY 用 secret 設定，不進版控：
 #   npx wrangler secret put DEEPSEEK_KEY
 # DISCORD_REPORT_WEBHOOK 只放 secret，永不寫入本檔或 git。
+#   用於 report.mjs 的「診斷回報」功能（純文字訊息，見 notifyDiscord()）。
+# DISCORD_ISSUE_THREAD_WEBHOOK：頁尾「問題回報」（issue-thread.mjs）專用，建議指向
+#   獨立的 Discord 論壇頻道，讓每則回報變成一則獨立討論串。沒設定時會退回沿用
+#   DISCORD_REPORT_WEBHOOK，但那個頻道是給純文字訊息用的，多半不是論壇頻道，
+#   帶 thread_name 會被 Discord 拒絕（400）。一般訊息不算討論串成功，玩家會看到通道未接通。
+#   Discord webhook 在 API 層級無法建立「私人」討論串（那是 bot token 才有的權限）；
+#   要讓討論串只有幕僚看得到，需要在 Discord 伺服器把該論壇頻道的權限設成幕僚限定。
 # DISCORD_FEEDBACK_WEBHOOK：匿名回饋送出用
 # DISCORD_JOIN_WEBHOOK：會員驗證成功後 Discord 公告（secret only，每 user／日防刷）
 # DISCORD_TOOL_UPDATE_WEBHOOK：每次新版本部署通知用
+# BOT_API_URL、BOT_API_SECRET：轉發頁尾回報到 Azatosz /api/contact-staff（secret only，不寫 [vars]）
 # TURNSTILE_SECRET_KEY、TURNSTILE_PROOF_SECRET 也只能用 secret 設定，不能寫入本檔。

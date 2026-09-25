@@ -227,8 +227,10 @@ where
 
     if !map.is_empty() {
         on_progress(82, "任務：簡體→台灣繁體…");
+        // keys 與 vals 必須同序：同一個 map 連續兩次疊代保證順序一致，
+        // 直接取 values 也免掉一次查表與 unwrap。
         let keys: Vec<String> = map.keys().cloned().collect();
-        let vals: Vec<String> = keys.iter().map(|k| map.get(k).unwrap().clone()).collect();
+        let vals: Vec<String> = map.values().cloned().collect();
         let conv = convert_s2tw_batch(&vals);
         for (i, k) in keys.iter().enumerate() {
             if let Some(v) = conv.get(i) {

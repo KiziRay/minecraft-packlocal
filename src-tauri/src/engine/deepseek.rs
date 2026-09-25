@@ -17,19 +17,23 @@ use std::time::{Duration, Instant};
 
 use super::cancel;
 use super::cancel::CANCEL_MESSAGE;
+use super::codex_chat::{self, CODEX_RESPONSES_URL};
 use super::discord_auth::managed_ai_session_cookie;
+use super::eligibility;
 use super::glossary::{self, Glossary, TermConsistencyStats};
 use super::jar_scan::LangMap;
 use super::mech_tokens::{is_ascii_enum_token, is_bracket_meta_token, is_poisoned_mech_translation, is_resource_path_token};
+use super::local_quality;
 use super::placeholder::{self, GuardStats};
+use super::sentence_split;
 use super::shared_glossary;
 use super::shared_tm;
 use super::secrets::{
-    api_chat_completions_url, get_ai_mode, resolve_ai_config, AiProvider, MaxTokensField,
-    ProviderCapabilities,
+    api_chat_completions_url, get_ai_mode, resolve_ai_config, resolve_cloud_fallback_config,
+    AiProvider, MaxTokensField, ProviderCapabilities,
 };
-use super::translation_quality::is_usable_zh;
-use super::tm::Tm;
+use super::translation_quality::{is_usable_zh, quality_fail_reason, QualityFailReason};
+use super::tm::{Tm, TmSaveGuard};
 use super::translation_mode::TranslationQuality;
 use super::translation_scope::TranslationScope;
 use super::turnstile::MANAGED_AI_PROTOCOL;
@@ -55,6 +59,8 @@ const NAME_MAX_CHARS: usize = 48;
 const UI_MAX_CHARS: usize = 200;
 const SOLO_MIN_CHARS: usize = 2000;
 const STORY_MIN_CHARS: usize = 200;
+/// 每次開始翻譯前唯一送出的最小真實翻譯。它只活在記憶體，絕不進 LangMap、TM 或共享庫。
+const AI_TRANSLATION_PROBE_SOURCE: &str = "Iron Sword";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AiUsageTotals {
@@ -88,7 +94,7 @@ impl AiUsageTotals {
 
     fn inline_note(&self) -> String {
         format!(
-            "token 命中 {}／未命中 {}／輸出 {}",
+            "用量命中 {}／未命中 {}／輸出 {}",
             self.prompt_cache_hit_tokens, self.prompt_cache_miss_tokens, self.completion_tokens
         )
     }
@@ -113,22 +119,27 @@ fn remember_placeholder_rejection(source: &str) {
 }
 
 /// 把語言表已譯字串寫進本機 TM，供 ZIP／覆寫／任務共用（0.3.8）。
-pub fn seed_tm_from_langmaps(en_only: &LangMap, zh: &LangMap) -> usize {
+/// `en` 應為掃描時的英文目錄（勿用已被 subtract 的 pending）。
+pub fn seed_tm_from_langmaps(en: &LangMap, zh: &LangMap) -> usize {
     let mut tm = Tm::load();
     let mut seeded = 0usize;
-    for (ns, en_map) in en_only {
+    for (ns, en_map) in en {
         let Some(zh_map) = zh.get(ns) else {
             continue;
         };
-        for (key, en) in en_map {
+        for (key, en_val) in en_map {
             let Some(zh_val) = zh_map.get(key) else {
                 continue;
             };
-            if !is_usable_zh(en, zh_val) {
+            if !is_usable_zh(en_val, zh_val) {
                 continue;
             }
-            if placeholder::is_compatible(en, zh_val) {
-                tm.insert(en, zh_val);
+            if placeholder::is_compatible(en_val, zh_val) {
+                let ctx = context_hint(key);
+                match ctx {
+                    Some(c) => tm.insert_with_context(en_val, zh_val, Some(c)),
+                    None => tm.insert(en_val, zh_val),
+                };
                 seeded += 1;
             }
         }
@@ -142,15 +153,31 @@ pub fn seed_tm_from_langmaps(en_only: &LangMap, zh: &LangMap) -> usize {
 pub struct AiFillReport {
     /// 實際寫進語言表的條數
     pub filled: usize,
+    /// 本機術語表（user／builtin Enforce）exact 命中
     pub glossary_hits: usize,
     pub tm_hits: usize,
     /// 社群共享翻譯記憶命中（免送 AI）
     pub shared_hits: usize,
+    /// 社群共享術語命中
+    pub shared_glossary_hits: usize,
     pub ai_translated: usize,
     /// 佔位符壞掉、已退回原文（含嚴格上限外略過）
     pub rejected: usize,
     /// guard 通過但品質閘未過，保留英文、不送嚴格重試
     pub quality_skipped: usize,
+    /// 品質失敗細因累計（與 quality_skipped 對齊；僅量測，不改判定）
+    pub quality_still_english: usize,
+    pub quality_mixed_fragment: usize,
+    pub quality_same_as_source: usize,
+    /// 本地小模型退化輸出的細因（重複迴圈／截斷／旁白／數字漂移／加油添醋）
+    pub local_degenerate: Vec<(&'static str, usize)>,
+    /// AI 這一層不可用的原因（`None` ＝ AI 正常跑過）。
+    ///
+    /// 有值代表「資料層有結果、但 AI 沒跑成」——呼叫端必須把這一層算成
+    /// **部分完成**，不可以當成完成。這是「宣稱完成卻整段沒翻」的防線。
+    pub ai_unavailable: Option<String>,
+    /// 具體因品質失敗而暫緩的語言表項目；一般補充不會再次送出。
+    pub quality_deferred: LangMap,
     pub usage: AiUsageTotals,
     pub notes: Vec<String>,
 }
@@ -161,11 +188,19 @@ impl AiFillReport {
     }
 
     pub fn note(&self) -> String {
-        let free = self.glossary_hits + self.shared_hits + self.tm_hits;
+        let free = self.glossary_hits
+            + self.shared_hits
+            + self.shared_glossary_hits
+            + self.tm_hits;
         let denom = free + self.ai_translated;
         let mut parts = vec![format!(
-            "補譯 {} 條（術語表 {}、共享庫 {}、翻譯記憶 {}、AI {}）",
-            self.filled, self.glossary_hits, self.shared_hits, self.tm_hits, self.ai_translated
+            "補譯 {} 條（術語 {}、共享術語 {}、共享庫 {}、翻譯記憶 {}、AI {}）",
+            self.filled,
+            self.glossary_hits,
+            self.shared_glossary_hits,
+            self.shared_hits,
+            self.tm_hits,
+            self.ai_translated
         )];
         if denom > 0 {
             let pct = (free * 100) / denom;
@@ -173,9 +208,23 @@ impl AiFillReport {
         }
         if self.quality_skipped > 0 {
             parts.push(format!(
-                "{} 條因品質未過保留英文",
-                self.quality_skipped
+                "品質未過略過 {} 句（未寫入；{} {}／{} {}／{} {}）",
+                self.quality_skipped,
+                QualityFailReason::StillEnglish.label_zh(),
+                self.quality_still_english,
+                QualityFailReason::MixedFragment.label_zh(),
+                self.quality_mixed_fragment,
+                QualityFailReason::SameAsSource.label_zh(),
+                self.quality_same_as_source
             ));
+        }
+        let deferred = self
+            .quality_deferred
+            .values()
+            .map(|map| map.len())
+            .sum::<usize>();
+        if deferred > 0 {
+            parts.push(format!("品質暫緩 {deferred} 條，本次不重送"));
         }
         if self.rejected > 0 {
             parts.push(format!("{} 條因佔位符不符退回原文", self.rejected));
@@ -196,12 +245,121 @@ enum CandidateClass {
     PlaceholderFail,
 }
 
-fn classify_candidate(source: &str, candidate: &str) -> (CandidateClass, Option<String>, GuardStats) {
+/// 非本地模型的分類（測試用的簡短寫法）。
+#[cfg(test)]
+fn classify_candidate(
+    source: &str,
+    candidate: &str,
+) -> (
+    CandidateClass,
+    Option<String>,
+    GuardStats,
+    Option<QualityFailReason>,
+) {
+    classify_candidate_for(source, candidate, false).0
+}
+
+/// 分類譯文，並在本地模型時多跑一輪小模型專屬的退化檢查。
+///
+/// 回傳 `(分類結果, 本地退化細因)`。細因只用來告訴使用者哪裡出問題，
+/// 判定本身仍走同一條 `QualityFail` 路徑。
+#[allow(clippy::type_complexity)]
+/// AI 送出前的三道前置檢查，全部收斂成一個 `Result`。
+///
+/// 抽出來是為了讓呼叫端能用 `match` 明確處理「失敗但不該中斷」，
+/// 而不是被三個散落的 `?` 悄悄丟掉已完成的工作。
+fn ai_preflight() -> Result<Engine, String> {
+    super::discord_auth::require_discord_guild_for_ai()?;
+    if get_ai_mode() == "local" {
+        if !crate::engine::local_llm::is_installed() {
+            return Err("尚未安裝本地模型。請先同意並完成偵測／下載。".into());
+        }
+        crate::engine::local_llm::ensure_ready_for_translate(None)?;
+    }
+    Engine::connect()
+}
+
+fn classify_candidate_for(
+    source: &str,
+    candidate: &str,
+    local: bool,
+) -> (
+    (
+        CandidateClass,
+        Option<String>,
+        GuardStats,
+        Option<QualityFailReason>,
+    ),
+    Option<local_quality::LocalIssue>,
+) {
     let mut stats = GuardStats::default();
-    match placeholder::guard(source, candidate, &mut stats) {
-        Some(safe) if is_usable_zh(source, &safe) => (CandidateClass::Accept, Some(safe), stats),
-        Some(_) => (CandidateClass::QualityFail, None, stats),
-        None => (CandidateClass::PlaceholderFail, None, stats),
+    let Some(safe) = placeholder::guard(source, candidate, &mut stats) else {
+        return ((CandidateClass::PlaceholderFail, None, stats, None), None);
+    };
+    if let Err(reason) = quality_fail_reason(source, &safe) {
+        return ((CandidateClass::QualityFail, None, stats, Some(reason)), None);
+    }
+    if !local {
+        return ((CandidateClass::Accept, Some(safe), stats, None), None);
+    }
+
+    // 以下是雲端大模型不需要的：小模型會吐出「看起來像正常中文」但實際壞掉的譯文
+    // （鬼打牆重複、話沒說完、數字被改掉）。既有三道閘門一道都攔不住。
+    //
+    // 處理順序刻意是「先修、再判嚴重性」：
+    //  1. 修得掉的（模型旁白）直接清乾淨，那通常就是正確答案
+    //  2. 修不掉的才看嚴重性——只有**會害到玩家**的才退回英文
+    let check = local_quality::check(source, &safe);
+    // 清乾淨的版本要重新過一次佔位符把關，不能因為「只是去掉開頭」就免檢
+    let text = match check.cleaned {
+        Some(cleaned) => match placeholder::guard(source, &cleaned, &mut stats) {
+            Some(ok) => ok,
+            None => safe.clone(),
+        },
+        None => safe.clone(),
+    };
+    let Some(issue) = check.issue else {
+        return ((CandidateClass::Accept, Some(text), stats, None), None);
+    };
+    // 話沒說完要不要擋，得看譯文本身還剩多少資訊，所以用 blocks_output_for
+    let blocks = issue.blocks_output_for(source, &text);
+    crate::dev_log!(
+        "quality",
+        "本地退化 {}（{}） | 原文長 {} / 譯文長 {} | 原文={:?} | 譯文={:?}",
+        issue.label_zh(),
+        if blocks { "退回英文並排進補完佇列" } else { "照樣採用" },
+        source.chars().count(),
+        text.chars().count(),
+        source.chars().take(80).collect::<String>(),
+        text.chars().take(80).collect::<String>()
+    );
+    if blocks {
+        return (
+            (CandidateClass::QualityFail, None, stats, None),
+            Some(issue),
+        );
+    }
+    // 不完美但資訊還在：照樣採用，只把問題記下來。
+    // 對看不懂英文的玩家來說，「話沒說完的中文」還是遠比「完整的英文」有用。
+    ((CandidateClass::Accept, Some(text), stats, None), Some(issue))
+}
+
+/// 累計本地退化細因，供最終報告告訴使用者「模型在哪裡出了什麼問題」。
+fn record_local_issue(report: &mut AiFillReport, issue: Option<local_quality::LocalIssue>) {
+    let Some(issue) = issue else { return };
+    let key = issue.label_zh();
+    match report.local_degenerate.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, count)) => *count += 1,
+        None => report.local_degenerate.push((key, 1)),
+    }
+}
+
+fn record_quality_fail(report: &mut AiFillReport, reason: Option<QualityFailReason>) {
+    match reason {
+        Some(QualityFailReason::StillEnglish) => report.quality_still_english += 1,
+        Some(QualityFailReason::MixedFragment) => report.quality_mixed_fragment += 1,
+        Some(QualityFailReason::SameAsSource) => report.quality_same_as_source += 1,
+        None => {}
     }
 }
 
@@ -217,34 +375,61 @@ fn split_strict_retry_cap(
     (items, overflow)
 }
 
+/// 品質失敗：不寫入譯文（維持 absent），只累加 `quality_skipped`。
+/// 佔位符失敗：寫回英文原文並負向快取，避免同輪重燒。
 fn keep_english_skip(
     translations: &mut HashMap<usize, String>,
     report: &mut AiFillReport,
     uid: usize,
     source: &str,
     placeholder: bool,
+    quality_reason: Option<QualityFailReason>,
 ) {
-    translations.insert(uid, source.to_string());
     if placeholder {
+        translations.insert(uid, source.to_string());
         remember_placeholder_rejection(source);
         report.rejected += 1;
     } else {
+        // 假英文不得進 langmap／資源包／TM；下次仍可補翻真缺
         report.quality_skipped += 1;
+        record_quality_fail(report, quality_reason);
     }
 }
 
 // ═══ 玩家向訊息 ═══════════════════════════════════════════════
 
-/// 給玩家看的額度／無回應說明（不提服務商名稱）
+/// 給玩家看的額度／驗證說明（不洩模型／主機名，依目前 AI 來源給下一步）
 fn ai_quota_support_message(detail: &str) -> String {
     let d = sanitize_provider_name(detail);
-    format!(
-        "【代管額度已用盡或金鑰無法使用】\n\
+    if d.contains("GPT") {
+        return ai_quota_support_message_for(detail, AiProvider::Codex, false);
+    }
+    ai_quota_support_message_for(detail, AiProvider::Deepseek, false)
+}
+
+fn ai_quota_support_message_for(detail: &str, provider: AiProvider, _managed: bool) -> String {
+    let d = sanitize_provider_name(detail);
+    if matches!(provider, AiProvider::Codex) {
+        return format!(
+            "【ChatGPT 暫時不能翻譯】\n\
 {d}\n\n\
-代管翻譯由開發者個人提供，不是無限額度。\n\
-額度用盡時代管不可用；共享庫與本機轉換仍可繼續。\n\
-可支持開發，或改用自訂 DeepSeek／相容端點（https://platform.deepseek.com）。\n\
-https://zeitfrei.bobaboba.me"
+這次 ChatGPT 不接受翻譯請求，可能是翻譯用量已達上限，也可能只是短時間內送出太多次；這不一定代表你平常聊天的額度用完了。\n\
+翻譯會消耗你的 ChatGPT 帳號額度，可以到 ChatGPT「設定 → 使用量」查看什麼時候重設。\n\
+工具在試翻時就停下來了，沒有寫入任何翻譯。請稍後再試、重新登入 ChatGPT，或改用自訂 API／本地模型。"
+        );
+    }
+    if matches!(provider, AiProvider::LocalLlm) {
+        return format!(
+            "【本地模型沒有回應】\n\
+{d}\n\n\
+請確認已完成本地模型安裝，且健康檢查已通過。速度隨這台電腦而異。"
+        );
+    }
+    format!(
+        "【自訂 API 額度或金鑰無法使用】\n\
+{d}\n\n\
+自訂 API 使用你填入服務商的金鑰與額度。\n\
+請到該服務商後台確認金鑰、餘額與速率限制；也可改用 GPT 或本地模型。"
     )
 }
 
@@ -634,7 +819,15 @@ where
                 continue;
             }
             let t = en.trim();
-            if t.is_empty() || looks_untranslatable(t) {
+            // 集中判定（P0-03）。這裡是 AI／共享庫／TM 的共同入口，
+            // 而且手上同時有 key 與 value——舊版只把 value 丟給 looks_untranslatable，
+            // 於是 `botania.entry.bcIntegration` 這種語言 key 一路送進 AI 並寫進共享庫。
+            let verdict = eligibility::classify(eligibility::Candidate {
+                source_kind: "lang",
+                logical_key: k,
+                text: t,
+            });
+            if !verdict.may_send_to_ai() {
                 continue;
             }
             jobs.push(shared_tm::SharedTmJob {
@@ -647,6 +840,8 @@ where
         }
     }
 
+    jobs.sort_by(|a, b| (&a.namespace, &a.key).cmp(&(&b.namespace, &b.key)));
+
     if jobs.is_empty() {
         on_progress(88, "沒有需要 AI 補的文字，略過網路翻譯");
         return Ok(AiFillReport::default());
@@ -658,8 +853,9 @@ where
     // ── 社群共享翻譯記憶（keyed：模組·key·原文）：先撈，命中就免送 AI ──
     // 隱藏、預設開；查不到／服務未就緒都略過，但寫可觀測 note。
     on_progress(43, "查詢社群共享翻譯（不需你設定）…");
-    let skip_lookup = force_refresh || super::shared_tm::skip_shared_lookup();
-    let shared_lookup = if skip_lookup {
+    let skip_shared_lookup = super::shared_tm::skip_shared_lookup();
+    let reuse_tm = !force_refresh;
+    let shared_lookup = if skip_shared_lookup {
         shared_tm::LookupResult::default()
     } else {
         shared_tm::lookup_detailed(&jobs)
@@ -690,7 +886,7 @@ where
             );
         }
     } else if shared_lookup.status == shared_tm::LookupStatus::Empty {
-        on_progress(44, "社群共享庫已連線，本次 0 命中（庫可能尚空）");
+        on_progress(44, "社群共享庫已連線，本次 0 命中");
     } else if shared_lookup.status == shared_tm::LookupStatus::Failed {
         on_progress(44, "社群共享庫查詢失敗，已略過（不影響本機翻譯）");
     }
@@ -723,19 +919,30 @@ where
             &unique,
             &ctx,
             use_ai,
-            !skip_lookup,
+            reuse_tm,
+            force_refresh,
             quality,
             44,
             44,
             scope,
             &mut on_progress,
         )?;
+        let quality_failed_uids = resolved.quality_deferred.clone();
         // 併入子報告的計數
         let sub = &resolved.report;
         report.glossary_hits += sub.glossary_hits;
         report.tm_hits += sub.tm_hits;
+        report.shared_hits += sub.shared_hits;
+        report.shared_glossary_hits += sub.shared_glossary_hits;
         report.ai_translated += sub.ai_translated;
         report.rejected += sub.rejected;
+        report.quality_skipped += sub.quality_skipped;
+        report.local_degenerate.extend(sub.local_degenerate.clone());
+        // AI 不可用要一路帶到最外層，呼叫端才知道這一輪只有資料層的成果，
+        // 不可以講成「完成」。
+        if report.ai_unavailable.is_none() {
+            report.ai_unavailable = sub.ai_unavailable.clone();
+        }
         report.notes.extend(sub.notes.clone());
 
         // 寫回語言表 + 蒐集「這次新由 AI 產出的」以貢獻給社群
@@ -769,12 +976,12 @@ where
                         context: job.context.clone(),
                         scope: job.scope.clone(),
                     });
-                    if let (Some(scope), Some(context)) = (job.scope.clone(), job.context.clone()) {
-                        if is_shared_term_candidate(&job.source, Some(&context)) {
+                    if let Some(scope) = job.scope.clone() {
+                        if is_shared_term_candidate(&job.source, job.context.as_deref()) {
                             glossary_share.push(shared_glossary::SharedGlossaryEntry {
                                 source: job.source.clone(),
                                 translated: text.clone(),
-                                context: Some(context),
+                                context: job.context.clone(),
                                 scope,
                             });
                         }
@@ -790,6 +997,14 @@ where
                     86,
                     &format!("正在寫回譯文到語言表（{write_done}/{write_total}）…"),
                 );
+            }
+            if quality_failed_uids.contains(&uid) {
+                let job = &jobs[i];
+                report
+                    .quality_deferred
+                    .entry(job.namespace.clone())
+                    .or_default()
+                    .insert(job.key.clone(), job.source.clone());
             }
         }
         // 匿名回饋給社群（失敗／逾時不影響本機；有牆鐘預算）
@@ -823,12 +1038,65 @@ where
     Ok(report)
 }
 
-fn is_shared_term_candidate(source: &str, context: Option<&str>) -> bool {
+fn is_shared_term_candidate(source: &str, _context: Option<&str>) -> bool {
     let trimmed = source.trim();
-    context.is_some()
-        && !trimmed.is_empty()
+    !trimmed.is_empty()
         && trimmed.len() <= 120
         && !trimmed.contains(['\n', '\r'])
+}
+
+/// 收尾：把合格短詞貢獻到社群共享術語；回傳玩家可見說明（若有）。
+pub fn contribute_shared_glossary_from_langmaps(
+    en: &LangMap,
+    zh: &LangMap,
+    scope: &TranslationScope,
+) -> Option<String> {
+    let entries = collect_glossary_share_from_langmaps(en, zh, scope);
+    shared_glossary::contribute(&entries).player_note()
+}
+
+/// 從最終 en∩zh 蒐集可貢獻的共享術語（短詞；ctx 可空，與 lookup hash 規則一致）。
+pub fn collect_glossary_share_from_langmaps(
+    en: &LangMap,
+    zh: &LangMap,
+    scope: &TranslationScope,
+) -> Vec<shared_glossary::SharedGlossaryEntry> {
+    if !scope.is_known() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (ns, en_map) in en {
+        let Some(zh_map) = zh.get(ns) else {
+            continue;
+        };
+        for (key, source) in en_map {
+            let Some(translated) = zh_map.get(key) else {
+                continue;
+            };
+            if !is_usable_zh(source, translated)
+                || is_poisoned_mech_translation(source, translated)
+                || !placeholder::is_compatible(source, translated)
+            {
+                continue;
+            }
+            let ctx = context_hint(key);
+            if !is_shared_term_candidate(source, ctx) {
+                continue;
+            }
+            let gh = shared_glossary::glossary_hash(source, ctx);
+            if !seen.insert(gh) {
+                continue;
+            }
+            out.push(shared_glossary::SharedGlossaryEntry {
+                source: source.clone(),
+                translated: translated.clone(),
+                context: ctx.map(str::to_owned),
+                scope: scope.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// 翻譯任意字串列表（任務書／書本／覆寫文字用），回傳與輸入等長（缺則空字串）。
@@ -949,7 +1217,8 @@ where
         &unique,
         &ctx,
         true,
-        reuse_shared,
+        true,
+        true,
         TranslationQuality::Balanced,
         0,
         99,
@@ -994,6 +1263,7 @@ fn contribute_plain_job_outputs(jobs: &[shared_tm::SharedTmJob], out: &[String])
 struct Resolved {
     translations: HashMap<usize, String>,
     report: AiFillReport,
+    quality_deferred: HashSet<usize>,
 }
 
 /// 術語表 → 翻譯記憶 → AI，三層依序解決 `unique` 裡的每一條。
@@ -1004,6 +1274,7 @@ fn resolve_unique(
     ctx: &[Option<&'static str>],
     use_ai: bool,
     reuse_tm: bool,
+    allow_quality_retry: bool,
     _quality: TranslationQuality,
     base_pct: u8,
     span_pct: u8,
@@ -1019,12 +1290,15 @@ fn resolve_unique(
             &format!("已套用你自訂的 {} 條譯名", gloss.user_entries),
         );
     }
-    let mut tm = Tm::load();
+    // user → builtin（glossary::load 已合併；後寫入的 user 覆寫 builtin）
+    let mut tm = TmSaveGuard::new(Tm::load());
     let mut translations: HashMap<usize, String> = HashMap::new();
     let mut report = AiFillReport::default();
+    let mut quality_deferred: HashSet<usize> = HashSet::new();
     let mut guard = GuardStats::default();
 
-    if reuse_tm {
+    let reuse_shared = !super::shared_tm::skip_shared_lookup();
+    if reuse_shared {
         on_progress(base_pct, "查詢共享庫與術語表（免送 AI）…");
     }
 
@@ -1037,7 +1311,7 @@ fn resolve_unique(
             scope: scope.cloned(),
         })
         .collect();
-    let shared_glossary_lookup = if reuse_tm {
+    let shared_glossary_lookup = if reuse_shared {
         shared_glossary::lookup_detailed(&glossary_jobs)
     } else {
         shared_glossary::LookupResult::default()
@@ -1045,19 +1319,23 @@ fn resolve_unique(
     report.notes.push(shared_glossary_lookup.player_note());
     let shared_glossary_hits = &shared_glossary_lookup.hits;
 
-    // ── 第 1、2 層：查表，完全不用網路 ──
+    // 優先序：user glossary → builtin → shared → tm → AI
     let mut need_ai: Vec<(usize, String)> = Vec::new();
     for (uid, src) in unique.iter().enumerate() {
-        if let Some(zh) = gloss.exact_safe(src) {
-            translations.insert(uid, zh);
-            report.glossary_hits += 1;
-            continue;
+        if let Some(zh) = gloss.exact(src) {
+            if let Some(safe) = placeholder::guard(src, zh, &mut guard)
+                .filter(|safe| is_usable_zh(src, safe) && !is_poisoned_mech_translation(src, safe))
+            {
+                translations.insert(uid, safe);
+                report.glossary_hits += 1;
+                continue;
+            }
         }
         if let Some(candidate) = shared_glossary_hits.get(&uid) {
             if let Some(safe) = placeholder::guard(src, candidate, &mut guard) {
                 if is_usable_zh(src, &safe) && !is_poisoned_mech_translation(src, &safe) {
                     translations.insert(uid, safe);
-                    report.shared_hits += 1;
+                    report.shared_glossary_hits += 1;
                     continue;
                 }
             }
@@ -1083,14 +1361,18 @@ fn resolve_unique(
         need_ai.push((uid, src.clone()));
     }
 
-    let pre = report.glossary_hits + report.shared_hits + report.tm_hits;
+    let pre = report.glossary_hits
+        + report.shared_glossary_hits
+        + report.shared_hits
+        + report.tm_hits;
     if pre > 0 {
         on_progress(
             base_pct,
             &format!(
-                "免費命中 {} 句（術語表 {}、共享庫 {}、翻譯記憶 {}），只剩 {} 句要送 AI",
+                "免費命中 {} 句（本機術語 {}、共享術語 {}、共享庫 {}、翻譯記憶 {}），只剩 {} 句要送 AI",
                 pre,
                 report.glossary_hits,
+                report.shared_glossary_hits,
                 report.shared_hits,
                 report.tm_hits,
                 need_ai.len()
@@ -1103,6 +1385,7 @@ fn resolve_unique(
         return Ok(Resolved {
             translations,
             report,
+            quality_deferred,
         });
     }
 
@@ -1123,13 +1406,41 @@ fn resolve_unique(
         return Ok(Resolved {
             translations,
             report,
+            quality_deferred,
         });
     }
 
     // ── 第 3 層：AI（限次重試佔位符拒譯；負向快取避免同輪重燒）──
+    //
+    // ⚠️ 這一段的失敗**絕對不可以用 `?` 往上拋**。
+    //
+    // `translations` 此刻已經裝著資料層（術語表／共享術語／共享翻譯庫／翻譯記憶）
+    // 的全部命中。實測站長一包：33233 條待譯裡，共享庫命中 32151、共享術語 671，
+    // 真正要送 AI 的只有 271 條。舊版在這裡 `?` 一拋，那 32822 條查得到的譯文
+    // **全部被丟掉**，整個階段 0 產出——FTB Quests 與文字覆寫在 GPT 額度用盡時
+    // 一個字都沒翻出來，就是這樣來的。
+    //
+    // 使用者明確選了 AI，就不能在 AI 無法翻譯時靜默降級成「不使用 AI」。
+    // 那會把「有 AI 品質把關」的期待變成只有共享庫／快取的部分結果，還讓人誤以為
+    // 整包已照選擇翻完。開工前已有嚴格探測；若執行中端點仍失效，也必須中止並保留
+    // 可診斷原因，而不是改走另一個未被選擇的流程。
     on_progress(base_pct, "連線 AI 並探測服務…");
-    let engine = Engine::connect()?;
-    let system_prompt = build_system_prompt(&gloss, unique);
+    let ai_ready = ai_preflight();
+    let engine = match ai_ready {
+        Ok(engine) => engine,
+        Err(reason) if is_cancel_message(&reason) => return Err(reason),
+        Err(reason) => {
+            let short = reason.lines().next().unwrap_or("AI 不可用");
+            on_progress(base_pct, &format!("AI 不可用（{short}），已停止翻譯。"));
+            crate::dev_log!("ai", "AI 不可用，停止翻譯（已命中本機／共享 {} 句）：{}", pre, reason);
+            return Err(format!("AI 無法協助翻譯，已停止本次翻譯：{reason}"));
+        }
+    };
+    let is_local_model = matches!(engine.provider, AiProvider::LocalLlm);
+    // 本地模型重試只花時間、不花錢也不吃額度，所以品質沒過就該再試一次，
+    // 不必像雲端那樣等使用者選「強制模式」。這是本地與雲端成本結構的根本差異。
+    let allow_quality_retry = allow_quality_retry || is_local_model;
+    let system_prompt = build_system_prompt(&gloss, unique, is_local_model);
     let mut batch_state = BatchRuntimeState::new(system_prompt, engine.capabilities.start_parallel);
     let mut term_stats = TermConsistencyStats::default();
     let mut pending_ai: Vec<PendingItem> = need_ai
@@ -1139,7 +1450,11 @@ fn resolve_unique(
                 report.rejected += 1;
                 None
             } else {
-                Some(PendingItem { uid, source: src })
+                Some(PendingItem {
+                    uid,
+                    source: src,
+                    reason: PendingReason::NoAnswer,
+                })
             }
         })
         .collect();
@@ -1147,6 +1462,29 @@ fn resolve_unique(
         base_pct,
         &format!("AI 翻譯 {} 句（已扣掉重複與已知譯名）…", pending_ai.len()),
     );
+
+    // 長句先拆句再送。本地小模型碰到長從屬句常「只翻到一半」甚至語意反轉
+    // （實測：`Heal … Or Harm Undead Creatures` 被譯成「造成 4 點傷害」，
+    // 治療變傷害而且整個 Or 子句消失）。拆開之後每一段都短、指涉清楚。
+    // 這一步失敗時項目原封不動退回下面的主迴圈整句翻，不會留下半成品。
+    if !pending_ai.is_empty() {
+        pending_ai = translate_long_sentences_split(
+            &engine,
+            &mut batch_state,
+            &gloss,
+            &mut term_stats,
+            &mut guard,
+            &mut tm,
+            &mut translations,
+            &mut report,
+            pending_ai,
+            ctx,
+            reuse_tm,
+            base_pct,
+            span_pct,
+            on_progress,
+        )?;
+    }
 
     let mut attempt = 0usize;
     while !pending_ai.is_empty() && attempt <= PLACEHOLDER_RETRY_LIMIT {
@@ -1174,7 +1512,7 @@ fn resolve_unique(
         let mut next_pending = collect_unresolved_items(&masked_need_ai, &raw);
         let unresolved_ids: HashSet<usize> = next_pending.iter().map(|item| item.uid).collect();
         let mut placeholder_retry: Vec<MaskedItem> = Vec::new();
-        let mut quality_skip_round = 0usize;
+        let mut quality_retry: Vec<MaskedItem> = Vec::new();
         for item in &masked_need_ai {
             if unresolved_ids.contains(&item.uid) {
                 continue;
@@ -1184,7 +1522,9 @@ fn resolve_unique(
             };
             let candidate = placeholder::unmask(masked_out, &item.tokens);
             let candidate = gloss.enforce_terms(&item.source, &candidate, &mut term_stats);
-            let (class, safe, attempt_guard) = classify_candidate(&item.source, &candidate);
+            let ((class, safe, attempt_guard, qreason), local_issue) =
+                classify_candidate_for(&item.source, &candidate, is_local_model);
+            record_local_issue(&mut report, local_issue);
             guard.checked += attempt_guard.checked;
             guard.repaired += attempt_guard.repaired;
             guard.rejected += attempt_guard.rejected;
@@ -1207,28 +1547,137 @@ fn resolve_unique(
                     report.ai_translated += 1;
                 }
                 CandidateClass::QualityFail => {
-                    keep_english_skip(
-                        &mut translations,
-                        &mut report,
-                        item.uid,
-                        &item.source,
-                        false,
-                    );
-                    quality_skip_round += 1;
+                    if allow_quality_retry {
+                        // 強制模式才允許同輪品質複查一次。
+                        quality_retry.push(item.clone());
+                    } else {
+                        // 一般模式不重送相同項目；保留具體 uid 供工作階段暫緩。
+                        keep_english_skip(
+                            &mut translations,
+                            &mut report,
+                            item.uid,
+                            &item.source,
+                            false,
+                            qreason,
+                        );
+                        quality_deferred.insert(item.uid);
+                    }
                 }
                 CandidateClass::PlaceholderFail => {
                     placeholder_retry.push(item.clone());
                 }
             }
         }
-        if quality_skip_round > 0 {
+        if !quality_retry.is_empty() {
             on_progress(
                 base_pct.saturating_add(span_pct / 4),
                 &format!(
-                    "品質未過略過 {} 句（保留英文，不重燒）",
-                    quality_skip_round
+                    "品質複查：強制模式重試 {} 句…",
+                    quality_retry.len()
                 ),
             );
+            let quality_raw = match run_batches(
+                &engine,
+                &mut batch_state,
+                &quality_retry,
+                base_pct,
+                span_pct,
+                on_progress,
+                false,
+            ) {
+                Ok(raw) => raw,
+                Err(e) if is_cancel_message(&e) => return Err(e),
+                Err(e) => {
+                    report.notes.push(format!(
+                        "品質再試中斷（已保留主批成果）：{}",
+                        e.lines().next().unwrap_or("連線問題")
+                    ));
+                    for item in &quality_retry {
+                        keep_english_skip(
+                            &mut translations,
+                            &mut report,
+                            item.uid,
+                            &item.source,
+                            false,
+                            None,
+                        );
+                    }
+                    HashMap::new()
+                }
+            };
+            let mut quality_skip_round = 0usize;
+            for item in &quality_retry {
+                let Some(masked_out) = quality_raw.get(&item.uid) else {
+                    if quality_raw.is_empty() {
+                        // 已在 Err 分支計入 quality_skipped
+                        quality_skip_round += 1;
+                        continue;
+                    }
+                    keep_english_skip(
+                        &mut translations,
+                        &mut report,
+                        item.uid,
+                        &item.source,
+                        false,
+                        None,
+                    );
+                    quality_skip_round += 1;
+                    continue;
+                };
+                let candidate = placeholder::unmask(masked_out, &item.tokens);
+                let candidate = gloss.enforce_terms(&item.source, &candidate, &mut term_stats);
+                let ((class, safe, attempt_guard, qreason), local_issue) =
+                    classify_candidate_for(&item.source, &candidate, is_local_model);
+                record_local_issue(&mut report, local_issue);
+                guard.checked += attempt_guard.checked;
+                guard.repaired += attempt_guard.repaired;
+                guard.rejected += attempt_guard.rejected;
+                match class {
+                    CandidateClass::Accept => {
+                        let safe = safe.expect("Accept always has safe text");
+                        if reuse_tm {
+                            if let Some(value) = item.context {
+                                tm.insert_with_context(&item.source, &safe, Some(value));
+                            } else {
+                                tm.insert(&item.source, &safe);
+                            }
+                        } else if let Some(value) = item.context {
+                            tm.upsert_with_context(&item.source, &safe, Some(value));
+                        } else {
+                            tm.upsert(&item.source, &safe);
+                        }
+                        translations.insert(item.uid, safe);
+                        report.ai_translated += 1;
+                    }
+                    CandidateClass::QualityFail | CandidateClass::PlaceholderFail => {
+                        keep_english_skip(
+                            &mut translations,
+                            &mut report,
+                            item.uid,
+                            &item.source,
+                            false,
+                            qreason,
+                        );
+                        // 品質未過一律排進補完佇列——包含**沒有 qreason 的那種**。
+                        // 本地模型被擋下的退化輸出（`{0` 亂碼、只剩半個詞）走的就是
+                        // qreason=None 這條路；舊版因此把它們排除在補完之外，
+                        // 等於「本地翻不好的句子永遠翻不好」。
+                        if matches!(class, CandidateClass::QualityFail) {
+                            quality_deferred.insert(item.uid);
+                        }
+                        quality_skip_round += 1;
+                    }
+                }
+            }
+            if quality_skip_round > 0 {
+                on_progress(
+                    base_pct.saturating_add(span_pct / 4),
+                    &format!(
+                        "品質未過略過 {} 句（未寫入）",
+                        quality_skip_round
+                    ),
+                );
+            }
         }
 
         if !placeholder_retry.is_empty() {
@@ -1244,6 +1693,7 @@ fn resolve_unique(
                         item.uid,
                         &item.source,
                         true,
+                        None,
                     );
                 }
                 on_progress(
@@ -1269,7 +1719,7 @@ fn resolve_unique(
                         STRICT_PLACEHOLDER_RETRY_CAP
                     ),
                 );
-                let strict_raw = run_batches(
+                let strict_raw = match run_batches(
                     &engine,
                     &mut batch_state,
                     &to_strict,
@@ -1277,19 +1727,41 @@ fn resolve_unique(
                     span_pct,
                     on_progress,
                     true,
-                )?;
+                ) {
+                    Ok(raw) => raw,
+                    Err(e) if is_cancel_message(&e) => return Err(e),
+                    Err(e) => {
+                        report.notes.push(format!(
+                            "佔位符嚴格重試中斷（已保留既有成果）：{}",
+                            e.lines().next().unwrap_or("連線問題")
+                        ));
+                        for item in &to_strict {
+                            next_pending.push(PendingItem {
+                                uid: item.uid,
+                                source: item.source.clone(),
+                                reason: PendingReason::NoAnswer,
+                            });
+                        }
+                        HashMap::new()
+                    }
+                };
                 for item in &to_strict {
                     let Some(masked_out) = strict_raw.get(&item.uid) else {
+                        if strict_raw.is_empty() {
+                            continue;
+                        }
                         next_pending.push(PendingItem {
                             uid: item.uid,
                             source: item.source.clone(),
+                            reason: PendingReason::NoAnswer,
                         });
                         continue;
                     };
                     let candidate = placeholder::unmask(masked_out, &item.tokens);
                     let candidate = gloss.enforce_terms(&item.source, &candidate, &mut term_stats);
-                    let (class, safe, attempt_guard) =
-                        classify_candidate(&item.source, &candidate);
+                    let ((class, safe, attempt_guard, qreason), local_issue) =
+                        classify_candidate_for(&item.source, &candidate, is_local_model);
+                    record_local_issue(&mut report, local_issue);
                     guard.checked += attempt_guard.checked;
                     guard.repaired += attempt_guard.repaired;
                     guard.rejected += attempt_guard.rejected;
@@ -1317,12 +1789,17 @@ fn resolve_unique(
                                 item.uid,
                                 &item.source,
                                 false,
+                                qreason,
                             );
+                            // 沒有 qreason 的品質未過＝本地模型退化被擋下，
+                            // 同樣要排進補完佇列（見上面同類註解）
+                            quality_deferred.insert(item.uid);
                         }
                         CandidateClass::PlaceholderFail => {
                             next_pending.push(PendingItem {
                                 uid: item.uid,
                                 source: item.source.clone(),
+                                reason: PendingReason::PlaceholderBroken,
                             });
                         }
                     }
@@ -1334,29 +1811,92 @@ fn resolve_unique(
         attempt += 1;
     }
 
+    // 本地模式的最後一步：小模型過不了品質關的句子，改用雲端翻一次。
+    //
+    // 「本地翻譯品質要跟雲端一樣」這個要求，靠調本地模型本身是做不到的——
+    // 小模型的能力就是不如大模型。但**交付出去的結果**可以一樣：
+    // 讓本地負責它做得好的（絕大多數），做不好的那些交給雲端補完。
+    if is_local_model && !quality_deferred.is_empty() {
+        escalate_to_cloud(
+            &gloss,
+            &mut term_stats,
+            &mut guard,
+            &mut tm,
+            &mut translations,
+            &mut report,
+            &mut quality_deferred,
+            unique,
+            ctx,
+            reuse_tm,
+            base_pct,
+            span_pct,
+            on_progress,
+        );
+    }
+
     if report.quality_skipped > 0 {
         report.notes.push(format!(
-            "品質未過略過 {} 句（保留英文，不重燒）",
-            report.quality_skipped
+            "品質未過略過 {} 句（未寫入；{}={}／{}={}／{}={}）",
+            report.quality_skipped,
+            QualityFailReason::StillEnglish.as_str(),
+            report.quality_still_english,
+            QualityFailReason::MixedFragment.as_str(),
+            report.quality_mixed_fragment,
+            QualityFailReason::SameAsSource.as_str(),
+            report.quality_same_as_source
         ));
     }
-    if !pending_ai.is_empty() {
-        let skipped = pending_ai.len();
-        for item in &pending_ai {
-            // 保留英文原文，避免缺譯；仍負向快取以免補漏重燒
-            keep_english_skip(
-                &mut translations,
-                &mut report,
-                item.uid,
-                &item.source,
-                true,
-            );
-        }
+    if !report.local_degenerate.is_empty() {
+        // 這段話要讓「不懂技術的玩家」看得懂發生什麼事、要不要理它。
+        // 關鍵是分清楚兩種情況：**有翻出來但不夠好**、和**沒翻出來留英文**——
+        // 前者不必做什麼，後者才需要考慮改用線上 AI。
+        let detail = report
+            .local_degenerate
+            .iter()
+            .map(|(label, count)| format!("{label} {count} 句"))
+            .collect::<Vec<_>>()
+            .join("、");
+        let total: usize = report.local_degenerate.iter().map(|(_, c)| *c).sum();
         report.notes.push(format!(
-            "已略過 {} 句佔位符失敗（不重燒）",
-            skipped
+            "本地模型有 {total} 句翻得不太好（{detail}）。這是離線小模型的能力限制，\
+不是工具漏掉沒翻。其中只有會誤導你的（數字對不上、整段重複）才會留原文，\
+其餘照樣採用——讀起來不完美，但看得懂。想要更好的品質，可以在工作台的「AI 輔助翻譯」改選「自訂 API」或「GPT」。"
         ));
     }
+    drain_pending_ai(
+        &pending_ai,
+        &mut translations,
+        &mut report,
+        &mut quality_deferred,
+    );
+
+    // 本地模式的最後一步：小模型過不了品質關、或這一輪沒拿到回應的句子，
+    // 改用雲端翻一次。
+    //
+    // 「本地翻譯品質要跟雲端一樣」這個要求，靠調本地模型本身是做不到的——
+    // 小模型的能力就是不如大模型。但**交付出去的結果**可以一樣：
+    // 讓本地負責它做得好的（絕大多數），做不好的那些交給雲端補完。
+    //
+    // 這段必須排在 pending_ai 收尾**之後**：沒拿到回應的句子是在上面那段
+    // 才進 quality_deferred 的，排在前面就會漏掉它們（舊版就是排在前面）。
+    if is_local_model && !quality_deferred.is_empty() {
+        escalate_to_cloud(
+            &gloss,
+            &mut term_stats,
+            &mut guard,
+            &mut tm,
+            &mut translations,
+            &mut report,
+            &mut quality_deferred,
+            unique,
+            ctx,
+            reuse_tm,
+            base_pct,
+            span_pct,
+            on_progress,
+        );
+    }
+
     report.usage = engine.usage_snapshot();
     for note in engine.drain_notices() {
         report.notes.push(note);
@@ -1389,7 +1929,298 @@ fn resolve_unique(
     Ok(Resolved {
         translations,
         report,
+        quality_deferred,
     })
+}
+
+/// 本地模型過不了品質關的句子，改用雲端補完，讓最終品質與全程走雲端一致。
+///
+/// 為什麼需要這一步：小模型的**能力**不可能等於大模型，這是模型本身的限制，
+/// 調參數、換 prompt 都繞不過去。但站長要的是「**結果**一樣」——那就讓本地做它
+/// 做得好的（絕大多數短句、名稱、術語），把它做不好的那一小撮交給雲端。
+///
+/// 沒有可用雲端時（沒設自訂 API、也沒登入 GPT）不是失敗，只是補不了；
+/// 這時要明講「設定哪一個就能自動補完」，而不是留下一句沒人看得懂的錯誤。
+#[allow(clippy::too_many_arguments)]
+fn escalate_to_cloud(
+    gloss: &Glossary,
+    term_stats: &mut TermConsistencyStats,
+    guard: &mut GuardStats,
+    tm: &mut TmSaveGuard,
+    translations: &mut HashMap<usize, String>,
+    report: &mut AiFillReport,
+    quality_deferred: &mut HashSet<usize>,
+    unique: &[String],
+    ctx: &[Option<&'static str>],
+    reuse_tm: bool,
+    base_pct: u8,
+    span_pct: u8,
+    on_progress: &mut dyn FnMut(u8, &str),
+) {
+    let pending: Vec<PendingItem> = {
+        let mut ids: Vec<usize> = quality_deferred.iter().copied().collect();
+        ids.sort_unstable(); // HashSet 疊代順序不穩定，排序才能重現
+        ids.into_iter()
+            .filter_map(|uid| {
+                unique.get(uid).map(|source| PendingItem {
+                    uid,
+                    source: source.clone(),
+                    reason: PendingReason::NoAnswer,
+                })
+            })
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let Some(engine) = Engine::connect_cloud_fallback() else {
+        // 兩種原因：玩家自己關掉了補完，或是還沒有可用的線上 AI。
+        // 分開講，因為要採取的行動完全不同。
+        if !super::secrets::cloud_topup_enabled() {
+            report.notes.push(format!(
+                "有 {} 句本地模型翻不好，依你的設定保留原文（沒有送到線上 AI）。",
+                pending.len()
+            ));
+        } else {
+            report.notes.push(format!(
+                "有 {} 句本地模型翻不好，先保留原文。到工作台的「AI 輔助翻譯」改選「自訂 API」或「GPT」之後，工具會自動用線上 AI 把這些句子補完，品質就跟全程用線上 AI 一樣。",
+                pending.len()
+            ));
+        }
+        return;
+    };
+    on_progress(
+        base_pct,
+        &format!(
+            "本地模型翻不好的 {} 句，改用線上 AI 補完（讓品質一致）…",
+            pending.len()
+        ),
+    );
+
+    let items = build_masked_items(&pending, ctx);
+    let system_prompt = build_system_prompt(gloss, unique, false);
+    let mut state = BatchRuntimeState::new(system_prompt, engine.capabilities.start_parallel);
+    let raw = match run_batches(&engine, &mut state, &items, base_pct, span_pct, on_progress, false)
+    {
+        Ok(raw) => raw,
+        Err(e) => {
+            // 補完失敗不影響本地已經翻好的部分，照原樣留在待補清單
+            report.notes.push(format!(
+                "線上 AI 補完沒有完成，這些句子先保留原文：{}",
+                e.lines().next().unwrap_or("連線問題")
+            ));
+            return;
+        }
+    };
+
+    let mut fixed = 0usize;
+    for item in &items {
+        let Some(masked_out) = raw.get(&item.uid) else {
+            continue;
+        };
+        let candidate = placeholder::unmask(masked_out, &item.tokens);
+        let candidate = gloss.enforce_terms(&item.source, &candidate, term_stats);
+        // 雲端的產出一樣要過把關；這裡不開本地專屬檢查（大模型不犯那些病）
+        let ((class, safe, attempt_guard, _), _) =
+            classify_candidate_for(&item.source, &candidate, false);
+        guard.checked += attempt_guard.checked;
+        guard.repaired += attempt_guard.repaired;
+        guard.rejected += attempt_guard.rejected;
+        if !matches!(class, CandidateClass::Accept) {
+            continue;
+        }
+        let safe = safe.expect("Accept always has safe text");
+        if reuse_tm {
+            if let Some(value) = item.context {
+                tm.insert_with_context(&item.source, &safe, Some(value));
+            } else {
+                tm.insert(&item.source, &safe);
+            }
+        } else if let Some(value) = item.context {
+            tm.upsert_with_context(&item.source, &safe, Some(value));
+        } else {
+            tm.upsert(&item.source, &safe);
+        }
+        translations.insert(item.uid, safe);
+        quality_deferred.remove(&item.uid);
+        report.ai_translated += 1;
+        // 這一句已經補好了，不該再算在「品質未過」裡
+        report.quality_skipped = report.quality_skipped.saturating_sub(1);
+        fixed += 1;
+    }
+
+    report.usage.add(&engine.usage_snapshot());
+    if fixed > 0 {
+        report.notes.push(format!(
+            "已用線上 AI 補完 {fixed} 句本地模型翻不好的內容，品質與全程使用線上 AI 一樣。"
+        ));
+    }
+    let left = pending.len().saturating_sub(fixed);
+    if left > 0 {
+        report
+            .notes
+            .push(format!("還有 {left} 句連線上 AI 也沒過品質檢查，已列進沒翻到的清單。"));
+    }
+}
+
+/// 本地小模型專用：把長句拆成子句分別送翻，再依原順序組回去。
+///
+/// 回傳「這一輪沒解決」的項目，交給主迴圈照原本的整句流程處理。
+/// 只要拆句這條路有任何一步不順（子句沒回來、組回來的譯文沒過把關、
+/// 連線失敗），該句就原封不動退回去整句翻——**寧可品質差一點，
+/// 也不要交出半中半英或順序錯亂的東西**。
+///
+/// 防錯位的關鍵：每個子句配一個**獨立 uid**（排在真實 uid 之後），
+/// 送進既有批次引擎後用 uid 一一取回，完全不依賴模型維持順序或數量。
+#[allow(clippy::too_many_arguments)]
+fn translate_long_sentences_split(
+    engine: &Engine,
+    batch_state: &mut BatchRuntimeState,
+    gloss: &Glossary,
+    term_stats: &mut TermConsistencyStats,
+    guard: &mut GuardStats,
+    tm: &mut TmSaveGuard,
+    translations: &mut HashMap<usize, String>,
+    report: &mut AiFillReport,
+    pending: Vec<PendingItem>,
+    ctx: &[Option<&'static str>],
+    reuse_tm: bool,
+    base_pct: u8,
+    span_pct: u8,
+    on_progress: &mut dyn FnMut(u8, &str),
+) -> Result<Vec<PendingItem>, String> {
+    let is_local = matches!(engine.provider, AiProvider::LocalLlm);
+    let mut leftover: Vec<PendingItem> = Vec::with_capacity(pending.len());
+    let mut jobs: Vec<(PendingItem, Vec<String>)> = Vec::new();
+    for item in pending {
+        // 用 _safe 版本：拆句只是最佳化，不該有能力中斷整輪翻譯。
+        // v21 就是這裡一個位元組索引 bug 讓整包翻譯在 63% 全毀。
+        let segments = if sentence_split::should_split_safe(&item.source, is_local) {
+            sentence_split::split_sentence_safe(&item.source)
+        } else {
+            Vec::new()
+        };
+        if segments.len() >= 2 {
+            jobs.push((item, segments));
+        } else {
+            leftover.push(item);
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(leftover);
+    }
+
+    // 子句 uid 一律排在所有真實 uid 之後，確保不會和任何待譯項目相撞
+    let mut next_uid = ctx
+        .len()
+        .max(jobs.iter().map(|(item, _)| item.uid + 1).max().unwrap_or(0));
+    let mut segment_items: Vec<MaskedItem> = Vec::new();
+    // (原句 uid, 該句的子句 uid 依原順序)
+    let mut segment_ids: Vec<Vec<usize>> = Vec::with_capacity(jobs.len());
+    for (item, segments) in &jobs {
+        let context = ctx.get(item.uid).copied().flatten();
+        let mut ids = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let (masked, tokens) = placeholder::mask(segment);
+            segment_items.push(MaskedItem {
+                uid: next_uid,
+                source: segment.clone(),
+                masked,
+                tokens,
+                context,
+            });
+            ids.push(next_uid);
+            next_uid += 1;
+        }
+        segment_ids.push(ids);
+    }
+
+    on_progress(
+        base_pct,
+        &format!(
+            "長句拆解：{} 句較長的說明先拆成 {} 個子句分別翻譯（降低漏譯與語意錯誤）…",
+            jobs.len(),
+            segment_items.len()
+        ),
+    );
+
+    let raw = match run_batches(
+        engine,
+        batch_state,
+        &segment_items,
+        base_pct,
+        span_pct,
+        on_progress,
+        false,
+    ) {
+        Ok(raw) => raw,
+        Err(e) if is_cancel_message(&e) => return Err(e),
+        Err(e) => {
+            // 拆句這條路壞掉不該影響正事：整批退回整句翻
+            report.notes.push(format!(
+                "長句拆解未完成，改用整句翻譯：{}",
+                e.lines().next().unwrap_or("連線問題")
+            ));
+            leftover.extend(jobs.into_iter().map(|(item, _)| item));
+            return Ok(leftover);
+        }
+    };
+
+    let by_uid: HashMap<usize, &MaskedItem> =
+        segment_items.iter().map(|item| (item.uid, item)).collect();
+    let mut merged = 0usize;
+    for ((item, segments), ids) in jobs.into_iter().zip(segment_ids.into_iter()) {
+        let pieces: Vec<Option<String>> = ids
+            .iter()
+            .map(|id| {
+                let segment = by_uid.get(id)?;
+                let masked_out = raw.get(id)?;
+                let text = placeholder::unmask(masked_out, &segment.tokens);
+                Some(gloss.enforce_terms(&segment.source, &text, term_stats))
+            })
+            .collect();
+        let Some(joined) = sentence_split::rejoin(&segments, &pieces) else {
+            leftover.push(item);
+            continue;
+        };
+        // 組回來的整句要重新過一次佔位符與品質檢查——拆句不是免檢通道
+        let ((class, safe, attempt_guard, _), local_issue) =
+            classify_candidate_for(&item.source, &joined, is_local);
+        record_local_issue(report, local_issue);
+        guard.checked += attempt_guard.checked;
+        guard.repaired += attempt_guard.repaired;
+        guard.rejected += attempt_guard.rejected;
+        match class {
+            CandidateClass::Accept => {
+                let safe = safe.expect("Accept always has safe text");
+                let context = ctx.get(item.uid).copied().flatten();
+                if reuse_tm {
+                    if let Some(value) = context {
+                        tm.insert_with_context(&item.source, &safe, Some(value));
+                    } else {
+                        tm.insert(&item.source, &safe);
+                    }
+                } else if let Some(value) = context {
+                    tm.upsert_with_context(&item.source, &safe, Some(value));
+                } else {
+                    tm.upsert(&item.source, &safe);
+                }
+                translations.insert(item.uid, safe);
+                report.ai_translated += 1;
+                merged += 1;
+            }
+            // 拆句版本沒過把關就當作沒發生過，退回整句翻
+            CandidateClass::QualityFail | CandidateClass::PlaceholderFail => leftover.push(item),
+        }
+    }
+    if merged > 0 {
+        on_progress(
+            base_pct,
+            &format!("長句拆解完成 {merged} 句；其餘退回整句翻譯"),
+        );
+    }
+    Ok(leftover)
 }
 
 // ═══ 連線 ═════════════════════════════════════════════════════
@@ -1399,11 +2230,9 @@ struct Engine {
     client: Arc<reqwest::blocking::Client>,
     base_url: Arc<String>,
     url: Arc<String>,
-    /// 代管模式為空——不送 Authorization，金鑰由 Worker 注入。
+    /// 自訂 API 金鑰；GPT 模式可為空。
     api_key: Arc<String>,
     model: Arc<String>,
-    /// 只在代管模式使用；送往自家 Worker，由 Worker 驗證登入與伺服器會員身分。
-    /// 執行中可更新（玩家重登後換新 cookie）。
     managed_session: Arc<Mutex<String>>,
     managed: bool,
     provider: AiProvider,
@@ -1417,6 +2246,26 @@ struct Engine {
 struct PendingItem {
     uid: usize,
     source: String,
+    reason: PendingReason,
+}
+
+/// 一句話為什麼還躺在待譯清單裡。**這兩種必須分開處理。**
+///
+/// 舊版把兩種都當成「佔位符失敗」：寫回英文 ＋ 進負向快取。
+/// 結果是「這一批 AI 根本沒回應」的句子被永久標記成翻不動——
+/// 玩家按「補充漏翻」也救不回來，因為負向快取讓它連試都不試。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReason {
+    /// AI 有回應，但譯文把 `%s`／`§` 之類的格式符號弄壞了。
+    ///
+    /// 寫回英文是對的：壞掉的格式符號會讓遊戲當掉，英文至少能玩。
+    /// 進負向快取也是對的：同一句再送一次，結果通常一樣。
+    PlaceholderBroken,
+    /// 根本沒拿到回應（批次重試額度用盡、連線中斷、回應裡缺這一條）。
+    ///
+    /// 這種**不是**翻不動，是還沒翻到。不可以寫回英文假裝完成，
+    /// 也不可以進負向快取——要留在缺口裡，讓補完／補充漏翻能再試。
+    NoAnswer,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,9 +2315,24 @@ enum BatchTrackKind {
 }
 
 impl BatchTrackKind {
-    fn batch_size(self, strict_single: bool) -> usize {
+    /// 每批送幾條。
+    ///
+    /// 本地模型另有一套較小的值。原因不是品質假設，是硬限制：llama-server 的上下文視窗
+    /// 是 prompt ＋ 輸出共用，一批 48 條加上術語表很容易把視窗吃滿，結果是漏條、
+    /// 格式跑掉或直接截斷。每條字串本來就彼此獨立、不需要跨條上下文，所以縮小批次
+    /// 只影響「一次送幾條」，不影響單條的翻譯品質；模組包語境是靠 system prompt 的
+    /// 術語表提供的，與批次大小無關。
+    fn batch_size_for(self, strict_single: bool, local: bool) -> usize {
         if strict_single {
             return 1;
+        }
+        if local {
+            return match self {
+                Self::Name => 12,
+                Self::Ui => 12,
+                Self::Story => 6,
+                Self::Solo => 1,
+            };
         }
         match self {
             Self::Name => 48,
@@ -1515,7 +2379,14 @@ fn is_length_truncated(v: &Value) -> bool {
 
 /// DeepSeek 官方：思考模式預設開啟；批次 JSON 翻譯需明確關閉。
 fn should_send_thinking_disabled(engine: &Engine) -> bool {
-    matches!(engine.provider, AiProvider::Managed | AiProvider::Deepseek)
+    matches!(engine.provider, AiProvider::Deepseek)
+}
+
+/// 本地模型多半是 Qwen3 系列的「混合推理」模型，llama-server（--jinja）用
+/// `chat_template_kwargs.enable_thinking` 這個鍵關閉思考過程——跟 DeepSeek 官方的
+/// `thinking` 欄位是兩套完全不同的 API 慣例，不能共用同一個判斷式。
+fn should_disable_local_thinking(engine: &Engine) -> bool {
+    matches!(engine.provider, AiProvider::LocalLlm)
 }
 
 fn is_empty_response_error(msg: &str) -> bool {
@@ -1698,27 +2569,57 @@ impl BatchRuntimeState {
 
 impl Engine {
     fn connect_raw() -> Result<Self, String> {
-        // AI 來源由使用者明確選擇；自訂模式缺金鑰時直接回報，代管模式再驗 Discord。
         let cfg = resolve_ai_config()?;
-        let managed_session = if cfg.managed {
-            managed_ai_session_cookie()?
-        } else {
-            String::new()
-        };
-
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .pool_max_idle_per_host(cfg.capabilities.start_parallel + 2)
             .build()
             .map_err(|e| e.to_string())?;
+        let url = if matches!(cfg.provider, AiProvider::Codex) {
+            CODEX_RESPONSES_URL.to_string()
+        } else {
+            api_chat_completions_url(&cfg.base_url)
+        };
         Ok(Engine {
             client: Arc::new(client),
             base_url: Arc::new(cfg.base_url.clone()),
-            url: Arc::new(api_chat_completions_url(&cfg.base_url)),
+            url: Arc::new(url),
             api_key: Arc::new(cfg.api_key),
             model: Arc::new(cfg.model),
-            managed_session: Arc::new(Mutex::new(managed_session)),
-            managed: cfg.managed,
+            managed_session: Arc::new(Mutex::new(String::new())),
+            managed: false,
+            provider: cfg.provider,
+            capabilities: cfg.capabilities,
+            degraded: Arc::new(Mutex::new(RequestDegradeState::default())),
+            usage: Arc::new(Mutex::new(AiUsageTotals::default())),
+            notices: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// 用「雲端補完」設定建一個引擎，不管使用者目前選的是哪個模式。
+    ///
+    /// 給本地模式的品質升級用：小模型過不了品質關的句子改用雲端翻一次，
+    /// 交付出去的結果就跟全程走雲端一樣。
+    fn connect_cloud_fallback() -> Option<Self> {
+        let cfg = resolve_cloud_fallback_config()?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .pool_max_idle_per_host(cfg.capabilities.start_parallel + 2)
+            .build()
+            .ok()?;
+        let url = if matches!(cfg.provider, AiProvider::Codex) {
+            CODEX_RESPONSES_URL.to_string()
+        } else {
+            api_chat_completions_url(&cfg.base_url)
+        };
+        Some(Engine {
+            client: Arc::new(client),
+            base_url: Arc::new(cfg.base_url.clone()),
+            url: Arc::new(url),
+            api_key: Arc::new(cfg.api_key),
+            model: Arc::new(cfg.model),
+            managed_session: Arc::new(Mutex::new(String::new())),
+            managed: false,
             provider: cfg.provider,
             capabilities: cfg.capabilities,
             degraded: Arc::new(Mutex::new(RequestDegradeState::default())),
@@ -1729,13 +2630,12 @@ impl Engine {
 
     fn connect() -> Result<Self, String> {
         let engine = Self::connect_raw()?;
-        let managed = engine.managed;
         if let Err(probe) = probe_ai_ready(&engine) {
-            return Err(if managed {
-                probe
-            } else {
-                ai_quota_support_message(&probe)
-            });
+            return Err(ai_quota_support_message_for(
+                &probe,
+                engine.provider,
+                false,
+            ));
         }
         engine.reset_usage();
         Ok(engine)
@@ -1856,9 +2756,10 @@ impl Engine {
     }
 }
 
-/// 代管 AI（免金鑰）是否可用——一定可用（URL 內建）。留給 UI 判斷是否預設開 AI。
+/// 已無免費代管；此函式保留給舊呼叫點，恆為 false。
+#[allow(dead_code)]
 pub fn managed_ai_available() -> bool {
-    true
+    false
 }
 
 fn build_masked_items(
@@ -1880,6 +2781,54 @@ fn build_masked_items(
         .collect()
 }
 
+/// AI 這一輪跑完後，還沒有譯文的句子怎麼收尾。
+///
+/// # 為什麼要分兩種
+///
+/// 舊版一律當成「佔位符失敗」：寫回英文原文 ＋ 進負向快取。對真的把 `%s`
+/// 弄壞的譯文來說那是對的，但對「這一批 AI 根本沒回應」的句子來說是災難——
+/// 英文被寫進 langmap 看起來像翻完了，負向快取又讓「補充漏翻」連試都不試，
+/// 所以那些句子**永遠**回不來。
+///
+/// 回傳 `(佔位符失敗數, 沒拿到回應數)`。
+fn drain_pending_ai(
+    pending: &[PendingItem],
+    translations: &mut HashMap<usize, String>,
+    report: &mut AiFillReport,
+    quality_deferred: &mut HashSet<usize>,
+) -> (usize, usize) {
+    let mut broken = 0usize;
+    let mut unanswered = 0usize;
+    for item in pending {
+        match item.reason {
+            PendingReason::PlaceholderBroken => {
+                // 譯文把格式符號弄壞了：英文原文至少不會讓遊戲當掉，
+                // 而且同一句再送一次結果通常一樣，所以負向快取是對的。
+                keep_english_skip(translations, report, item.uid, &item.source, true, None);
+                broken += 1;
+            }
+            PendingReason::NoAnswer => {
+                // 沒拿到回應＝還沒翻到，不是翻不動。
+                // 不寫英文、不進負向快取，留在缺口裡讓補完與補充漏翻能再試。
+                quality_deferred.insert(item.uid);
+                unanswered += 1;
+            }
+        }
+    }
+    if broken > 0 {
+        report
+            .notes
+            .push(format!("已略過 {broken} 句佔位符失敗（不重燒）"));
+    }
+    if unanswered > 0 {
+        report.notes.push(format!(
+            "有 {unanswered} 句這一輪沒拿到 AI 回應（不是翻不動）。\
+它們維持原文並留在缺口裡，下次按「補充漏翻」會再試一次。"
+        ));
+    }
+    (broken, unanswered)
+}
+
 fn collect_unresolved_items(
     items: &[MaskedItem],
     resolved: &HashMap<usize, String>,
@@ -1887,27 +2836,45 @@ fn collect_unresolved_items(
     items
         .iter()
         .filter(|item| !resolved.contains_key(&item.uid))
+        // 沒出現在結果裡＝沒拿到回應（批次被放棄或回應缺這一條）
         .map(|item| PendingItem {
             uid: item.uid,
             source: item.source.clone(),
+            reason: PendingReason::NoAnswer,
         })
         .collect()
 }
 
-fn build_system_prompt(gloss: &Glossary, texts: &[String]) -> String {
+fn build_system_prompt(gloss: &Glossary, texts: &[String], local: bool) -> String {
+    let term_cap = if local {
+        LOCAL_PROMPT_GLOSSARY_TERMS
+    } else {
+        MAX_PROMPT_GLOSSARY_TERMS
+    };
     let fixed_terms = gloss
         .prompt_cache_terms(texts)
         .into_iter()
-        .take(MAX_PROMPT_GLOSSARY_TERMS)
+        .take(term_cap)
         .collect::<Vec<_>>();
     // 固定前綴必須跨批 byte-identical，且夠長以觸發上游 Context Caching（≥64 token）。
     // 動態內容只允許「本回合固定譯名」區塊；勿插入時間戳／批號／句數。
     let mut prompt = String::with_capacity(8192);
-    prompt.push_str(STABLE_SYSTEM_PREFIX);
+    if local {
+        // 本地小模型走精簡版：規則越多、指令遵循越差，而且 8192 的視窗是
+        // prompt 與輸出共用的，system 佔掉的每一個 token 都從可翻譯的內容裡扣。
+        // 雲端那份有 10 條規則加上百餘個台灣用語範例，對小模型是反效果。
+        prompt.push_str(LOCAL_SYSTEM_PREFIX);
+    } else {
+        prompt.push_str(STABLE_SYSTEM_PREFIX);
+    }
     prompt.push_str("固定譯名（英文=中文；原文出現時優先使用）：\n");
     if fixed_terms.is_empty() {
-        // 維持穩定長度：即使用不到術語，也輸出固定占位，避免前綴過短無法進 cache
-        prompt.push_str(STABLE_EMPTY_TERMS_BLOCK);
+        if local {
+            prompt.push_str("(這批沒有固定術語。)\n");
+        } else {
+            // 維持穩定長度：即使用不到術語，也輸出固定占位，避免前綴過短無法進 cache
+            prompt.push_str(STABLE_EMPTY_TERMS_BLOCK);
+        }
     } else {
         for (en, zh) in &fixed_terms {
             prompt.push_str("- ");
@@ -1920,6 +2887,29 @@ fn build_system_prompt(gloss: &Glossary, texts: &[String]) -> String {
     prompt.push_str(STABLE_SYSTEM_SUFFIX);
     prompt
 }
+
+/// 本地小模型的 prompt 裡最多放幾條固定術語。
+///
+/// 雲端可以放 150 條（有 context caching，成本幾乎不變）；本地的 8192 視窗是
+/// prompt 與輸出**共用**的，術語表塞太多就等於把可翻譯的空間吃掉。
+const LOCAL_PROMPT_GLOSSARY_TERMS: usize = 40;
+
+/// 本地小模型專用的精簡 system prompt。
+///
+/// 設計取捨：只留**違反就會壞掉**的規則（佔位符、只輸出 JSON、不要旁白），
+/// 其餘品質期待（語氣、簡潔度、術語一致）改由譯後把關處理——
+/// 小模型記不住十條規則，但譯後檢查一定會執行。
+///
+/// 特別加了「不要重複同一個詞」與「不要加解釋」兩條，因為那正是
+/// `local_quality.rs` 抓到最多的兩種退化輸出，能在源頭少發生一次是一次。
+const LOCAL_SYSTEM_PREFIX: &str = "\
+你是 Minecraft 模組的台灣繁體中文譯者。把每筆 t 譯成自然的台灣繁體中文。\n\
+1. {0} {name} %s %1$s <item:...> $(br) 這類 token 原封不動保留，不可增刪或改字。\n\
+2. 數字與單位照抄，不可改動。\n\
+3. 只輸出譯文本身：不要加解釋、不要寫「以下是翻譯」、不要重複同一個詞。\n\
+4. 純代號、路徑、網址照原樣輸出。\n\
+5. 譯文長度應與原文相當，不要擴寫。\n\
+";
 
 /// 跨批不變的 system 前半（規則＋台灣用語指引）。長度刻意超過 Context Caching 最小單位。
 const STABLE_SYSTEM_PREFIX: &str = "\
@@ -1963,14 +2953,27 @@ fn build_user_payload(items: &[MaskedItem]) -> String {
     )
 }
 
-fn clamp_completion_tokens(input_chars: usize, item_count: usize) -> usize {
+/// 本地模型的輸出上限。
+///
+/// llama-server 的 `-c` 是**整個** KV 視窗（prompt ＋ 輸出共用）。舊版上下文寫死 4096，
+/// 這裡卻可能要求 8192 個輸出 token——比整個視窗還大，長文本必定截斷或直接失敗，
+/// 使用者看到的是「已安裝但翻譯失敗」。現在上下文最低 8192（見 local_llm/server.rs），
+/// 輸出夾在 2048＝視窗的四分之一，剩下四分之三留給 system prompt、術語表與待譯內容。
+pub(crate) const LOCAL_LLM_MAX_COMPLETION_TOKENS: usize = 2048;
+
+fn clamp_completion_tokens_for(input_chars: usize, item_count: usize, local: bool) -> usize {
     let from_chars = input_chars.saturating_mul(8).saturating_div(10);
     let from_items = item_count
         .saturating_mul(TOKENS_PER_ITEM)
         .max(MIN_COMPLETION_TOKENS);
+    let ceiling = if local {
+        LOCAL_LLM_MAX_COMPLETION_TOKENS
+    } else {
+        MAX_COMPLETION_TOKENS
+    };
     from_chars
         .max(from_items)
-        .clamp(MIN_COMPLETION_TOKENS, MAX_COMPLETION_TOKENS)
+        .clamp(MIN_COMPLETION_TOKENS.min(ceiling), ceiling)
 }
 
 fn classify_track(source: &str, context: Option<&str>) -> BatchTrackKind {
@@ -2014,7 +3017,11 @@ fn is_story_like(context: Option<&str>, source: &str) -> bool {
             && (source.contains('\n') || source.chars().count() > 120))
 }
 
-fn plan_track_batches(items: &[MaskedItem], strict_single: bool) -> Vec<BatchPlan> {
+fn plan_track_batches_for(
+    items: &[MaskedItem],
+    strict_single: bool,
+    local: bool,
+) -> Vec<BatchPlan> {
     if strict_single {
         return items
             .iter()
@@ -2041,7 +3048,7 @@ fn plan_track_batches(items: &[MaskedItem], strict_single: bool) -> Vec<BatchPla
     let mut index = 0usize;
     while index < sorted.len() {
         let track = classify_track(&sorted[index].source, sorted[index].context);
-        let batch_size = track.batch_size(false);
+        let batch_size = track.batch_size_for(false, local);
         let mut bucket = Vec::new();
         while index < sorted.len()
             && classify_track(&sorted[index].source, sorted[index].context) == track
@@ -2067,7 +3074,11 @@ fn run_batches(
     on_progress: &mut dyn FnMut(u8, &str),
     strict_single: bool,
 ) -> Result<HashMap<usize, String>, String> {
-    let plans = plan_track_batches(items, strict_single);
+    let plans = plan_track_batches_for(
+        items,
+        strict_single,
+        matches!(engine.provider, AiProvider::LocalLlm),
+    );
     let total_batches = plans.len().max(1);
     let total_unique = items.len();
 
@@ -2547,7 +3558,11 @@ fn translate_chunk(
     plan: &BatchPlan,
 ) -> Result<ChunkSuccess, ChunkError> {
     let payload = build_user_payload(&plan.items);
-    let max_tokens = clamp_completion_tokens(payload.chars().count(), plan.items.len());
+    let max_tokens = clamp_completion_tokens_for(
+        payload.chars().count(),
+        plan.items.len(),
+        matches!(engine.provider, AiProvider::LocalLlm),
+    );
     let wanted: HashSet<usize> = plan.items.iter().map(|item| item.uid).collect();
     let mut attempts = 0usize;
     let mut length_retries = 0usize;
@@ -2561,6 +3576,15 @@ fn translate_chunk(
             });
         }
         let features = engine.current_features();
+        crate::dev_log!(
+            "ai",
+            "送出批次 track={:?} 條數={} 首句={:?} 上限tokens={} 嘗試={}",
+            plan.track,
+            plan.items.len(),
+            plan.items.first().map(|i| i.source.chars().take(48).collect::<String>()),
+            max_tokens,
+            attempts
+        );
         let mut body = json!({
             "model": engine.model.as_str(),
             "messages": [
@@ -2571,12 +3595,28 @@ fn translate_chunk(
         if features.send_temperature {
             body["temperature"] = json!(if plan.items.len() == 1 { 0.0 } else { 0.1 });
         }
+        if matches!(engine.provider, AiProvider::LocalLlm) {
+            // 重複懲罰是本地小模型最有效的一道防線：低溫取樣容易卡在同一個 token 上，
+            // 吐出「造成傷害傷害傷害傷害」這種輸出。`local_quality.rs` 會在事後抓到它，
+            // 但在源頭少發生一次，就少一次重翻。
+            // 這兩個是 llama.cpp 的取樣參數（我們自己安裝的 llama-server 一定支援），
+            // 只送給本地端，不影響任何雲端服務。
+            body["repeat_penalty"] = json!(1.15);
+            body["repeat_last_n"] = json!(128);
+        }
         if features.send_response_format {
             body["response_format"] = json!({ "type": "json_object" });
         }
         if should_send_thinking_disabled(engine) {
             // https://api-docs.deepseek.com/zh-cn/guides/thinking_mode — 預設開啟；批次翻譯關閉
             body["thinking"] = json!({ "type": "disabled" });
+        }
+        if should_disable_local_thinking(engine) {
+            // 現場實測過：不關會把 max_tokens 燒在思考過程上，content 留空、
+            // finish_reason=length；送 "Iron Sword" 給 32 tokens 全被 reasoning_content
+            // 吃光。關掉後同一句話 3 個 token 就答完，且是正確答案「鐵劍」；真實批次
+            // （4 條混雜句子）也驗證過完整正確、finish_reason=stop。翻譯不需要推理過程。
+            body["chat_template_kwargs"] = json!({ "enable_thinking": false });
         }
         match features.max_tokens_field {
             MaxTokensField::MaxTokens => body["max_tokens"] = json!(max_tokens),
@@ -2585,150 +3625,232 @@ fn translate_chunk(
             }
         }
 
-        let mut req = engine
-            .client
-            .post(engine.url.as_str())
-            .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(plan.track.timeout_secs()))
-            .json(&body);
-        if engine.managed {
-            req = req
-                .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
-                .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Zeitfrei-Session", engine.session_cookie());
-        } else if !engine.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", engine.api_key));
-        }
+        let response_json: Value = if matches!(engine.provider, AiProvider::Codex) {
+            match codex_chat::complete_chat(
+                engine.client.as_ref(),
+                engine.model.as_str(),
+                &body,
+                Duration::from_secs(plan.track.timeout_secs()),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    let code = error.status_code.unwrap_or(0);
+                    let clean = sanitize_provider_name(&error.message);
+                    crate::dev_log!(
+                        "gpt",
+                        "GPT 翻譯端點回應失敗 | HTTP={} | 模型={} | 嘗試={}",
+                        code,
+                        engine.model,
+                        attempts
+                    );
+                    let is_retryable = code == 0 || code == 200 || code == 429 || code >= 500;
+                    let congestion = code == 429
+                        || code >= 500
+                        || clean.contains("逾時")
+                        || clean.contains("稍後再試");
+                    if is_retryable && attempts < 2 {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(600 + attempts as u64 * 600));
+                        continue;
+                    }
+                    let kind = if code == 402 {
+                        ChatErrorKind::Quota
+                    } else if code == 401 || code == 403 {
+                        ChatErrorKind::Fatal
+                    } else if code == 429 || code == 0 || code == 200 || code >= 500 {
+                        ChatErrorKind::Transient
+                    } else if looks_like_quota_or_auth_error(&clean) {
+                        ChatErrorKind::Quota
+                    } else {
+                        ChatErrorKind::Fatal
+                    };
+                    return Err(ChunkError {
+                        message: clean,
+                        congestion,
+                        retries: attempts,
+                        kind,
+                    });
+                }
+            }
+        } else {
+            let mut req = engine
+                .client
+                .post(engine.url.as_str())
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(plan.track.timeout_secs()))
+                .json(&body);
+            if engine.managed {
+                req = req
+                    .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
+                    .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
+                    .header("X-Zeitfrei-Session", engine.session_cookie());
+            } else if !engine.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", engine.api_key));
+            }
 
-        let resp = match req.send() {
-            Ok(resp) => resp,
-            Err(err) => {
-                let is_timeout = err.is_timeout();
-                let err_msg = if is_timeout {
-                    "等待 AI 回應逾時".into()
-                } else {
-                    format!("連線失敗（無回應）：{err}")
-                };
-                if attempts < 2 {
-                    attempts += 1;
-                    thread::sleep(Duration::from_millis(400 + attempts as u64 * 400));
-                    continue;
+            let resp = match req.send() {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let is_timeout = err.is_timeout();
+                    let err_msg = if is_timeout {
+                        "等待 AI 回應逾時".into()
+                    } else {
+                        format!("連線失敗（無回應）：{err}")
+                    };
+                    if attempts < 2 {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(400 + attempts as u64 * 400));
+                        continue;
+                    }
+                    return Err(ChunkError {
+                        message: err_msg,
+                        congestion: is_timeout,
+                        retries: attempts,
+                        kind: ChatErrorKind::Transient,
+                    });
                 }
-                return Err(ChunkError {
-                    message: err_msg,
-                    congestion: is_timeout,
-                    retries: attempts,
-                    kind: ChatErrorKind::Transient,
-                });
-            }
-        };
+            };
 
-        let status = resp.status();
-        let code = status.as_u16();
-        let body_text = resp.text().unwrap_or_default();
-        if !status.is_success() {
-            if engine.maybe_degrade_for_unsupported(code, &body_text) {
-                continue;
+            let status = resp.status();
+            let code = status.as_u16();
+            let body_text = resp.text().unwrap_or_default();
+            // 本地模型的失敗診斷：實測有一批 8 條被送九次仍失敗，而當時的紀錄
+            // 只寫「批失敗」，看不出模型到底回了什麼。依 rules/50 的升級梯，
+            // 這一輪先收證據（HTTP 狀態、finish_reason、回應前 200 字），
+            // 不憑猜測調 prompt 或參數。
+            if matches!(engine.provider, AiProvider::LocalLlm) && !status.is_success() {
+                crate::dev_log!(
+                    "local",
+                    "本地模型 HTTP {} | 批次 {} 條 | 嘗試 {} 次 | 上限tokens={} | 回應前 200 字={:?}",
+                    code,
+                    plan.items.len(),
+                    attempts,
+                    max_tokens,
+                    body_text.chars().take(200).collect::<String>()
+                );
             }
-            if let Some(mapped) = map_chat_http_error(code, &body_text, engine.managed) {
-                let congestion = matches!(mapped.kind, ChatErrorKind::Transient)
-                    || code == 429
-                    || code >= 500;
-                if matches!(mapped.kind, ChatErrorKind::Transient) && attempts < 2 {
-                    attempts += 1;
-                    thread::sleep(Duration::from_millis(600 + attempts as u64 * 600));
+            if !status.is_success() {
+                if engine.maybe_degrade_for_unsupported(code, &body_text) {
                     continue;
                 }
-                return Err(ChunkError {
-                    message: mapped.message,
-                    congestion,
-                    retries: attempts,
-                    kind: mapped.kind,
-                });
-            }
-            if code == 429 || code >= 500 {
-                let err_msg = if code == 429 {
-                    "請求太頻繁，稍後再試".into()
-                } else if code == 503 {
-                    "服務暫時無法使用（503），稍後再試".into()
-                } else {
-                    let snippet =
-                        sanitize_provider_name(&body_text.chars().take(200).collect::<String>());
-                    format!("服務錯誤 {code}：{snippet}")
-                };
-                if attempts < 2 {
-                    attempts += 1;
-                    thread::sleep(Duration::from_millis(600 + attempts as u64 * 600));
-                    continue;
+                if let Some(mapped) = map_chat_http_error(code, &body_text, engine.managed) {
+                    let congestion = matches!(mapped.kind, ChatErrorKind::Transient)
+                        || code == 429
+                        || code >= 500;
+                    if matches!(mapped.kind, ChatErrorKind::Transient) && attempts < 2 {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(600 + attempts as u64 * 600));
+                        continue;
+                    }
+                    return Err(ChunkError {
+                        message: mapped.message,
+                        congestion,
+                        retries: attempts,
+                        kind: mapped.kind,
+                    });
+                }
+                if code == 429 || code >= 500 {
+                    let err_msg = if code == 429 {
+                        "請求太頻繁，稍後再試".into()
+                    } else if code == 503 {
+                        "服務暫時無法使用（503），稍後再試".into()
+                    } else {
+                        let snippet =
+                            sanitize_provider_name(&body_text.chars().take(200).collect::<String>());
+                        format!("服務錯誤 {code}：{snippet}")
+                    };
+                    if attempts < 2 {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(600 + attempts as u64 * 600));
+                        continue;
+                    }
+                    return Err(ChunkError {
+                        message: err_msg,
+                        congestion: true,
+                        retries: attempts,
+                        kind: ChatErrorKind::Transient,
+                    });
+                }
+                if code == 401 || code == 403 {
+                    return Err(ChunkError {
+                        message: format!(
+                            "金鑰無效或無權限：{}",
+                            sanitize_provider_name(&body_text.chars().take(120).collect::<String>())
+                        ),
+                        congestion: false,
+                        retries: attempts,
+                        kind: ChatErrorKind::Fatal,
+                    });
+                }
+                if code == 402 {
+                    return Err(ChunkError {
+                        message: format!(
+                            "帳號餘額不足：{}",
+                            sanitize_provider_name(&body_text.chars().take(120).collect::<String>())
+                        ),
+                        congestion: false,
+                        retries: attempts,
+                        kind: ChatErrorKind::Quota,
+                    });
+                }
+                let snippet =
+                    sanitize_provider_name(&body_text.chars().take(200).collect::<String>());
+                if looks_like_quota_or_auth_error(&snippet)
+                    || looks_like_quota_or_auth_error(&body_text)
+                {
+                    return Err(ChunkError {
+                        message: format!("可能額度不足或金鑰問題（{code}）：{snippet}"),
+                        congestion: false,
+                        retries: attempts,
+                        kind: ChatErrorKind::Quota,
+                    });
                 }
                 return Err(ChunkError {
-                    message: err_msg,
-                    congestion: true,
-                    retries: attempts,
-                    kind: ChatErrorKind::Transient,
-                });
-            }
-            if code == 401 || code == 403 {
-                return Err(ChunkError {
-                    message: format!(
-                        "金鑰無效或無權限：{}",
-                        sanitize_provider_name(&body_text.chars().take(120).collect::<String>())
-                    ),
+                    message: format!("服務錯誤 {code}：{snippet}"),
                     congestion: false,
                     retries: attempts,
                     kind: ChatErrorKind::Fatal,
                 });
             }
-            if code == 402 {
-                return Err(ChunkError {
-                    message: format!(
-                        "帳號餘額不足：{}",
-                        sanitize_provider_name(&body_text.chars().take(120).collect::<String>())
-                    ),
-                    congestion: false,
-                    retries: attempts,
-                    kind: ChatErrorKind::Quota,
-                });
-            }
-            let snippet = sanitize_provider_name(&body_text.chars().take(200).collect::<String>());
-            if looks_like_quota_or_auth_error(&snippet) || looks_like_quota_or_auth_error(&body_text)
-            {
-                return Err(ChunkError {
-                    message: format!("可能額度不足或金鑰問題（{code}）：{snippet}"),
-                    congestion: false,
-                    retries: attempts,
-                    kind: ChatErrorKind::Quota,
-                });
-            }
-            return Err(ChunkError {
-                message: format!("服務錯誤 {code}：{snippet}"),
-                congestion: false,
-                retries: attempts,
-                kind: ChatErrorKind::Fatal,
-            });
-        }
 
-        let response_json: Value = match serde_json::from_str(&body_text) {
-            Ok(value) => value,
-            Err(err) => {
-                let err_msg = format!("回應無法解析（無有效內容）：{err}");
-                if attempts < 2 {
-                    attempts += 1;
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
+            match serde_json::from_str(&body_text) {
+                Ok(value) => value,
+                Err(err) => {
+                    let err_msg = format!("回應無法解析（無有效內容）：{err}");
+                    if attempts < 2 {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                    return Err(ChunkError {
+                        message: err_msg,
+                        congestion: false,
+                        retries: attempts,
+                        kind: ChatErrorKind::Transient,
+                    });
                 }
-                return Err(ChunkError {
-                    message: err_msg,
-                    congestion: false,
-                    retries: attempts,
-                    kind: ChatErrorKind::Transient,
-                });
             }
         };
         engine.record_usage(&parse_usage_totals(&response_json));
         let content = extract_message_content(&response_json);
         if content.trim().is_empty() {
             let msg = diagnose_empty_choice(&response_json);
+            if matches!(engine.provider, AiProvider::LocalLlm) {
+                // 本地模型回空 content 的證據：光看「批失敗」看不出是被截斷、
+                // 被拒答、還是 JSON 解析不出來。留下 finish_reason 與原始回應
+                // 才有辦法對症——這一輪只收證據，不調參數。
+                crate::dev_log!(
+                    "local",
+                    "本地模型回空 content | {} | 批次 {} 條 | 嘗試 {} 次 | 上限tokens={} | 首句={:?}",
+                    msg,
+                    plan.items.len(),
+                    attempts,
+                    max_tokens,
+                    plan.items
+                        .first()
+                        .map(|i| i.source.chars().take(48).collect::<String>())
+                );
+            }
             if is_length_truncated(&response_json) {
                 if length_retries < LENGTH_TRUNCATION_RETRY_LIMIT {
                     length_retries += 1;
@@ -2765,8 +3887,29 @@ fn translate_chunk(
             });
         }
 
-        match parse_translation_object(&content) {
-            Ok(map) => {
+        let requested_ids: Vec<usize> = wanted.iter().copied().collect();
+        match parse_translation_object_audited(&content, &requested_ids) {
+            Ok((map, audit)) => {
+                // 對帳結果決定這批可不可信（Phase 3）。
+                // 模型自己編出來的 id、或同一個 id 給了兩種不同譯文，代表它沒有照
+                // 格式走；此時整批的其他答案也不值得採信。少數幾筆沒回來則屬常態，
+                // 交給下一輪補——兩者的處理方式必須不同，混在一起就會把
+                // 「模型亂回」靜默降級成「這次少翻了幾句」。
+                if audit.needs_diagnostic_split() {
+                    engine.push_notice(format!("{}；改拆半重試…", audit.summary()));
+                    return Err(ChunkError {
+                        message: format!("批次回應與送出內容對不上（{}）", audit.summary()),
+                        congestion: false,
+                        retries: attempts,
+                        kind: ChatErrorKind::Transient,
+                    });
+                }
+                // 沒到要拆半的程度，但也不是乾淨的一批：把差額講出來。
+                // 這些沒回來的句子會留在待補清單裡，使用者看得到原因，
+                // 而不是事後發現「明明說翻完了卻少了幾句」。
+                if !audit.is_clean() {
+                    engine.push_notice(audit.summary());
+                }
                 let filtered = map
                     .into_iter()
                     .filter(|(uid, translated)| wanted.contains(uid) && !translated.trim().is_empty())
@@ -2883,7 +4026,12 @@ fn parse_translation_object(content: &str) -> Result<HashMap<usize, String>, Str
         Value::Array(rows) => rows,
         _ => Vec::new(),
     };
-    let mut by_i = HashMap::new();
+    Ok(parse_translation_rows(&items).into_iter().collect())
+}
+
+/// 抽出原始 (id, 譯文) 序列，**不去重**——去重會抹掉「同一個 id 回兩次」這個訊號。
+fn parse_translation_rows(items: &[Value]) -> Vec<(usize, String)> {
+    let mut rows = Vec::new();
     for item in items {
         let Some(i) = item.get("i").and_then(|value| value.as_u64()) else {
             continue;
@@ -2891,9 +4039,155 @@ fn parse_translation_object(content: &str) -> Result<HashMap<usize, String>, Str
         let Some(translated) = item.get("t").and_then(|value| value.as_str()) else {
             continue;
         };
-        by_i.insert(i as usize, translated.to_string());
+        rows.push((i as usize, translated.to_string()));
     }
-    Ok(by_i)
+    rows
+}
+
+/// 解析並對帳。回傳的 map 只含**送出去過而且沒有衝突**的 id：
+/// 模型自己編的 id 一律丟掉（不可能寫進任何 key），
+/// 同 id 衝突的也丟掉（不知道哪個才對，就不要猜）。
+pub fn parse_translation_object_audited(
+    content: &str,
+    requested: &[usize],
+) -> Result<(HashMap<usize, String>, BatchAudit), String> {
+    let body = extract_json_body(strip_code_fence(content));
+    let value: Value = serde_json::from_str(body).map_err(|e| {
+        format!(
+            "回傳格式不對：{e} / {}",
+            body.chars().take(120).collect::<String>()
+        )
+    })?;
+    let items: Vec<Value> = match value {
+        Value::Object(map) => map
+            .get("r")
+            .and_then(|rows| rows.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    };
+    let rows = parse_translation_rows(&items);
+    let audit = audit_batch_response(requested, &rows);
+
+    let requested_set: HashSet<usize> = requested.iter().copied().collect();
+    let mut by_i: HashMap<usize, String> = HashMap::new();
+    for (id, text) in rows {
+        if !requested_set.contains(&id) || audit.conflicting.contains(&id) {
+            continue;
+        }
+        by_i.entry(id).or_insert(text);
+    }
+    Ok((by_i, audit))
+}
+
+/// 一批 AI 回應與「我們送出去的東西」對帳的結果。
+///
+/// 配對本身早就是靠 id（`{"i":…,"t":…}`）而不是陣列位置，所以不會錯位。
+/// 這裡補的是另一半：**回應本身可不可信**。模型少回一筆、同一個 id 回兩次、
+/// 回一個我們沒送過的 id——這些都代表這批的輸出不穩定，靜默接受就會變成
+/// 「翻譯完成了但少了幾句」，而且沒有任何跡象可查。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BatchAudit {
+    pub requested: usize,
+    /// 有回、且內容非空的 id 數
+    pub resolved: usize,
+    /// 送出去但沒回來的
+    pub missing: Vec<usize>,
+    /// 同一個 id 回了不只一次，且內容彼此不同（純重複同值不算問題）
+    pub conflicting: Vec<usize>,
+    /// 回了我們沒送過的 id（模型自己編的）
+    pub unknown: Vec<usize>,
+    /// 有回但譯文是空字串
+    pub empty: Vec<usize>,
+}
+
+impl BatchAudit {
+    /// 這批可以整批採信嗎？
+    pub fn is_clean(&self) -> bool {
+        self.missing.is_empty()
+            && self.conflicting.is_empty()
+            && self.unknown.is_empty()
+            && self.empty.is_empty()
+    }
+
+    /// 這批該不該進「拆批重試」流程。
+    ///
+    /// 判準刻意分兩級：少數幾筆沒回來是常態（下一輪補），
+    /// 但**幻覺 id 或同 id 衝突**代表模型沒有照格式走，整批都不該當成可靠輸出。
+    pub fn needs_diagnostic_split(&self) -> bool {
+        if !self.conflicting.is_empty() || !self.unknown.is_empty() {
+            return true;
+        }
+        // 超過三成沒回來，不是零星漏掉，是這批本身有問題（多半是被截斷）
+        self.requested > 0 && self.missing.len() * 10 > self.requested * 3
+    }
+
+    /// 給開發者定位用的一行摘要。不含原文，只有數量與 id。
+    pub fn summary(&self) -> String {
+        format!(
+            "批次對帳：送出 {}、可用 {}、未回 {}、衝突 {}、未知 {}、空譯文 {}",
+            self.requested,
+            self.resolved,
+            self.missing.len(),
+            self.conflicting.len(),
+            self.unknown.len(),
+            self.empty.len()
+        )
+    }
+}
+
+/// 以「我們送出去的 id 集合」為準對帳一批回應。
+///
+/// `raw_rows` 是還沒去重的原始 (id, 譯文) 序列——必須未去重，
+/// 否則偵測不到「同一個 id 回兩次」。
+pub fn audit_batch_response(requested: &[usize], raw_rows: &[(usize, String)]) -> BatchAudit {
+    use std::collections::BTreeMap;
+    let requested_set: HashSet<usize> = requested.iter().copied().collect();
+
+    let mut first_seen: BTreeMap<usize, String> = BTreeMap::new();
+    let mut conflicting: Vec<usize> = Vec::new();
+    let mut unknown: Vec<usize> = Vec::new();
+
+    for (id, text) in raw_rows {
+        if !requested_set.contains(id) {
+            if !unknown.contains(id) {
+                unknown.push(*id);
+            }
+            continue;
+        }
+        match first_seen.get(id) {
+            Some(prev) if prev != text => {
+                if !conflicting.contains(id) {
+                    conflicting.push(*id);
+                }
+            }
+            Some(_) => {} // 同一個 id 回了兩次但內容相同，無害
+            None => {
+                first_seen.insert(*id, text.clone());
+            }
+        }
+    }
+
+    let mut missing: Vec<usize> = Vec::new();
+    let mut empty: Vec<usize> = Vec::new();
+    let mut resolved = 0usize;
+    for id in requested {
+        match first_seen.get(id) {
+            None => missing.push(*id),
+            Some(text) if text.trim().is_empty() => empty.push(*id),
+            Some(_) => resolved += 1,
+        }
+    }
+
+    BatchAudit {
+        requested: requested.len(),
+        resolved,
+        missing,
+        conflicting,
+        unknown,
+        empty,
+    }
 }
 
 fn parse_usage_totals(response: &Value) -> AiUsageTotals {
@@ -2904,6 +4198,12 @@ fn parse_usage_totals(response: &Value) -> AiUsageTotals {
         .or_else(|| {
             usage
                 .get("prompt_tokens_details")
+                .and_then(|value| value.get("cached_tokens"))
+                .and_then(|value| value.as_u64())
+        })
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
                 .and_then(|value| value.get("cached_tokens"))
                 .and_then(|value| value.as_u64())
         })
@@ -2965,24 +4265,31 @@ fn mentions_unsupported_params(body: &str) -> bool {
             || lower.contains("temperature"))
 }
 
-/// 嚴格探測自訂 API 金鑰（儲存後／測試鈕／一鍵翻譯開工前）。
+/// 嚴格探測目前選定的 AI 是否真的能完成最小翻譯。
+///
+/// 「登入成功」、「/health 正常」或「帳號仍可聊天」都不等於翻譯端點可用：GPT
+/// 的端點可能在實際 Responses 請求回 429，本地模型也可能健康檢查通過但 chat
+/// endpoint／模型載入失敗。這裡必須走和正式批次相同的 `translate_chunk`，因此
+/// custom API、GPT 與本地模型都會在掃描、寫檔前被同一條閘門驗證。
+pub fn verify_ai_assistance() -> Result<(), String> {
+    let engine = Engine::connect_raw().map_err(|e| sanitize_provider_name(&e))?;
+    probe_ai_ready_inner(&engine, true).map_err(|e| {
+        let clean = sanitize_provider_name(&e);
+        if matches!(engine.provider, AiProvider::Codex) || looks_like_quota_or_auth_error(&clean) {
+            ai_quota_support_message_for(&clean, engine.provider, engine.managed)
+        } else {
+            clean
+        }
+    })
+}
+
+/// 嚴格探測自訂 API 金鑰（儲存後／測試鈕）。
 /// 網路失敗、空內容、401／餘額問題一律 Err；代管模式不可呼叫。
 pub fn verify_custom_api() -> Result<(), String> {
     if get_ai_mode() != "custom" {
         return Err("目前不是自訂 API 模式。".into());
     }
-    let engine = Engine::connect_raw().map_err(|e| sanitize_provider_name(&e))?;
-    if engine.managed {
-        return Err("目前不是自訂 API 模式。".into());
-    }
-    probe_ai_ready_inner(&engine, true).map_err(|e| {
-        let clean = sanitize_provider_name(&e);
-        if looks_like_quota_or_auth_error(&clean) {
-            ai_quota_support_message(&clean)
-        } else {
-            clean
-        }
-    })
+    verify_ai_assistance()
 }
 
 /// 輕量探測：餘額 API 或迷你 chat；網路抖動不阻擋，明確額度／金鑰問題直接回錯。
@@ -2993,8 +4300,20 @@ fn probe_ai_ready(engine: &Engine) -> Result<(), String> {
 fn probe_ai_ready_inner(engine: &Engine, strict: bool) -> Result<(), String> {
     let base = engine.base_url.trim_end_matches('/');
 
+    if matches!(engine.provider, AiProvider::LocalLlm) {
+        let health = format!("{base}/health");
+        match engine.client.get(&health).send() {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(_) => return Err("本地模型尚未就緒。請先完成安裝並等到健康檢查通過。".into()),
+            Err(err) if strict => return Err(format!("本地模型連線失敗：{err}")),
+            Err(_) => return Err("本地模型尚未就緒。請先完成安裝並等到健康檢查通過。".into()),
+        }
+        // 健康檢查只證明 server 活著；不能在這裡提早 return。後面仍須送出
+        // 一句真正的翻譯請求，才知道模型、chat endpoint、API key 與輸出格式都可用。
+    }
+
     // 代管 Worker 沒有 /user/balance 端點，跳過餘額查詢，直接用迷你 chat 探測。
-    if !engine.managed {
+    if !engine.managed && !matches!(engine.provider, AiProvider::Codex) {
         let bal_url = format!("{base}/user/balance");
         match engine
             .client
@@ -3025,20 +4344,36 @@ fn probe_ai_ready_inner(engine: &Engine, strict: bool) -> Result<(), String> {
         }
     }
 
-    let probe_texts = vec!["OK".to_string()];
-    let prompt = Arc::new(build_system_prompt(&glossary::load(None), &probe_texts));
+    // 不用「OK」：模型原樣回 OK 也會被視為有內容，卻不能證明它真的能翻譯。
+    // 這筆 `MaskedItem` 不會交給 `fill_missing`，因此沒有任何寫入 LangMap、TM 或共享庫的路徑。
+    let probe_texts = vec![AI_TRANSLATION_PROBE_SOURCE.to_string()];
+    let prompt = Arc::new(build_system_prompt(
+        &glossary::load(None),
+        &probe_texts,
+        matches!(engine.provider, AiProvider::LocalLlm),
+    ));
     let plan = BatchPlan {
         track: BatchTrackKind::Ui,
         items: vec![MaskedItem {
             uid: 0,
-            source: "OK".into(),
-            masked: "OK".into(),
+            source: AI_TRANSLATION_PROBE_SOURCE.into(),
+            masked: AI_TRANSLATION_PROBE_SOURCE.into(),
             tokens: Vec::new(),
             context: None,
         }],
     };
     match translate_chunk(engine, &prompt, &plan) {
-        Ok(success) if !success.map.is_empty() => Ok(()),
+        Ok(success)
+            if success
+                .map
+                .get(&0)
+                .is_some_and(|translated| quality_fail_reason(AI_TRANSLATION_PROBE_SOURCE, translated).is_ok()) =>
+        {
+            Ok(())
+        }
+        Ok(success) if success.map.contains_key(&0) => {
+            Err("AI 有回應，但沒有給出可用的繁體中文翻譯。".into())
+        }
         Ok(_) if cancel::is_cancelled() => {
             if strict {
                 Err("探測已取消".into())
@@ -3080,38 +4415,6 @@ fn balance_looks_empty(v: &Value) -> bool {
     false
 }
 
-pub fn looks_untranslatable(t: &str) -> bool {
-    if t.len() <= 1 {
-        return true;
-    }
-    if t.chars().filter(|c| c.is_alphabetic()).count() == 0 {
-        return true;
-    }
-    if t.starts_with("http://") || t.starts_with("https://") {
-        return true;
-    }
-    if t.contains("://") && !t.contains(' ') {
-        return true;
-    }
-    if is_resource_location(t) || is_resource_path_token(t) {
-        return true;
-    }
-    false
-}
-
-/// `minecraft:stone_sword`、`create:andesite_alloy` 這種資源 id。
-///
-/// 翻成「我的世界:石劍」會直接讓配方／JEI 對不上，所以連送都不要送給 AI。
-/// 判準刻意嚴格：全小寫、無空白——`Warning: fire` 或 `HP:100` 不會被誤殺。
-fn is_resource_location(t: &str) -> bool {
-    if !t.contains(':') || t.contains(char::is_whitespace) {
-        return false;
-    }
-    t.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '_' | '/' | '.' | '-')
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3129,25 +4432,205 @@ mod tests {
         }
     }
 
+    /// AI 掛掉時，資料層命中的譯文不可以被誤標為「使用 AI 完成」。
+    ///
+    /// 實測代價：站長那一包 33233 條待譯裡，共享翻譯庫命中 32151、共享術語 671，
+    /// 真正送 AI 的只有 271 條。舊版在 `Engine::connect()?` 一拋，
+    /// 那 32822 條查得到的譯文雖然留在記憶體，卻被當成整輪完成而寫出——
+    /// FTB Quests 與 FancyMenu 的缺口因此被掩蓋。
+    ///
+    /// 這條測試守的是：額度問題不是使用者取消；必須留下可診斷原因，
+    /// 由呼叫端停止這次有選 AI 的翻譯，不能寫出假完成結果。
+    #[test]
+    fn ai_failure_must_not_discard_what_the_data_layers_already_found() {
+        // 「AI 不可用」與「使用者取消」是兩件不同的事，只有後者該中斷
+        assert!(
+            !is_cancel_message("ChatGPT 暫時不接受翻譯請求：The usage limit has been reached"),
+            "端點拒絕不是使用者取消，不可以當成中斷"
+        );
+        assert!(
+            !is_cancel_message("本地模型尚未就緒。請先完成安裝並等到健康檢查通過。"),
+            "本地模型沒裝好也不是取消"
+        );
+        assert!(is_cancel_message(CANCEL_MESSAGE), "只有這個才是真的取消");
+
+        // 報告要能表達「資料層有成果，但 AI 沒跑成」這個中間狀態，
+        // 呼叫端才有辦法把它算成「部分完成」而不是「完成」。
+        let mut report = AiFillReport {
+            shared_hits: 32151,
+            shared_glossary_hits: 671,
+            ..Default::default()
+        };
+        assert!(report.ai_unavailable.is_none(), "預設是 AI 正常");
+        report.ai_unavailable = Some("ChatGPT 暫時不接受翻譯請求".into());
+        assert!(
+            report.ai_unavailable.is_some(),
+            "AI 不可用必須留下痕跡，否則結尾會誤報完成"
+        );
+        // 資料層的成果一條都不能少
+        assert_eq!(report.shared_hits + report.shared_glossary_hits, 32822);
+    }
+
+    #[test]
+    fn gpt_endpoint_rejection_never_claims_the_chatgpt_account_is_exhausted() {
+        let message = ai_quota_support_message_for(
+            "ChatGPT 暫時不接受翻譯請求：The usage limit has been reached",
+            AiProvider::Codex,
+            false,
+        );
+        assert!(message.contains("不一定代表你平常聊天的額度用完了"));
+        assert!(message.contains("翻譯會消耗你的 ChatGPT 帳號額度"), "要誠實說明會用到額度");
+        assert!(message.contains("沒有寫入任何翻譯"));
+        assert!(!message.contains("GPT 帳號額度或速率限制"));
+        let own_text = message.replace("The usage limit has been reached", "");
+        for word in ["Codex", "端點", "權杖", "探測", "預檢", "429", "Token", "token"] {
+            assert!(!own_text.contains(word), "玩家看得到的文字不可出現「{word}」");
+        }
+    }
+
+    #[test]
+    fn translation_probe_is_a_real_zh_translation_but_has_no_persistent_target() {
+        // 這是唯一用於預檢的文字；它不是玩家整合包中的鍵值，也不會交給寫檔／TM／共享庫流程。
+        assert_eq!(AI_TRANSLATION_PROBE_SOURCE, "Iron Sword");
+        assert!(quality_fail_reason(AI_TRANSLATION_PROBE_SOURCE, "鐵劍").is_ok());
+        assert!(quality_fail_reason(AI_TRANSLATION_PROBE_SOURCE, "Iron Sword").is_err());
+    }
+
+    #[test]
+    fn no_answer_items_must_not_be_written_back_as_english_or_negatively_cached() {
+        // 站長那一輪的實況：一批用完重試額度後整批消失，那些句子被寫回英文
+        // 並進負向快取，於是「補充漏翻」連試都不試——永遠救不回來。
+        let mut translations: HashMap<usize, String> = HashMap::new();
+        let mut report = AiFillReport::default();
+        let mut deferred: HashSet<usize> = HashSet::new();
+        let pending = vec![
+            PendingItem {
+                uid: 1,
+                source: "Deals %s extra damage".into(),
+                reason: PendingReason::NoAnswer,
+            },
+            PendingItem {
+                uid: 2,
+                source: "Costs %s mana".into(),
+                reason: PendingReason::PlaceholderBroken,
+            },
+        ];
+
+        let (broken, unanswered) =
+            drain_pending_ai(&pending, &mut translations, &mut report, &mut deferred);
+        assert_eq!((broken, unanswered), (1, 1));
+
+        // 沒拿到回應的：維持缺口，並排進補完佇列
+        assert!(
+            !translations.contains_key(&1),
+            "沒拿到回應的句子不可以被寫回英文假裝翻完了"
+        );
+        assert!(deferred.contains(&1), "要排進補完佇列才救得回來");
+        assert!(
+            !is_placeholder_negatively_cached("Deals %s extra damage"),
+            "沒拿到回應不代表翻不動，不可以進負向快取"
+        );
+
+        // 真的把格式符號弄壞的：維持舊行為（英文保底 ＋ 不重燒）
+        assert_eq!(translations.get(&2).map(String::as_str), Some("Costs %s mana"));
+        assert!(!deferred.contains(&2));
+        assert!(is_placeholder_negatively_cached("Costs %s mana"));
+
+        // 兩種原因要分開講，不可以混成一句
+        let notes = report.notes.join("
+");
+        assert!(notes.contains("佔位符失敗"), "{notes}");
+        assert!(notes.contains("沒拿到 AI 回應"), "{notes}");
+    }
+
+    #[test]
+    fn unresolved_batch_items_are_tagged_as_no_answer() {
+        // run_batches 放棄的批次會讓這些 uid 不出現在結果裡。
+        // 它們必須被標成「沒拿到回應」，而不是「翻不動」。
+        let items = vec![
+            MaskedItem {
+                uid: 7,
+                source: "Iron Sword".into(),
+                masked: "Iron Sword".into(),
+                tokens: vec![],
+                context: None,
+            },
+            MaskedItem {
+                uid: 8,
+                source: "Gold Sword".into(),
+                masked: "Gold Sword".into(),
+                tokens: vec![],
+                context: None,
+            },
+        ];
+        let mut resolved = HashMap::new();
+        resolved.insert(7usize, "鐵劍".to_string());
+
+        let unresolved = collect_unresolved_items(&items, &resolved);
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].uid, 8);
+        assert_eq!(unresolved[0].reason, PendingReason::NoAnswer);
+    }
+
+    #[test]
+    fn keep_english_skip_quality_does_not_write_translation() {
+        let mut translations = HashMap::new();
+        let mut report = AiFillReport::default();
+        keep_english_skip(
+            &mut translations,
+            &mut report,
+            7,
+            "Diamond Sword",
+            false,
+            Some(QualityFailReason::SameAsSource),
+        );
+        assert!(translations.get(&7).is_none(), "quality fail must not write English");
+        assert_eq!(report.quality_skipped, 1);
+        assert_eq!(report.quality_same_as_source, 1);
+        assert_eq!(report.rejected, 0);
+        keep_english_skip(&mut translations, &mut report, 8, "Hello %s", true, None);
+        assert_eq!(translations.get(&8).map(String::as_str), Some("Hello %s"));
+        assert_eq!(report.rejected, 1);
+    }
+
     #[test]
     fn classify_still_english_is_quality_fail_not_placeholder() {
-        let (class, safe, _) = classify_candidate("Diamond Sword", "Diamond Sword");
+        let (class, safe, _, reason) = classify_candidate("Diamond Sword", "Diamond Sword");
         assert_eq!(class, CandidateClass::QualityFail);
         assert!(safe.is_none());
+        assert_eq!(reason, Some(QualityFailReason::SameAsSource));
     }
 
     #[test]
     fn classify_broken_placeholder_is_placeholder_fail() {
-        let (class, safe, _) = classify_candidate("Hello %s", "你好");
+        let (class, safe, _, reason) = classify_candidate("Hello %s", "你好");
         assert_eq!(class, CandidateClass::PlaceholderFail);
         assert!(safe.is_none());
+        assert!(reason.is_none());
     }
 
     #[test]
     fn classify_good_zh_is_accept() {
-        let (class, safe, _) = classify_candidate("Diamond Sword", "鑽石劍");
+        let (class, safe, _, reason) = classify_candidate("Diamond Sword", "鑽石劍");
         assert_eq!(class, CandidateClass::Accept);
         assert_eq!(safe.as_deref(), Some("鑽石劍"));
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn classify_mixed_fragment_reason() {
+        let (class, safe, _, reason) =
+            classify_candidate("x", "黑色Argillite Brick 階梯");
+        assert_eq!(class, CandidateClass::QualityFail);
+        assert!(safe.is_none());
+        assert_eq!(reason, Some(QualityFailReason::MixedFragment));
+    }
+
+    #[test]
+    fn classify_proper_noun_with_enough_cjk_accepts() {
+        let (class, safe, _, _) = classify_candidate("Flan Assault Rifle", "Flan 突擊步槍");
+        assert_eq!(class, CandidateClass::Accept);
+        assert_eq!(safe.as_deref(), Some("Flan 突擊步槍"));
     }
 
     #[test]
@@ -3193,6 +4676,26 @@ mod tests {
     }
 
     #[test]
+    fn only_local_llm_gets_the_thinking_disabled_kwarg() {
+        // 這條釘死本輪修掉的空回應 bug：DeepSeek 用 `thinking`，本地模型用
+        // `chat_template_kwargs.enable_thinking`，兩者是不同 API，不能共用判斷式，
+        // 也不能誤送給不支援這個欄位的服務商。
+        let mut engine = test_engine();
+        engine.provider = AiProvider::LocalLlm;
+        assert!(should_disable_local_thinking(&engine));
+        assert!(!should_send_thinking_disabled(&engine));
+
+        engine.provider = AiProvider::Deepseek;
+        assert!(!should_disable_local_thinking(&engine));
+        assert!(should_send_thinking_disabled(&engine));
+
+        for other in [AiProvider::Openai, AiProvider::Glm, AiProvider::Qwen, AiProvider::Codex] {
+            engine.provider = other;
+            assert!(!should_disable_local_thinking(&engine), "{other:?} 不該被關思考");
+        }
+    }
+
+    #[test]
     fn context_hint_reads_leading_segment() {
         assert_eq!(context_hint("item.minecraft.diamond_sword"), Some("物品名"));
         assert_eq!(context_hint("block.create.cogwheel"), Some("方塊名"));
@@ -3209,25 +4712,6 @@ mod tests {
     #[test]
     fn context_hint_returns_none_for_unknown_shapes() {
         assert!(context_hint("somemod.random_thing").is_none());
-    }
-
-    #[test]
-    fn untranslatable_filter_skips_ids_and_urls() {
-        assert!(looks_untranslatable("https://example.com"));
-        assert!(looks_untranslatable("minecraft:stone_sword"));
-        assert!(looks_untranslatable("create:andesite_alloy"));
-        assert!(looks_untranslatable("123"));
-        assert!(looks_untranslatable("root.txt"));
-        assert!(looks_untranslatable("alligator.json"));
-        assert!(!looks_untranslatable("Diamond Sword"));
-    }
-
-    #[test]
-    fn colon_text_meant_for_players_is_still_translated() {
-        // 這些看起來有冒號，但是真的要翻的句子，不能被 id 判斷誤殺
-        assert!(!looks_untranslatable("Warning: fire"));
-        assert!(!looks_untranslatable("HP:100"));
-        assert!(!looks_untranslatable("Tier: Advanced"));
     }
 
     #[test]
@@ -3251,6 +4735,96 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_batch_reports_no_problems() {
+        let (map, audit) = parse_translation_object_audited(
+            r#"{"r":[{"i":1,"t":"鑽石劍"},{"i":2,"t":"鐵鎬"}]}"#,
+            &[1, 2],
+        )
+        .unwrap();
+        assert!(audit.is_clean(), "{}", audit.summary());
+        assert!(!audit.needs_diagnostic_split());
+        assert_eq!(audit.resolved, 2);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn hallucinated_ids_are_dropped_and_force_a_split() {
+        // 模型回了一個我們沒送過的 id。舊版會把它放進 map（雖然後續查不到），
+        // 但更重要的是：這代表模型沒照格式走，整批都不該當成可靠輸出。
+        let (map, audit) = parse_translation_object_audited(
+            r#"{"r":[{"i":1,"t":"鑽石劍"},{"i":99,"t":"我自己編的"}]}"#,
+            &[1, 2],
+        )
+        .unwrap();
+        assert_eq!(audit.unknown, vec![99]);
+        assert!(!map.contains_key(&99), "沒送過的 id 絕不可寫進結果");
+        assert!(audit.needs_diagnostic_split());
+        assert!(!audit.is_clean());
+    }
+
+    #[test]
+    fn same_id_with_two_different_answers_is_not_guessed() {
+        // 同一個 id 給了兩種譯文＝不知道哪個對。舊版是「後面的蓋掉前面的」，
+        // 靜默選一個。現在兩個都不採用，整批進拆半重試。
+        let (map, audit) = parse_translation_object_audited(
+            r#"{"r":[{"i":1,"t":"鑽石劍"},{"i":1,"t":"鑽石之劍"}]}"#,
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(audit.conflicting, vec![1]);
+        assert!(!map.contains_key(&1), "衝突的 id 不該猜一個寫進去");
+        assert!(audit.needs_diagnostic_split());
+    }
+
+    #[test]
+    fn duplicate_but_identical_answers_are_harmless() {
+        let (map, audit) = parse_translation_object_audited(
+            r#"{"r":[{"i":1,"t":"鑽石劍"},{"i":1,"t":"鑽石劍"}]}"#,
+            &[1],
+        )
+        .unwrap();
+        assert!(audit.conflicting.is_empty(), "重複但內容相同不算問題");
+        assert!(audit.is_clean());
+        assert_eq!(map.get(&1).map(String::as_str), Some("鑽石劍"));
+    }
+
+    #[test]
+    fn a_few_missing_entries_are_normal_but_mass_truncation_is_not() {
+        // 少數沒回來＝下一輪補，不必整批重試
+        let few = audit_batch_response(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[(1, "a".into()), (2, "b".into()), (3, "c".into()), (4, "d".into()),
+              (5, "e".into()), (6, "f".into()), (7, "g".into()), (8, "h".into()),
+              (9, "i".into())],
+        );
+        assert_eq!(few.missing, vec![10]);
+        assert!(!few.needs_diagnostic_split(), "掉一筆不該讓整批重跑");
+
+        // 掉太多＝這批本身有問題（多半被截斷），要拆半
+        let many = audit_batch_response(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[(1, "a".into()), (2, "b".into())],
+        );
+        assert_eq!(many.missing.len(), 8);
+        assert!(many.needs_diagnostic_split());
+    }
+
+    #[test]
+    fn empty_translations_are_flagged_not_written() {
+        let (map, audit) = parse_translation_object_audited(
+            r#"{"r":[{"i":1,"t":""},{"i":2,"t":"鐵鎬"}]}"#,
+            &[1, 2],
+        )
+        .unwrap();
+        assert_eq!(audit.empty, vec![1]);
+        assert_eq!(audit.resolved, 1);
+        assert!(!audit.is_clean());
+        // map 裡雖然有 key，但呼叫端會用 trim().is_empty() 濾掉；
+        // 這裡確認稽核本身有把它標出來，不是靜默當成翻好了
+        assert_eq!(map.get(&1).map(String::as_str), Some(""));
+    }
+
+    #[test]
     fn system_prompt_is_batch_independent() {
         let gloss = glossary::load(None);
         let texts = vec![
@@ -3258,8 +4832,8 @@ mod tests {
             "Quest Start".to_string(),
             "Diamond Sword".to_string(),
         ];
-        let prompt = build_system_prompt(&gloss, &texts);
-        let again = build_system_prompt(&gloss, &texts);
+        let prompt = build_system_prompt(&gloss, &texts, false);
+        let again = build_system_prompt(&gloss, &texts, false);
         assert_eq!(prompt, again);
         let payload_a = build_user_payload(&[masked(0, "Creeper {0}", Some("生物名"))]);
         let payload_b = build_user_payload(&[masked(7, "Quest line", Some("任務文字"))]);
@@ -3274,7 +4848,7 @@ mod tests {
         assert!(!prompt.contains("\"i\":0"));
         assert!(!prompt.contains("Quest line"));
         // 不同句集合若術語命中不同，譯名區塊可不同；但規則前綴必須相同
-        let other = build_system_prompt(&gloss, &["Totally Unique Widget Name XYZ".into()]);
+        let other = build_system_prompt(&gloss, &["Totally Unique Widget Name XYZ".into()], false);
         assert!(other.starts_with("你是 Minecraft"));
         assert_eq!(
             prompt.find("固定譯名"),
@@ -3285,9 +4859,32 @@ mod tests {
     #[test]
     fn system_prompt_stable_prefix_is_long_enough_for_cache() {
         let gloss = glossary::load(None);
-        let prompt = build_system_prompt(&gloss, &[]);
+        let prompt = build_system_prompt(&gloss, &[], false);
         assert!(prompt.contains("CachePrefixPad") || prompt.len() >= 500);
         assert!(prompt.contains("輸出格式"));
+    }
+
+    #[test]
+    fn local_prompt_is_much_shorter_than_the_cloud_one() {
+        // 本地模型的 8192 視窗是 prompt 與輸出共用的：system 佔掉的每個 token
+        // 都是從可翻譯的內容裡扣的。而且規則越多，小模型的指令遵循越差。
+        let gloss = glossary::load(None);
+        let texts = vec!["Diamond Sword".to_string(), "Creeper Head".to_string()];
+        let cloud = build_system_prompt(&gloss, &texts, false);
+        let local = build_system_prompt(&gloss, &texts, true);
+        assert!(
+            local.chars().count() * 2 < cloud.chars().count(),
+            "本地 prompt 應不到雲端的一半：本地 {} 字、雲端 {} 字",
+            local.chars().count(),
+            cloud.chars().count()
+        );
+        // 精簡不等於拿掉會壞掉的規則
+        assert!(local.contains("%s"), "佔位符規則不可省");
+        assert!(local.contains("數字"), "數字照抄的規則不可省");
+        assert!(local.contains("輸出格式"), "JSON 輸出格式不可省");
+        assert!(local.contains("固定譯名"), "術語表仍要帶上");
+        // 雲端那份的台灣用語長清單對小模型是反效果，不該出現在本地版
+        assert!(!local.contains("苦力怕、殭屍"), "百餘字的用語清單不該進本地 prompt");
     }
 
     #[test]
@@ -3317,23 +4914,23 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(summary(plan_track_batches(&items_a, false)), summary(plan_track_batches(&items_b, false)));
+        assert_eq!(summary(plan_track_batches_for(&items_a, false, false)), summary(plan_track_batches_for(&items_b, false, false)));
     }
 
     #[test]
     fn max_tokens_are_clamped() {
-        assert_eq!(clamp_completion_tokens(10, 1), 512);
-        assert_eq!(clamp_completion_tokens(1000, 1), 800);
-        assert_eq!(clamp_completion_tokens(20_000, 1), 8192);
+        assert_eq!(clamp_completion_tokens_for(10, 1, false), 512);
+        assert_eq!(clamp_completion_tokens_for(1000, 1, false), 800);
+        assert_eq!(clamp_completion_tokens_for(20_000, 1, false), 8192);
         // 多條時依條數提高下限（48 * 40 = 1920）
-        assert_eq!(clamp_completion_tokens(10, 40), 1920);
+        assert_eq!(clamp_completion_tokens_for(10, 40, false), 1920);
     }
 
     #[test]
     fn name_ui_batch_size_is_48() {
-        assert_eq!(BatchTrackKind::Name.batch_size(false), 48);
-        assert_eq!(BatchTrackKind::Ui.batch_size(false), 48);
-        assert_eq!(BatchTrackKind::Story.batch_size(false), 20);
+        assert_eq!(BatchTrackKind::Name.batch_size_for(false, false), 48);
+        assert_eq!(BatchTrackKind::Ui.batch_size_for(false, false), 48);
+        assert_eq!(BatchTrackKind::Story.batch_size_for(false, false), 20);
     }
 
     #[test]
@@ -3397,6 +4994,22 @@ mod tests {
                 completion_tokens: 30,
             }
         );
+
+        let responses_details = json!({
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 50,
+                "input_tokens_details": { "cached_tokens": 75 }
+            }
+        });
+        assert_eq!(
+            parse_usage_totals(&responses_details),
+            AiUsageTotals {
+                prompt_cache_hit_tokens: 75,
+                prompt_cache_miss_tokens: 125,
+                completion_tokens: 50,
+            }
+        );
     }
 
     #[test]
@@ -3457,8 +5070,7 @@ mod tests {
         let msg = ai_quota_support_message("deepseek-chat 402 Insufficient Balance");
         assert!(!msg.to_lowercase().contains("deepseek-chat"));
         assert!(msg.contains("AI 服務"));
-        // 官方平台網址可出現；模型／主機名不可
-        assert!(msg.contains("platform.deepseek.com"));
+        assert!(msg.contains("自訂 API") || msg.contains("服務商"));
     }
 
     #[test]
@@ -3479,7 +5091,7 @@ mod tests {
         assert!(auth_relogin_message().contains("Discord"));
         let peek = vec![
             "連線失敗（無回應）：timeout".into(),
-            "使用開發者代管 AI 前，請先登入 Discord。".into(),
+            "翻譯前請先登入 Discord。".into(),
         ];
         let classified = classify_batch_abort(&peek).expect("classified");
         assert!(!classified.contains("額度可能已用完"));
@@ -3491,10 +5103,10 @@ mod tests {
     #[test]
     fn quota_message_recommends_deepseek_platform() {
         let msg = ai_quota_support_message("402 Insufficient Balance");
-        assert!(msg.contains("platform.deepseek.com"));
-        assert!(msg.contains("不是無限"));
-        assert!(msg.contains("共享庫"));
+        assert!(msg.contains("自訂 API"));
+        assert!(msg.contains("platform.deepseek.com") || msg.contains("服務商"));
         assert!(!msg.to_lowercase().contains("deepseek-chat"));
+        assert!(!msg.contains("免費代管"));
     }
 
     #[test]
@@ -3710,5 +5322,51 @@ mod tests {
         ));
         assert!(is_empty_response_error("回傳為空 JSON 物件（無譯文）"));
         assert!(!is_empty_response_error("請求太頻繁，稍後再試"));
+    }
+
+    #[test]
+    fn local_llm_output_cap_fits_inside_the_context_window() {
+        // 這條釘死本輪修掉的矛盾：上下文 4096、輸出上限 8192，長文本必爆。
+        // 輸出上限必須 ≤ 最小上下文的四分之一，剩下的留給 prompt。
+        let min_ctx = crate::engine::local_llm::context_size_for(0) as usize;
+        assert!(min_ctx >= 8192, "最小上下文 {min_ctx}");
+        assert!(
+            LOCAL_LLM_MAX_COMPLETION_TOKENS * 4 <= min_ctx,
+            "輸出 {LOCAL_LLM_MAX_COMPLETION_TOKENS} 對上下文 {min_ctx} 太大"
+        );
+        // 不論丟多長的輸入，本地那條路都不會超過上限
+        for chars in [10usize, 5_000, 100_000] {
+            for items in [1usize, 12, 48] {
+                let got = clamp_completion_tokens_for(chars, items, true);
+                assert!(got <= LOCAL_LLM_MAX_COMPLETION_TOKENS, "chars={chars} items={items} got={got}");
+            }
+        }
+        // 雲端那條路維持原本的大上限，不受影響
+        assert!(clamp_completion_tokens_for(100_000, 48, false) > LOCAL_LLM_MAX_COMPLETION_TOKENS);
+    }
+
+    #[test]
+    fn local_llm_uses_smaller_batches() {
+        for track in [BatchTrackKind::Name, BatchTrackKind::Ui, BatchTrackKind::Story] {
+            let cloud = track.batch_size_for(false, false);
+            let local = track.batch_size_for(false, true);
+            assert!(local < cloud, "{track:?}: local={local} cloud={cloud}");
+            assert!(local >= 1);
+        }
+        assert_eq!(BatchTrackKind::Solo.batch_size_for(false, true), 1);
+        // strict_single 仍然壓過一切
+        assert_eq!(BatchTrackKind::Name.batch_size_for(true, true), 1);
+    }
+
+    #[test]
+    fn local_llm_parallel_matches_server_slots_and_uses_placeholder_guard() {
+        // 送出端的併發必須跟 llama-server 實際開的 slot 數一致，否則多開的 slot
+        // 沒人用（還是序列），或送太多請求排隊反而更慢。
+        let slots = crate::engine::local_llm::recommended_parallel_slots() as usize;
+        assert_eq!(provider_capabilities(AiProvider::LocalLlm).start_parallel, slots);
+        assert!((1..=3).contains(&slots), "併發數要保守：實得 {slots}");
+        let mut st = crate::engine::placeholder::GuardStats::default();
+        assert!(crate::engine::placeholder::guard("Deals %s damage", "造成傷害", &mut st).is_none());
+        assert!(crate::engine::placeholder::guard("Deals %s damage", "造成 %s 傷害", &mut st).is_some());
     }
 }

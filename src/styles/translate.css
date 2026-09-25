@@ -1,0 +1,430 @@
+/* —— Workspace shell —— */
+.workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: clamp(10px, 1.8vh, 20px) 0 clamp(8px, 1.2vh, 14px);
+}
+.workspace-frame {
+  width: 100%;
+  margin: 0;
+  min-height: 0;
+  flex: 1;
+}
+.content-column { min-width: 0; }
+.page-panel[hidden] { display: none !important; }
+.primary-action[hidden],
+.run-dock[hidden],
+#ai-options-group[hidden] { display: none !important; }
+
+.service-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, var(--dock-width));
+  gap: var(--gap);
+  align-items: start;
+}
+body[data-app-page="font"] .workspace-frame,
+body[data-app-page="diagnose"] .workspace-frame {
+  grid-template-columns: minmax(0, min(720px, 100%)) minmax(220px, var(--dock-width));
+  justify-content: center;
+}
+
+.main-stage { padding: 2px 0 8px; min-width: 0; }
+.stage-intro { margin-bottom: 16px; }
+.stage-kicker {
+  margin: 0 0 6px;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.stage-sub {
+  margin: 0;
+  max-width: var(--stage-max);
+  color: var(--muted);
+  font-size: clamp(13px, 1.35vw, 14px);
+  line-height: 1.55;
+}
+
+/* —— Honest note / AI home / legacy coverage —— */
+.inline-honest {
+  margin: 0 0 14px;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.path-validate[data-state="ok"] { color: var(--ok); }
+.path-validate[data-state="error"] { color: var(--danger); }
+.path-validate[data-state="idle"] { color: var(--faint); }
+
+.ai-home-panel {
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--panel) 88%, var(--canvas));
+}
+.ai-home-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.ai-home-head .options-group-title { margin: 0; }
+.ai-toggle-row { margin: 0; }
+.ai-source-inline {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.ai-auth-fold { margin-top: 8px; }
+.run-status-head { margin-bottom: 8px; }
+
+.coverage-tier-block { display: none !important; }
+.coverage-honest {
+  margin: 0;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* —— Fields / actions —— */
+.path-block { margin: 0 0 16px; }
+.path-block > label,
+.field-block > label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.path-hint, .field-help { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.input-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: stretch;
+}
+.input-row input { flex: 1 1 12rem; }
+.input-row .small-button { flex: 0 0 auto; }
+.input-row input,
+.field-block input,
+.field-block select,
+textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--ink);
+  transition: border-color 160ms var(--ease);
+}
+.input-row input:hover,
+.field-block input:hover,
+.field-block select:hover,
+textarea:hover { border-color: var(--input-hover); }
+.input-row input:focus,
+.field-block input:focus,
+.field-block select:focus,
+textarea:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  outline: none;
+}
+textarea {
+  min-height: 180px;
+  resize: vertical;
+  line-height: 1.55;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.primary-button,
+.secondary-button,
+.small-button,
+.danger-button,
+.text-button,
+.side-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 160ms var(--ease), border-color 160ms var(--ease), transform 120ms var(--ease), opacity 160ms var(--ease);
+}
+.primary-button:active,
+.secondary-button:active,
+.small-button:active,
+.danger-button:active { transform: scale(0.985); }
+.primary-button {
+  min-height: var(--btn-h-lg);
+  padding: 0 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 70%, #1a120c);
+  background: var(--accent);
+  color: #fff8f2;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 650;
+}
+.primary-button:hover:not(:disabled) { background: var(--accent-hover); }
+.primary-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.primary-action {
+  max-width: var(--cta-max);
+}
+.start-translate {
+  width: 100%;
+  max-width: var(--cta-max);
+}
+/* 本包選項現在跟「遊戲資料夾」標籤同一行（見 .path-block-head），不再是獨立滿版按鈕。 */
+.path-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  /* 視窗窄時「本包選項」會換到第二行；沒有這個間距，換行後的按鈕會跟下面
+     input-row 的「瀏覽…」擠在一起，視覺上像疊在一起。 */
+  margin-bottom: 6px;
+}
+/* 蓋掉 .more-options-cta 原本「填滿一整列」的寬度規則：這裡是跟標籤同一行的小按鈕。 */
+.path-block-head .more-options-cta:not([hidden]) {
+  width: auto;
+  max-width: none;
+}
+.secondary-button,
+.small-button {
+  min-height: var(--btn-h-sm);
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.secondary-button:hover,
+.small-button:hover { border-color: var(--accent); }
+.danger-button {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--line));
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 650;
+}
+.text-button {
+  min-height: var(--hit-min);
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+}
+.text-button:hover { color: var(--ink); }
+.danger-text-button { color: var(--danger); }
+.danger-text-button:hover { color: color-mix(in srgb, var(--danger) 80%, var(--ink)); }
+.action-area { margin-top: 4px; }
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.secondary-actions { margin-top: 12px; }
+.run-control-row {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+/* 現在這一列只有「停止翻譯」：中止動作獨立成行，不再跟設定入口搶版面權重。 */
+.run-control-row .run-control-stop {
+  flex: 1;
+  min-height: 44px;
+  margin: 0;
+}
+.more-options-cta:not([disabled]) {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: var(--ink);
+  font-weight: 700;
+}
+.share-support-row {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.share-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.pack-meta-card {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 92%, var(--canvas));
+}
+.local-cache-card {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+/*
+  接續提示：跟「本機已有翻譯」同一種卡片，但這是啟動時主動冒出來的，
+  用比較低調的中性底色，不要一開工具就搶走選資料夾的注意力。
+*/
+.resume-card {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--accent) 4%, var(--panel));
+}
+/* 寫不進去是「現在就得處理」，跟設定檔壞掉同一級的警示。 */
+.write-access-card {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: var(--danger-soft);
+}
+/* 設定檔壞掉是「有東西不對勁」，用警示色，跟一般資訊卡分開。 */
+.settings-health-card {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: var(--danger-soft);
+}
+.local-cache-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 8px;
+}
+.local-cache-head .options-group-title {
+  margin: 0;
+  font-size: 15px;
+}
+.local-cache-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+.local-cache-message {
+  margin: 0 0 6px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.local-cache-path {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.local-cache-actions {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.local-cache-restart-row {
+  margin: 8px 0 0;
+  text-align: right;
+}
+.step-total-time {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+.step-total-time[hidden] { display: none !important; }
+.pack-meta-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 10px;
+}
+.pack-meta-head .options-group-title {
+  margin: 0;
+  font-size: 15px;
+}
+.pack-meta-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pack-meta-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.pack-meta-form[hidden],
+.pack-meta-summary[hidden] {
+  display: none !important;
+}
+.pack-meta-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pack-meta-summary-text {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.share-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/*
+ * Discord 列：驗證完成後收成一行摘要。
+ * 政策不變（所有 AI 來源都需要會籍），但「已經好了」不該一直佔四顆按鈕的版面；
+ * 還沒好的時候維持展開，因為那正是使用者需要動手的時候。
+ */
+#managed-auth-panel[data-settled="1"] #discord-auth-note,
+#managed-auth-panel[data-settled="1"] #btn-discord-refresh {
+  display: none;
+}
+#managed-auth-panel[data-settled="1"] .managed-auth-compact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+#managed-auth-panel[data-settled="1"] .auth-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+#managed-auth-panel[data-settled="1"] #discord-auth-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

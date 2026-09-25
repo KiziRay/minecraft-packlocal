@@ -2,6 +2,8 @@ import { corsHeaders } from "./cors.mjs";
 import { isSafeOutboundUrl } from "./security.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const EMBED_COLOR = 0x35c5c9;
+const EMBED_FOOTER = { text: "模組包翻譯工具 · ZeitFrei" };
 
 function json(obj, status = 200, request) {
   return new Response(JSON.stringify(obj), {
@@ -34,26 +36,6 @@ function sanitizeNote(note, limitChars = 800) {
   return s.length > limitChars ? s.slice(0, limitChars) : s;
 }
 
-async function notifyDiscordFeedback(env, content) {
-  const hook = env?.DISCORD_FEEDBACK_WEBHOOK && String(env.DISCORD_FEEDBACK_WEBHOOK).trim();
-  if (!hook) return { ok: false, error: "feedback webhook not configured" };
-
-  let resp;
-  try {
-    if (!isSafeOutboundUrl(hook)) return { ok: false, error: "feedback webhook blocked" };
-    resp = await fetch(hook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content: String(content || "").slice(0, 1800) }),
-      signal: AbortSignal.timeout(8000),
-    });
-  } catch (_) {
-    return { ok: false, error: "feedback notify failed" };
-  }
-  if (!resp.ok) return { ok: false, error: "feedback notify failed" };
-  return { ok: true };
-}
-
 const FEEDBACK_PAIN_LABELS = {
   incomplete: "翻不乾淨",
   apply_find: "不好套用或找不到結果",
@@ -74,6 +56,72 @@ const FEEDBACK_WISH_LABELS = {
 function feedbackLabel(map, key) {
   const k = String(key || "").trim();
   return map[k] || k || "—";
+}
+
+function field(name, value, inline = true) {
+  const v = String(value || "").trim();
+  if (!v) return null;
+  return { name, value: v.slice(0, 1024), inline };
+}
+
+/** Discord 匿名回饋 webhook payload（embed，無 content）。 */
+export function buildFeedbackDiscordPayload({
+  clientId,
+  rating,
+  note,
+  painPoint,
+  wish,
+  source,
+  toolVersion,
+} = {}) {
+  const shortClient =
+    typeof clientId === "string" && clientId.length > 10
+      ? clientId.slice(0, 10) + "…"
+      : String(clientId || "").trim();
+  if (!shortClient) return null;
+
+  const fields = [
+    field("評分", rating != null ? `${rating}/5` : ""),
+    field("痛點", painPoint ? `${feedbackLabel(FEEDBACK_PAIN_LABELS, painPoint)}（${painPoint}）` : ""),
+    field("期望", wish ? `${feedbackLabel(FEEDBACK_WISH_LABELS, wish)}（${wish}）` : ""),
+    field("備註", note || "", false),
+    field("來源", source || ""),
+    field("版本", toolVersion || ""),
+    field("clientId", shortClient),
+  ].filter(Boolean);
+
+  return {
+    embeds: [
+      {
+        title: "MCPL 使用回饋（匿名）",
+        color: EMBED_COLOR,
+        fields,
+        footer: EMBED_FOOTER,
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  };
+}
+
+async function notifyDiscordFeedback(env, payload) {
+  const hook = env?.DISCORD_FEEDBACK_WEBHOOK && String(env.DISCORD_FEEDBACK_WEBHOOK).trim();
+  if (!hook) return { ok: false, error: "feedback webhook not configured" };
+  if (!payload?.embeds?.length) return { ok: false, error: "feedback payload empty" };
+
+  let resp;
+  try {
+    if (!isSafeOutboundUrl(hook)) return { ok: false, error: "feedback webhook blocked" };
+    resp = await fetch(hook, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (_) {
+    return { ok: false, error: "feedback notify failed" };
+  }
+  if (!resp.ok) return { ok: false, error: "feedback notify failed" };
+  return { ok: true };
 }
 
 export async function submitFeedback(request, env) {
@@ -120,23 +168,17 @@ export async function submitFeedback(request, env) {
     // KV 寫入失敗仍允許送 webhook，但不讓它變成 spam relay
   }
 
-  const shortClient = clientId.length > 10 ? clientId.slice(0, 10) + "…" : clientId;
-  const content = [
-    "MCPL 使用回饋（匿名）",
-    `clientId: ${shortClient}`,
-    painPoint ? `pain: ${feedbackLabel(FEEDBACK_PAIN_LABELS, painPoint)} (${painPoint})` : null,
-    wish ? `wish: ${feedbackLabel(FEEDBACK_WISH_LABELS, wish)} (${wish})` : null,
-    rating != null ? `rating: ${rating}/5` : null,
-    note ? `note: ${note}` : null,
-    source ? `source: ${source}` : null,
-    toolVersion ? `toolVersion: ${toolVersion}` : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const notify = await notifyDiscordFeedback(env, content);
+  const payload = buildFeedbackDiscordPayload({
+    clientId,
+    rating,
+    note,
+    painPoint,
+    wish,
+    source,
+    toolVersion,
+  });
+  const notify = await notifyDiscordFeedback(env, payload);
   if (!notify.ok) return json({ ok: false, error: notify.error }, 503);
 
   return json({ ok: true });
 }
-

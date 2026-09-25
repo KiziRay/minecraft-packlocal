@@ -1,0 +1,232 @@
+/* 介面縮放提示（html { zoom }；掛 body，left/top 須除以 zoom） */
+.zoom-hint {
+  position: fixed;
+  z-index: 12000;
+  pointer-events: none;
+  max-width: 260px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong, var(--line));
+  background: var(--panel, #1c1f26);
+  color: var(--ink, #e8eaef);
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.zoom-hint.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.app-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  z-index: 12000;
+  transform: translateX(-50%) translateY(8px);
+  max-width: min(92vw, 420px);
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong, var(--line));
+  background: var(--panel, #1c1f26);
+  color: var(--ink, #e8eaef);
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.app-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* 首次使用 spotlight 引導 */
+.onboard-root {
+  position: fixed;
+  inset: 0;
+  z-index: 11000;
+  pointer-events: none;
+}
+.onboard-root[hidden] { display: none !important; }
+.onboard-root.is-active { pointer-events: auto; }
+.onboard-shade {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  pointer-events: auto;
+}
+.onboard-hole {
+  position: absolute;
+  border-radius: 10px;
+  box-shadow: 0 0 0 9999px rgba(8, 10, 14, 0.58);
+  outline: 2px solid color-mix(in srgb, var(--accent, #7c9cff) 75%, white);
+  outline-offset: 2px;
+  pointer-events: none;
+  transition: top 0.18s ease, left 0.18s ease, width 0.18s ease, height 0.18s ease;
+}
+.onboard-bubble {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  width: min(320px, calc(100vw - 24px));
+  max-height: min(86dvh, 560px);
+  padding: 14px 14px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong, var(--line));
+  background: var(--panel, #1c1f26);
+  color: var(--ink, #e8eaef);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+  overflow: hidden;
+}
+.onboard-bubble h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 700;
+}
+.onboard-bubble p {
+  margin: 0;
+  color: var(--muted, #a7adbb);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.onboard-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-bottom: 12px;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+.onboard-meta {
+  margin-bottom: 10px;
+  color: var(--faint, #7a8190);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.onboard-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.onboard-actions .text-button,
+.onboard-actions .small-button,
+.onboard-actions .primary-button {
+  min-height: 32px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+  body.is-loading .main-stage > *,
+  body.is-loading .side-block > *,
+  body.is-loading .service-tabs > * { opacity: 1 !important; }
+  body.is-loading .main-stage::before,
+  body.is-loading .side-block::before,
+  body.is-loading .service-tabs::before { display: none !important; }
+}
+
+.ai-source-segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+.ai-source-seg {
+  display: grid;
+  gap: 2px;
+  padding: 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--canvas) 88%, transparent);
+  cursor: pointer;
+}
+.ai-source-seg:has(input:checked) {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+}
+.ai-source-seg input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.ai-source-seg strong {
+  display: block;
+  font-size: 13px;
+}
+.ai-source-seg small {
+  display: block;
+  color: var(--faint);
+  font-size: 11px;
+}
+.ai-config-card {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--canvas) 90%, transparent);
+}
+.ai-custom-panel {
+  display: grid;
+  gap: 8px;
+}
+.device-code-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: clamp(20px, 4vh, 48px);
+  background: color-mix(in srgb, #000 48%, transparent);
+}
+.device-code-overlay[hidden] {
+  display: none !important;
+}
+.device-code-shell {
+  width: min(440px, 100%);
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 18px 48px color-mix(in srgb, #000 35%, transparent);
+}
+.device-code-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.device-code-value {
+  margin: 12px 0;
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 1.2;
+  border-radius: 12px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--canvas));
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.device-code-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+

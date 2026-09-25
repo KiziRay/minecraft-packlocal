@@ -1,0 +1,9 @@
+{
+  "modpack-i18n-theme": "light",
+  "modpack-i18n-consent-hide-v1.0.6": "1",
+  "modpack-i18n-onboarding-seen-v1.0.7": "1",
+  "modpack-i18n-sfx-volume-v1": "0.3",
+  "modpack-i18n-keep-local-model-v1": "1",
+  "appearance": { "sfxMuted": "1" },
+  "localModel": { "keepAlive": "1", "installDir": "D:/models" }
+}

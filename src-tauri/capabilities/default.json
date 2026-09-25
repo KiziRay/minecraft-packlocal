@@ -1,10 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主視窗與說明視窗",
-  "windows": ["main", "guide"],
+  "description": "主視窗、說明視窗與設定視窗",
+  "windows": ["main", "guide", "settings"],
   "permissions": [
     "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:event:allow-emit-to",
     "core:window:allow-close",
     "core:window:allow-minimize",
     "core:window:allow-maximize",

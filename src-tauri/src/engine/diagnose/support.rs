@@ -29,7 +29,9 @@ fn re(src: &'static str) -> &'static Regex {
     static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, &'static Regex>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut guard = cache.lock().expect("diagnose regex cache");
+    // 同 placeholder::re：只放常數 regex 的 cache，中毒了照樣能用，
+    // 不該讓一次偶發 panic 之後所有診斷都跟著 panic。
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
         .entry(src)
         .or_insert_with(|| Box::leak(Box::new(Regex::new(src).expect("diagnose regex compiles"))))

@@ -36,7 +36,13 @@ fn re(src: &'static str) -> &'static Regex {
     static CACHE: OnceLock<std::sync::Mutex<HashMap<&'static str, &'static Regex>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("placeholder regex cache poisoned");
+    // 中毒的鎖照樣拿來用。
+    //
+    // 這個 cache 只放「編譯好的常數 regex」，沒有任何跨欄位不變式可以被破壞——
+    // 最壞情況就是某一筆還沒插進去。反過來說，如果這裡照標準寫法 unwrap，
+    // 翻譯的並行工作執行緒只要有任何一個 panic 過，這個鎖就永久中毒，
+    // 之後**每一次** mask／guard 呼叫都會跟著 panic：一次偶發失敗會變成整輪翻譯全毀。
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.entry(src).or_insert_with(|| {
         Box::leak(Box::new(
             Regex::new(src).expect("placeholder regex must compile"),
@@ -306,6 +312,31 @@ mod tests {
 
     fn pos(s: &str) -> Vec<String> {
         extract(s).positional
+    }
+
+    #[test]
+    fn a_panicking_worker_thread_does_not_break_everyone_else() {
+        // 翻譯是多執行緒跑的。以前 regex cache 的鎖用 unwrap，任何一個工作執行緒
+        // panic 過一次，這個鎖就永久中毒，之後每一次 mask／guard 都跟著 panic——
+        // 一次偶發失敗會變成整輪翻譯全毀。
+        let before = extract("Deals %s damage").positional;
+        assert_eq!(before, vec!["%s"]);
+
+        // 在別的執行緒裡 panic 掉（模擬工作執行緒出事）
+        let crashed = std::thread::spawn(|| {
+            let _ = extract("warm up the cache %d");
+            panic!("模擬工作執行緒崩潰");
+        })
+        .join();
+        assert!(crashed.is_err(), "這個執行緒本來就該 panic");
+
+        // 崩潰之後，其他人必須照常運作
+        assert_eq!(extract("Deals %s damage").positional, vec!["%s"]);
+        let mut stats = GuardStats::default();
+        assert_eq!(
+            guard("Deals %s damage", "造成 %s 傷害", &mut stats),
+            Some("造成 %s 傷害".to_string())
+        );
     }
 
     #[test]

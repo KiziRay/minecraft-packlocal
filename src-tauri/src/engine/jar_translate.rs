@@ -193,7 +193,7 @@ fn rewrite_one_jar(
             return Err(format!("包含不安全的 ZIP 路徑：{name}"));
         }
         if is_signature_path(&name) {
-            return Err("JAR 含有簽章檔（META-INF/*.SF、*.RSA、*.DSA 或 *.EC），拒絕重打包以免留下失效簽章。".into());
+            return Err("這個模組有數位簽章，重新打包會讓簽章失效、可能導致遊戲拒絕載入，所以保持原檔不動。此模組的內建文字會維持英文，屬正常現象，不影響遊戲執行。".into());
         }
         if let Some((namespace, _, extension)) = parse_language_path(&name) {
             jar_namespaces.insert(namespace.clone());

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "modelId": "fixture-q4",
+  "gguf": {
+    "name": "model-q4.gguf",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bytes": 16
+  },
+  "runtimes": {
+    "cuda": {
+      "name": "llama-cuda.zip",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bytes": 8
+    },
+    "vulkan": {
+      "name": "llama-vulkan.zip",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "bytes": 8
+    },
+    "cpu": {
+      "name": "llama-cpu.zip",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "bytes": 8
+    }
+  }
+}

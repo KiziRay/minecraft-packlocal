@@ -309,6 +309,9 @@ where
     on_progress(88, "覆寫文字：寫出檔案…");
     let mut written = 0usize;
     let mut patchouli_zh_tw = 0usize;
+    // 同一本書可能有 en_us／zh_cn／uk_ua 好幾份，全部都會映到同一個 zh_tw 路徑。
+    // 記住每個目的地目前是由哪個優先度寫的，只有更好的來源才准覆蓋。
+    let mut zh_tw_written: HashMap<PathBuf, u8> = HashMap::new();
     for payload in &file_payloads {
         if let Some(new_bytes) = payload.apply(&map)? {
             let rel = payload
@@ -322,15 +325,23 @@ where
             fs::write(&out_path, &new_bytes)
                 .map_err(|e| format!("{}: {e}", out_path.display()))?;
             written += 1;
-            if let Some(zh_rel) = book_en_to_zh_tw_rel(rel) {
-                let zh_out = output_dir.join(&zh_rel);
-                if let Some(parent) = zh_out.parent() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Some((zh_rel, priority)) = book_locale_to_zh_tw_rel(rel) {
+                let better = match zh_tw_written.get(&zh_rel) {
+                    Some(&existing) => priority < existing,
+                    None => true,
+                };
+                if better {
+                    let zh_out = output_dir.join(&zh_rel);
+                    if let Some(parent) = zh_out.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::write(&zh_out, &new_bytes)
+                        .map_err(|e| format!("{}: {e}", zh_out.display()))?;
+                    if zh_tw_written.insert(zh_rel, priority).is_none() {
+                        patchouli_zh_tw += 1;
+                        written += 1;
+                    }
                 }
-                fs::write(&zh_out, &new_bytes)
-                    .map_err(|e| format!("{}: {e}", zh_out.display()))?;
-                patchouli_zh_tw += 1;
-                written += 1;
             }
         }
     }
@@ -1543,30 +1554,78 @@ fn strip_wrapping_quotes(s: &str) -> &str {
     t
 }
 
-/// Patchouli／Citadel 書 `…/en_us/` 或 `…/zh_cn/` → 同相對路徑的 `zh_tw`（供遊戲選繁中）。
-fn book_en_to_zh_tw_rel(rel: &Path) -> Option<PathBuf> {
-    let s = rel.to_string_lossy().replace('\\', "/");
-    let lower = s.to_ascii_lowercase();
+/// 看起來像不像 Minecraft 的語系資料夾名（`en_us`、`zh_cn`、`uk_ua`、`fil_ph`…）。
+///
+/// 判斷靠形狀而不是白名單：Minecraft 的語系代碼是「2–3 個小寫字母 ＋ 底線 ＋
+/// 剛好 2 個小寫字母／數字」。地區碼限制成剛好 2 個是刻意的——放寬到 3–4 個
+/// 就會把 `my_book`、`the_end` 這種一般資料夾名吃進來。
+///
+/// 形狀相符但其實不是語系的資料夾（例如某本書的 id 剛好叫 `ar_ts`）會多寫出
+/// 一份 `zh_tw` 副本。那是可以接受的代價：現在的失效模式是**整批書一個都讀不到**。
+fn is_locale_folder_name(seg: &str) -> bool {
+    let Some((lang, region)) = seg.split_once('_') else {
+        return false;
+    };
+    (2..=3).contains(&lang.len())
+        && region.len() == 2
+        && lang.chars().all(|c| c.is_ascii_lowercase())
+        && region
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+}
+
+/// 同一個 `zh_tw` 目的地可能有好幾個來源語系搶著寫，數字小的優先。
+///
+/// 英文原文最準（模組作者寫的就是它），簡中次之（轉繁品質可預期），
+/// 其他語言（烏克蘭文、俄文…）只在完全沒有更好的來源時才拿來墊底。
+fn book_locale_priority(locale: &str) -> u8 {
+    match locale {
+        "en_us" => 0,
+        "zh_cn" => 1,
+        "zh_hk" => 2,
+        _ => 3,
+    }
+}
+
+/// Patchouli／Citadel 書的任一語系資料夾 → 同相對路徑的 `zh_tw`（供遊戲選繁中）。
+///
+/// # 為什麼不能只認 en_us／zh_cn／zh_hk
+///
+/// 站長 2026-09-02 的輸出裡有
+/// `data/croptopia/patchouli_books/guide/uk_ua/categories/crops.json`，
+/// 而整個 `data/` 底下 **`zh_tw` 資料夾數量是 0**——那本書被翻好了，
+/// 卻寫進烏克蘭文資料夾，遊戲永遠讀不到。
+///
+/// 舊版只認三個寫死的語系，其餘一律 `None`＝譯文留在原語系資料夾。
+/// 現在改成認得所有語系資料夾，並回傳優先度讓呼叫端決定誰能覆蓋誰。
+fn book_locale_to_zh_tw_rel(rel: &Path) -> Option<(PathBuf, u8)> {
     if !is_book_content_path(rel) {
         return None;
     }
-    let from = if lower.contains("/en_us/") || lower.ends_with("/en_us") {
-        ("/en_us/", "/en_us", "\\en_us\\")
-    } else if lower.contains("/zh_cn/") || lower.ends_with("/zh_cn") {
-        ("/zh_cn/", "/zh_cn", "\\zh_cn\\")
-    } else if lower.contains("/zh_hk/") || lower.ends_with("/zh_hk") {
-        ("/zh_hk/", "/zh_hk", "\\zh_hk\\")
-    } else {
-        return None;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    // 副檔名不要參與語系比對：`…/en_us.txt` 的語系在檔名而不是資料夾。
+    let (stem, ext) = match s.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.contains('/') => (stem, Some(ext)),
+        _ => (s.as_str(), None),
     };
-    let replaced = s
-        .replace(from.0, "/zh_tw/")
-        .replace(from.1, "/zh_tw")
-        .replace(from.2, "\\zh_tw\\");
-    if replaced == s {
+    let mut parts: Vec<String> = stem.split('/').map(|p| p.to_string()).collect();
+    // 由後往前找語系段：書本結構是 `<book>/<locale>/<類別>/<檔案>`，
+    // 從後面找才不會把路徑前段偶然像語系的資料夾誤判成語系。
+    let idx = parts
+        .iter()
+        .rposition(|p| is_locale_folder_name(&p.to_ascii_lowercase()))?;
+    let locale = parts[idx].to_ascii_lowercase();
+    if locale == "zh_tw" {
+        // 本來就在正確的位置，不需要再複製一份
         return None;
     }
-    Some(PathBuf::from(replaced))
+    parts[idx] = "zh_tw".to_string();
+    let mut replaced = parts.join("/");
+    if let Some(ext) = ext {
+        replaced.push('.');
+        replaced.push_str(ext);
+    }
+    Some((PathBuf::from(replaced), book_locale_priority(&locale)))
 }
 
 fn property_replaced_line(line: &str, map: &HashMap<String, String>, fancy_only: bool) -> String {
@@ -1869,6 +1928,64 @@ mod tests {
     }
 
     #[test]
+    fn any_locale_folder_lands_in_zh_tw_not_the_source_locale() {
+        // 站長 2026-09-02 的實際輸出：croptopia 的書翻好了，
+        // 卻寫進 uk_ua（烏克蘭文）資料夾，整個 data/ 底下 zh_tw 數量是 0。
+        // 舊版只認 en_us／zh_cn／zh_hk，其餘語系一律回 None＝留在原地。
+        let (rel, priority) = book_locale_to_zh_tw_rel(Path::new(
+            "data/croptopia/patchouli_books/guide/uk_ua/categories/crops.json",
+        ))
+        .expect("uk_ua 也是語系資料夾，必須映到 zh_tw");
+        assert_eq!(
+            rel,
+            PathBuf::from("data/croptopia/patchouli_books/guide/zh_tw/categories/crops.json")
+        );
+        // 其他語言是墊底來源，優先度必須低於英文與簡中
+        assert!(priority > book_locale_priority("en_us"));
+        assert!(priority > book_locale_priority("zh_cn"));
+
+        // 已經在正確位置的不用再複製一份
+        assert!(book_locale_to_zh_tw_rel(Path::new(
+            "data/croptopia/patchouli_books/guide/zh_tw/categories/crops.json"
+        ))
+        .is_none());
+
+        // 不是書本內容的路徑仍然不碰
+        assert!(book_locale_to_zh_tw_rel(Path::new(
+            "config/fancymenu/customization/uk_ua/menu.txt"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn english_beats_other_locales_for_the_same_zh_tw_destination() {
+        // 同一本書有 en_us 與 uk_ua 兩份，兩份都會映到同一個 zh_tw 路徑。
+        // 英文是模組作者的原文，必須贏過烏克蘭文，否則譯文會是「翻譯的翻譯」。
+        let base = "data/x/patchouli_books/g";
+        let (en_rel, en_pri) =
+            book_locale_to_zh_tw_rel(Path::new(&format!("{base}/en_us/e/a.json"))).unwrap();
+        let (uk_rel, uk_pri) =
+            book_locale_to_zh_tw_rel(Path::new(&format!("{base}/uk_ua/e/a.json"))).unwrap();
+        assert_eq!(en_rel, uk_rel, "兩者搶同一個目的地");
+        assert!(en_pri < uk_pri, "英文優先度要比較高（數字比較小）");
+    }
+
+    #[test]
+    fn locale_folder_detection_does_not_swallow_ordinary_folders() {
+        assert!(is_locale_folder_name("en_us"));
+        assert!(is_locale_folder_name("uk_ua"));
+        assert!(is_locale_folder_name("pt_br"));
+        assert!(is_locale_folder_name("fil_ph"));
+        // 一般資料夾名不可以被當成語系
+        assert!(!is_locale_folder_name("patchouli_books"));
+        assert!(!is_locale_folder_name("categories"));
+        assert!(!is_locale_folder_name("my_book"), "地區碼 4 個字＝不是語系");
+        assert!(!is_locale_folder_name("the_end"), "地區碼 3 個字＝不是語系");
+        assert!(!is_locale_folder_name("guide"));
+        assert!(!is_locale_folder_name("EN_US"), "大寫不是 Minecraft 的寫法");
+    }
+
+    #[test]
     fn book_en_us_txt_maps_to_zh_tw_and_is_whole_file() {
         assert!(is_book_locale_txt(Path::new(
             "assets/alexsmobs/book/animal_dictionary/en_us/root.txt"
@@ -1877,17 +1994,19 @@ mod tests {
             "assets/alexsmobs/book/animal_dictionary/root.json"
         )));
         assert_eq!(
-            book_en_to_zh_tw_rel(Path::new(
+            book_locale_to_zh_tw_rel(Path::new(
                 "assets/alexsmobs/book/animal_dictionary/en_us/root.txt"
-            )),
+            ))
+            .map(|(p, _)| p),
             Some(PathBuf::from(
                 "assets/alexsmobs/book/animal_dictionary/zh_tw/root.txt"
             ))
         );
         assert_eq!(
-            book_en_to_zh_tw_rel(Path::new(
+            book_locale_to_zh_tw_rel(Path::new(
                 "assets/alexsmobs/book/animal_dictionary/zh_cn/root.txt"
-            )),
+            ))
+            .map(|(p, _)| p),
             Some(PathBuf::from(
                 "assets/alexsmobs/book/animal_dictionary/zh_tw/root.txt"
             ))

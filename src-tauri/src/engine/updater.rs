@@ -17,10 +17,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::hashutil::sha256_hex;
+use super::provenance;
+use super::release_manifest::{
+    validate as validate_manifest, ClientContext, ManifestReject, ReleaseManifest,
+};
 use super::secrets::MANAGED_BASE_URL;
+use super::trust_keys::PINNED_KEYS;
 
-/// 目前版本（編譯時由 Cargo 帶入）。
+/// 程式內版本。**由 `Cargo.toml` 取得，不得寫死字串**——1.0.9 之前這裡是硬編的
+/// `"1.0.9"`，是 P0-07「版本真相分裂」的來源：改了 Cargo.toml 也不會反映到更新比對。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 建置識別＝版本＋短 commit（＋ dirty 標記），由 `build.rs` 注入的 provenance 組出。
+/// 同版不同建置可區分，且一眼看得出是不是乾淨建置。
+pub fn current_build_id() -> String {
+    provenance::current_build_id()
+}
 const MIN_UPDATE_BYTES: usize = 100_000;
 const MAX_UPDATE_BYTES: usize = 256 * 1024 * 1024;
 // 若更新流程掛住，避免鎖永遠不回收；前端也有 download_invoke timeout。
@@ -94,6 +106,30 @@ pub struct UpdateCheck {
     /// 檢查本身是否成功（false＝連不上，UI 顯示「暫時無法檢查」）
     pub ok: bool,
     pub message: String,
+    /// true＝這是測試版建置：不連更新站、不下載、不跳更新視窗
+    pub test_build: bool,
+}
+
+/// 測試版不自動更新時給玩家看的話。
+pub const TEST_BUILD_UPDATE_MESSAGE: &str =
+    "測試版不自動更新。要換新的測試版，請到測試資料夾手動下載。";
+
+/// 測試通道的建置一律不檢查、不下載更新：測試版是手動發送的，
+/// 自動更新會把測試者換成正式版，或把別批次的測試版蓋上來。
+pub fn test_build_update_check(current: &str, channel: provenance::Channel) -> Option<UpdateCheck> {
+    if channel != provenance::Channel::Test {
+        return None;
+    }
+    Some(UpdateCheck {
+        current: current.to_string(),
+        latest: current.to_string(),
+        update_available: false,
+        url: String::new(),
+        notes: String::new(),
+        ok: true,
+        message: TEST_BUILD_UPDATE_MESSAGE.to_string(),
+        test_build: true,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +142,29 @@ struct LatestResponse {
     notes: String,
     #[serde(default)]
     sha256: Option<String>,
+    /// 帶簽章的 release manifest。舊 Worker 不回這個欄位，行為維持不變；
+    /// 一旦回了就必須通過 `release_manifest::validate`，不通過即拒絕更新。
+    #[serde(default)]
+    manifest: Option<ReleaseManifest>,
+}
+
+/// 目前 client 的身分，用於 manifest 的通道／版本／相容範圍比對。
+pub fn client_context() -> ClientContext {
+    ClientContext {
+        version: CURRENT_VERSION.to_string(),
+        build_id: current_build_id(),
+        channel: provenance::current().channel,
+    }
+}
+
+/// 對 Worker 提供的 manifest 做完整驗證。回 `Ok(None)` 表示對方沒有提供 manifest
+/// （舊 Worker），此時沿用既有的版本比對路徑。
+fn check_manifest(latest: &LatestResponse) -> Result<Option<()>, ManifestReject> {
+    let Some(manifest) = latest.manifest.as_ref() else {
+        return Ok(None);
+    };
+    validate_manifest(manifest, &client_context(), PINNED_KEYS)?;
+    Ok(Some(()))
 }
 
 /// 把 `1.2.3` 這種版本轉成可比較的數字序列；非數字尾綴（`-beta`）安全忽略。
@@ -139,17 +198,27 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
-fn endpoint() -> String {
-    format!("{}/api/desktop/latest", MANAGED_BASE_URL.trim_end_matches('/'))
+fn endpoint(build_id: Option<&str>) -> String {
+    let base = format!("{}/api/desktop/latest", MANAGED_BASE_URL.trim_end_matches('/'));
+    // build id 直接串進 query string，含 `+`／空白等字元會在傳輸中被改寫成別的值，
+    // Worker 拿到的就不是我們送的東西。不安全就整個不帶，退回無參數查詢
+    // ——寧可少一個提示參數，也不要送一個會被靜默竄改的識別碼。
+    match build_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && provenance::is_url_safe_build_id(value))
+    {
+        Some(value) => format!("{base}?build={value}"),
+        None => base,
+    }
 }
 
-fn fetch_latest() -> Result<LatestResponse, String> {
+fn fetch_latest(build_id: Option<&str>) -> Result<LatestResponse, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| format!("無法建立更新連線：{e}"))?;
     let response = client
-        .get(endpoint())
+        .get(endpoint(build_id))
         .send()
         .map_err(|_| "暫時無法檢查更新（可能沒有網路）。".to_string())?;
     if !response.status().is_success() {
@@ -167,6 +236,9 @@ fn fetch_latest() -> Result<LatestResponse, String> {
 /// 檢查更新。連不上時回 `ok=false`，不當成錯誤（純資訊查詢）。
 pub fn check_update() -> UpdateCheck {
     let current = CURRENT_VERSION.to_string();
+    if let Some(test_build) = test_build_update_check(&current, provenance::current().channel) {
+        return test_build;
+    }
     let fail = |msg: &str| UpdateCheck {
         current: current.clone(),
         latest: current.clone(),
@@ -175,12 +247,20 @@ pub fn check_update() -> UpdateCheck {
         notes: String::new(),
         ok: false,
         message: msg.to_string(),
+        test_build: false,
     };
 
-    let latest = match fetch_latest() {
+    let build_id = current_build_id();
+    let latest = match fetch_latest(Some(&build_id)) {
         Ok(value) => value,
         Err(error) => return fail(&error),
     };
+
+    // manifest 存在就必須通過驗證：通道、來源身分、檔名、https、簽章缺一不可。
+    // 驗證失敗一律不提示更新，並把白話原因交給玩家。
+    if let Err(reject) = check_manifest(&latest) {
+        return fail(&reject.player_message());
+    }
 
     let available = is_newer(&latest.version, &current);
     UpdateCheck {
@@ -195,6 +275,7 @@ pub fn check_update() -> UpdateCheck {
         } else {
             format!("已是最新版（{current}）")
         },
+        test_build: false,
     }
 }
 
@@ -207,13 +288,33 @@ pub struct DownloadResult {
     pub automatic: bool,
     /// true＝背景更新工作已脫離目前行程，前端收到回應後可關閉舊程式。
     pub should_exit: bool,
+    /// true＝重新檢查時發現目前版本已經不低於伺服器版本。
+    pub already_current: bool,
+    pub current: String,
+    pub latest: String,
     pub message: String,
 }
 
 /// 下載免安裝 EXE 到暫存，強制驗證後排程替換更新。
+/// 測試版建置拒絕下載更新時要給玩家看的話；不是測試版回 `None`。
+pub fn test_build_download_refusal(channel: provenance::Channel) -> Option<String> {
+    (channel == provenance::Channel::Test).then(|| {
+        "測試版不會自動下載更新。要換新的測試版，請到測試資料夾手動下載。".to_string()
+    })
+}
+
 pub fn download_and_launch() -> Result<DownloadResult, String> {
+    // 測試版一律不下載：就算前端誤觸，也不能把測試者換成正式版或別批次的測試版
+    if let Some(refusal) = test_build_download_refusal(provenance::current().channel) {
+        return Err(refusal);
+    }
     let _guard = UpdateGuard::acquire()?;
-    let latest = fetch_latest()?;
+    // 下載時帶 build ID，與檢查更新一致，避免 Worker 回傳錯誤 URL／假版號。
+    let build_id = current_build_id();
+    let latest = fetch_latest(Some(&build_id))?;
+    // 真正要寫檔的路徑必須自己再驗一次，不能倚賴檢查更新那一輪的結果
+    // （兩次呼叫之間 Worker 可能換了回應）。
+    check_manifest(&latest).map_err(|reject| reject.player_message())?;
     let current = CURRENT_VERSION.to_string();
     if !is_newer(&latest.version, &current) {
         return Ok(DownloadResult {
@@ -221,6 +322,9 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
             launched: false,
             automatic: false,
             should_exit: false,
+            already_current: true,
+            current: current.clone(),
+            latest: latest.version.clone(),
             message: format!("已是最新版（{current}），不需要更新。"),
         });
     }
@@ -266,12 +370,20 @@ pub fn download_and_launch() -> Result<DownloadResult, String> {
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("準備更新 EXE 失敗：{e}"))?;
 
+    crate::dev_log!("update", "驗證通過，準備替換：{}", dest.display());
     let (launched, automatic, should_exit) = apply_portable_update(&dest)?;
+    crate::dev_log!(
+        "update",
+        "替換完成 launched={launched} automatic={automatic} should_exit={should_exit}"
+    );
     Ok(DownloadResult {
         path: dest.display().to_string(),
         launched,
         automatic,
         should_exit,
+        already_current: false,
+        current,
+        latest: latest.version,
         message: if automatic {
             "免安裝更新檔已驗證，工具將關閉、替換並由新版重新開啟。".into()
         } else {
@@ -318,22 +430,12 @@ fn is_mcpl_update_filename(name: &str) -> bool {
     else {
         return false;
     };
-    let mut parts = ver.split('.');
-    let Some(major) = parts.next() else {
-        return false;
-    };
-    let Some(minor) = parts.next() else {
-        return false;
-    };
-    let Some(patch) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && !major.is_empty()
-        && major.bytes().all(|b| b.is_ascii_digit())
-        && !minor.is_empty()
-        && minor.bytes().all(|b| b.is_ascii_digit())
-        && patch.chars().next().is_some_and(|c| c.is_ascii_digit())
+    let segs: Vec<_> = ver.split('.').collect();
+    segs.len() >= 3
+        && segs.len() <= 4
+        && segs
+            .iter()
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn validate_sha256(value: Option<&str>) -> Result<String, String> {
@@ -368,6 +470,11 @@ fn spawn_hidden_bat(bat: &std::path::Path, breakaway: bool) -> bool {
     if bat_s.is_empty() || !bat.exists() {
         return false;
     }
+    // `cmd /c` needs the double-quote pair around the complete command when
+    // the batch path contains spaces.  The official exe name contains both a
+    // space and CJK characters, so passing the raw path can report success for
+    // spawning cmd.exe while never executing the batch file.
+    let cmd_bat = quoted_cmd_bat(&bat_s);
     let mut hide_flags: u32 = 0x0800_0000 | 0x0000_0200; // NO_WINDOW | NEW_PROCESS_GROUP
     if breakaway {
         hide_flags |= 0x0100_0000; // BREAKAWAY_FROM_JOB
@@ -379,7 +486,7 @@ fn spawn_hidden_bat(bat: &std::path::Path, breakaway: bool) -> bool {
 
     // 1) cmd /c bat + CREATE_NO_WINDOW（不要用 DETACHED，也不要先假成功的 VBS）
     if Command::new("cmd")
-        .args(["/c", &bat_s])
+        .args(["/d", "/s", "/c", &cmd_bat])
         .creation_flags(hide_flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -392,8 +499,8 @@ fn spawn_hidden_bat(bat: &std::path::Path, breakaway: bool) -> bool {
 
     // 2) PowerShell 隱藏啟動 cmd /c bat
     let ps = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','{}') -WindowStyle Hidden",
-        bat_s.replace('\'', "''")
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d','/s','/c','{}') -WindowStyle Hidden",
+        cmd_bat.replace('\'', "''")
     );
     if Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
@@ -430,17 +537,22 @@ fn spawn_hidden_bat(bat: &std::path::Path, breakaway: bool) -> bool {
 
     // 4) DETACHED fallback（可能閃黑框，總比沒重開好）
     Command::new("cmd")
-        .args(["/c", &bat_s])
+        .args(["/d", "/s", "/c", &cmd_bat])
         .creation_flags(det_flags)
         .spawn()
         .is_ok()
+}
+
+#[cfg(windows)]
+fn quoted_cmd_bat(path: &str) -> String {
+    format!("\"\"{}\"\"", path.replace('"', ""))
 }
 
 /// 等本 PID 結束後再 `start` 新 exe（主路徑：檔已替換完成）。
 #[cfg(windows)]
 fn build_delayed_start_bat(pid: u32, exe: &str) -> String {
     format!(
-        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nif exist \"{exe}\" start \"\" \"{exe}\"\r\ndel \"%~f0\"\r\n",
+        "@echo off\r\nchcp 65001 >nul\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nif exist \"{exe}\" start \"\" \"{exe}\"\r\ndel \"%~f0\"\r\n",
         pid = pid,
         exe = exe
     )
@@ -450,7 +562,7 @@ fn build_delayed_start_bat(pid: u32, exe: &str) -> String {
 #[cfg(windows)]
 fn build_fallback_replace_bat(pid: u32, new_path: &str, cur_path: &str) -> String {
     format!(
-        "@echo off\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nmove /Y \"{new}\" \"{cur}\" >nul\r\nif exist \"{cur}\" start \"\" \"{cur}\"\r\ndel \"%~f0\"\r\n",
+        "@echo off\r\nchcp 65001 >nul\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nset \"attempts=0\"\r\n:replace\r\nset /a attempts+=1\r\nif exist \"{cur}\" del /F /Q \"{cur}\" >nul 2>&1\r\nmove /Y \"{new}\" \"{cur}\" >nul 2>&1\r\nif exist \"{cur}\" goto start\r\nif %attempts% GEQ 30 goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto replace\r\n:start\r\nstart \"\" \"{cur}\"\r\n:done\r\ndel \"%~f0\"\r\n",
         pid = pid,
         new = new_path,
         cur = cur_path
@@ -515,6 +627,13 @@ fn apply_portable_update(tmp: &std::path::Path) -> Result<(bool, bool, bool), St
     let _ = std::fs::remove_file(&bak);
 
     let renamed = std::fs::rename(&current, &bak);
+    crate::dev_log!(
+        "update",
+        "改名舊版 {} → {} 結果={:?}",
+        current.display(),
+        bak.display(),
+        renamed.as_ref().err().map(|e| e.to_string())
+    );
     if renamed.is_ok() {
         if let Err(e) = std::fs::copy(tmp, &current) {
             let _ = std::fs::rename(&bak, &current);
@@ -531,6 +650,7 @@ fn apply_portable_update(tmp: &std::path::Path) -> Result<(bool, bool, bool), St
         write_bat_file(&script_path, &script)?;
 
         let mut launched = spawn_hidden_bat(&script_path, true) || spawn_hidden_bat(&script_path, false);
+        crate::dev_log!("update", "重啟腳本 {} spawn={}", script_path.display(), launched);
         if !launched {
             // bat 失敗才 breakaway 直開（備援；父仍活著，仍有 Job 風險）
             const DIRECT_FLAGS: u32 = 0x0800_0000 | 0x0000_0200 | 0x0100_0000;
@@ -542,7 +662,14 @@ fn apply_portable_update(tmp: &std::path::Path) -> Result<(bool, bool, bool), St
             launched = cmd.spawn().is_ok();
         }
         if !launched {
-            return Err("已更新完成，但自動重啟失敗，請手動開啟程式。".into());
+            crate::dev_log!("update", "三重保險全部失敗，改請使用者手動開啟");
+            // 不要只丟一句錯誤就結束——新版已經就位了，把路徑給他，
+            // 讓他一步就能開起來，而不是自己去翻資料夾。
+            return Err(format!(
+                "更新檔已經準備好，但自動重啟沒有成功。請手動開啟：
+{}",
+                current.display()
+            ));
         }
         // 給子行程一點時間；真正 start 仍等 PID 結束（與 ZeitFrei 一致）
         std::thread::sleep(std::time::Duration::from_millis(600));
@@ -580,6 +707,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_channel_never_checks_or_downloads_updates() {
+        let check = test_build_update_check("1.1.1", provenance::Channel::Test)
+            .expect("測試版必須直接回覆「不自動更新」");
+        assert!(check.test_build);
+        assert!(check.ok, "這不是檢查失敗，是刻意不更新");
+        assert!(!check.update_available, "測試版不可提示下載");
+        assert!(check.url.is_empty(), "測試版不可帶下載連結");
+        assert_eq!(check.message, TEST_BUILD_UPDATE_MESSAGE);
+        for channel in [provenance::Channel::Stable, provenance::Channel::Beta, provenance::Channel::Canary] {
+            assert!(test_build_update_check("1.1.1", channel).is_none());
+        }
+    }
+
+    #[test]
+    fn test_channel_refuses_to_download_updates() {
+        let refusal = test_build_download_refusal(provenance::Channel::Test)
+            .expect("測試版必須拒絕下載");
+        assert!(refusal.contains("測試版"), "要用白話說明原因：{refusal}");
+        for channel in [provenance::Channel::Stable, provenance::Channel::Beta, provenance::Channel::Canary] {
+            assert!(test_build_download_refusal(channel).is_none());
+        }
+        if option_env!("MCPL_CHANNEL").is_none() || option_env!("MCPL_CHANNEL") == Some("test") {
+            let err = download_and_launch().err().expect("測試版建置的下載必須直接失敗");
+            assert!(err.contains("測試版"));
+        }
+    }
+
+    #[test]
+    fn default_build_channel_is_test_so_dev_builds_do_not_auto_update() {
+        // build.rs 沒有指定 MCPL_CHANNEL 時預設 test；本機 cargo test 就是這種建置
+        if option_env!("MCPL_CHANNEL").is_none() || option_env!("MCPL_CHANNEL") == Some("test") {
+            assert!(check_update().test_build, "測試版建置的 check_update 不可連線或下載");
+        }
+    }
+
+    #[test]
     fn newer_version_is_detected_numerically() {
         assert!(is_newer("0.5.0", "0.4.0"));
         assert!(is_newer("0.4.1", "0.4.0"));
@@ -592,6 +755,34 @@ mod tests {
         assert!(!is_newer("0.4.0", "0.4.0"));
         assert!(!is_newer("0.3.9", "0.4.0"));
         assert!(!is_newer("0.4.0", "0.4.1"));
+        assert!(!is_newer("1.0.6", "1.0.7"));
+    }
+
+    #[test]
+    fn update_endpoint_can_identify_same_version_build() {
+        // build id 已從硬編的 "1.0.9" 改為 provenance 組出的 `版本-短commit[-dirty]`，
+        // 所以只釘住「帶得出 build 參數且以目前版本開頭」，不再釘死字面值。
+        let build_id = current_build_id();
+        let current = endpoint(Some(&build_id));
+        let legacy = endpoint(None);
+        assert!(current.contains("/api/desktop/latest?build="));
+        assert!(current.ends_with(&build_id));
+        assert!(build_id.starts_with(CURRENT_VERSION));
+        // 進 query string 前必須是 URL-safe，否則 `+` 會被解讀成空白
+        assert!(crate::engine::provenance::is_url_safe_build_id(&build_id));
+        assert!(legacy.ends_with("/api/desktop/latest"));
+        assert!(!legacy.contains("build="));
+    }
+
+    #[test]
+    fn endpoint_drops_build_ids_that_would_be_mangled_in_a_query_string() {
+        // `+` 會被解讀成空白；空白本身更是直接壞掉。這些一律不帶參數，
+        // 而不是送一個 Worker 會認錯的字串。
+        for unsafe_id in ["1.0.9+abcdef", "1.0.9 dirty", "1.0.9&x=1", "  "] {
+            let url = endpoint(Some(unsafe_id));
+            assert!(!url.contains("build="), "不安全的 build id 不該進 query：{unsafe_id}");
+        }
+        assert!(endpoint(Some("1.0.9-e66c7999b843")).ends_with("?build=1.0.9-e66c7999b843"));
     }
 
     #[test]
@@ -622,7 +813,7 @@ mod tests {
     #[test]
     fn updater_accepts_only_official_exe_downloads() {
         assert!(validate_download_url(
-            "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.0.exe"
+            "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.8.1.exe"
         )
         .is_ok());
         assert!(validate_download_url(
@@ -644,6 +835,7 @@ mod tests {
     #[test]
     fn delayed_start_bat_matches_zeitfrei_shape() {
         let script = build_delayed_start_bat(12345, "D:\\Down\\MCPL-1.0.3 (1).exe");
+        assert!(script.contains("chcp 65001 >nul"));
         assert!(script.contains("PID eq 12345"));
         assert!(script.contains("start \"\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
         // if exist 單行（無區塊括號包住路徑），括號檔名安全
@@ -658,8 +850,22 @@ mod tests {
             "D:\\Down\\MCPL-1.0.3 (1).new",
             "D:\\Down\\MCPL-1.0.3 (1).exe",
         );
+        assert!(script.contains("chcp 65001 >nul"));
         assert!(script.contains("move /Y \"D:\\Down\\MCPL-1.0.3 (1).new\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
+        assert!(script.contains("if %attempts% GEQ 30 goto done"));
         assert!(script.contains("start \"\" \"D:\\Down\\MCPL-1.0.3 (1).exe\""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_invocation_quotes_space_and_cjk_paths() {
+        let command = quoted_cmd_bat(
+            r"C:\Users\jolin\Minecraft 模組整合包翻譯工具.update.bat",
+        );
+        assert_eq!(
+            command,
+            r#"""C:\Users\jolin\Minecraft 模組整合包翻譯工具.update.bat"""#
+        );
     }
 
     #[test]

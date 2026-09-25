@@ -1,57 +1,10 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use super::discord_auth::managed_ai_session_cookie;
 use super::secrets::MANAGED_BASE_URL;
-use super::turnstile::MANAGED_AI_PROTOCOL;
 
 const FEEDBACK_NOTE_MAX_CHARS: usize = 800;
 const FEEDBACK_CLIENT_ID_RE: &str = r"^[A-Za-z0-9_-]{8,64}$";
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ManagedAiUsageCmdResult {
-    pub ok: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-
-    // on success
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub day: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_spent: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_spent: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reset_at_utc: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_period: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_reset_at_utc: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ManagedAiGpRewardCmdResult {
-    pub ok: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub already_claimed: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub granted: Option<u64>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,31 +30,6 @@ struct WorkerError {
     #[serde(default)]
     #[serde(rename = "type")]
     error_type: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkerManagedUsageSuccess {
-    ok: bool,
-    day: Option<String>,
-    user_spent: Option<u64>,
-    user_budget: Option<u64>,
-    shared_spent: Option<u64>,
-    shared_budget: Option<u64>,
-    reset_at_utc: Option<String>,
-    shared_period: Option<String>,
-    shared_reset_at_utc: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkerGpRewardResponse {
-    ok: bool,
-    // worker/src/index.js 的回包欄位是 error（字串）
-    #[serde(default)]
-    error: Option<String>,
-    // 成功時 granted: number
-    granted: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,107 +102,6 @@ fn parse_worker_error_type(body_text: &str) -> (Option<String>, Option<String>) 
         }
     }
     (None, None)
-}
-
-pub fn managed_ai_usage_cmd() -> Result<ManagedAiUsageCmdResult, String> {
-    let session = managed_ai_session_cookie()?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get(worker_url("/api/managed/usage"))
-        .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
-        .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
-        .header("X-Zeitfrei-Session", session)
-        .send()
-        .map_err(|e| format!("usage 拉取失敗：{e}"))?;
-
-    let status = resp.status();
-    let body_text = resp.text().unwrap_or_default();
-    if status.is_success() {
-        let parsed: WorkerManagedUsageSuccess = serde_json::from_str(&body_text)
-            .map_err(|e| format!("usage 回應解析失敗：{e}"))?;
-        if parsed.ok {
-            return Ok(ManagedAiUsageCmdResult {
-                ok: true,
-                error_type: None,
-                message: None,
-                day: parsed.day,
-                user_spent: parsed.user_spent,
-                user_budget: parsed.user_budget,
-                shared_spent: parsed.shared_spent,
-                shared_budget: parsed.shared_budget,
-                reset_at_utc: parsed.reset_at_utc,
-                shared_period: parsed.shared_period,
-                shared_reset_at_utc: parsed.shared_reset_at_utc,
-            });
-        }
-    }
-
-    let (error_type, message) = parse_worker_error_type(&body_text);
-    Ok(ManagedAiUsageCmdResult {
-        ok: false,
-        error_type,
-        message,
-        day: None,
-        user_spent: None,
-        user_budget: None,
-        shared_spent: None,
-        shared_budget: None,
-        reset_at_utc: None,
-        shared_period: None,
-        shared_reset_at_utc: None,
-    })
-}
-
-pub fn managed_ai_gp_reward_cmd() -> Result<ManagedAiGpRewardCmdResult, String> {
-    let session = managed_ai_session_cookie()?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .post(worker_url("/api/managed/gp-reward"))
-        .header("X-Zeitfrei-AI-Protocol", MANAGED_AI_PROTOCOL)
-        .header("X-Zeitfrei-Client-Version", env!("CARGO_PKG_VERSION"))
-        .header("X-Zeitfrei-Session", session)
-        .header("content-type", "application/json")
-        .body("{}")
-        .send()
-        .map_err(|e| format!("GP claim 失敗：{e}"))?;
-
-    let status = resp.status();
-    let body_text = resp.text().unwrap_or_default();
-    let parsed: WorkerGpRewardResponse =
-        serde_json::from_str(&body_text).unwrap_or(WorkerGpRewardResponse {
-            ok: false,
-            error: Some(status.as_u16().to_string()),
-            granted: None,
-        });
-
-    if parsed.ok {
-        Ok(ManagedAiGpRewardCmdResult {
-            ok: true,
-            already_claimed: None,
-            granted: parsed.granted,
-            error_type: None,
-            message: None,
-        })
-    } else {
-        let err = parsed.error.unwrap_or_default();
-        Ok(ManagedAiGpRewardCmdResult {
-            ok: false,
-            already_claimed: Some(err == "already_claimed"),
-            granted: None,
-            error_type: Some(err),
-            message: None,
-        })
-    }
 }
 
 pub fn submit_usage_feedback_cmd(

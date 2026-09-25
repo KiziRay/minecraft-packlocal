@@ -14,6 +14,7 @@ import {
   looksLikeZipMagic,
   reportMpuComplete,
   reportMpuCreate,
+  reportMpuPart,
   reportObjectKey,
   reportQuotaDecision,
   sanitizePackLabel,
@@ -202,6 +203,44 @@ test("MPU create 成功並寫入 reports/v1 前綴", async () => {
   assert.equal(isReportToken(body.token), true);
   assert.ok(String(body.key).startsWith(REPORT_PREFIX));
   assert.ok(body.uploadId);
+});
+
+test("MPU part 驗 upload 歸屬，其他 user 不能補片", async () => {
+  const env = {
+    SHARES: mockShares(),
+    USAGE: mockUsage(),
+    DISCORD_REPORT_WEBHOOK: "https://example.invalid/hook",
+  };
+  const created = await reportMpuCreate(
+    new Request("https://example.com/api/report/mpu-create", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        size: 32,
+        reportCategory: "other",
+        packUnrelated: true,
+      }),
+    }),
+    env,
+    "user-owner",
+    1_700_000_000
+  );
+  const body = await created.json();
+  const url = new URL(`https://example.com/api/report/mpu-part?key=${encodeURIComponent(body.key)}&uploadId=${encodeURIComponent(body.uploadId)}&partNumber=1`);
+  const forbidden = await reportMpuPart(
+    new Request(url, { method: "PUT", headers: { "content-length": "2" }, body: "PK" }),
+    env,
+    url,
+    "user-other"
+  );
+  assert.equal(forbidden.status, 403);
+  const ok = await reportMpuPart(
+    new Request(url, { method: "PUT", headers: { "content-length": "2" }, body: "PK" }),
+    env,
+    url,
+    "user-owner"
+  );
+  assert.equal(ok.status, 200);
 });
 
 test("complete 時 webhook 失敗則不把部分成功當完成", async () => {

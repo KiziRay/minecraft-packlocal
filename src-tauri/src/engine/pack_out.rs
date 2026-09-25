@@ -7,8 +7,10 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use super::cancel;
 use super::jar_scan::LangMap;
 use super::security::{sanitize_folder_name, sanitize_namespace};
+use super::session::prune_stale_tool_packs;
 
 /// 找不到任何線索時的保底值（1.20.1，模組整合包長年主力版本）。
 const FALLBACK_PACK_FORMAT: u32 = 15;
@@ -394,6 +396,9 @@ pub struct BuildResult {
     pub namespaces: usize,
     pub files_written: usize,
     pub keys_total: usize,
+    /// 本次清掉的舊版工具資源包檔名
+    #[serde(default)]
+    pub pruned_tool_packs: Vec<String>,
 }
 
 /// 資源包輸出目錄：一律為「工作根/resourcepacks」
@@ -411,6 +416,7 @@ pub fn resourcepacks_root(work_root: &Path) -> PathBuf {
 }
 
 pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildResult, String> {
+    cancel::check()?;
     // opts.output_dir = 工作根（翻譯結果），不是使用者隨便選的任意層
     let work_root = PathBuf::from(&opts.output_dir);
     let safe_name = sanitize_folder_name(&opts.pack_folder_name)?;
@@ -439,6 +445,7 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
     let mut files = 1usize;
     let mut keys = 0usize;
     for (ns, map) in lang {
+        cancel::check()?;
         if map.is_empty() {
             continue;
         }
@@ -484,12 +491,15 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
     }
     zip_dir_to_file(&pack_dir, &zip_path)?;
 
+    let pruned_tool_packs = prune_stale_tool_packs(&rp_root, &safe_name)?;
+
     Ok(BuildResult {
         pack_path: zip_path.display().to_string(),
         pack_dir: pack_dir.display().to_string(),
         namespaces: lang.len(),
         files_written: files,
         keys_total: keys,
+        pruned_tool_packs,
     })
 }
 
@@ -499,6 +509,7 @@ fn zip_dir_to_file(dir: &Path, zip_path: &Path) -> Result<(), String> {
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        cancel::check()?;
         let path = entry.path();
         if path == dir {
             continue;

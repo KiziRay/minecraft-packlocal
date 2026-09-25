@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use super::placeholder;
 use super::mech_tokens::is_poisoned_mech_translation;
@@ -21,7 +22,7 @@ use super::translation_quality::is_usable_zh;
 /// 上限；超過就不再收新條目（避免無限長大拖慢啟動）。
 const MAX_ENTRIES: usize = 300_000;
 /// 過長的字串（整頁書本內容）不進記憶庫，重用機率低又佔空間。
-const MAX_SOURCE_LEN: usize = 400;
+const MAX_SOURCE_LEN: usize = 1200;
 
 #[derive(Debug, Default, Clone)]
 pub struct Tm {
@@ -44,17 +45,18 @@ pub struct TmStats {
 }
 
 pub fn tm_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("modpack-i18n-tool")
-        .join("tm.json")
+    super::paths::resolve_file(Path::new("tm.json"))
 }
 
 impl Tm {
     /// 從磁碟載入；檔案不存在或損壞都回傳空記憶庫（絕不讓翻譯流程失敗）。
     pub fn load() -> Self {
-        let path = tm_path();
-        let entries = fs::read_to_string(&path)
+        Self::load_from(&tm_path())
+    }
+
+    /// 從指定檔案載入。舊版（沒有 `version`、沒有上下文鍵）的記憶檔照樣可讀。
+    pub fn load_from(path: &Path) -> Self {
+        let entries = fs::read_to_string(path)
             .ok()
             .and_then(|t| serde_json::from_str::<TmFile>(&t).ok())
             .map(|f| f.entries)
@@ -184,13 +186,27 @@ impl Tm {
         if self.added == 0 {
             return Ok(());
         }
+        static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = SAVE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| "翻譯記憶寫入鎖定失敗。".to_string())?;
         let path = tm_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // 多個補充來源可能同時完成；把磁碟上剛寫入的條目合併回來，避免後完成的執行緒覆蓋前一批。
+        let mut entries = self.entries.clone();
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if let Ok(file) = serde_json::from_str::<TmFile>(&existing) {
+                for (key, value) in file.entries {
+                    entries.entry(key).or_insert(value);
+                }
+            }
+        }
         let file = TmFile {
             version: 1,
-            entries: self.entries.clone(),
+            entries,
         };
         let body = serde_json::to_string(&file).map_err(|e| e.to_string())?;
         // 先寫暫存再換名：中途斷電不會留下半個壞掉的記憶庫
@@ -218,10 +234,42 @@ impl Tm {
     }
 }
 
+/// 提前 return／panic 時仍盡力把本輪新增寫回磁碟。
+pub struct TmSaveGuard {
+    tm: Tm,
+}
+
+impl TmSaveGuard {
+    pub fn new(tm: Tm) -> Self {
+        Self { tm }
+    }
+}
+
+impl std::ops::Deref for TmSaveGuard {
+    type Target = Tm;
+    fn deref(&self) -> &Tm {
+        &self.tm
+    }
+}
+
+impl std::ops::DerefMut for TmSaveGuard {
+    fn deref_mut(&mut self) -> &mut Tm {
+        &mut self.tm
+    }
+}
+
+impl Drop for TmSaveGuard {
+    fn drop(&mut self) {
+        let _ = self.tm.save();
+    }
+}
+
 fn storage_key(source: &str, context: Option<&str>) -> String {
+    // Align with shared_tm::normalize_source (whitespace fold + NFC).
+    let normalized = super::shared_tm::normalize_source(source);
     match context.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => format!("{}\u{0}{}", source.trim(), value),
-        None => source.trim().to_string(),
+        Some(value) => format!("{normalized}\u{0}{value}"),
+        None => normalized,
     }
 }
 
@@ -248,6 +296,13 @@ mod tests {
         assert_eq!(tm.get("Diamond Sword").as_deref(), Some("鑽石劍"));
         assert_eq!(tm.stats().hits, 1);
         assert_eq!(tm.stats().added, 1);
+    }
+
+    #[test]
+    fn lookup_collapses_internal_whitespace() {
+        let mut tm = blank();
+        tm.insert("Diamond  Sword", "鑽石劍");
+        assert_eq!(tm.get("Diamond Sword").as_deref(), Some("鑽石劍"));
     }
 
     #[test]

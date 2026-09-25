@@ -1,6 +1,6 @@
 [package]
 name = "modpack-i18n-tool"
-version = "1.0.5"
+version = "1.1.1"
 description = "模組包一鍵繁中翻譯"
 authors = ["ZeitFrei"]
 edition = "2021"
@@ -27,6 +27,11 @@ open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 zhconv = { version = "0.4.1", default-features = false, features = ["mediawiki-tw", "compress"] }
 unicode-normalization = "0.1"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# release manifest 的 Ed25519 信任根。兩者早已由 reqwest→rustls 帶進 Cargo.lock，
+# 提升為直接依賴不引入任何新的傳遞依賴，也不增加編譯產物體積。
+ring = "0.17"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "s"

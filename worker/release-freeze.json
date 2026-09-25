@@ -1,0 +1,17 @@
+{
+  "note": "正式發版（2.0.0）前禁止變更的更新相關設定。只有 scripts/cf-predeploy.mjs --release 允許改動；改版號時同步更新這裡。",
+  "frozenKeys": [
+    "LATEST_VERSION",
+    "UPDATE_BUILD_ID",
+    "DOWNLOAD_URL",
+    "LEGACY_DOWNLOAD_URL",
+    "UPDATE_SHA256"
+  ],
+  "values": {
+    "LATEST_VERSION": "1.0.8.11",
+    "UPDATE_BUILD_ID": "1.0.8.11",
+    "DOWNLOAD_URL": "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.8.exe",
+    "LEGACY_DOWNLOAD_URL": "https://modpack-i18n.jolin34563.workers.dev/download/MCPL-1.0.8.exe",
+    "UPDATE_SHA256": "c4c33ca3586f9e2a0ced727d3bd88f3b8890b8af7615c443cd7630caaae560cf"
+  }
+}

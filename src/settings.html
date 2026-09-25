@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-Hant" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#20242c" />
+  <title>Minecraft 模組整合包翻譯工具・設定</title>
+  <link rel="stylesheet" href="settings-window.css" />
+</head>
+<body>
+  <main class="settings-shell">
+    <header class="settings-header">
+      <div>
+        <p class="eyebrow">Minecraft 模組整合包翻譯工具 <span id="app-version">—</span></p>
+        <h1>設定與使用說明</h1>
+        <p class="lead">改完立刻生效，主畫面也會跟著變；翻譯進行中也可以放心調整。</p>
+      </div>
+      <button id="close-window" class="button secondary" type="button">關閉</button>
+    </header>
+
+    <p id="status" class="status" role="status">正在讀取設定…</p>
+
+    <nav class="tabs" aria-label="設定分類" role="tablist">
+      <button class="tab active" type="button" role="tab" aria-selected="true" data-pane="general">外觀與操作</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-pane="translate">翻譯與 AI</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-pane="data">資料與備份</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-pane="help">關於</button>
+    </nav>
+
+    <!-- 外觀與操作 -->
+    <section id="pane-general" class="pane" role="tabpanel">
+      <section class="card">
+        <h2>外觀</h2>
+        <label class="row" for="theme-select">
+          <span><strong>深色／淺色</strong><small>主畫面會同時切換。</small></span>
+          <select id="theme-select">
+            <option value="dark">深色</option>
+            <option value="light">淺色</option>
+          </select>
+        </label>
+        <label class="row checkbox-row" for="ui-autoscale">
+          <span><strong>依螢幕大小自動縮放</strong><small>開著時會依你的螢幕自動挑一個合適的大小。</small></span>
+          <input id="ui-autoscale" type="checkbox" />
+        </label>
+        <label class="row range-row" for="ui-scale">
+          <span><strong>介面大小</strong><small>80% 到 170%。字太小或太大都可以在這裡調。</small></span>
+          <input id="ui-scale" type="range" min="80" max="170" step="10" value="100" />
+          <output id="ui-scale-value" for="ui-scale">100%</output>
+        </label>
+        <div class="button-row">
+          <button id="ui-scale-reset" class="button secondary" type="button">介面大小改回 100%</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>操作</h2>
+        <label class="row checkbox-row" for="minimize-on-close">
+          <span><strong>按主畫面的 X 時縮到背景</strong><small>翻譯會繼續進行。要完全結束，請按主畫面右下角的「離開」。</small></span>
+          <input id="minimize-on-close" type="checkbox" checked />
+        </label>
+        <label class="row checkbox-row" for="sfx-muted">
+          <span><strong>關掉提示音</strong><small>完成與出錯時的提示音。</small></span>
+          <input id="sfx-muted" type="checkbox" />
+        </label>
+        <label class="row range-row" for="sfx-volume">
+          <span><strong>提示音音量</strong></span>
+          <input id="sfx-volume" type="range" min="0" max="1" step="0.01" value="0.55" />
+          <output id="sfx-volume-value" for="sfx-volume">55%</output>
+        </label>
+      </section>
+    </section>
+
+    <!-- 翻譯與 AI -->
+    <section id="pane-translate" class="pane" role="tabpanel" hidden>
+      <section class="card">
+        <h2>翻譯結果放哪裡</h2>
+        <label class="row" for="output-storage-mode">
+          <span><strong>預設存放位置</strong><small id="output-storage-hint">工具會替每個模組整合包建立獨立的資料夾。</small></span>
+          <select id="output-storage-mode">
+            <option value="managed">交給工具管理（建議）</option>
+            <option value="beside">放在模組整合包旁邊</option>
+            <option value="custom">我自己指定一個資料夾</option>
+          </select>
+        </label>
+        <div id="output-custom-root-row" class="path-row" hidden>
+          <p class="path-label">自己指定的資料夾</p>
+          <code id="output-custom-root">尚未選擇</code>
+          <div class="button-row">
+            <button id="pick-output-custom-root" class="button secondary" type="button">選擇資料夾…</button>
+            <button id="clear-output-custom-root" class="button secondary" type="button">清除</button>
+          </div>
+        </div>
+        <label class="row checkbox-row" for="cache-remind">
+          <span><strong>發現這台電腦已經翻過時提醒我</strong><small>選遊戲資料夾時，如果之前翻過，會先問你要直接用還是重翻。</small></span>
+          <input id="cache-remind" type="checkbox" checked />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>AI 與金鑰</h2>
+        <label class="row checkbox-row" for="remember-api-key">
+          <span><strong>把 API 金鑰記在這台電腦</strong><small>不勾選時，關掉工具後金鑰就會消失，下次要重新貼上。勾選會以未加密的方式存在這台電腦。</small></span>
+          <input id="remember-api-key" type="checkbox" />
+        </label>
+        <div class="button-row">
+          <button id="clear-api-key" class="button secondary" type="button">清除已記住的金鑰</button>
+        </div>
+        <label class="row checkbox-row" for="local-cloud-topup">
+          <span><strong>本地模型翻不好時，改用線上 AI 補完</strong><small>只有翻不好的那幾句會送到你設定的線上 AI，會用到你自己的額度；關掉的話那幾句會保留原文。</small><small id="local-cloud-topup-state">尚未選擇（第一次需要時會問你）</small></span>
+          <input id="local-cloud-topup" type="checkbox" />
+        </label>
+        <p class="muted">選哪一種 AI、登入 ChatGPT、貼自訂 API 金鑰，都要看你選的是哪個模組整合包，所以放在主畫面。</p>
+        <div class="button-row">
+          <button id="goto-ai" class="button primary" type="button">到主畫面選 AI</button>
+          <button id="goto-translation" class="button secondary" type="button">回主畫面翻譯</button>
+        </div>
+      </section>
+    </section>
+
+    <!-- 資料與備份 -->
+    <section id="pane-data" class="pane" role="tabpanel" hidden>
+      <section class="card">
+        <h2>備份</h2>
+        <div class="row">
+          <span><strong>裝進遊戲前要不要備份</strong><small id="backup-choice-label">每次詢問</small></span>
+          <button id="reset-backup-choice" class="button secondary" type="button" hidden>改回每次詢問</button>
+        </div>
+        <p class="muted">備份是給「移除翻譯」還原被覆蓋的原檔用的。刪掉之後，工具新增的檔案仍然可以移除，但被覆蓋的原檔就還原不回來了。</p>
+        <div class="button-row">
+          <button id="delete-backups" class="button danger" type="button">刪除目前遊戲資料夾的全部備份…</button>
+        </div>
+        <p class="muted">按下後會回到主畫面，再問你一次才會真的刪除。</p>
+      </section>
+
+      <section class="card">
+        <h2>工具資料</h2>
+        <p class="path-label">金鑰、術語表、翻譯記憶、本地模型和這份設定都放在這裡</p>
+        <code id="data-root">讀取中…</code>
+        <p id="data-root-hint" class="muted"></p>
+        <div class="button-row">
+          <button id="open-data-root" class="button secondary" type="button">開啟資料夾</button>
+          <button id="migrate-data-root" class="button secondary" type="button" hidden>搬到工具旁邊</button>
+        </div>
+        <p id="settings-path" class="muted"></p>
+      </section>
+
+      <section id="dev-mode-card" class="card" hidden>
+        <h2>開發人員診斷紀錄</h2>
+        <p>開啟後會把每個步驟的細節寫下來，方便找出問題。一般使用請保持關閉。</p>
+        <label class="row checkbox-row" for="dev-mode">
+          <span><strong>寫下完整診斷紀錄</strong><small id="dev-log-path">尚未啟用</small></span>
+          <input id="dev-mode" type="checkbox" />
+        </label>
+        <button id="open-dev-log" class="button secondary" type="button">開啟診斷紀錄</button>
+      </section>
+    </section>
+
+    <!-- 關於 -->
+    <section id="pane-help" class="pane" role="tabpanel" hidden>
+      <section class="card">
+        <h2>更新與引導</h2>
+        <div class="row">
+          <span><strong>檢查更新</strong><small id="update-status-text">目前版本 —</small></span>
+          <button id="check-update" class="button secondary" type="button">檢查更新</button>
+        </div>
+        <div class="row">
+          <span><strong>重看新手引導</strong><small>回到主畫面，從第一步再帶你走一次。</small></span>
+          <button id="replay-onboarding" class="button secondary" type="button">重看引導</button>
+        </div>
+      </section>
+
+      <section class="card prose">
+        <h2>使用說明</h2>
+        <ol>
+          <li>在主畫面選你實際在玩的模組整合包的遊戲資料夾；確認沒問題後，才會出現 AI 選項和「開始翻譯」。</li>
+          <li>需要 AI 時，選本地模型、ChatGPT 或自訂 API。開始翻譯前會先試翻一小段，確認連得上；這一小段不會存進任何翻譯結果。</li>
+          <li>按「開始翻譯」，進度會顯示在右側。翻完會自動裝進遊戲。原本的模組檔案不會被直接改掉。</li>
+          <li>同一台電腦翻過的模組整合包會被記住，下次可以直接套用或分享，不用重翻。</li>
+          <li>中文字變成方框時，到主畫面的「字體」分頁做字體資源包。</li>
+        </ol>
+      </section>
+
+      <section class="card prose">
+        <h2>免責說明</h2>
+        <ul>
+          <li>這是翻譯輔助工具。AI、翻譯記憶與共享資料都可能翻錯或翻不完整，重要內容請自己再確認。</li>
+          <li>圖片上的字、寫死在程式裡的字翻不到，這是技術限制，不是故障。</li>
+          <li>自訂 API 與 ChatGPT 用的是你自己的帳號與額度，費用由你負擔。</li>
+          <li>本地模型的速度與穩定度看你這台電腦，不保證每台都跑得動。</li>
+          <li>第一次裝進遊戲時會問你要不要備份，之後照你的選擇做；不論選哪個，都建議你自己也留一份模組整合包與存檔。</li>
+        </ul>
+      </section>
+
+      <section class="card prose">
+        <h2>遇到問題</h2>
+        <p>回報時會自動附上找問題需要的資訊。畫面或翻譯怪怪的，請先別刪翻譯結果，方便我們找出是哪一步出錯。</p>
+        <button id="report-issue" class="button primary" type="button">回主畫面回報問題</button>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="settings-window.js"></script>
+</body>
+</html>

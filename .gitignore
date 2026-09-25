@@ -49,6 +49,10 @@ dist-release/
 SHA256SUMS
 SHA256SUMS.txt
 
+# 第十輪：可攜式資料根（見 engine/paths.rs）——執行檔跟這個 repo 根目錄放在一起時
+# 會在本機產生真實使用者資料（金鑰、術語表、翻譯記憶……），不能進版控。
+modpack-i18n-data/
+
 # 舊版未使用 Icon；公開 repository 只保留目前採用的原始美術資產
 src/assets/zeitfrei-modpack-icon.png
 src-tauri/icons/zeitfrei-modpack-icon.png
@@ -66,6 +70,12 @@ src-tauri/icons/icon.png
 # 機密與建置
 secrets.json
 *.key
+# release manifest 的簽章私鑰：永遠不進 repo、不進 exe、不進 Worker secret。
+# 簽章是離線人工步驟，私鑰只以執行期參數傳入（見 engine/trust_keys.rs）。
+*.pem
+*.pk8
+signing/
+.mcpl-signing/
 src-tauri/target
 src-tauri/target-portable/
 

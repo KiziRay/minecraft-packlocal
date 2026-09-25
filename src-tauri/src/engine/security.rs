@@ -195,6 +195,23 @@ pub fn validate_api_base_url(url: &str) -> Result<String, String> {
     Ok(u.to_string())
 }
 
+/// 僅給本地模型：http://127.0.0.1:18765–18899。自訂 API 仍走 validate_api_base_url。
+pub fn validate_local_llm_base_url(url: &str) -> Result<String, String> {
+    let u = url.trim().trim_end_matches('/');
+    let lower = u.to_ascii_lowercase();
+    if !(lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://[::1]:")) {
+        return Err("本地模型只允許 127.0.0.1。".into());
+    }
+    let port_str = lower.rsplit(':').next().unwrap_or("");
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| "本地模型連接埠無效。".to_string())?;
+    if !(18765..=18899).contains(&port) {
+        return Err("本地模型連接埠必須在 18765–18899。".into());
+    }
+    Ok(u.to_string())
+}
+
 /// 金鑰基本長度與字元檢查（不驗證是否真有效）
 pub fn validate_api_key(key: &str) -> Result<(), String> {
     let k = key.trim();
@@ -334,6 +351,15 @@ mod tests {
         assert!(is_probably_network_path(Path::new(r"Y:\packs\instance")));
         assert!(is_probably_network_path(Path::new(r"z:/packs/instance")));
         assert!(!is_probably_network_path(Path::new(r"C:\Games\instance")));
+    }
+
+    #[test]
+    fn api_base_url_still_rejects_localhost() {
+        assert!(validate_api_base_url("https://127.0.0.1").is_err());
+        assert!(validate_api_base_url("https://localhost").is_err());
+        assert!(validate_api_base_url("http://127.0.0.1:18765").is_err());
+        assert!(validate_local_llm_base_url("http://127.0.0.1:18765").is_ok());
+        assert!(validate_local_llm_base_url("https://api.deepseek.com").is_err());
     }
 
     #[test]

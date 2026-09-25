@@ -1,18 +1,21 @@
-//! 把「翻譯結果」工作目錄打包成帶密碼自解 exe（NanaZip），供 R2 分享。
+//! 把「翻譯結果」工作目錄打包成帶密碼自解檔，供限時分享。
 //!
 //! Allowlist 同可安裝內容；不含說明／session／日誌。
-//! 密碼固定 `cloud.zeitfrei.uk`；找不到 NanaZip 明確報錯，不静默改無密碼 zip。
+//! 密碼固定 `cloud.zeitfrei.uk`；找不到壓縮工具時給玩家泛用錯誤，不静默改無密碼 zip。
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use super::nanazip_ensure;
 use super::security::sanitize_folder_name;
+use super::session::{is_tool_resource_pack, resolve_canonical_tool_zip};
+use super::win_process::hide_console;
 
 /// 分享自解檔固定密碼（落地頁會顯示）。
 pub const SHARE_SFX_PASSWORD: &str = "cloud.zeitfrei.uk";
@@ -27,18 +30,6 @@ pub const SHARE_SFX_FILENAME: &str = "模組包繁中翻譯自解檔.exe";
 const CLOUD_URL: &str = "https://cloud.zeitfrei.uk/";
 const APPLY_SCRIPT_NAME: &str = "套用翻譯.ps1";
 const SFX_CONFIG_NAME: &str = "sfx_config.txt";
-
-#[cfg(windows)]
-fn hide_console(cmd: &mut Command) -> &mut Command {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null())
-}
-
-#[cfg(not(windows))]
-fn hide_console(cmd: &mut Command) -> &mut Command {
-    cmd.stdin(Stdio::null())
-}
 
 /// 工作目錄是否至少有一個可分享檔（資源包／覆寫等；不含說明／session）。
 pub fn has_shareable_content(work_root: &Path) -> bool {
@@ -73,7 +64,7 @@ pub fn package_translation(work_root: &Path, dest_dir: &Path, name: &str) -> Res
     Ok(zip_path)
 }
 
-/// 用 NanaZip 打帶密碼自解 exe；內含 allowlist＋雲端捷徑＋套用腳本。
+/// 打帶密碼自解 exe；內含 allowlist＋雲端捷徑＋套用腳本。
 pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !work_root.is_dir() {
         return Err("找不到翻譯結果資料夾，請先完成翻譯再打包。".into());
@@ -83,8 +74,7 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
     }
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("無法建立輸出資料夾：{e}"))?;
 
-    let nanazip = find_nanazip_cli()?;
-    let sfx_module = find_nanazip_sfx_module()?;
+    let (nanazip, sfx_module) = nanazip_ensure::require_tools()?;
     let _ = name;
 
     let stage = std::env::temp_dir().join(format!(
@@ -96,14 +86,27 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
     fs::create_dir_all(&stage).map_err(|e| format!("無法建立暫存：{e}"))?;
 
     let result = (|| {
+        let canonical = resolve_canonical_tool_zip(work_root);
+        let pack_zip_name = canonical
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|n| n.to_ascii_lowercase().ends_with(".zip"))
+            .or_else(|| {
+                canonical.as_ref().and_then(|p| {
+                    p.file_name()
+                        .map(|s| format!("{}.zip", s.to_string_lossy()))
+                })
+            })
+            .unwrap_or_else(|| "模組包翻譯工具.zip".to_string());
         stage_shareable_files(work_root, &stage)?;
         write_cloud_url_shortcut(&stage.join(CLOUD_URL_SHORTCUT_NAME))?;
-        write_apply_script(&stage.join(APPLY_SCRIPT_NAME))?;
+        write_apply_script(&stage.join(APPLY_SCRIPT_NAME), &pack_zip_name)?;
         let config_path = stage.join(SFX_CONFIG_NAME);
-        write_sfx_config(&config_path)?;
+        write_sfx_config(&config_path, &pack_zip_name)?;
 
         let archive_7z = stage.join("_payload.7z");
-        let mut cmd = Command::new(&nanazip);
+        let mut cmd = std::process::Command::new(&nanazip);
         hide_console(&mut cmd);
         let output = cmd
             .current_dir(&stage)
@@ -122,20 +125,12 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|e| format!("無法執行 NanaZip：{e}"))?;
+            .map_err(|_| nanazip_ensure::player_unavailable())?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim();
-            let code = output.status.code().unwrap_or(-1);
-            return Err(if detail.is_empty() {
-                format!("NanaZip 壓縮失敗（結束碼 {code}），無法建立自解檔。")
-            } else {
-                let clipped: String = detail.chars().take(240).collect();
-                format!("NanaZip 壓縮失敗（結束碼 {code}）：{clipped}")
-            });
+            return Err(nanazip_ensure::player_unavailable());
         }
         if !archive_7z.is_file() {
-            return Err("NanaZip 未產出壓縮檔。".into());
+            return Err(nanazip_ensure::player_unavailable());
         }
 
         let exe_path = dest_dir.join(SHARE_SFX_FILENAME);
@@ -195,7 +190,7 @@ fn stage_shareable_files(work_root: &Path, stage: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `resourcepacks/` 頂層只留 zip：資料夾打成同名 zip，既有 zip 原樣複製。
+/// `resourcepacks/` 頂層只留 zip：資料夾打成同名 zip；工具 zip 只帶 canonical 一個。
 fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), String> {
     let rp = work_root.join("resourcepacks");
     if !rp.is_dir() {
@@ -203,6 +198,16 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
     }
     let dest_rp = stage.join("resourcepacks");
     fs::create_dir_all(&dest_rp).map_err(|e| e.to_string())?;
+
+    let canonical = resolve_canonical_tool_zip(work_root);
+    let canonical_name = canonical.as_ref().and_then(|p| {
+        if p.is_file() {
+            p.file_name().map(|s| s.to_string_lossy().to_string())
+        } else {
+            p.file_name()
+                .map(|s| format!("{}.zip", s.to_string_lossy()))
+        }
+    });
 
     let mut existing_zips = Vec::new();
     for entry in fs::read_dir(&rp).map_err(|e| e.to_string())? {
@@ -216,6 +221,18 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
         if !name_str.to_ascii_lowercase().ends_with(".zip") {
             continue;
         }
+        let stem = name_str
+            .trim_end_matches(".zip")
+            .trim_end_matches(".ZIP");
+        if is_tool_resource_pack(stem) {
+            if canonical_name
+                .as_ref()
+                .map(|c| !name_str.eq_ignore_ascii_case(c))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+        }
         fs::copy(&path, dest_rp.join(&name))
             .map_err(|e| format!("複製失敗 {}：{e}", path.display()))?;
         existing_zips.push(name_str.to_ascii_lowercase());
@@ -228,7 +245,18 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
             continue;
         }
         let folder_name = entry.file_name();
-        let zip_name = format!("{}.zip", folder_name.to_string_lossy());
+        let folder_str = folder_name.to_string_lossy();
+        let stem = folder_str.as_ref();
+        if is_tool_resource_pack(stem) {
+            if canonical
+                .as_ref()
+                .map(|c| c != &path)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+        }
+        let zip_name = format!("{}.zip", folder_str);
         if existing_zips
             .iter()
             .any(|n| n == &zip_name.to_ascii_lowercase())
@@ -236,6 +264,24 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
             continue;
         }
         zip_directory_contents(&path, &dest_rp.join(&zip_name))?;
+    }
+
+    if let Some(ref canon) = canonical {
+        if canon.is_dir() {
+            let zip_name = canon
+                .file_name()
+                .map(|s| format!("{}.zip", s.to_string_lossy()))
+                .unwrap_or_else(|| "模組包翻譯工具.zip".to_string());
+            if !dest_rp.join(&zip_name).is_file() {
+                zip_directory_contents(canon, &dest_rp.join(&zip_name))?;
+            }
+        } else if canon.is_file() {
+            let name = canon.file_name().unwrap_or_default();
+            if !dest_rp.join(name).is_file() {
+                fs::copy(canon, dest_rp.join(name))
+                    .map_err(|e| format!("複製失敗 {}：{e}", canon.display()))?;
+            }
+        }
     }
     Ok(())
 }
@@ -275,49 +321,62 @@ fn write_cloud_url_shortcut(path: &Path) -> Result<(), String> {
     fs::write(path, body).map_err(|e| format!("寫入雲端捷徑失敗：{e}"))
 }
 
-fn write_apply_script(path: &Path) -> Result<(), String> {
+fn write_apply_script(path: &Path, pack_zip_name: &str) -> Result<(), String> {
+    let pack_zip_name = pack_zip_name.replace('\'', "''");
     // 接收端：提醒選 Minecraft 目錄 → 依 allowlist 複製（對齊 apply_to_instance）→ 捷徑放到根目錄
-    let script = r#"$ErrorActionPreference = 'Stop'
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
-$root = if ($args.Count -ge 1 -and $args[0]) { $args[0] } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$packZip = '{pack_zip_name}'
+$root = if ($args.Count -ge 1 -and $args[0]) {{ $args[0] }} else {{ Split-Path -Parent $MyInvocation.MyCommand.Path }}
 $root = (Resolve-Path $root).Path
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '請選擇 Minecraft 遊戲資料夾（實例根目錄或 .minecraft）。翻譯會自動套用。'
+$dialog.Description = '請選擇 Minecraft 遊戲資料夾（實例根目錄，需含 mods 或 resourcepacks）。翻譯會自動套用。'
 $dialog.ShowNewFolderButton = $false
-if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {{
   [System.Windows.Forms.MessageBox]::Show('已取消套用。', '模組包翻譯') | Out-Null
   exit 1
-}
+}}
 $mc = $dialog.SelectedPath
-function Ensure-Dir([string]$p) { if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
-function Copy-Tree([string]$src, [string]$dst) {
-  if (-not (Test-Path $src)) { return }
+$hasMods = Test-Path (Join-Path $mc 'mods')
+$hasRp = Test-Path (Join-Path $mc 'resourcepacks')
+if (-not $hasMods -and -not $hasRp) {{
+  [System.Windows.Forms.MessageBox]::Show("選取的資料夾不像 Minecraft 實例根目錄（找不到 mods 或 resourcepacks）。`n`n請選整合包實例根，不要只選 .minecraft 子資料夾。", '模組包翻譯') | Out-Null
+  exit 1
+}}
+function Ensure-Dir([string]$p) {{ if (-not (Test-Path $p)) {{ New-Item -ItemType Directory -Path $p -Force | Out-Null }} }}
+function Copy-Tree([string]$src, [string]$dst) {{
+  if (-not (Test-Path $src)) {{ return }}
   Ensure-Dir $dst
   Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
-}
+}}
 $rp = Join-Path $root 'resourcepacks'
-if (Test-Path $rp) {
+$srcZip = Join-Path $rp $packZip
+if (Test-Path $srcZip) {{
   Ensure-Dir (Join-Path $mc 'resourcepacks')
-  Copy-Item -Path (Join-Path $rp '*') -Destination (Join-Path $mc 'resourcepacks') -Recurse -Force -ErrorAction SilentlyContinue
-}
-foreach ($name in @('config','patchouli_books','kubejs','minemenu','datapacks','defaultconfigs','global_packs','paxi','data')) {
+  Copy-Item -Path $srcZip -Destination (Join-Path $mc 'resourcepacks' $packZip) -Force -ErrorAction Stop
+}} elseif (Test-Path $rp) {{
+  [System.Windows.Forms.MessageBox]::Show("找不到資源包 $packZip，分享檔可能不完整。", '模組包翻譯') | Out-Null
+}}
+foreach ($name in @('config','patchouli_books','kubejs','minemenu','datapacks','defaultconfigs','global_packs','paxi','data')) {{
   $src = Join-Path $root $name
-  if (Test-Path $src) { Copy-Tree $src (Join-Path $mc $name) }
-}
+  if (Test-Path $src) {{ Copy-Tree $src (Join-Path $mc $name) }}
+}}
 $url = Join-Path $root 'ZeitFrei雲端.url'
-if (Test-Path $url) {
+if (Test-Path $url) {{
   Copy-Item -Path $url -Destination (Join-Path $mc 'ZeitFrei雲端.url') -Force -ErrorAction SilentlyContinue
-}
-[System.Windows.Forms.MessageBox]::Show("翻譯已套用到：`n$mc`n`n請關閉遊戲後重開，語言選繁體中文（台灣），並啟用翻譯資源包。", '模組包翻譯') | Out-Null
-"#;
+}}
+[System.Windows.Forms.MessageBox]::Show("翻譯已套用到：`n$mc`n`n請關閉遊戲後重開，語言選繁體中文（台灣），並在資源包列表只啟用：`n$packZip", '模組包翻譯') | Out-Null
+"#
+    );
     fs::write(path, script).map_err(|e| format!("寫入套用腳本失敗：{e}"))
 }
 
-fn write_sfx_config(path: &Path) -> Result<(), String> {
+fn write_sfx_config(path: &Path, pack_zip_name: &str) -> Result<(), String> {
     let config = format!(
         ";!@Install@!UTF-8!\r\n\
 Title=\"模組包翻譯套用\"\r\n\
-BeginPrompt=\"請選擇 Minecraft 遊戲資料夾後自動套用翻譯。解壓密碼請見下載頁（{SHARE_SFX_PASSWORD}）。\"\r\n\
+BeginPrompt=\"只含一個翻譯資源包（{pack_zip_name}）。請選含 mods 或 resourcepacks 的 Minecraft 實例根；解壓密碼見下載頁（{SHARE_SFX_PASSWORD}）。\"\r\n\
 ExtractTitle=\"解壓翻譯檔\"\r\n\
 ExtractDialogText=\"正在解壓…\"\r\n\
 GUIFlags=\"8+32+64+256+4096\"\r\n\
@@ -340,92 +399,6 @@ fn combine_sfx(sfx_module: &Path, config: &Path, archive: &Path, exe_path: &Path
     }
     out.flush().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn find_nanazip_cli() -> Result<PathBuf, String> {
-    let candidates = [
-        "NanaZipC",
-        "NanaZipC.exe",
-        "nanazipc",
-        "7z",
-        "7z.exe",
-    ];
-    for name in candidates {
-        let mut cmd = Command::new("where");
-        hide_console(&mut cmd);
-        if let Ok(output) = cmd.arg(name).output() {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = text.lines().next() {
-                    let p = PathBuf::from(line.trim());
-                    if p.is_file() {
-                        return Ok(p);
-                    }
-                }
-            }
-        }
-    }
-    let prog = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
-    for rel in ["NanaZip/NanaZipC.exe", "7-Zip/7z.exe"] {
-        let p = PathBuf::from(&prog).join(rel);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-    Err(
-        "找不到 NanaZip／NanaZipC，無法建立帶密碼自解 exe。請先安裝 NanaZip 後再分享（不會改成無密碼 zip）。"
-            .into(),
-    )
-}
-
-fn find_nanazip_sfx_module() -> Result<PathBuf, String> {
-    let mut roots = Vec::new();
-    if let Ok(pf) = std::env::var("ProgramFiles") {
-        roots.push(PathBuf::from(&pf).join("NanaZip"));
-        roots.push(PathBuf::from(&pf).join("7-Zip"));
-    }
-    roots.push(PathBuf::from(r"C:\Program Files\NanaZip"));
-    roots.push(PathBuf::from(r"C:\Program Files\7-Zip"));
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join(r"Programs\NanaZip"));
-    }
-    // Store：只掃名稱含 NanaZip 的套件目錄
-    let apps = PathBuf::from(r"C:\Program Files\WindowsApps");
-    if apps.is_dir() {
-        if let Ok(rd) = fs::read_dir(&apps) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.contains("NanaZip") {
-                    roots.push(entry.path());
-                }
-            }
-        }
-    }
-
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        for entry in WalkDir::new(&root)
-            .max_depth(4)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.eq_ignore_ascii_case("NanaZip.Core.Windows.sfx")
-                || name.eq_ignore_ascii_case("7z.sfx")
-                || name.eq_ignore_ascii_case("7zS.sfx")
-            {
-                return Ok(path.to_path_buf());
-            }
-        }
-    }
-    Err(
-        "找不到 NanaZip Windows SFX 模組，無法建立自解 exe。請安裝完整 NanaZip 後再試。"
-            .into(),
-    )
 }
 
 fn zip_dir(src: &Path, zip_path: &Path) -> Result<(), String> {
@@ -628,6 +601,57 @@ mod tests {
             "{names:?}"
         );
         assert!(stage.join("config/ftbquests/chapter.snbt").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stages_only_canonical_tool_zip_when_multiple_exist() {
+        use super::super::jar_scan::LangMap;
+        use super::super::session::{save_session, TranslateSession, SESSION_FILE};
+
+        let root = scratch("canon");
+        let _ = fs::remove_dir_all(&root);
+        let work = root.join("翻譯結果");
+        let rp = work.join("resourcepacks");
+        fs::create_dir_all(&rp).unwrap();
+        fs::write(rp.join("模組包翻譯工具+0823+v4.0.1.zip"), b"old").unwrap();
+        fs::write(rp.join("模組包翻譯工具+0827+v4.0.2.zip"), b"new").unwrap();
+        let session = TranslateSession {
+            version: 1,
+            review_pass: 0,
+            instance_path: "C:/games/test".into(),
+            output_dir: work.display().to_string(),
+            pack_name: "模組包翻譯工具+0827+v4.0.2".into(),
+            pack_path: String::new(),
+            pending_en: LangMap::default(),
+            pending_count: 0,
+            quality_deferred: LangMap::default(),
+            keys_zh: 0,
+            keys_hk_hint: 0,
+            note: String::new(),
+            target_version: None,
+            translation_mode: "append".into(),
+            translation_quality: "balanced".into(),
+            coverage_tier: "max".into(),
+            mods_fingerprint: 0,
+            run_preferences: Default::default(),
+            last_run_outcome: Default::default(),
+        };
+        save_session(&work, &session).unwrap();
+        assert!(work.join(SESSION_FILE).is_file());
+
+        let stage = root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        stage_shareable_files(&work, &stage).unwrap();
+
+        let staged_rp = stage.join("resourcepacks");
+        let names: Vec<String> = fs::read_dir(&staged_rp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].contains("0827"));
+        assert!(!names[0].contains("0823"));
         let _ = fs::remove_dir_all(&root);
     }
 }

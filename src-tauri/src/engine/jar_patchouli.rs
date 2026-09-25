@@ -1,8 +1,10 @@
 //! JAR 內 Patchouli 書本的非破壞式翻譯。
 //!
-//! 多數 Patchouli 書頁位於 `data/<namespace>/patchouli_books`，不在 lang 檔。
-//! 抽出後交給共用文字掃描器，再嵌回 `jar-translated` 副本；原始 JAR 不會被改寫。
-//! `work/data` 僅作除錯產出，不會套用到遊戲的 `minecraft/data/`。
+//! Patchouli 書頁可能位於 `data/<namespace>/patchouli_books` 或
+//! `assets/<namespace>/patchouli_books`（兩種根目錄都是 Patchouli 支援的合法
+//! 位置，後者是 Botania、Ad Astra、Croptopia 等主流模組實際採用的位置），不在
+//! lang 檔。抽出後交給共用文字掃描器，再嵌回 `jar-translated` 副本；原始 JAR
+//! 不會被改寫。`work/data` 僅作除錯產出，不會套用到遊戲的 `minecraft/data/`。
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -230,7 +232,13 @@ fn extract_patchouli(source_jar: &Path, stage_root: &Path) -> Result<Option<Extr
 
 fn is_patchouli_book_entry(name: &str) -> bool {
     let lower = name.replace('\\', "/").to_ascii_lowercase();
-    lower.starts_with("data/")
+    // Patchouli 書本兩種根目錄都合法：較新的慣例放 data/<ns>/patchouli_books/，
+    // 但很多主流模組（Botania、Ad Astra、Croptopia、Archon…）仍放
+    // assets/<ns>/patchouli_books/。過去這裡只認 data/，實測對這批模組
+    // （單一整合包內就有 13 個、合計 2400+ 條書頁文字）全數略過不翻，
+    // 是「掃描/整合不夠全面」回報的主要根因。rebuild_jar() 只按相對路徑比對，
+    // 不假設根目錄，所以這裡放寬不需要動其他地方。
+    (lower.starts_with("data/") || lower.starts_with("assets/"))
         && lower.contains("/patchouli_books/")
         && (lower.ends_with(".json") || lower.ends_with(".txt"))
 }
@@ -300,6 +308,23 @@ mod tests {
             "data/example/patchouli_books/book/en_us/root.txt"
         ));
         assert!(!is_patchouli_book_entry("data/example/recipes/a.json"));
+        assert!(!is_patchouli_book_entry(
+            "assets/example/book/animal_dictionary/en_us/root.txt"
+        ));
+    }
+
+    #[test]
+    fn accepts_assets_rooted_patchouli_books_too() {
+        // 釘死這輪修的迴歸：Botania、Ad Astra、Croptopia、Archon 等主流模組把
+        // 書頁放在 assets/<ns>/patchouli_books/ 而不是 data/<ns>/patchouli_books/，
+        // 過去這裡只認 data/，導致這些模組的書頁全數被跳過、完全沒進翻譯流程。
+        assert!(is_patchouli_book_entry(
+            "assets/ad_astra/patchouli_books/astrodux/en_us/categories/the_moon.json"
+        ));
+        assert!(is_patchouli_book_entry(
+            "assets/botania/patchouli_books/lexicon/en_us/root.txt"
+        ));
+        // 但同樣在 assets/ 底下、不是 patchouli_books 資料夾的檔案仍要維持排除。
         assert!(!is_patchouli_book_entry(
             "assets/example/book/animal_dictionary/en_us/root.txt"
         ));
@@ -378,6 +403,98 @@ mod tests {
         assert!(
             !mc.join("data").exists(),
             "不得把 Patchouli 寫進遊戲 minecraft/data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embeds_translated_patchouli_from_assets_root_too() {
+        // 對應 Botania／Ad Astra 這批把書頁放在 assets/ 而不是 data/ 底下的模組；
+        // 端對端跑一次抽取→翻譯→重建，確認不只是路徑判斷通過，實際會寫回 jar。
+        let root = std::env::temp_dir().join(format!("jar_patchouli_assets_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("work");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let jar = mc.join("mods/assets_guidebook.jar");
+        {
+            let file = File::create(&jar).unwrap();
+            let mut writer = ZipWriter::new(file);
+            writer
+                .start_file(
+                    "assets/example/patchouli_books/guide/en_us/categories/village.json",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(r#"{"name":"村庄模块"}"#.as_bytes())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let report = translate_jar_patchouli(&mc, &work, false, None, |_, _| {}).unwrap();
+        assert!(report.books_found >= 1, "{report:?}");
+        assert!(report.strings_translated >= 1, "{}", report.note);
+
+        let out_jar = work.join("jar-translated/assets_guidebook.jar");
+        assert!(out_jar.is_file(), "{}", report.note);
+        let file = File::open(&out_jar).unwrap();
+        let mut zip = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().replace('\\', "/"))
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("assets/example/patchouli_books/guide/zh_tw/categories/village.json")),
+            "assets/ 根目錄的書頁應該也要被翻譯並寫回：{names:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jar_books_in_other_locales_still_land_in_zh_tw() {
+        // JAR 內 Patchouli 走的是同一支 translate_text_overlays，所以站長那個
+        // 「書翻好了卻寫進 uk_ua」的問題在 JAR 這條路上也存在。這個測試確認
+        // 兩條路都修好了——不是只有鬆散書本。
+        let root = std::env::temp_dir().join(format!("jar_patchouli_locale_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("work");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let jar = mc.join("mods/croptopia.jar");
+        {
+            let file = File::create(&jar).unwrap();
+            let mut writer = ZipWriter::new(file);
+            writer
+                .start_file(
+                    "data/croptopia/patchouli_books/guide/uk_ua/categories/crops.json",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(r#"{"name":"村庄模块"}"#.as_bytes())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let report = translate_jar_patchouli(&mc, &work, false, None, |_, _| {}).unwrap();
+        let out_jar = work.join("jar-translated/croptopia.jar");
+        assert!(out_jar.is_file(), "{}", report.note);
+        let file = File::open(&out_jar).unwrap();
+        let mut zip = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().replace('\\', "/"))
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("patchouli_books/guide/zh_tw/categories/crops.json")),
+            "非 en_us 的語系資料夾也要輸出到 zh_tw，否則遊戲讀不到：{names:?}"
         );
         let _ = fs::remove_dir_all(root);
     }

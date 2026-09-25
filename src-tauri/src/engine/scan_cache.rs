@@ -143,10 +143,7 @@ fn now_unix() -> u64 {
 }
 
 fn cache_path() -> Result<PathBuf, String> {
-    Ok(dirs::data_dir()
-        .ok_or_else(|| "找不到使用者資料目錄，略過掃描快取".to_string())?
-        .join("modpack-i18n-tool")
-        .join("scan-cache.json"))
+    Ok(super::paths::resolve_file(Path::new("scan-cache.json")))
 }
 
 fn cache_key(path: &Path) -> String {

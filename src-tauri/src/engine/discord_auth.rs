@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -41,6 +41,9 @@ pub struct DiscordAuthStatus {
 
 impl DiscordAuthStatus {
     fn logged_out(message: &str) -> Self {
+        // 登出／登入失效時，開發人員模式的資格必須跟著消失，
+        // 否則換帳號之後上一個人的權限還留著。
+        super::dev_mode::set_eligible("");
         Self {
             logged_in: false,
             in_guild: false,
@@ -76,10 +79,7 @@ struct DiscordSessionFile {
 }
 
 fn session_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("modpack-i18n-tool")
-        .join("discord-session.json")
+    super::paths::resolve_file(Path::new("discord-session.json"))
 }
 
 fn read_session() -> DiscordSessionFile {
@@ -110,7 +110,7 @@ pub fn cancel_discord_login() {
 pub fn managed_ai_session_cookie() -> Result<String, String> {
     let saved = read_session().cookie;
     if saved.trim().is_empty() {
-        return Err("使用開發者提供的 AI 前，請先登入 Discord。".into());
+        return Err("翻譯前請先登入 Discord。".into());
     }
     decode_inner(&saved)
         .filter(|cookie| !cookie.trim().is_empty())
@@ -215,6 +215,11 @@ pub fn check_discord_auth_status() -> DiscordAuthStatus {
         .unwrap_or("")
         .to_string();
 
+    // 登入狀態每變動一次就重新判定「開發人員測試模式」的資格。
+    // 放在這裡而不是登入流程裡，是因為使用者也可能從別的地方（重啟、session 過期）
+    // 換掉身分，只有這條路是每次都會走到的。
+    super::dev_mode::set_eligible(&user_id);
+
     DiscordAuthStatus {
         logged_in: true,
         in_guild,
@@ -226,9 +231,30 @@ pub fn check_discord_auth_status() -> DiscordAuthStatus {
         message: if in_guild {
             "Discord 登入與官方伺服器會員驗證完成。".into()
         } else {
-            "請先加入 ZeitFrei 官方 Discord 伺服器，再按重新檢查。".into()
+            "請先加入 ZeitFrei 官方 Discord 伺服器，再按重新檢查。原因：維護、收集建議、調整工具。"
+                .into()
         },
     }
+}
+
+/// 自訂 API／GPT／本地模型翻譯前必須通過 Discord 會籍。
+pub fn discord_allows_ai(logged_in: bool, in_guild: bool, service_available: bool) -> bool {
+    logged_in && in_guild && service_available
+}
+
+pub fn require_discord_guild_for_ai() -> Result<(), String> {
+    let status = check_discord_auth_status();
+    if !status.service_available {
+        return Err(if status.message.trim().is_empty() {
+            "目前無法確認 Discord 登入狀態，請檢查網路後再試。".into()
+        } else {
+            status.message
+        });
+    }
+    if discord_allows_ai(status.logged_in, status.in_guild, status.service_available) {
+        return Ok(());
+    }
+    Err("翻譯前請先登入 Discord 並加入官方伺服器。原因：維護、收集建議、調整工具。".into())
 }
 
 pub fn login_discord_blocking(app: AppHandle) -> Value {
@@ -394,7 +420,7 @@ fn b64decode(value: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::b64decode;
+    use super::{b64decode, discord_allows_ai};
 
     #[test]
     fn base64_decoder_accepts_padded_input() {
@@ -404,5 +430,13 @@ mod tests {
     #[test]
     fn base64_decoder_rejects_invalid_input() {
         assert!(b64decode("not@base64").is_none());
+    }
+
+    #[test]
+    fn ai_requires_discord_login_and_guild() {
+        assert!(!discord_allows_ai(false, false, true));
+        assert!(!discord_allows_ai(true, false, true));
+        assert!(!discord_allows_ai(true, true, false));
+        assert!(discord_allows_ai(true, true, true));
     }
 }

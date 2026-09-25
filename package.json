@@ -1,15 +1,18 @@
 {
   "name": "modpack-i18n-tool",
   "private": true,
-  "version": "1.0.5",
+  "type": "module",
+  "version": "1.1.1",
   "description": "Minecraft 模組包→台灣繁體中文（Tauri 2；原始 JAR 只讀，建立翻譯副本）",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
     "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "check:ui": "node scripts/check-ui-link.mjs",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
-    "check:worker": "node --check worker/src/index.js && node --check worker/src/turnstile.mjs && node --check worker/src/share.mjs && node --check worker/src/tm.mjs && node --check worker/src/report.mjs && node --check worker/src/cors.mjs && node --check worker/src/security.mjs && node --check worker/src/feedback.mjs",
+    "test:ui": "node --test src/*.test.mjs src/**/*.test.mjs",
+    "check:worker": "node scripts/check-worker.mjs",
     "test:worker": "node --test worker/test/*.test.mjs",
     "deploy": "wrangler deploy --config worker/wrangler.toml",
     "preview": "wrangler dev --config worker/wrangler.toml"
