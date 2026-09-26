@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings_mapped;
 use super::mech_tokens::is_resource_path_token;
@@ -192,6 +193,7 @@ where
         });
     }
 
+    super::output_guard::guard_map("任務書與手冊", &mut map);
     let _ = super::shared_tm::contribute_plain_pairs(&map, &ns_by_src, "overlay", scope);
 
     // 3) 寫回（與擷取共用同一套 walk，結構層字串絕不會被動到）
@@ -208,7 +210,8 @@ where
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let s = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        fs::write(&out_path, s + "\n").map_err(|e| format!("{}: {e}", out_path.display()))?;
+        let bytes = super::output_guard::finish_file(&path.to_string_lossy(), &fs::read(&path).unwrap_or_default(), (s + "\n").into_bytes());
+        fs::write(&out_path, bytes).map_err(|e| format!("{}: {e}", out_path.display()))?;
         written += 1;
     }
 
@@ -450,10 +453,6 @@ fn should_translate(s: &str) -> bool {
     }
     let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
     has_alpha || looks_chinese(t)
-}
-
-fn looks_chinese(s: &str) -> bool {
-    s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 fn has_latin_letter(s: &str) -> bool {

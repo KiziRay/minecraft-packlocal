@@ -998,6 +998,19 @@ fn write_options(mc: &Path, plan: &OptionsPlan, zip_name: Option<&str>) -> Resul
 
 /// 已啟用且含 `assets/*/font/` 的資源包可能蓋掉翻譯／自訂字體 → 警告（不做 codec 重寫）。
 fn warn_enabled_packs_covering_font(mc: &Path, our_zip_name: &str) -> Vec<String> {
+    let suspects = enabled_packs_covering_font(mc, &|name| name == our_zip_name);
+    if suspects.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "以下已啟用資源包含 font/，可能蓋過翻譯或自訂字體顯示：{}。請在資源包選單把「繁中翻譯／字體包」置頂，或暫時停用上述包後重開遊戲。",
+        suspects.join("、")
+    )]
+}
+
+/// 已啟用（options.txt resourcePacks）且含 `font/` 的資源包名稱；`skip` 為真的略過。
+/// B2：output_guard 的「字體可能不支援中文」共用這一份判斷。
+pub(crate) fn enabled_packs_covering_font(mc: &Path, skip: &dyn Fn(&str) -> bool) -> Vec<String> {
     let options = mc.join("options.txt");
     let Ok(text) = fs::read_to_string(&options) else {
         return Vec::new();
@@ -1006,33 +1019,20 @@ fn warn_enabled_packs_covering_font(mc: &Path, our_zip_name: &str) -> Vec<String
         return Vec::new();
     };
     let value = list_line.strip_prefix("resourcePacks:").unwrap_or("").trim();
-    let our_entry = format!("file/{our_zip_name}");
     let mut suspects = Vec::new();
     for raw in value.split('"') {
         let entry = raw.trim();
-        if entry.is_empty()
-            || entry == "vanilla"
-            || entry == ","
-            || entry == "["
-            || entry == "]"
-            || entry == our_entry
-        {
+        if entry.is_empty() || entry == "vanilla" || entry == "," || entry == "[" || entry == "]" {
             continue;
         }
         let Some(name) = entry.strip_prefix("file/") else {
             continue;
         };
-        if pack_contains_font_override(mc, name) {
+        if !skip(name) && pack_contains_font_override(mc, name) {
             suspects.push(name.to_string());
         }
     }
-    if suspects.is_empty() {
-        return Vec::new();
-    }
-    vec![format!(
-        "以下已啟用資源包含 font/，可能蓋過翻譯或自訂字體顯示：{}。請在資源包選單把「繁中翻譯／字體包」置頂，或暫時停用上述包後重開遊戲。",
-        suspects.join("、")
-    )]
+    suspects
 }
 
 fn pack_contains_font_override(mc: &Path, pack_name: &str) -> bool {

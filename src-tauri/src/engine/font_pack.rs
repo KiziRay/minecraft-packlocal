@@ -13,7 +13,7 @@ use super::pack_out::{pack_format_for_version, pack_mcmeta_value};
 use super::security::{check_font_file, ensure_under_base, sanitize_folder_name};
 
 /// 空名稱時的字體包預設顯示名（勿依賴 sanitize 的翻譯包預設「繁體中文翻譯」）。
-const DEFAULT_FONT_PACK_NAME: &str = "繁體中文遊戲字體";
+pub(crate) const DEFAULT_FONT_PACK_NAME: &str = "繁體中文遊戲字體";
 /// 未指定版本／format 時的保底（約對應 1.21）。
 const DEFAULT_FONT_PACK_FORMAT: u32 = 34;
 const ASCII_SKIP: &str = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";

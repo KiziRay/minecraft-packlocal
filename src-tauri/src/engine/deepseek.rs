@@ -22,7 +22,7 @@ use super::discord_auth::managed_ai_session_cookie;
 use super::eligibility;
 use super::glossary::{self, Glossary, TermConsistencyStats};
 use super::jar_scan::LangMap;
-use super::mech_tokens::{is_ascii_enum_token, is_bracket_meta_token, is_poisoned_mech_translation, is_resource_path_token};
+use super::mech_tokens::{is_poisoned_mech_translation, skip_before_ai};
 use super::local_quality;
 use super::placeholder::{self, GuardStats};
 use super::sentence_split;
@@ -967,6 +967,7 @@ where
                 if job.scope.is_some()
                     && is_usable_zh(&job.source, text)
                     && !is_poisoned_mech_translation(&job.source, text)
+                    && super::output_guard::passes(&job.source, text)
                 {
                     to_share.push(shared_tm::SharedTmEntry {
                         namespace: job.namespace.clone(),
@@ -1077,6 +1078,7 @@ pub fn collect_glossary_share_from_langmaps(
             if !is_usable_zh(source, translated)
                 || is_poisoned_mech_translation(source, translated)
                 || !placeholder::is_compatible(source, translated)
+                || !super::output_guard::passes(source, translated)
             {
                 continue;
             }
@@ -1241,7 +1243,10 @@ fn contribute_plain_job_outputs(jobs: &[shared_tm::SharedTmJob], out: &[String])
         if t.is_empty() || t == job.source.trim() {
             continue;
         }
-        if !is_usable_zh(&job.source, t) || is_poisoned_mech_translation(&job.source, t) {
+        if !is_usable_zh(&job.source, t)
+            || is_poisoned_mech_translation(&job.source, t)
+            || !super::output_guard::passes(&job.source, t)
+        {
             continue;
         }
         entries.push(shared_tm::SharedTmEntry {
@@ -1321,6 +1326,7 @@ fn resolve_unique(
 
     // 優先序：user glossary → builtin → shared → tm → AI
     let mut need_ai: Vec<(usize, String)> = Vec::new();
+    let mut mechanism_kept = 0usize;
     for (uid, src) in unique.iter().enumerate() {
         if let Some(zh) = gloss.exact(src) {
             if let Some(safe) = placeholder::guard(src, zh, &mut guard)
@@ -1355,10 +1361,16 @@ fn resolve_unique(
             }
         }
         // 機制 token／FancyMenu meta：不送 AI（避免再產生毒譯文）
-        if is_ascii_enum_token(src) || is_bracket_meta_token(src) || is_resource_path_token(src) {
+        if skip_before_ai(src) {
+            mechanism_kept += 1;
             continue;
         }
         need_ai.push((uid, src.clone()));
+    }
+    if mechanism_kept > 0 {
+        report
+            .notes
+            .push(format!("{mechanism_kept} 項是機制代號或檔案路徑，保留原文（翻了會失效）"));
     }
 
     let pre = report.glossary_hits

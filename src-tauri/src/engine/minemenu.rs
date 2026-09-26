@@ -88,6 +88,7 @@ where
             }
         }
     }
+    super::output_guard::guard_map("快捷選單", &mut map);
     if !map.is_empty() {
         let _ = super::shared_tm::contribute_plain_pairs(&map, &HashMap::new(), "overlay", scope);
     }
@@ -112,7 +113,9 @@ fn write_minemenu_outputs(
     fs::create_dir_all(&out_menu).map_err(|e| e.to_string())?;
     let dest = out_menu.join("menu.json");
     let final_s = to_ascii_json(data);
-    fs::write(&dest, final_s.as_bytes()).map_err(|e| e.to_string())?;
+    let original = fs::read(_minecraft_dir.join("minemenu").join("menu.json")).unwrap_or_default();
+    let bytes = super::output_guard::finish_file("minemenu/menu.json", &original, final_s.into_bytes());
+    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
     Ok(dest.display().to_string())
 }
 

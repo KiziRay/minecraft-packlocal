@@ -52,7 +52,10 @@ pub fn rewrite_translated_jars(
         output_root: output_root.display().to_string(),
         ..Default::default()
     };
-    let values = merge_values(translated, fallback_english);
+    // B2：不合格的譯文從語言表拿掉（退回英文），再合併
+    let mut guarded = translated.clone();
+    super::output_guard::guard_langmap("模組內建語言檔", &mut guarded, Some(fallback_english));
+    let values = merge_values(&guarded, fallback_english);
     let jars = list_jars(&mods);
     report.jars_scanned = jars.len();
 
@@ -285,6 +288,7 @@ fn rewrite_one_jar(
             let mut original = Vec::new();
             entry.read_to_end(&mut original).map_err(|e| e.to_string())?;
             let content = render_language_file(map, &extension, Some(&original))?;
+            let content = super::output_guard::finish_file(&name, &original, content);
             let options = entry.options();
             output_zip
                 .start_file(&name, options)
@@ -321,6 +325,7 @@ fn rewrite_one_jar(
                 .start_file(name, options)
                 .map_err(|e| format!("新增語言檔失敗：{e}"))?;
             let content = render_language_file(map, extension, None)?;
+            let content = super::output_guard::finish_file(name, if extension == "json" { b"{}" } else { b"" }, content);
             output_zip.write_all(&content).map_err(|e| e.to_string())?;
             stats.files_written += 1;
             if counted_namespaces.insert(namespace.clone()) {

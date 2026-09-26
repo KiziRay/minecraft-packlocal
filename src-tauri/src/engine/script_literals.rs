@@ -114,6 +114,7 @@ where
             }
         }
     }
+    super::output_guard::guard_map("KubeJS 腳本", &mut map);
     if !map.is_empty() {
         let _ = super::shared_tm::contribute_plain_pairs(&map, &HashMap::new(), "overlay", scope);
     }
@@ -141,6 +142,7 @@ where
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        let output = super::output_guard::finish_file(&path.to_string_lossy(), raw.as_bytes(), output.into_bytes());
         fs::write(target, output).map_err(|e| e.to_string())?;
         report.files_written += 1;
     }

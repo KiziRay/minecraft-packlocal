@@ -85,7 +85,7 @@ fn inspect_jar(
             continue;
         }
         let name = item.name().replace('\\', "/");
-        if name.contains("..") || name.starts_with('/') {
+        if !super::output_guard::zip_entry_ok(&name) {
             report.skipped_entries += 1;
             continue;
         }

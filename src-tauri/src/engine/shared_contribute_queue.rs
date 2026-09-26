@@ -189,7 +189,17 @@ pub(crate) fn merge_queue_entries(
     trim_queue_to_caps(&q)
 }
 
+/// B2：過不了 output guard 的譯文不上傳（佇列入口與送出入口共用）。
+pub fn guard_share_entries(entries: &[SharedTmEntry]) -> Vec<SharedTmEntry> {
+    entries
+        .iter()
+        .filter(|e| super::output_guard::passes(&e.source, &e.translated))
+        .cloned()
+        .collect()
+}
+
 pub fn enqueue(entries: &[SharedTmEntry]) -> usize {
+    let entries = &guard_share_entries(entries);
     if entries.is_empty() {
         return 0;
     }

@@ -32,16 +32,10 @@ pub fn convert_s2tw_batch(texts: &[String]) -> Vec<String> {
 
 /// 沒有任何 CJK 字元就不必進轉換表（絕大多數待譯英文走這條捷徑）。
 fn needs_conversion(s: &str) -> bool {
-    s.chars().any(is_cjk)
+    // 相容漢字 U+F900–FAFF 是模組圖示字，不進轉換表（cjk.rs）
+    super::cjk::looks_chinese(s)
 }
 
-fn is_cjk(c: char) -> bool {
-    matches!(c,
-        '\u{3400}'..='\u{4dbf}'   // 擴展 A
-        | '\u{4e00}'..='\u{9fff}' // 基本區
-        | '\u{f900}'..='\u{faff}' // 相容漢字
-    )
-}
 
 /// 對整張 LangMap 做台灣正體轉換（AI 補譯後必跑，避免簡中混入）。
 #[allow(dead_code)]

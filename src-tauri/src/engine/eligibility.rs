@@ -263,29 +263,24 @@ fn looks_like_language_key(t: &str) -> bool {
     })
 }
 
-/// `EU`、`EU/t`、`RF`。短、無空白、以大寫為主。
+/// 單位符號白名單（B2：改白名單）。
 ///
-/// 刻意不把 `Iron` 這種算進來：它雖然只有四個字，但有長度 ≥3 的小寫串，是真的單字。
+/// 舊判定「短、無空白、有大寫」把 `Yes`／`No`／`On`／`Off`／`Axe` 這種按鈕與物品字
+/// 全當成單位保留，按鈕永遠是英文。現在只認得明確列出的單位，
+/// 可再接 `/t`、`/s`、`/tick` 這類「每單位時間」後綴。大小寫必須完全一致（`mB` ≠ `MB`）。
+const UNIT_SYMBOLS: &[&str] = &[
+    "EU", "RF", "FE", "kFE", "MFE", "GFE", "AE", "J", "kJ", "MJ", "GJ", "W", "kW", "MW", "GW",
+    "mB", "B", "kB", "Hz", "kHz", "MHz", "V", "kV", "A", "mA", "Ω", "SU", "RPM", "TPS", "FPS",
+    "XP", "HP", "MP", "°C", "°F", "K", "ms", "kg", "g", "cm", "mm", "km", "m", "L", "mL",
+];
+
 fn is_unit_symbol(t: &str) -> bool {
     let trimmed = t.trim();
-    if trimmed.len() > 5 || trimmed.contains(char::is_whitespace) {
-        return false;
-    }
-    if !trimmed.chars().any(|c| c.is_ascii_uppercase()) {
-        return false;
-    }
-    let mut lowercase_run = 0usize;
-    for ch in trimmed.chars() {
-        if ch.is_ascii_lowercase() {
-            lowercase_run += 1;
-            if lowercase_run >= 3 {
-                return false;
-            }
-        } else {
-            lowercase_run = 0;
-        }
-    }
-    true
+    let base = ["/t", "/s", "/tick", "/sec"]
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .unwrap_or(trimmed);
+    UNIT_SYMBOLS.contains(&base)
 }
 
 #[cfg(test)]
@@ -538,3 +533,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "eligibility_b2_tests.rs"]
+mod b2_tests;

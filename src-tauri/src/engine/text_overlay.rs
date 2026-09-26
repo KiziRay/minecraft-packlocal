@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings_mapped;
 use super::mech_tokens::{
@@ -303,6 +304,7 @@ where
         });
     }
 
+    super::output_guard::guard_map("覆寫文字", &mut map);
     let _ = super::shared_tm::contribute_plain_pairs(&map, &ns_by_src, "overlay", scope);
 
     // 3) 寫出（Patchouli：en_us 路徑同步寫 zh_tw，避免只改英檔卻算「完成」）
@@ -314,6 +316,7 @@ where
     let mut zh_tw_written: HashMap<PathBuf, u8> = HashMap::new();
     for payload in &file_payloads {
         if let Some(new_bytes) = payload.apply(&map)? {
+            let new_bytes = super::output_guard::finish_file(&payload.path.to_string_lossy(), payload.raw.as_bytes(), new_bytes);
             let rel = payload
                 .path
                 .strip_prefix(minecraft_dir)
@@ -1446,10 +1449,6 @@ fn is_color_or_format_only(s: &str) -> bool {
         break;
     }
     only_codes
-}
-
-fn looks_chinese(s: &str) -> bool {
-    s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 fn has_latin_letter(s: &str) -> bool {

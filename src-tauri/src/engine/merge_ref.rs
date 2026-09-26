@@ -47,6 +47,9 @@ pub fn merge_fill_missing(base: &mut LangMap, reference: &LangMap) -> usize {
             if !is_usable_zh("", v) {
                 continue;
             }
+            let Some(v) = &super::output_guard::lang_entry("簡中參考包", ns, k, v, None) else {
+                continue;
+            };
             if !slot.contains_key(k) {
                 slot.insert(k.clone(), v.clone());
                 n += 1;

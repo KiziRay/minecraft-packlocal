@@ -793,10 +793,13 @@ struct OneClickResult {
     apply_message: String,
     /// 不備份模式下，等玩家確認才會覆蓋的原檔
     pending_overwrites: Vec<String>,
+    /// B2：顯示安全——退回英文清單與「字體可能不支援中文」（B8 顯示）
+    display_safety: engine::DisplaySafety,
 }
 
 /// 把套用狀態接到翻譯結果上；還沒裝進遊戲時，結論的第一句就要講這件事。
 fn with_apply_notice(mut result: OneClickResult, applied: &ApplyResult) -> OneClickResult {
+    result.display_safety = engine::take_run_report(Path::new(&result.report.minecraft_dir));
     result.apply_status = applied.status;
     result.pending_overwrites = applied.pending_overwrites.clone();
     if !applied.is_applied() {
@@ -1785,6 +1788,8 @@ fn run_one_click(
     coverage_tier: Option<String>,
     _advanced_unpack: bool,
 ) -> Result<OneClickResult, String> {
+    // B2：每輪開始先清空上一輪的退回紀錄
+    engine::begin_guard_run();
     preflight_selected_ai(app, use_ai, "開始掃描整合包")?;
     // 上次沒送成功的社群共享庫貢獻，開工前先補送一次。
     // 這件事本來就會做，但過去完全不出聲，使用者看到「859 條暫存稍後再送」之後
@@ -1960,6 +1965,10 @@ fn run_one_click(
         })?;
     // 掃描當下的英文目錄：供收尾貢獻／seed（subtract 後 pending 會少掉已併入鍵）
     let en_catalog = en_only.clone();
+    // B2：完整英文原文表存進翻譯結果，補翻／修復／貼回建包時用（不隨待補清單縮減）
+    if let Err(e) = engine::source_catalog_save(&work, &engine::snapshot_sources()) {
+        emit_warn(app, &format!("英文原文表存檔失敗（之後補翻時會重新讀取遊戲原文）：{e}"));
+    }
     // 停止時把當下有效譯文掃尾進共享庫（成功路徑會 disarm）
     let mut stop_share = OnCancelShare {
         active: true,
@@ -1986,11 +1995,13 @@ fn run_one_click(
 
     // ═══ 階段 A2：本機合併「先前完整繁中參考包」（對齊 CTE2 全翻，不花 AI）═══
     let mut ref_note;
-    let ref_path = reference_pack
+    let user_ref = reference_pack
         .as_ref()
         .map(|s| PathBuf::from(s.trim().trim_matches('"')))
-        .filter(|p| p.exists())
-        .or_else(discover_default_reference);
+        .filter(|p| p.exists());
+    // B2：只有使用者明確指定的參考包算人工譯文（只免長度）；自動搜到的照常完整檢查
+    let ref_is_user_choice = user_ref.is_some();
+    let ref_path = user_ref.or_else(discover_default_reference);
     if let Some(ref_p) = ref_path {
         emit_progress_stage(
             app,
@@ -2001,13 +2012,18 @@ fn run_one_click(
         match load_reference_zh_tw(&ref_p) {
             Ok((ref_zh, files)) => {
                 let before = count_map(&zh);
-                let filled = merge_fill_missing(&mut zh, &ref_zh);
+                let filled = engine::source_catalog::merge_reference(&mut zh, &ref_zh, ref_is_user_choice);
                 stamp_missing_provenance(&mut provenance, &zh, LangSource::RefPack);
                 subtract_covered(&mut en_only, &zh);
                 postprocess_lang_values(&mut zh, &dict);
                 convert_langmap_s2tw_selective(&mut zh, &|ns, k| {
                     needs_s2tw_key(&provenance, ns, k)
                 });
+                // B2：參考包人工譯文登記（寫出時只免長度），並把它存進英文原文表
+                engine::source_catalog::remember_reference_after_merge(&zh, &ref_zh, &provenance, ref_is_user_choice);
+                if let Err(e) = engine::source_catalog_save(&work, &engine::snapshot_sources()) {
+                    emit_warn(app, &format!("英文原文表存檔失敗（之後補翻時會重新讀取遊戲原文）：{e}"));
+                }
                 let after = count_map(&zh);
                 ref_note = format!(
                     "參考包 {} 個繁中／簡中語言檔，本機補入 {} 條（{} → {}）",
@@ -3276,6 +3292,7 @@ fn run_one_click(
     );
 
     Ok(with_apply_notice(OneClickResult {
+        display_safety: Default::default(),
         run_plan: plan.clone(),
         run_plan_has_overrides: plan.has_overrides(),
         report,
@@ -3531,6 +3548,8 @@ fn run_supplement(
     use_ai: bool,
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
+    // B2：每輪開始先清空上一輪的退回紀錄
+    engine::begin_guard_run();
     reset_contribute_tracker();
     preflight_selected_ai(app, use_ai, "開始讀取上次的翻譯工作階段")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(5), "正在讀取上次的翻譯工作階段…");
@@ -3641,6 +3660,11 @@ fn run_supplement(
     let mut pending = remaining_pending(&session.pending_en, &zh);
     let rework = rework_unusable_zh(&zh);
     merge_pending(&mut pending, &rework);
+    // B2：建包前載入不會縮減的英文原文全表（舊結果沒有就先重掃補齊）
+    let catalog = engine::source_catalog::prepare_build_sources(&work, Path::new(session.instance_path.trim()));
+    if let Some(note) = catalog.player_note() {
+        emit_log(app, "info", note);
+    }
     // 不合格譯文從 zh 移除，避免寫回資源包繼續鎖死
     for (ns, map) in &rework {
         if let Some(slot) = zh.get_mut(ns) {
@@ -3807,6 +3831,7 @@ fn run_supplement(
             emit_warn(app, w);
         }
         return Ok(with_apply_notice(OneClickResult {
+             display_safety: Default::default(),
              run_plan: supplement_plan.clone(),
              run_plan_has_overrides: supplement_plan.has_overrides(),
              report: empty_report(
@@ -4146,6 +4171,7 @@ fn run_supplement(
     };
 
     Ok(with_apply_notice(OneClickResult {
+        display_safety: Default::default(),
         run_plan: supplement_plan.clone(),
         run_plan_has_overrides: supplement_plan.has_overrides(),
         report: empty_report(
@@ -4239,6 +4265,8 @@ fn run_repair(
     use_ai: bool,
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
+    // B2：每輪開始先清空上一輪的退回紀錄
+    engine::begin_guard_run();
     reset_contribute_tracker();
     preflight_selected_ai(app, use_ai, "開始修復翻譯結果")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(3), "修復：尋找工作階段…");
@@ -4311,6 +4339,11 @@ fn run_repair(
     // 2) 可選：AI 補缺
     let mut ai_filled = 0usize;
     let mut pending = remaining_pending(&session.pending_en, &zh);
+    // B2：建包前載入不會縮減的英文原文全表（舊結果沒有就先重掃補齊）
+    let catalog = engine::source_catalog::prepare_build_sources(&work, Path::new(session.instance_path.trim()));
+    if let Some(note) = catalog.player_note() {
+        actions.push(note.to_string());
+    }
     let repair_mode =
         resolve_translation_mode(translation_mode_override.as_deref(), &session.translation_mode);
     // 修復與補翻同屬 Supplement：沿用工作階段裡使用者自己選過的設定，不再覆寫。
@@ -4559,6 +4592,7 @@ fn run_repair(
     );
 
     Ok(with_apply_notice(OneClickResult {
+        display_safety: Default::default(),
         run_plan: repair_plan.clone(),
         run_plan_has_overrides: repair_plan.has_overrides(),
         report: empty_report(
@@ -5248,6 +5282,8 @@ async fn import_translations_cmd(
     output_dir: String,
     text: String,
 ) -> Result<engine::ImportReport, String> {
+    // B2：每輪開始先清空上一輪的退回紀錄
+    engine::begin_guard_run();
     let out = normalize_path_strict(&output_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         let work = result_work_root(&out);
@@ -5257,6 +5293,11 @@ async fn import_translations_cmd(
             return Err("看不出可匯入的內容。請貼「鍵<Tab>譯文」每行一條，或直接貼回匯出的那張表。".into());
         }
         let mut zh = load_pack_zh(&work).unwrap_or_default();
+        // B2：建包前載入英文原文全表，重新寫出的舊譯文也完整檢查
+        let catalog = engine::source_catalog::prepare_build_sources(&work, Path::new(session.instance_path.trim()));
+        if let Some(note) = catalog.player_note() {
+            emit_log(&app, "info", note);
+        }
         let report = engine::merge_imported(&mut zh, &session.pending_en, &entries);
         if report.accepted == 0 {
             return Ok(report);

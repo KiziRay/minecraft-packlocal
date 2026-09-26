@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 /// Java 格式佔位符。**旗標刻意不含空白**，否則 `50% chance` 會被誤判成 `% c`。
-const RE_JAVA_SPEC: &str = r"%(?:(\d+)\$)?[-#+0,(]*\d*(?:\.\d+)?[bBhHsScCdoxXeEfgGaAtTn%]";
+pub(crate) const RE_JAVA_SPEC: &str = r"%(?:(\d+)\$)?[-#+0,(]*\d*(?:\.\d+)?[bBhHsScCdoxXeEfgGaAtTn%]";
 /// `{0}` / `{player}`
 const RE_BRACE: &str = r"\{[A-Za-z_][A-Za-z0-9_]*\}|\{\d+\}";
 /// `%player%`（內文 ≥3 字，避免吃到 `%s%`）
@@ -99,7 +99,8 @@ pub fn extract(s: &str) -> Placeholders {
 pub fn is_compatible(source: &str, translated: &str) -> bool {
     let a = extract(source);
     let b = extract(translated);
-    a.positional == b.positional && a.keyed == b.keyed
+    (a.positional == b.positional && a.keyed == b.keyed)
+        || super::placeholder_fix::specs_equivalent(source, translated)
 }
 
 /// 取原文的首／尾空白（拼接字串常靠它，例如 `"等級： "`）。
@@ -174,6 +175,13 @@ fn fix_newlines(source: &str, translated: &str) -> Option<String> {
 ///
 /// 回傳 `Some(可安全使用的譯文)`，或 `None` 代表破壞無法修復——呼叫端應退回原文。
 pub fn validate_and_repair(source: &str, translated: &str) -> Option<String> {
+    // B2：色碼數量與 JSON text component 結構也要對得上（placeholder_fix）
+    let fixed = validate_and_repair_specs(source, translated)?;
+    let fixed = super::placeholder_fix::repair_colour_codes(source, &fixed)?;
+    super::placeholder_fix::text_component_ok(source, &fixed).then_some(fixed)
+}
+
+fn validate_and_repair_specs(source: &str, translated: &str) -> Option<String> {
     let t = translated.trim();
     if t.is_empty() {
         return None;
@@ -252,6 +260,7 @@ pub fn guard(source: &str, translated: &str, stats: &mut GuardStats) -> Option<S
 ///
 /// **不使用環視**（Rust regex 不支援，也用不到）：靠交替順序與明確邊界避免誤吃。
 const RE_MASK_TOKENS: &str = concat!(
+    r"[\x{E000}-\x{F8FF}\x{F900}-\x{FAFF}\x{F0000}-\x{FFFFD}\x{100000}-\x{10FFFD}]+|", // B2：模組字型圖示字
     r"\$\([^)]*\)",                                   // Patchouli：$(br) $(l:item) $()
     r"|/\$",                                          // Patchouli 簡寫收尾
     r"|\[#\]\([0-9A-Fa-f]*\)",                        // Modonomicon 顏色標記
@@ -276,13 +285,11 @@ fn mask_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(RE_MASK_TOKENS).expect("mask regex must compile"))
 }
 
-fn unmask_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\{(\d+)\}").expect("unmask regex must compile"))
-}
-
 /// 把結構 token 換成 `{0} {1} …`，回傳（遮罩後文字, token 表）。
 pub fn mask(text: &str) -> (String, Vec<String>) {
+    if let Some(component) = super::placeholder_fix::mask_text_component(text, mask_re()) {
+        return component;
+    }
     let mut tokens: Vec<String> = Vec::new();
     let masked = mask_re()
         .replace_all(text, |c: &regex::Captures| {
@@ -296,14 +303,8 @@ pub fn mask(text: &str) -> (String, Vec<String>) {
 
 /// 還原遮罩：`{N}` 換回第 N 個 token；索引越界就原樣留著（交給 guard 判）。
 pub fn unmask(masked: &str, tokens: &[String]) -> String {
-    unmask_re()
-        .replace_all(masked, |c: &regex::Captures| {
-            match c[1].parse::<usize>().ok().and_then(|i| tokens.get(i)) {
-                Some(t) => t.clone(),
-                None => c[0].to_string(),
-            }
-        })
-        .into_owned()
+    // B2：`%s` 被 AI 換了順序時改寫成 `%N$s`，主詞受詞不會顛倒
+    super::placeholder_fix::unmask_reordering(masked, tokens)
 }
 
 #[cfg(test)]
@@ -557,3 +558,7 @@ mod tests {
         assert_eq!(out.as_deref(), Some("造成 %s 傷害"));
     }
 }
+
+#[cfg(test)]
+#[path = "placeholder_b2_tests.rs"]
+mod b2_tests;

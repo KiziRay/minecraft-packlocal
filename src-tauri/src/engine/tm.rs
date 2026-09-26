@@ -115,7 +115,8 @@ impl Tm {
         if s.len() > MAX_SOURCE_LEN {
             return;
         }
-        if !placeholder::is_compatible(s, t) || !is_usable_zh(s, t) {
+        // B2：過不了 output guard（太長、圖示字、色碼…）的譯文不進記憶
+        if !placeholder::is_compatible(s, t) || !is_usable_zh(s, t) || !super::output_guard::passes(s, t) {
             self.rejected += 1;
             return;
         }
@@ -155,6 +156,7 @@ impl Tm {
             || !placeholder::is_compatible(s, t)
             || !is_usable_zh(s, t)
             || is_poisoned_mech_translation(s, t)
+            || !super::output_guard::passes(s, t)
         {
             self.rejected += 1;
             return;

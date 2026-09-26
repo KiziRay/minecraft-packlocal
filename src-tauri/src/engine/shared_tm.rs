@@ -518,6 +518,8 @@ fn contribute_budgeted(
     max_chunks: usize,
     skip_flush: bool,
 ) -> ContributeResult {
+    // B2：過不了 output guard 的譯文不上傳（contribute、LangMap 掃尾共用這個入口）
+    let entries = &shared_contribute_queue::guard_share_entries(entries);
     let mut total = if skip_flush {
         ContributeResult::default()
     } else {
@@ -865,6 +867,8 @@ pub(crate) fn contribute_without_flush_budget(
     deadline: Instant,
     max_chunks: usize,
 ) -> ContributeResult {
+    // B2：佇列 flush 送舊條目也走這裡，同樣先過 output guard
+    let entries = &shared_contribute_queue::guard_share_entries(entries);
     if entries.is_empty() {
         return ContributeResult::default();
     }
@@ -1309,3 +1313,7 @@ mod tests {
         assert_eq!(detailed.status, LookupStatus::Skipped);
     }
 }
+
+#[cfg(test)]
+#[path = "shared_tm_b2_tests.rs"]
+mod b2_tests;

@@ -256,6 +256,22 @@ pub fn lookup_detailed(jobs: &[SharedGlossaryJob]) -> LookupResult {
     }
 }
 
+/// 能不能上傳到共享術語（上傳入口本身的把關）。
+fn is_shareable(entry: &SharedGlossaryEntry) -> bool {
+    let source = entry.source.trim();
+    let translated = entry.translated.trim();
+    entry.scope.is_known()
+        && !source.is_empty()
+        && source.len() <= MAX_SOURCE_LEN
+        && !translated.is_empty()
+        && translated.len() <= MAX_ZH_LEN
+        && source != translated
+        && placeholder::is_compatible(source, translated)
+        && is_usable_zh(source, translated)
+        // B2：過不了 output guard 的譯文不上傳（入口本身把關，不靠呼叫端）
+        && super::output_guard::passes(source, translated)
+}
+
 pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
     if entries.is_empty() {
         return ContributeResult::default();
@@ -268,18 +284,7 @@ pub fn contribute(entries: &[SharedGlossaryEntry]) -> ContributeResult {
     };
     let items: Vec<Value> = entries
         .iter()
-        .filter(|entry| {
-            let source = entry.source.trim();
-            let translated = entry.translated.trim();
-            entry.scope.is_known()
-                && !source.is_empty()
-                && source.len() <= MAX_SOURCE_LEN
-                && !translated.is_empty()
-                && translated.len() <= MAX_ZH_LEN
-                && source != translated
-                && placeholder::is_compatible(source, translated)
-                && is_usable_zh(source, translated)
-        })
+        .filter(|entry| is_shareable(entry))
         .map(|entry| {
             json!({
                 "gh": glossary_hash(&entry.source, entry.context.as_deref()),
@@ -376,5 +381,31 @@ mod tests {
         assert!(lookup(&[]).is_empty());
         assert_eq!(lookup_detailed(&[]).status, LookupStatus::Skipped);
         assert_eq!(contribute(&[]).attempted, 0);
+    }
+}
+
+#[cfg(test)]
+mod b2_tests {
+    use super::*;
+
+    fn entry(source: &str, translated: &str) -> SharedGlossaryEntry {
+        SharedGlossaryEntry {
+            source: source.into(),
+            translated: translated.into(),
+            context: None,
+            scope: TranslationScope::from_name("B2 Test Pack"),
+        }
+    }
+
+    #[test]
+    fn b2_l2_glossary_upload_entry_itself_applies_output_guard() {
+        // 不經網路：直接測上傳入口用的把關函式
+        assert!(!is_shareable(&entry("On", "目前處於開啟狀態")), "太長");
+        assert!(!is_shareable(&entry("\u{E001} Mana", "魔力")), "圖示字弄丟");
+        assert!(is_shareable(&entry("Cancel", "取消")));
+        let src = include_str!("shared_glossary.rs");
+        let body = &src[src.find("pub fn contribute(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("is_shareable("), "上傳入口要呼叫把關");
     }
 }

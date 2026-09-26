@@ -252,7 +252,7 @@ fn process_archive(
             .join(&id)
             .join(&name);
         let options = entry.options();
-        if entry.is_file() && candidate.is_file() {
+        if entry.is_file() && candidate.is_file() && super::output_guard::zip_entry_ok(&name) {
             let bytes = fs::read(candidate).map_err(|e| e.to_string())?;
             writer
                 .start_file(&name, options)

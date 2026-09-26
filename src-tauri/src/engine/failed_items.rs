@@ -211,6 +211,14 @@ pub fn merge_imported(
                 .push(format!("{namespace}:{key}（看起來還是原文或中英混雜）"));
             continue;
         }
+        // B2：貼回的譯文同樣要過 output guard（長度、圖示字、換行…）
+        let safe = match super::output_guard::check_entry(source, &safe) {
+            Ok(safe) => safe,
+            Err(reason) => {
+                report.rejected.push(format!("{namespace}:{key}（{}）", reason.player_text()));
+                continue;
+            }
+        };
         zh.entry(namespace).or_default().insert(key.clone(), safe);
         report.accepted += 1;
     }

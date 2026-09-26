@@ -69,6 +69,8 @@ pub fn scan_instance<F>(
 where
     F: FnMut(u8, &str),
 {
+    // B2：換掃另一個整合包前清空英文原文表，避免拿到上一包的英文
+    super::output_guard::reset_sources();
     let mc = resolve_minecraft_dir(instance_or_mc)?;
     crate::dev_log!(
         "scan",
@@ -176,6 +178,14 @@ where
     }
 
     cancel::check()?;
+
+    // B2：模組自帶 zh_tw 只收 mods jar（此刻 raw 只有 jar 的內容）。
+    // 資源包與鬆散語言檔（包括本工具已套用進遊戲的翻譯包）不算模組自帶，
+    // 之後 merge_raw_lang「較長者勝」蓋掉 raw 也不影響這份。
+    let native_tw: LangMap = raw
+        .iter()
+        .filter_map(|(ns, locales)| locales.get("zh_tw").map(|tw| (ns.clone(), tw.clone())))
+        .collect();
 
     // ─── 2) resourcepacks（資料夾 + zip）───
     on_progress(23, "本地整理：讀資源包語言…");
@@ -335,7 +345,12 @@ where
     let mut from_cn = 0usize;
     let mut from_hk = 0usize;
 
+    // B2：完整英文原文（含已有中文的鍵），給 output guard 與「英文原文表」
+    let mut en_full: LangMap = HashMap::new();
     for (ns, locales) in raw {
+        if let Some(en) = locales.get("en_us").or_else(|| locales.get("en_gb")) {
+            en_full.insert(ns.clone(), en.clone());
+        }
         let (out, eo, tw, cn, hk) = merge_namespace_locales(&ns, &locales, do_opencc, &mut provenance);
         from_tw += tw;
         from_cn += cn;
@@ -423,6 +438,8 @@ where
     for e in report.errors.iter().take(50) {
         crate::dev_log!("scan", "掃描錯誤：{e}");
     }
+    super::output_guard::remember_sources(&en_full);
+    super::output_guard::remember_native(&native_tw);
     Ok((zh, en_only, provenance, report))
 }
 

@@ -270,7 +270,7 @@ pub(crate) fn rebuild_jar(
         let name = entry.name().replace('\\', "/");
         written_names.insert(name.trim_end_matches('/').to_string());
         let candidate = translated_root.join(&name);
-        if entry.is_file() && candidate.is_file() {
+        if entry.is_file() && candidate.is_file() && super::output_guard::zip_entry_ok(&name) {
             let bytes = fs::read(candidate).map_err(|e| e.to_string())?;
             writer
                 .start_file(&name, entry.options())
@@ -292,7 +292,7 @@ pub(crate) fn rebuild_jar(
                 .strip_prefix(translated_root)
                 .map_err(|e| e.to_string())?;
             let name = relative.to_string_lossy().replace('\\', "/");
-            if name.is_empty() || written_names.contains(&name) {
+            if name.is_empty() || written_names.contains(&name) || !super::output_guard::zip_entry_ok(&name) {
                 continue;
             }
             let bytes = fs::read(entry.path()).map_err(|e| e.to_string())?;

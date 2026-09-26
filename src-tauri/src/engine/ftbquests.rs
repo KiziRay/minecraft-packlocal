@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings_with_scope;
 use super::mech_tokens::{is_ascii_enum_token, is_poisoned_mech_translation, is_resource_path_token};
@@ -239,6 +240,7 @@ where
         }
     }
 
+    super::output_guard::guard_map("FTB 任務", &mut map);
     if !map.is_empty() {
         let _ = super::shared_tm::contribute_plain_pairs(&map, &HashMap::new(), "overlay", scope);
     }
@@ -257,7 +259,8 @@ where
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            fs::write(&out_path, new_text.as_bytes()).map_err(|e| e.to_string())?;
+            let bytes = super::output_guard::finish_file(&out_path.to_string_lossy(), text.as_bytes(), new_text.into_bytes());
+            fs::write(&out_path, bytes).map_err(|e| e.to_string())?;
             written += 1;
         } else if prefer_work && !dest_root.join(rel).is_file() {
             // 工作目錄有內容但未變更時仍確保輸出存在（方便套用）
@@ -703,10 +706,6 @@ fn should_translate_quest_string(s: &str) -> bool {
 fn is_safe_display_translation(src: &str, zh: &str) -> bool {
     !is_poisoned_mech_translation(src, zh)
         && !(is_ascii_enum_token(src) && looks_chinese(zh))
-}
-
-fn looks_chinese(s: &str) -> bool {
-    s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 fn has_latin_letter(s: &str) -> bool {

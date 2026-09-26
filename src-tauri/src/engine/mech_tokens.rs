@@ -1,5 +1,8 @@
 //! 機制 id／ASCII enum token 共用判斷（overlay、FTB、診斷共用，避免兩套規則漂移）。
 
+
+use super::cjk::looks_chinese;
+
 /// 全小寫 snake／kebab-case 單 token（無空白、純 ASCII）：不當顯示文翻。
 /// 例：`goal`、`crafting`、`has_iron`、`mid-left`、`bottom-right`。
 pub fn is_ascii_enum_token(s: &str) -> bool {
@@ -40,14 +43,6 @@ pub fn is_resource_path_token(s: &str) -> bool {
         return false;
     }
     lower.contains('/') || RESOURCE_PATH_EXTS.iter().any(|ext| lower.ends_with(ext))
-}
-
-fn contains_cjk(s: &str) -> bool {
-    s.chars().any(|c| {
-        ('\u{4e00}'..='\u{9fff}').contains(&c)
-            || ('\u{3400}'..='\u{4dbf}').contains(&c)
-            || ('\u{f900}'..='\u{faff}').contains(&c)
-    })
 }
 
 fn is_legal_resource_location_chars(s: &str) -> bool {
@@ -139,12 +134,12 @@ pub fn is_poisoned_mech_translation(source: &str, translated: &str) -> bool {
         return true;
     }
     if is_resource_path_token(src) {
-        return contains_cjk(zh) || !is_legal_resource_location_chars(zh);
+        return looks_chinese(zh) || !is_legal_resource_location_chars(zh);
     }
-    if !is_ascii_enum_token(src) {
+    if !is_identifier_token(src) {
         return false;
     }
-    contains_cjk(zh)
+    looks_chinese(zh)
 }
 
 /// Aggressive 欄位（如 `category`）值「像句子」才翻：含空白、CJK、或常見標點。
@@ -300,4 +295,19 @@ mod tests {
         assert!(is_origins_powers_path("data/mod/origins/human.json"));
         assert!(!is_origins_powers_path("data/mod/quests/chapter.json"));
     }
+}
+
+/// 機制識別字：全小寫、而且帶 `_`／`-`／數字（`has_iron`、`mid-left`、`tier2`）。
+///
+/// B2：`is_ascii_enum_token` 連 `axe`、`on` 這種一般英文單字也算進來，
+/// 在沒有 key 可參考的地方（AI 前的最後一關、毒譯文判斷）會把按鈕字默默略過。
+/// 單一個純字母小寫字不算識別字；要靠 key 判斷的來源（任務、覆寫）仍用 `is_ascii_enum_token`。
+pub fn is_identifier_token(s: &str) -> bool {
+    is_ascii_enum_token(s)
+        && s.trim().chars().any(|c| c == '_' || c == '-' || c.is_ascii_digit())
+}
+
+/// 送 AI 前的最後一關：機制識別字、FancyMenu meta、資源路徑不送；一般單字照送。
+pub fn skip_before_ai(s: &str) -> bool {
+    is_identifier_token(s) || is_bracket_meta_token(s) || is_resource_path_token(s)
 }

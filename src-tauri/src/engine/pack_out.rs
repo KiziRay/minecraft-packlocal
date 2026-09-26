@@ -494,9 +494,10 @@ pub fn build_resource_pack_skipping_bundled(
         let dir = pack_dir.join("assets").join(&safe_ns).join("lang");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         pairs.sort_by(|a, b| a.0.cmp(b.0));
+        // B2：每條譯文寫出前過 output guard；不合格的不寫（遊戲顯示英文）
         let obj: serde_json::Map<String, serde_json::Value> = pairs
             .into_iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .filter_map(|(k, v)| super::output_guard::lang_entry("翻譯資源包", ns, k, v, None).map(|v| (k.clone(), serde_json::Value::String(v))))
             .collect();
         let path = dir.join("zh_tw.json");
         let s = serde_json::to_string_pretty(&serde_json::Value::Object(obj))
