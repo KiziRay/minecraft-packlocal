@@ -1,6 +1,15 @@
 mod app_settings;
 pub mod migrate;
 mod apply_instance;
+mod apply_guard;
+pub mod apply_identity;
+mod apply_knowledge;
+mod mcpl_marker;
+pub mod apply_notice;
+mod apply_plan;
+pub mod apply_record;
+mod apply_restore;
+mod apply_pending;
 mod archive_overlay;
 mod codex_auth;
 mod codex_chat;
@@ -23,6 +32,9 @@ mod failed_items;
 #[cfg(test)]
 mod fixtures_guard;
 mod font_pack;
+pub mod font_restore;
+mod native_lang;
+mod options_txt;
 mod ftbquests;
 mod gap_model;
 pub mod game_process;
@@ -38,6 +50,7 @@ mod jar_display;
 mod jar_origins;
 mod jar_patchouli;
 mod jar_translate;
+mod jar_sources;
 mod lenient_json;
 pub mod local_llm;
 mod local_quality;
@@ -57,6 +70,7 @@ pub mod provenance;
 mod quests_books;
 pub mod release_manifest;
 mod resource_pack_guard;
+pub mod pack_repair;
 mod run_journal;
 pub mod run_plan;
 mod safe_text;
@@ -86,7 +100,7 @@ mod usage_feedback;
 
 pub use apply_instance::{
     apply_to_instance, delete_apply_backups_in, has_apply_backups_in, restore_last_apply_in, ApplyResult,
-    DeleteBackupResult, RestoreResult,
+    ApplyStatus, DeleteBackupResult, RestoreResult,
 };
 pub use archive_overlay::translate_archive_overlays;
 pub use codex_auth::{
@@ -152,7 +166,8 @@ pub use dev_mode::{
 };
 pub use run_journal::{list_runs, write_run_log};
 pub use failed_items::{build_failed_items_csv, merge_imported, parse_import_text, write_failed_items_csv, ImportReport};
-pub use resource_pack_guard::{check_pack_health, repair_pack_list, PackHealthReport};
+pub use pack_repair::repair_pack_list;
+pub use resource_pack_guard::{check_pack_health, PackHealthReport};
 pub use out_layout::{
     cleanup_transient_work, ensure_result_layout, prune_empty_result_dirs, suggest_output_base,
     write_coverage_report, write_gap_summary_file,
@@ -162,9 +177,10 @@ pub use pack_version::{
     build_pack_name, detect_pack_version, resolve_output_pack_name, PackVersionInfo,
 };
 pub use pack_out::{
-    build_resource_pack, detect_minecraft_version, detect_pack_format,
+    build_resource_pack, build_resource_pack_skipping_bundled, detect_minecraft_version, detect_pack_format,
     ensure_minecraft_version_for_translate, pack_format_for_version, BuildOptions,
 };
+pub use native_lang::collect_mod_zh_tw;
 pub use quests_books::translate_quests_books;
 pub use secrets::{
     cloud_topup_choice, get_ai_mode, get_api_settings_public, get_gpt_model, get_minimize_on_close,

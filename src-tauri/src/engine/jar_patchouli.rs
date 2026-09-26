@@ -115,6 +115,9 @@ where
         match rebuild_jar(base, &output, &jar_translated, &stage) {
             Ok(()) => {
                 report.files_written += count_files(&jar_translated);
+                if let Err(e) = super::jar_sources::record_source(work_root, relative, &item.source_jar) {
+                    report.skipped.push(format!("{}：{e}", item.source_jar.display()));
+                }
             }
             Err(error) => report
                 .skipped

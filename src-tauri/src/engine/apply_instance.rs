@@ -1,18 +1,48 @@
-//! 一鍵套用到遊戲實例：先備份再複製資源包／任務／文字覆寫（社群期望：可裝、可回滾）。
+//! 一鍵套用到遊戲：依套用清單把翻譯放進遊戲資料夾、啟用資源包、把遊戲語言設成繁中。
+//!
+//! 每個會備份／覆蓋／還原／刪除的動作都先過 apply_guard.rs 的前置條件檢查；
+//! 紀錄與標記（apply_record.rs、mcpl_marker.rs）一律先寫，才動遊戲檔。
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::apply_guard::{self, Ctx};
+use super::apply_knowledge::{self, Class, Knowledge};
+#[cfg(test)]
+use super::apply_knowledge::APPLY_MANIFEST;
+use super::apply_plan::{self, Group, ItemSource};
+use super::apply_notice::language_display_name;
+use super::apply_record::{self, ApplyRecord, BackupPolicy, FileKind, Origin};
+use super::apply_restore;
 use super::cancel;
 use super::game_process::{self, GameRunning};
+use super::hashutil::sha256_hex;
 use super::jar_scan::resolve_minecraft_dir;
-use super::out_layout::{ensure_result_layout, ResultLayout, RESULT_DIR_NAME};
+use super::options_txt;
+use super::out_layout::{ensure_result_layout, ResultLayout};
+use super::paths::long_path;
 use super::session::{find_session_file, is_tool_resource_pack, load_session};
+
+/// 套用的結果狀態。只有 `Applied` 代表檔案已經放進遊戲；其餘都是「翻譯已完成、還沒套用」，
+/// 而且一個檔都沒動——玩家處理完（關遊戲、先開一次遊戲、選備份、確認覆蓋）再按「套用到遊戲」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApplyStatus {
+    Applied,
+    /// 遊戲正在執行
+    GameRunning,
+    /// 全新的遊戲資料夾（沒有 options.txt）：請先啟動一次遊戲
+    NoOptionsTxt,
+    /// 第一次套用，還沒選要不要備份
+    NeedsBackupChoice,
+    /// 選了不備份，這次會蓋掉原檔：要玩家確認
+    NeedsOverwriteConfirm,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {
+    pub status: ApplyStatus,
     pub backup_dir: String,
     pub backup_created: bool,
     pub backup_reused: bool,
@@ -20,187 +50,156 @@ pub struct ApplyResult {
     pub jars_copied: usize,
     pub quests_copied: bool,
     pub minemenu_copied: bool,
+    /// 這次有沒有把遊戲語言改成繁中
+    pub lang_set: bool,
+    /// 改之前的語言（移除翻譯時會改回來）
+    pub original_lang: Option<String>,
+    /// 不備份模式下，這次會被覆蓋、且無法還原的原檔（相對遊戲資料夾）
+    pub pending_overwrites: Vec<String>,
+    /// 來源不明（無法確定原本是不是工具改的）而沒有備份就覆蓋的檔
+    pub unknown_files: Vec<String>,
+    /// 上次套用後被改過、這次沒有動的檔
+    pub skipped_changed: Vec<String>,
+    /// 覆蓋前先移入隔離區的檔（來源不明，不會自動還原）
+    pub quarantined_files: Vec<String>,
+    /// 標記對不上又重建不了、所以這次沒有覆蓋的檔
+    pub unconfirmed_files: Vec<String>,
+    /// 翻譯之後模組被更新、改名或刪除：舊翻譯沒有放進遊戲（模組已更新，需重新翻譯）
+    pub outdated_mods: Vec<String>,
     pub player_summary: String,
     pub warnings: Vec<String>,
 }
 
-/// 套用清單：記錄每個寫入的檔（相對遊戲目錄），以及它是「新增」還是「覆蓋既有」。
-/// 有了它，「還原上次套用」才能精準反轉：新增的刪掉、覆蓋的從備份還原。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct ApplyManifest {
-    stamp: String,
-    mc_dir: String,
-    backup_dir: String,
-    /// 這次新增（原本不存在）→ 還原時刪除
-    added: Vec<String>,
-    /// 這次覆蓋（原本存在，已備份）→ 還原時從備份複製回來
-    overwritten: Vec<String>,
+impl ApplyResult {
+    pub fn is_applied(&self) -> bool {
+        self.status == ApplyStatus::Applied
+    }
+
+    fn pending(status: ApplyStatus, message: String, pending_overwrites: Vec<String>) -> Self {
+        Self {
+            status,
+            backup_dir: String::new(),
+            backup_created: false,
+            backup_reused: false,
+            zip_copied: None,
+            jars_copied: 0,
+            quests_copied: false,
+            minemenu_copied: false,
+            lang_set: false,
+            original_lang: None,
+            pending_overwrites,
+            unknown_files: Vec::new(),
+            skipped_changed: Vec::new(),
+            quarantined_files: Vec::new(),
+            unconfirmed_files: Vec::new(),
+            outdated_mods: Vec::new(),
+            player_summary: message,
+            warnings: Vec::new(),
+        }
+    }
 }
 
-const APPLY_MANIFEST: &str = "套用清單.json";
-
-fn rel_to(mc: &Path, target: &Path) -> String {
-    target
-        .strip_prefix(mc)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-/// 一鍵還原：反轉最近一次套用（新增的刪掉、覆蓋的還原）。
+/// 移除翻譯的結果。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreResult {
     pub backup_dir: String,
     pub removed: usize,
     pub restored: usize,
+    /// 套用後被玩家或整合包更新改過、所以沒有動的檔
+    pub skipped_modified: Vec<String>,
+    /// 無法確認是不是工具改的（或標記對不上）、所以沒有動的檔
+    pub uncertain: Vec<String>,
+    /// 沒有備份、無法還原成原本內容的檔
+    pub unrestorable: Vec<String>,
+    /// 已從備份放回原檔的檔
+    pub restored_files: Vec<String>,
+    /// 已刪除的工具新增檔
+    pub removed_files: Vec<String>,
+    /// 標記有缺但能從另一端補回：已補好標記，這次沒有動檔
+    pub repaired: Vec<String>,
+    /// 隔離區裡保存的玩家原本版本：「檔案 — 保存位置」
+    pub quarantined: Vec<String>,
     pub player_summary: String,
     pub warnings: Vec<String>,
 }
 
-/// 從指定的翻譯結果位置找最近一次套用備份；沒有指定時相容舊版實例旁備份。
+/// 移除翻譯：每個檔都先過前置條件檢查（原則 B＋標記互相關聯），不需要備份也能執行。
 pub fn restore_last_apply_in(
     instance_path: &Path,
     result_root: Option<&Path>,
 ) -> Result<RestoreResult, String> {
-    let mc = resolve_minecraft_dir(instance_path)?;
-    let mut backups = find_backup_dirs(&mc, result_root);
-    if backups.is_empty() {
-        return Err("找不到任何『翻譯套用備份_』資料夾，沒有可還原的套用紀錄。".into());
-    }
-    backups.sort(); // 時間戳在名字裡，字典序≈時間序
-    let backup_root = backups.last().unwrap().clone();
+    // 測試不偵測真的遊戲行程（玩家同時開著別的整合包時會誤判）；測試直接呼叫下面那個
+    let running = if cfg!(test) { GameRunning::No } else { game_process::is_game_running(instance_path) };
+    restore_last_apply_with_game_state(instance_path, result_root, running)
+}
 
-    let manifest_path = backup_root.join(APPLY_MANIFEST);
-    let mut removed = 0usize;
-    let mut restored = 0usize;
-    let mut warnings = Vec::new();
-    let mut critical_failures = Vec::new();
-
-    if let Ok(text) = fs::read_to_string(&manifest_path) {
-        let manifest: ApplyManifest = serde_json::from_str(&text)
-            .map_err(|e| format!("套用清單讀取失敗：{e}"))?;
-        if !manifest.mc_dir.is_empty() {
-            let manifest_key = path_key(Path::new(&manifest.mc_dir));
-            let current_key = path_key(&mc);
-            if manifest_key != current_key {
-                return Err(format!(
-                    "備份對應的遊戲目錄與目前選擇不符，已中止還原以免改到錯誤實例。\n\
-備份紀錄：{}\n\
-目前選擇：{}",
-                    manifest.mc_dir,
-                    mc.display()
-                ));
-            }
-        }
-        // 新增的 → 刪除
-        for rel in &manifest.added {
-            let p = mc.join(rel);
-            if !p.is_file() {
-                continue;
-            }
-            match fs::remove_file(&p) {
-                Ok(()) => removed += 1,
-                Err(error) => {
-                    let message = format!("無法移除新增檔「{rel}」：{error}");
-                    warnings.push(message.clone());
-                    critical_failures.push(message);
-                }
-            }
-        }
-        // 覆蓋的 → 從備份複製回來（備份鏡像 mc 相對結構）
-        for rel in &manifest.overwritten {
-            let from = backup_root.join(rel);
-            let to = mc.join(rel);
-            if !from.is_file() {
-                let message = format!("備份缺少應還原的檔案「{rel}」，已略過。");
-                warnings.push(message);
-                continue;
-            }
-            if let Some(parent) = to.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
-                    let message = format!("無法建立還原目錄「{}」：{error}", parent.display());
-                    warnings.push(message.clone());
-                    critical_failures.push(message);
-                    continue;
-                }
-            }
-            match fs::copy(&from, &to) {
-                Ok(_) => restored += 1,
-                Err(error) => {
-                    let message = format!("還原覆蓋檔「{rel}」失敗：{error}");
-                    warnings.push(message.clone());
-                    critical_failures.push(message);
-                }
-            }
-        }
-    } else {
-        // 舊備份沒有清單：退回「把備份內容整包蓋回去」（只能還原覆蓋，無法刪掉新增的）
-        for sub in [
-            "mods",
-            "resourcepacks",
-            "config",
-            "minemenu",
-            "patchouli_books",
-            "kubejs",
-            "datapacks",
-            "defaultconfigs",
-            "global_packs",
-            "paxi",
-            "data",
-        ] {
-            let from = backup_root.join(sub);
-            if from.is_dir() {
-                let (count, failures) = restore_tree(&from, &mc.join(sub));
-                restored += count;
-                for failure in failures {
-                    warnings.push(failure.clone());
-                    critical_failures.push(failure);
-                }
-            }
-        }
-    }
-
-    if !critical_failures.is_empty() {
+/// 移除翻譯本體。前置條件：遊戲沒開著（會刪、會蓋遊戲資料夾裡的檔）——開著就一個檔都不動。
+pub fn restore_last_apply_with_game_state(
+    instance_path: &Path,
+    result_root: Option<&Path>,
+    running: GameRunning,
+) -> Result<RestoreResult, String> {
+    if let GameRunning::Yes { detail } = &running {
         return Err(format!(
-            "還原未完全成功（{} 項失敗），請關閉遊戲後重試或手動從備份還原。\n\
-備份來源：{}\n\
-已移除新增檔：{} 個；已還原覆蓋檔：{} 個\n\
-失敗項目：\n{}",
-            critical_failures.len(),
-            backup_root.display(),
-            removed,
-            restored,
-            critical_failures.join("\n")
+            "Minecraft 正在使用這個模組整合包，現在移除翻譯可能讓檔案被鎖住或只移除一半，所以一個檔都沒有動。\n\
+請完全關閉遊戲後再按「移除翻譯」。（{detail}）"
         ));
     }
-
-    let warning_block = if warnings.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n注意：\n• {}", warnings.join("\n• "))
+    let mc = resolve_minecraft_dir(instance_path)?;
+    let mut knowledge = Knowledge::load(&mc, result_root)?;
+    if !knowledge.record.has_translation() && knowledge.legacy_listed().is_empty() {
+        // 只裝過字體包、或只修復過資源包清單：那些不是翻譯，由各自的功能處理
+        return Err("這個遊戲資料夾沒有用工具裝過翻譯，沒有翻譯可以移除。".into());
+    }
+    let ctx = match Ctx::existing(&mc)? {
+        Some(ctx) => ctx,
+        // 只有舊版清單、還沒有識別碼：認領舊備份前要先有身分
+        None => Ctx::begin(&mc)?,
     };
-    let player_summary = format!(
-        "已還原上次套用。\n\
-• 備份來源：\n{}\n\
-• 移除本次新增檔：{} 個\n\
-• 還原被覆蓋檔：{} 個\n\n\
-現在再開一次遊戲：\n\
-• 若開得起來 → 先前是翻譯檔造成的，歡迎把當機報告給我們修\n\
-• 若還是開不起來 → 不是翻譯，多半是整合包缺模組（可用『診斷開不了』看是缺什麼）\n\
-（原始 mods/*.jar 不會直接修改；翻譯副本會先備份後套用）{}",
-        backup_root.display(),
-        removed,
-        restored,
-        warning_block
-    );
+    let outcome = apply_restore::restore_all(&ctx, &mut knowledge, "");
+    remember_knowledge(&mut knowledge);
+    // 紀錄存不了要回報，不吞掉
+    apply_record::save(&mc, &mut knowledge.record)?;
+    if !outcome.failures.is_empty() {
+        return Err(format!(
+            "移除翻譯沒有全部完成（{} 項失敗），請完全關閉遊戲後再按一次「移除翻譯」。\n\
+已刪除工具加入的檔案：{} 個；已還原原檔：{} 個\n失敗項目：\n{}",
+            outcome.failures.len(),
+            outcome.removed_files.len(),
+            outcome.restored_files.len(),
+            outcome.failures.join("\n")
+        ));
+    }
+    let backup_dir = apply_record::instance_backup_dir(&mc);
     Ok(RestoreResult {
-        backup_dir: backup_root.display().to_string(),
-        removed,
-        restored,
-        player_summary,
-        warnings,
+        backup_dir: if long_path(&backup_dir).is_dir() {
+            backup_dir.display().to_string()
+        } else {
+            String::new()
+        },
+        removed: outcome.removed_files.len(),
+        restored: outcome.restored_files.len(),
+        player_summary: with_notice(knowledge.notice.as_deref(), apply_restore::describe(&outcome)),
+        skipped_modified: outcome.skipped_modified,
+        uncertain: outcome.uncertain,
+        unrestorable: outcome.unrestorable.iter().chain(outcome.backup_deleted.iter()).cloned().collect(),
+        restored_files: outcome.restored_files,
+        removed_files: outcome.removed_files,
+        repaired: outcome.repaired,
+        quarantined: outcome.quarantined,
+        warnings: Vec::new(),
     })
+}
+
+/// 存紀錄前把「目前知道的」併進去：舊版清單提過的檔（舊備份刪掉後仍記得），
+/// 以及這份紀錄開始時就無法判斷的狀態。
+fn remember_knowledge(knowledge: &mut Knowledge) {
+    let touched = apply_knowledge::legacy_touched_set(&knowledge.legacy);
+    knowledge.record.legacy_touched.extend(touched);
+    if knowledge.uncertain.is_some() {
+        knowledge.record.started_uncertain = true;
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -208,244 +207,144 @@ pub fn restore_last_apply_in(
 pub struct DeleteBackupResult {
     pub deleted: usize,
     pub failed: Vec<String>,
+    /// 無法確認屬於這個整合包、所以沒有刪的備份
+    pub kept: Vec<String>,
     pub player_summary: String,
 }
 
+/// 刪除這個整合包的全部工具備份。每一份都要先過 require_backup_owned／require_legacy_owned：
+/// 標記屬本包的才刪；無法確認的（別的整合包的、沒有清單的舊備份、缺標記的）一律不刪並列出。
+/// 刪舊版備份前先把舊版清單提過的檔記進套用紀錄，之後才不會把舊版翻譯當成原檔備份。
 pub fn delete_apply_backups_in(
     instance_path: &Path,
     result_root: Option<&Path>,
 ) -> Result<DeleteBackupResult, String> {
     let mc = resolve_minecraft_dir(instance_path)?;
-    let backups = find_backup_dirs(&mc, result_root);
-
+    let mut knowledge = Knowledge::load(&mc, result_root)?;
+    let mut ctx = Ctx::existing(&mc)?;
+    if !knowledge.legacy.is_empty() {
+        // 前置條件：存紀錄前先確認（或建立）整合包識別碼，紀錄才會存到正確的位置
+        if ctx.is_none() {
+            ctx = Some(Ctx::begin(&mc)?);
+            knowledge = Knowledge::load(&mc, result_root)?;
+        }
+        remember_knowledge(&mut knowledge);
+        apply_record::save(&mc, &mut knowledge.record)?;
+    }
     let mut deleted = 0usize;
     let mut failed = Vec::new();
-    for backup in backups {
-        match fs::remove_dir_all(&backup) {
-            Ok(()) => deleted += 1,
-            Err(error) => failed.push(format!("{}：{}", backup.display(), error)),
+    let mut kept = Vec::new();
+
+    if let Some(ctx) = &ctx {
+        let rels = apply_guard::backup_rels(&mc);
+        for rel in rels {
+            if !apply_guard::require_backup_owned(ctx, &rel) {
+                kept.push(format!("備份區的 {rel}（沒有屬於這個整合包的標記）"));
+                continue;
+            }
+            match apply_guard::delete_backup(&mc, &rel) {
+                Ok(()) => deleted += 1,
+                Err(error) => failed.push(error),
+            }
+        }
+        apply_guard::remove_empty_backup_dirs(&mc);
+        if deleted > 0 {
+            // 記下來：之後「移除翻譯」要照實說被覆蓋的檔已無法還原
+            knowledge.record.backups_deleted = true;
+            apply_record::save(&mc, &mut knowledge.record)?;
         }
     }
+    let legacy_count = knowledge.legacy.len();
+    for legacy in &knowledge.legacy {
+        match fs::remove_dir_all(long_path(&legacy.dir)) {
+            Ok(()) => deleted += 1,
+            Err(error) => failed.push(format!("{}：{}", legacy.dir.display(), error)),
+        }
+    }
+    for legacy in &knowledge.unowned_legacy {
+        kept.push(format!("{}（無法確認是不是這個整合包的舊版備份）", legacy.dir.display()));
+    }
 
-    let player_summary = if failed.is_empty() {
+    let legacy_note = if legacy_count > 0 {
+        format!("（其中 {legacy_count} 個是舊版工具的備份：之後將無法還原舊版工具改過的檔案）")
+    } else {
+        String::new()
+    };
+    let mut player_summary = if failed.is_empty() {
         if deleted == 0 {
-            "沒有找到工具建立的備份檔案。".to_string()
+            "沒有找到可以刪除的工具備份。".to_string()
         } else {
-            format!("已刪除 {} 個翻譯套用備份。", deleted)
+            format!("已刪除 {deleted} 個備份檔{legacy_note}。")
         }
     } else {
-        format!("已刪除 {} 個備份，但有 {} 個無法刪除。", deleted, failed.len())
+        format!("已刪除 {} 個備份檔{legacy_note}，但有 {} 個無法刪除。", deleted, failed.len())
     };
-
-    Ok(DeleteBackupResult {
-        deleted,
-        failed,
-        player_summary,
-    })
+    if !kept.is_empty() {
+        player_summary.push_str(&format!(
+            "\n以下 {} 項無法確認屬於這個整合包，沒有刪：\n  - {}",
+            kept.len(),
+            kept.join("\n  - ")
+        ));
+    }
+    Ok(DeleteBackupResult { deleted, failed, kept, player_summary })
 }
 
-/// 回報指定實例／結果位置是否存在本工具建立的套用備份。
-/// 這只讀取目錄名稱與套用清單，不會讀寫遊戲內容，供 UI 決定是否顯示還原／刪除按鈕。
+/// 這個遊戲資料夾有沒有「可以移除的翻譯」：有套用紀錄、舊版清單，或看得到工具的備份。
+/// 只讀取，不會修改檔案；供 UI 決定是否顯示「移除翻譯」與「刪除備份」。
+/// `.mcpl` 被刪時只判斷認不認得回來，不補回、不寫紀錄——真正的認回留給套用／移除，說明才會出現在那次的結果裡。
+/// 紀錄讀不出來時也回 true：讓玩家按下去看到原因與「重設套用紀錄」。
 pub fn has_apply_backups_in(
     instance_path: &Path,
     result_root: Option<&Path>,
 ) -> Result<bool, String> {
     let mc = resolve_minecraft_dir(instance_path)?;
-    Ok(!find_backup_dirs(&mc, result_root).is_empty())
-}
-
-fn find_backup_dirs(mc: &Path, result_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut containers = Vec::new();
-    let mut add_container = |path: PathBuf| {
-        if !containers.iter().any(|existing| existing == &path) {
-            containers.push(path);
-        }
+    let Ok(knowledge) = Knowledge::peek(&mc, result_root) else {
+        return Ok(true);
     };
-
-    if let Some(root) = result_root {
-        let work_root = if root.file_name().and_then(|name| name.to_str()) == Some(RESULT_DIR_NAME) {
-            root.to_path_buf()
-        } else {
-            root.join(RESULT_DIR_NAME)
-        };
-        add_container(work_root);
-        add_container(root.to_path_buf());
-    }
-    if let Some(parent) = mc.parent() {
-        // 舊版備份在 Minecraft 資料夾旁；保留讀取與刪除相容性。
-        add_container(parent.to_path_buf());
-    }
-
-    let mut backups = Vec::new();
-    for container in containers {
-        if let Ok(entries) = fs::read_dir(container) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.starts_with("翻譯套用備份_"))
-                        .unwrap_or(false)
-                    && !backups.iter().any(|existing| existing == &path)
-                {
-                    backups.push(path);
-                }
-            }
-        }
-    }
-    backups.sort();
-    backups
+    // 只算翻譯：只裝過字體包或只修復過清單時，不顯示「移除翻譯」
+    Ok(knowledge.record.has_translation()
+        || !knowledge.legacy_listed().is_empty()
+        || !knowledge.legacy.is_empty()
+        || !knowledge.unowned_legacy.is_empty()
+        || !apply_guard::backup_rels(&mc).is_empty())
 }
 
-fn collect_planned_tree(source: &Path, target_root: &Path, targets: &mut Vec<PathBuf>) {
-    for entry in walkdir::WalkDir::new(source).into_iter().filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let relative = path.strip_prefix(source).unwrap_or(path);
-        targets.push(target_root.join(relative));
-    }
-}
-
-fn path_key(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase()
-}
-
-fn manifest_contains(list: &[String], relative: &str) -> bool {
-    list.iter()
-        .any(|item| item.replace('\\', "/") == relative)
-}
-
-/// 找到同一實例、同一結果資料夾下仍能完整還原的舊備份。
-/// 只要這次會覆蓋一個舊備份沒有涵蓋的檔案，就不重用，改建新的備份保護玩家資料。
-fn find_reusable_backup(
-    work_root: &Path,
-    mc: &Path,
-    planned_targets: &[PathBuf],
-) -> Option<(PathBuf, ApplyManifest)> {
-    // 同時檢查目前結果資料夾與舊版曾放在 Minecraft 同層的備份，
-    // 避免升級工具後把同一份原始檔再備份一次。
-    let mut candidates = find_backup_dirs(mc, Some(work_root));
-    candidates.sort();
-    let mc_key = path_key(mc);
-
-    for backup_root in candidates.into_iter().rev() {
-        let manifest_path = backup_root.join(APPLY_MANIFEST);
-        let Ok(text) = fs::read_to_string(&manifest_path) else {
-            continue;
-        };
-        let Ok(manifest) = serde_json::from_str::<ApplyManifest>(&text) else {
-            continue;
-        };
-        if manifest.mc_dir.is_empty() || path_key(Path::new(&manifest.mc_dir)) != mc_key {
-            continue;
-        }
-
-        let complete = planned_targets.iter().all(|target| {
-            if !target.is_file() {
-                return true;
-            }
-            let relative = rel_to(mc, target);
-            if manifest_contains(&manifest.added, &relative) {
-                return true;
-            }
-            manifest_contains(&manifest.overwritten, &relative)
-                && backup_root.join(&relative).is_file()
-        });
-        if complete {
-            return Some((backup_root, manifest));
-        }
-    }
-    None
-}
-
-fn merge_manifests(previous: ApplyManifest, current: ApplyManifest) -> ApplyManifest {
-    let mut merged = previous;
-    for relative in current.added {
-        if !manifest_contains(&merged.added, &relative) {
-            merged.added.push(relative.clone());
-        }
-        merged
-            .overwritten
-            .retain(|item| item.replace('\\', "/") != relative);
-    }
-    for relative in current.overwritten {
-        if !manifest_contains(&merged.added, &relative)
-            && !manifest_contains(&merged.overwritten, &relative)
-        {
-            merged.overwritten.push(relative);
-        }
-    }
-    merged.added.sort();
-    merged.added.dedup();
-    merged.overwritten.sort();
-    merged.overwritten.dedup();
-    merged
-}
-
-fn restore_tree(from: &Path, to: &Path) -> (usize, Vec<String>) {
-    let mut n = 0usize;
-    let mut failures = Vec::new();
-    for entry in walkdir::WalkDir::new(from).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let rel = path.strip_prefix(from).unwrap_or(path);
-        let target = to.join(rel);
-        if let Some(parent) = target.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                failures.push(format!(
-                    "無法建立還原目錄「{}」：{error}",
-                    parent.display()
-                ));
-                continue;
-            }
-        }
-        match fs::copy(path, &target) {
-            Ok(_) => n += 1,
-            Err(error) => failures.push(format!(
-                "還原檔案失敗「{}」→「{}」：{error}",
-                path.display(),
-                target.display()
-            )),
-        }
-    }
-    (n, failures)
-}
-
-/// 將「翻譯結果」套用到遊戲：resourcepacks zip + config 文字覆寫 + minemenu
-/// + patchouli_books / kubejs / 資料包根目錄（若 work 有）。
-/// 不修改原始 mods/*.jar；翻譯副本套用前會備份被覆蓋的目標。
 /// 一鍵套用。**這是唯一的寫入入口**，遊戲關閉檢查在這裡做（P0-02）。
 ///
-/// 為什麼不能只靠前端：`app.js` 的 `ensureGameClosed` 只擋得到它自己接線的按鈕，
-/// 而 one_click／補翻／修復／單獨套用最後全都走到這個函式。前端檢查與實際寫入
-/// 之間還有選路徑、跳確認等空窗，遊戲可能在那段時間被開起來。
+/// 為什麼不能只靠前端：one_click／補翻／修復／單獨套用最後全都走到這個函式，
+/// 前端檢查與實際寫入之間還有空窗，遊戲可能在那段時間被開起來。
 pub fn apply_to_instance(
     instance_path: &Path,
     output_or_work: &Path,
     pack_name_hint: Option<&str>,
-    create_backup: bool,
+    policy: BackupPolicy,
 ) -> Result<ApplyResult, String> {
     let running = game_process::is_game_running(instance_path);
-    apply_to_instance_with_game_state(instance_path, output_or_work, pack_name_hint, create_backup, running)
+    apply_to_instance_with_game_state(instance_path, output_or_work, pack_name_hint, policy, running)
 }
 
-/// 套用本體。把「偵測遊戲行程」這個會碰全域狀態的動作留在外層，
-/// 這裡只依傳入的判定結果行事——測試才能覆蓋 Yes／No／Unknown 三種情境
-/// 而不必真的去啟動一個 Minecraft。
+/// 一個即將寫入的項目，以及寫入前判斷出來的狀態。
+struct Decision {
+    index: usize,
+    rel: String,
+    class: Class,
+    planned_sha: String,
+    existed: bool,
+}
+
+/// 套用本體。「偵測遊戲行程」留在外層，這裡只依傳入的判定行事——測試才能覆蓋
+/// Yes／No／Unknown 而不必真的啟動 Minecraft。
+///
+/// 順序（每一步都是下一步的前置條件）：
+/// 1. 會讓套用停下來的檢查（遊戲開著、沒有 options.txt、還沒選備份、不備份時要蓋掉原檔）→ 零寫入回狀態。
+/// 2. 逐檔判斷原本是什麼；原檔先建立有效備份、來源不明的先移入隔離區、舊版備份先認領。
+/// 3. 先存紀錄與全部標記（含資源包清單與語言設定的標記）。
+/// 4. 才寫遊戲檔與設定檔。
 pub fn apply_to_instance_with_game_state(
     instance_path: &Path,
     output_or_work: &Path,
     pack_name_hint: Option<&str>,
-    create_backup: bool,
+    policy: BackupPolicy,
     running: GameRunning,
 ) -> Result<ApplyResult, String> {
     cancel::check()?;
@@ -455,519 +354,452 @@ pub fn apply_to_instance_with_game_state(
     let mc = resolve_minecraft_dir(instance_path)?;
     crate::dev_log!(
         "apply",
-        "開始套用 instance={} 來源={} 資源包提示={:?} 建立備份={}",
+        "開始套用 instance={} 來源={} 資源包提示={:?} 備份={:?}",
         instance_path.display(),
         output_or_work.display(),
         pack_name_hint,
-        create_backup
+        policy
     );
     let layout = ensure_result_layout(output_or_work)?;
     let work = &layout.work_root;
-
-    let mut warnings = Vec::new();
-    warnings.push(
-        "請先完全關閉 Minecraft／啟動器載入中的實例，再套用。若遊戲仍在跑，可能複製失敗或檔案被鎖。"
-            .into(),
-    );
-
     let pack_name = resolve_pack_name(work, pack_name_hint);
     let zip_src = find_zip_in_layout(&layout, &pack_name);
-    let resourcepacks_extra_src = work.join("resourcepacks-extra");
-    let quests_src = work.join("config").join("ftbquests");
-    let menu_src = work.join("minemenu").join("menu.json");
-    let patchouli_src = work.join("patchouli_books");
-    let config_src = work.join("config");
-    let openloader_src = work.join("config").join("openloader");
-    let kubejs_src = work.join("kubejs");
-    let fancymenu_src = work.join("config").join("fancymenu");
-    let datapacks_src = work.join("datapacks");
-    let defaultconfigs_src = work.join("defaultconfigs");
-    let global_packs_src = work.join("global_packs");
-    let paxi_src = work.join("paxi");
-    let jar_src = work.join("jar-translated");
-
-    let has_patchouli = dir_has_files(&patchouli_src);
-    let has_openloader = dir_has_files(&openloader_src);
-    let has_kubejs = dir_has_files(&kubejs_src);
-    let has_fancymenu = dir_has_files(&fancymenu_src);
-    let has_config = dir_has_files(&config_src);
-    let has_datapacks = dir_has_files(&datapacks_src);
-    let has_defaultconfigs = dir_has_files(&defaultconfigs_src);
-    let has_global_packs = dir_has_files(&global_packs_src);
-    let has_paxi = dir_has_files(&paxi_src);
-    let has_jars = dir_has_files(&jar_src);
-    let has_resourcepacks_extra = dir_has_files(&resourcepacks_extra_src);
-
-    if zip_src.is_none()
-        && !quests_src.is_dir()
-        && !menu_src.is_file()
-        && !has_patchouli
-        && !has_openloader
-        && !has_kubejs
-        && !has_fancymenu
-        && !has_config
-        && !has_datapacks
-        && !has_defaultconfigs
-        && !has_global_packs
-        && !has_paxi
-        && !has_jars
-        && !has_resourcepacks_extra
-    {
+    // 指紋標記：供下次「開始翻譯」判斷這個 zip 是不是這個整合包產生的
+    let zip_meta = zip_src.as_ref().map(|_| {
+        let meta = serde_json::json!({ "modsFingerprint": super::session::mods_fingerprint(instance_path) });
+        serde_json::to_string_pretty(&meta).unwrap_or_default().into_bytes()
+    });
+    let mut plan = apply_plan::build_plan(&mc, &layout, &pack_name, zip_src.as_deref(), zip_meta);
+    if plan.is_empty() {
         return Err(format!(
-            "在「{}」找不到可套用的 zip／任務／快捷選單／文字覆寫。請先完成一鍵翻譯。",
+            "在「{}」找不到可套用的翻譯內容。請先完成一鍵翻譯。",
             work.display()
         ));
     }
 
-    let menu_dest = mc.join("minemenu").join("menu.json");
-    let patchouli_dest = mc.join("patchouli_books");
-    let kubejs_dest = mc.join("kubejs");
-    let datapacks_dest = mc.join("datapacks");
+    // ── 1. 會讓套用停下來的檢查（任何一項不過就一個檔都不動）──
+    if let GameRunning::Yes { detail } = &running {
+        crate::dev_log!("apply", "遊戲正在執行，延後套用 instance={}", instance_path.display());
+        return Ok(ApplyResult::pending(
+            ApplyStatus::GameRunning,
+            format!(
+                "翻譯已完成，但 Minecraft 正在使用這個模組整合包，所以還沒裝進遊戲。\n\
+現在寫入可能讓檔案被鎖住、只裝一半。請完全關閉遊戲（含啟動器裡載入中的遊戲）後，按「套用到遊戲」。\n\
+（{detail}）"
+            ),
+            Vec::new(),
+        ));
+    }
+    let options_path = mc.join("options.txt");
+    if !long_path(&options_path).is_file() {
+        return Ok(ApplyResult::pending(
+            ApplyStatus::NoOptionsTxt,
+            "翻譯已完成，但這個遊戲資料夾還沒有啟動過遊戲，所以還沒裝進遊戲。\n\
+請先用啟動器開一次遊戲，看到標題畫面後關掉，再按「套用到遊戲」。不用重新翻譯。"
+                .into(),
+            Vec::new(),
+        ));
+    }
+    if policy == BackupPolicy::Ask {
+        return Ok(ApplyResult::pending(
+            ApplyStatus::NeedsBackupChoice,
+            "翻譯已完成。第一次把翻譯裝進這個遊戲前，請先決定要不要備份會被覆蓋的檔案。".into(),
+            Vec::new(),
+        ));
+    }
+    // 讀紀錄前先確認遊戲資料夾有識別碼（紀錄、備份、隔離區都以它為鍵）
+    let identity_known = super::mcpl_marker::read_instance(&mc)?.is_some();
+    // 先只判斷、不寫（還沒有識別碼時用舊鍵，或用認得回來的紀錄）：讀不到、或下面要先問玩家時都是零寫入
+    let mut knowledge = Knowledge::peek(&mc, Some(work))?;
 
-    let mut planned_targets = Vec::new();
-    if let Some(zip) = zip_src.as_deref() {
-        if let Some(name) = zip.file_name() {
-            planned_targets.push(mc.join("resourcepacks").join(name));
-        }
-        planned_targets.push(mc.join("options.txt"));
-    }
-    if has_resourcepacks_extra {
-        collect_planned_tree(
-            &resourcepacks_extra_src,
-            &mc.join("resourcepacks"),
-            &mut planned_targets,
-        );
-    }
-    if has_config {
-        collect_planned_tree(&config_src, &mc.join("config"), &mut planned_targets);
-    }
-    if menu_src.is_file() {
-        planned_targets.push(menu_dest.clone());
-    }
-    for (source, target, enabled) in [
-        (&patchouli_src, &patchouli_dest, has_patchouli),
-        (&kubejs_src, &kubejs_dest, has_kubejs),
-        (&datapacks_src, &datapacks_dest, has_datapacks),
-    ] {
-        if enabled {
-            collect_planned_tree(source, target, &mut planned_targets);
-        }
-    }
-    for (source, name, enabled) in [
-        (&defaultconfigs_src, "defaultconfigs", has_defaultconfigs),
-        (&global_packs_src, "global_packs", has_global_packs),
-        (&paxi_src, "paxi", has_paxi),
-    ] {
-        if enabled {
-            collect_planned_tree(source, &mc.join(name), &mut planned_targets);
-        }
-    }
-    if has_jars {
-        collect_planned_tree(&jar_src, &mc.join("mods"), &mut planned_targets);
+    // 前置條件：翻譯後的模組檔只放在「翻譯時用的同一個模組」上
+    let outdated_mods = super::jar_sources::drop_outdated(work, &mc, &mut plan, &knowledge.record);
+
+    // ── 2a. 逐檔判斷「原本是什麼」──
+    let mut decisions = Vec::new();
+    for (index, item) in plan.items.iter().enumerate() {
+        let planned_sha = match &item.source {
+            ItemSource::File(src) => apply_record::file_sha256(src)
+                .ok_or_else(|| format!("讀不到翻譯結果裡的檔案：{}", src.display()))?,
+            ItemSource::Bytes(bytes) => sha256_hex(bytes),
+        };
+        let rel = apply_record::rel_key(&mc, &item.dest);
+        let existed = long_path(&item.dest).is_file();
+        let class = knowledge.classify(&mc, &item.dest, &planned_sha);
+        // 看起來像工具產物、但沒有工具標記或舊版清單佐證的檔：當來源不明（原則 A），先隔離再覆蓋
+        decisions.push(Decision { index, rel, class, planned_sha, existed });
     }
 
-    // ── 後端最後一道遊戲關閉檢查（P0-02）──
-    //
-    // 位置刻意壓到這裡：上面全是唯讀的規劃（算 planned_targets），下一行才開始寫檔。
-    // 檢查與第一次寫入之間愈短，「檢查完使用者才把遊戲打開」的空窗愈小。
-    match &running {
-        GameRunning::Yes { detail } => {
-            crate::dev_log!("apply", "後端閘門擋下套用：遊戲正在執行 instance={}", instance_path.display());
-            return Err(format!(
-                "Minecraft 正在使用這個整合包，已停止套用。\n\
-                 現在寫入可能造成檔案被鎖、只套用一半，或讓遊戲讀到壞掉的資源包。\n\
-                 請完全關閉遊戲（含啟動器裡載入中的實例）後再套用一次。\n\
-                 （{detail}）"
+    if policy == (BackupPolicy::NoBackup { overwrite_confirmed: false }) {
+        let unprotected: Vec<String> = decisions
+            .iter()
+            .filter(|d| d.class == Class::Original || super::apply_pending::overwrites_unprotected(&d.class))
+            .map(|d| d.rel.clone())
+            .collect();
+        if !unprotected.is_empty() {
+            return Ok(ApplyResult::pending(
+                ApplyStatus::NeedsOverwriteConfirm,
+                format!(
+                    "翻譯已完成。這次會覆蓋遊戲裡 {} 個原本的檔案，你選了不備份，覆蓋後就無法還原這些檔案。",
+                    unprotected.len()
+                ),
+                unprotected,
             ));
         }
-        GameRunning::No => {}
-        GameRunning::Unknown => {
-            // 失效方向＝放行。偵測不出來（非 Windows、沒有 PowerShell、權限不足、逾時）
-            // 若一律擋下，會把「查不到」變成新的卡關。但**不得偽裝成已確認關閉**：
-            // 這句話會進 warnings，使用者看得到這次沒能確認。
-            warnings.push(
-                "這次無法確認 Minecraft 是否已關閉（偵測不可用），已照常套用。若遊戲內出現殘缺翻譯，請關閉遊戲後再套用一次。"
-                    .into(),
-            );
-        }
     }
 
-    let mut stamp = backup_stamp();
-    // 備份跟著翻譯結果走，刪除結果資料夾時可以一次清理；相同實例與目標已經有完整備份時直接沿用。
-    let mut backup_root = layout
-        .work_root
-        .join(format!("翻譯套用備份_{stamp}"));
-    let mut backup_reused = false;
-    let mut previous_manifest = None;
-    if create_backup {
-        if let Some((existing_root, manifest)) =
-            find_reusable_backup(&layout.work_root, &mc, &planned_targets)
-        {
-            backup_root = existing_root;
-            backup_reused = true;
-            stamp = manifest.stamp.clone();
-            previous_manifest = Some(manifest);
-        } else {
-            fs::create_dir_all(&backup_root).map_err(|e| format!("無法建立備份目錄：{e}"))?;
-        }
-    }
-
-    // ── 備份現有資源包 ──
-    if create_backup && !backup_reused {
-        if let Some(ref zip) = zip_src {
-        let name = zip
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("pack.zip");
-        let dest_rp = mc.join("resourcepacks").join(name);
-        if dest_rp.is_file() {
-            let bak = backup_root.join("resourcepacks");
-            fs::create_dir_all(&bak)
-                .map_err(|e| format!("建立資源包備份資料夾失敗：{e}"))?;
-            // 同 backup_matching_tree：備份失敗不能吞，否則會「沒備份卻照樣覆蓋」
-            fs::copy(&dest_rp, bak.join(name)).map_err(|e| {
-                format!(
-                    "備份既有資源包 {name} 失敗：{e}
-已停止套用，避免在沒有備份的情況下覆蓋。常見原因是遊戲還開著把檔案鎖住，或磁碟空間不足。"
-                )
-            })?;
-        }
-        // 若有同名資料夾資源包也備份
-        let folder = mc
-            .join("resourcepacks")
-            .join(name.trim_end_matches(".zip"));
-        if folder.is_dir() {
-            let bak = backup_root.join("resourcepacks").join(
-                folder
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("pack_dir"),
-            );
-            copy_dir_recursive(&folder, &bak)?;
-        }
-        }
-
-        if has_resourcepacks_extra && mc.join("resourcepacks").is_dir() {
-            backup_matching_tree(
-                &resourcepacks_extra_src,
-                &mc.join("resourcepacks"),
-                &backup_root.join("resourcepacks"),
-            )?;
-        }
-
-        // ── 備份 minemenu ──
-        if menu_src.is_file() && menu_dest.is_file() {
-            let bak = backup_root.join("minemenu");
-            fs::create_dir_all(&bak)
-                .map_err(|e| format!("建立快捷選單備份資料夾失敗：{e}"))?;
-            fs::copy(&menu_dest, bak.join("menu.json")).map_err(|e| {
-                format!("備份既有快捷選單設定失敗：{e}
-已停止套用，避免在沒有備份的情況下覆蓋。")
-            })?;
-        }
-
-        // ── 備份 patchouli_books ──
-        if has_patchouli && patchouli_dest.is_dir() {
-            let bak = backup_root.join("patchouli_books");
-            copy_dir_recursive(&patchouli_dest, &bak)?;
-        }
-
-        // ── 備份所有即將覆寫的 config 文字（含任務、openloader 與顯示型設定）──
-        if has_config && mc.join("config").is_dir() {
-            backup_matching_tree(&config_src, &mc.join("config"), &backup_root.join("config"))?;
-        }
-
-        // ── 備份 kubejs（僅 work 會覆寫的相對路徑）──
-        if has_kubejs && kubejs_dest.is_dir() {
-            backup_matching_tree(&kubejs_src, &kubejs_dest, &backup_root.join("kubejs"))?;
-        }
-
-        if has_datapacks && datapacks_dest.is_dir() {
-            let bak = backup_root.join("datapacks");
-            copy_dir_recursive(&datapacks_dest, &bak)?;
-        }
-
-        for (source, name) in [
-            (&defaultconfigs_src, "defaultconfigs"),
-            (&global_packs_src, "global_packs"),
-            (&paxi_src, "paxi"),
-        ] {
-            if dir_has_files(source) && mc.join(name).is_dir() {
-                copy_dir_recursive(&mc.join(name), &backup_root.join(name))?;
-            }
-        }
-
-        // ── 備份即將被翻譯 JAR 覆蓋的 mods 檔案 ──
-        if has_jars {
-            let mods_dest = mc.join("mods");
-            if mods_dest.is_dir() {
-                backup_matching_tree(&jar_src, &mods_dest, &backup_root.join("mods"))?;
-            }
-        }
-    }
-
-    // 寫備份說明
-    if create_backup && !backup_reused {
-        let bak_note = format!(
-        "【翻譯套用備份】\n\
-時間戳：{stamp}\n\
-遊戲目錄：{}\n\
-翻譯結果：{}\n\
-\n\
-還原方式：\n\
-1. 關閉遊戲\n\
-2. 把本備份內 mods / resourcepacks / config / minemenu / patchouli_books / kubejs / datapacks 對應複製回遊戲\n\
-3. 勿刪未備份的其他自訂檔\n\
-4. 原始 mods/*.jar 不會直接修改；翻譯副本會在備份後套用\n",
-        mc.display(),
-        work.display()
-    );
-        let _ = fs::write(backup_root.join("還原說明.txt"), bak_note);
-    }
-
-    // 套用清單（供一鍵還原）
-    let mut manifest = ApplyManifest {
-        stamp: stamp.clone(),
-        mc_dir: mc.display().to_string(),
-        backup_dir: if create_backup {
-            backup_root.display().to_string()
-        } else {
-            String::new()
-        },
-        ..Default::default()
-    };
-
-    // ── 複製 zip ──
-    let mut zip_copied = None;
-    let mut jars_copied = 0usize;
-    if let Some(zip) = zip_src {
-        let rp = mc.join("resourcepacks");
-        fs::create_dir_all(&rp).map_err(|e| e.to_string())?;
-        let name = zip
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("繁體中文翻譯.zip");
-        let dest = rp.join(name);
-        let existed = dest.is_file();
-        fs::copy(&zip, &dest).map_err(|e| {
-            format!(
-                "複製資源包失敗（請確認遊戲已關閉且路徑可寫）：{e}\n來源：{}\n目標：{}",
-                zip.display(),
-                dest.display()
-            )
-        })?;
-        record_written(&mut manifest, &mc, &dest, existed);
-        zip_copied = Some(dest.display().to_string());
-        // 寫一份指紋標記，供下次「開始翻譯」判斷這個 zip 到底是不是這個整合包產生的
-        // ——同一個實例路徑換了完全不同的整合包時，resourcepacks 裡的舊 zip 不會自動
-        // 消失，沒有這個標記就只能憑檔名判斷「有就合併」，可能把舊包的翻譯誤merge進
-        // 新包（見 lib.rs 的 run_one_click 合併點）。寫失敗不影響套用本身，忽略即可。
-        let fingerprint = super::session::mods_fingerprint(instance_path);
-        let meta_name = format!("{}.meta.json", name.trim_end_matches(".zip"));
-        let meta = serde_json::json!({ "modsFingerprint": fingerprint });
-        let _ = fs::write(
-            rp.join(meta_name),
-            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    let mut warnings = Vec::new();
+    if matches!(running, GameRunning::Unknown) {
+        // 失效方向＝放行（查不到不能變成新的卡關），但不得偽裝成已確認關閉。
+        warnings.push(
+            "這次無法確認 Minecraft 是否已關閉（偵測不可用），已照常套用。若遊戲內出現殘缺翻譯，請關閉遊戲後再套用一次。"
+                .into(),
         );
     }
 
-    // ── 複製 ZIP 內翻譯覆寫（不與主翻譯包混在一起）──
-    let mut resourcepack_overlays_copied = false;
-    if has_resourcepacks_extra {
-        merge_copy_dir(
-            &resourcepacks_extra_src,
-            &mc.join("resourcepacks"),
-            &mc,
-            &mut manifest,
-        )?;
-        resourcepack_overlays_copied = true;
+    // ── 2b. 前置條件：確定身分後，原檔先備份、來源不明先隔離、舊版備份先認領 ──
+    // 真的要動檔了：`.mcpl` 被刪而認得回來時，先認回原本的識別碼，才確認或建立識別碼
+    let reclaim_notice = if identity_known { None } else { super::apply_identity::require_identity(&mc)? };
+    let ctx = Ctx::begin(&mc)?;
+    if !identity_known {
+        // 第一次建立識別碼時舊鍵資料可能剛搬到新鍵：重新讀一次（認回的說明留著）
+        let notice = knowledge.notice.take();
+        knowledge = Knowledge::load(&mc, Some(work))?;
+        knowledge.notice = knowledge.notice.take().or(reclaim_notice).or(notice);
     }
-
-    // ── 複製所有 config 翻譯覆寫（任務、openloader、FancyMenu 與其他顯示型設定）──
-    let quests_copied = quests_src.is_dir();
-    if has_config {
-        fs::create_dir_all(mc.join("config")).map_err(|e| e.to_string())?;
-        merge_copy_dir(&config_src, &mc.join("config"), &mc, &mut manifest)?;
-    }
-
-    // ── 複製 minemenu ──
-    let mut minemenu_copied = false;
-    if menu_src.is_file() {
-        let menu_dir = mc.join("minemenu");
-        fs::create_dir_all(&menu_dir).map_err(|e| e.to_string())?;
-        let existed = menu_dest.is_file();
-        fs::copy(&menu_src, &menu_dest).map_err(|e| format!("複製快捷選單失敗：{e}"))?;
-        record_written(&mut manifest, &mc, &menu_dest, existed);
-        minemenu_copied = true;
-    }
-
-    // ── 複製 patchouli_books ──
-    let mut patchouli_copied = false;
-    if has_patchouli {
-        merge_copy_dir(&patchouli_src, &patchouli_dest, &mc, &mut manifest)?;
-        patchouli_copied = true;
-    }
-
-    let openloader_copied = has_openloader;
-
-    // ── 複製 kubejs（work 僅含翻譯產出；merge，不碰 mods）──
-    let mut kubejs_copied = false;
-    if has_kubejs {
-        merge_copy_dir(&kubejs_src, &kubejs_dest, &mc, &mut manifest)?;
-        kubejs_copied = true;
-    }
-
-    let fancymenu_copied = has_fancymenu;
-
-    let config_overlays_copied = has_config;
-
-    let mut datapacks_copied = false;
-    if has_datapacks {
-        merge_copy_dir(&datapacks_src, &datapacks_dest, &mc, &mut manifest)?;
-        datapacks_copied = true;
-    }
-
-    for (source, name) in [
-        (&defaultconfigs_src, "defaultconfigs"),
-        (&global_packs_src, "global_packs"),
-        (&paxi_src, "paxi"),
-    ] {
-        if dir_has_files(source) {
-            merge_copy_dir(source, &mc.join(name), &mc, &mut manifest)?;
-        }
-    }
-
-    if has_jars {
-        merge_copy_dir(&jar_src, &mc.join("mods"), &mc, &mut manifest)?;
-        jars_copied = count_files(&jar_src);
-    }
-
-    if let Some(ref copied) = zip_copied {
-        if let Some(name) = Path::new(copied).file_name().and_then(|s| s.to_str()) {
-            enable_resource_pack(
-                &mc,
-                name,
-                (create_backup && !backup_reused).then_some(&backup_root),
-                &mut manifest,
-            )?;
-            for warn in warn_enabled_packs_covering_font(&mc, name) {
-                warnings.push(warn);
-            }
-            for warn in collect_post_apply_warnings(&mc, work, Some(name)) {
-                warnings.push(warn);
-            }
-        }
-    }
-
-    // 寫套用清單（供「一鍵還原」精準反轉）
-    if create_backup {
-        let manifest = if let Some(previous) = previous_manifest {
-            merge_manifests(previous, manifest)
-        } else {
-            manifest
-        };
-        let js = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| format!("套用清單序列化失敗：{e}"))?;
-        fs::write(backup_root.join(APPLY_MANIFEST), js + "\n")
-            .map_err(|e| format!("寫入套用清單失敗：{e}"))?;
-    }
-
-    let overlay_line = {
-        let mut parts = Vec::new();
-        if patchouli_copied {
-            parts.push("patchouli_books");
-        }
-        if openloader_copied {
-            parts.push("config/openloader");
-        }
-        if kubejs_copied {
-            parts.push("kubejs");
-        }
-        if fancymenu_copied {
-            parts.push("config/fancymenu");
-        }
-        if config_overlays_copied {
-            parts.push("config 文字覆寫");
-        }
-        if datapacks_copied {
-            parts.push("datapacks");
-        }
-        if resourcepack_overlays_copied {
-            parts.push("resourcepacks 內 ZIP 覆寫");
-        }
-        if parts.is_empty() {
-            "無／未複製".into()
-        } else {
-            format!("已合併 {}", parts.join("、"))
-        }
-    };
-
-    let player_summary = format!(
-        "已套用到遊戲（依備份選項複製；目標＝整合包可遊玩文字→台灣繁中（除圖片））\n\
-• 備份目錄：\n{}\n\
-• 資源包：{}\n\
-• 翻譯 JAR：{} 個（是否備份原檔依選項，再覆蓋到 mods）\n\
-• 任務 ftbquests：{}\n\
-• 快捷選單：{}\n\
-• 文字覆寫：{}\n\n\
-【請你】\n\
-1. 開遊戲 → 語言選「繁體中文（台灣）」\n\
-2. 資源包啟用剛複製的 zip\n\
-3. 本工具不保證 100% 中文，任務／寫死字串／圖片文字可能仍英文\n\
-\n\
-【萬一遊戲／世界開不起來】\n\
-• 多半是整合包本身缺模組（結構／前置），跟翻譯無關——按「診斷開不了」會讀當機報告告訴你缺什麼。\n\
-• 想排除是不是翻譯造成的：按「還原上次套用」一鍵復原（新增的刪掉、覆蓋的還原），再開一次。\n\
-• 資源包（語言檔）很安全；會影響世界載入的是資料包／任務類，還原後即可排除。",
-        if create_backup && backup_reused {
-            format!("沿用既有備份：{}", backup_root.display())
-        } else if create_backup {
-            format!("新建備份：{}", backup_root.display())
-        } else {
-            "未建立備份（依你的選擇）".to_string()
-        },
-        zip_copied
+    let backup_dir = apply_record::instance_backup_dir(&mc);
+    let backup_existed = long_path(&backup_dir).is_dir();
+    let mut backed_up = 0usize;
+    let mut quarantined_files = Vec::new();
+    let mut markers: Vec<super::mcpl_marker::FileMarker> = Vec::new();
+    let mut unconfirmed: Vec<String> = Vec::new();
+    for decision in &decisions {
+        cancel::check()?;
+        let item = &plan.items[decision.index];
+        let previous = knowledge.record.files.get(&decision.rel).cloned();
+        let marker_id = previous
             .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("（本次無 zip）"),
-        jars_copied,
-        if quests_copied {
-            "已覆蓋 config/ftbquests"
+            .map(|p| p.marker_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(super::mcpl_marker::new_marker_id);
+        let original_sha = if decision.existed && decision.class != Class::ToolVersion {
+            apply_record::file_sha256(&item.dest).unwrap_or_default()
         } else {
-            "無／未複製"
-        },
-        if minemenu_copied {
-            "已複製"
-        } else {
-            "無／未複製"
-        },
-        overlay_line,
-    );
+            String::new()
+        };
+        let mut backup_id = String::new();
+        let mut quarantine_id = String::new();
+        let (kind, origin) = match &decision.class {
+            Class::Absent => (FileKind::Added, Origin::Known),
+            Class::ToolVersion => {
+                // 前置條件：覆蓋工具版本前，遊戲檔標記要完整（缺了從紀錄重建；重建不了就不動）
+                if let apply_guard::Check::Broken(why) =
+                    apply_guard::require_game_marker(&ctx, &knowledge.record, &decision.rel)
+                {
+                    crate::dev_log!("apply", "{}：{why}", decision.rel);
+                    unconfirmed.push(decision.rel.clone());
+                    continue;
+                }
+                let p = previous.as_ref().expect("工具版本一定在紀錄上");
+                backup_id = p.backup_id.clone();
+                quarantine_id = p.quarantine_id.clone();
+                (p.kind, p.origin)
+            }
+            Class::Original => {
+                if policy == BackupPolicy::Backup {
+                    backup_id = apply_guard::require_original_backup(&ctx, &item.dest, &decision.rel, &marker_id)?;
+                    backed_up += 1;
+                }
+                (FileKind::Overwritten, Origin::Known)
+            }
+            Class::LegacyBacked { original, manifest_dir } => {
+                quarantine_id = apply_guard::require_quarantined(&ctx, &item.dest, &decision.rel, &marker_id)?;
+                quarantined_files.push(decision.rel.clone());
+                backup_id = apply_guard::require_legacy_claimed(&ctx, &decision.rel, original, manifest_dir, &marker_id)?;
+                (FileKind::Overwritten, Origin::Known)
+            }
+            Class::LegacyAdded => {
+                quarantine_id = apply_guard::require_quarantined(&ctx, &item.dest, &decision.rel, &marker_id)?;
+                quarantined_files.push(decision.rel.clone());
+                (FileKind::Added, Origin::Known)
+            }
+            Class::Unknown => {
+                quarantine_id = apply_guard::require_quarantined(&ctx, &item.dest, &decision.rel, &marker_id)?;
+                quarantined_files.push(decision.rel.clone());
+                (FileKind::Overwritten, Origin::Unknown)
+            }
+            Class::Unwritten(previous) => {
+                // 上次中途中斷、還沒寫入：沿用上次的分類與連結；連結另一端壞了就不覆蓋
+                if let Err(why) = super::apply_pending::require_links_intact(&ctx, &decision.rel, previous) {
+                    crate::dev_log!("apply", "{}：{why}", decision.rel);
+                    unconfirmed.push(decision.rel.clone());
+                    continue;
+                }
+                backup_id = previous.backup_id.clone();
+                quarantine_id = previous.quarantine_id.clone();
+                if !quarantine_id.is_empty() {
+                    quarantined_files.push(decision.rel.clone());
+                }
+                (previous.kind, previous.origin)
+            }
+        };
+        knowledge.record.unconfirmed.remove(&decision.rel);
+        knowledge
+            .record
+            .set_entry(&decision.rel, kind, origin, None, decision.planned_sha.clone());
+        if let Some(entry) = knowledge.record.files.get_mut(&decision.rel) {
+            entry.marker_id = marker_id.clone();
+            entry.backup_id = backup_id.clone();
+            entry.quarantine_id = quarantine_id.clone();
+        }
+        let original_for_marker = match (&decision.class, previous.as_ref()) {
+            (Class::ToolVersion, _) => super::mcpl_marker::read_file_marker(&mc, &decision.rel)
+                .map(|m| m.original_sha256)
+                .unwrap_or_default(),
+            (Class::LegacyBacked { original, .. }, _) => apply_record::file_sha256(original).unwrap_or_default(),
+            (Class::Unwritten(previous), _) => previous.original_sha.clone(),
+            _ => original_sha,
+        };
+        markers.push(game_marker(
+            &ctx,
+            &marker_id,
+            &decision.rel,
+            kind,
+            origin,
+            &decision.planned_sha,
+            &original_for_marker,
+            &backup_id,
+            &quarantine_id,
+        ));
+    }
 
-    let warning_block = if warnings.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n注意：\n• {}", warnings.join("\n• "))
-    };
-    let player_summary = format!(
-        "{player_summary}{warning_block}"
-    );
+    // ── 2c. 設定檔：先算好要怎麼改，並準備清單項目與語言設定的標記 ──
+    let options_plan = plan_options(&ctx, &mc, plan.zip_name.as_deref(), &mut knowledge.record, &mut markers)?;
 
-    Ok(ApplyResult {
-        backup_dir: if create_backup {
-            backup_root.display().to_string()
+    // ── 3. 先存紀錄與全部標記 ──
+    remember_knowledge(&mut knowledge);
+    let extra_ids = options_plan.marker_ids();
+    apply_guard::require_record_and_markers(
+        &ctx,
+        &mut knowledge.record,
+        &markers,
+        Some(&options_plan.marker),
+        &extra_ids,
+    )?;
+
+    // ── 4. 才寫遊戲檔與設定檔 ──
+    // 每寫完一個檔才把它的標記標為「已寫入」；沒寫完的維持「待確認」
+    for decision in decisions.iter().filter(|d| !unconfirmed.contains(&d.rel)) {
+        cancel::check()?;
+        write_item(&plan.items[decision.index])?;
+        super::mcpl_marker::mark_written(&mc, &decision.rel)?;
+    }
+    let (lang_set, original_lang) = write_options(&mc, &options_plan, plan.zip_name.as_deref())?;
+
+    if let Some(name) = plan.zip_name.as_deref() {
+        warnings.extend(warn_enabled_packs_covering_font(&mc, name));
+        warnings.extend(collect_post_apply_warnings(&mc, work, Some(name)));
+    }
+
+    let backup_now = long_path(&backup_dir).is_dir();
+    let result = ApplyResult {
+        status: ApplyStatus::Applied,
+        backup_dir: if backup_now {
+            backup_dir.display().to_string()
         } else {
             String::new()
         },
-        backup_created: create_backup && !backup_reused,
-        backup_reused,
-        zip_copied,
-        jars_copied,
-        quests_copied,
-        minemenu_copied,
-        player_summary,
+        backup_created: policy == BackupPolicy::Backup && !backup_existed && backed_up > 0,
+        backup_reused: policy == BackupPolicy::Backup && backup_existed,
+        zip_copied: plan
+            .zip_name
+            .as_ref()
+            .map(|name| mc.join("resourcepacks").join(name).display().to_string()),
+        jars_copied: plan.count(Group::Mods),
+        quests_copied: plan
+            .items
+            .iter()
+            .any(|item| item.dest.starts_with(mc.join("config").join("ftbquests"))),
+        minemenu_copied: plan.has(Group::Minemenu),
+        lang_set,
+        original_lang,
+        pending_overwrites: Vec::new(),
+        unknown_files: quarantined_files.clone(),
+        skipped_changed: Vec::new(),
+        quarantined_files,
+        unconfirmed_files: unconfirmed,
+        outdated_mods,
+        player_summary: String::new(),
         warnings,
-    })
+    };
+    let player_summary =
+        with_notice(knowledge.notice.as_deref(), describe_applied(&plan, &result, policy, knowledge.uncertain.as_deref()));
+    Ok(ApplyResult { player_summary, ..result })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn game_marker(
+    ctx: &Ctx,
+    id: &str,
+    rel: &str,
+    kind: FileKind,
+    origin: Origin,
+    tool_sha: &str,
+    original_sha: &str,
+    backup_id: &str,
+    quarantine_id: &str,
+) -> super::mcpl_marker::FileMarker {
+    use super::mcpl_marker as mk;
+    let mut links = vec![mk::link(&ctx.batch_id, mk::REL_BATCH)];
+    if !backup_id.is_empty() {
+        links.push(mk::link(backup_id, mk::REL_BACKUP));
+    }
+    if !quarantine_id.is_empty() {
+        links.push(mk::link(quarantine_id, mk::REL_QUARANTINE));
+    }
+    let history = ctx_history(ctx, rel);
+    mk::FileMarker {
+        tool_history: history,
+        state: "pending".into(),
+        id: id.to_string(),
+        instance_id: ctx.instance_id.clone(),
+        rel: rel.to_string(),
+        role: if kind == FileKind::Added { "added".into() } else { "overwritten".into() },
+        tool_sha256: tool_sha.to_string(),
+        original_sha256: original_sha.to_string(),
+        backup: if backup_id.is_empty() {
+            String::new()
+        } else {
+            apply_record::instance_backup_dir(&ctx.mc).join(rel).display().to_string()
+        },
+        tool_version: env!("CARGO_PKG_VERSION").into(),
+        written_at: mk::now_secs(),
+        origin: if origin == Origin::Unknown { "unknown".into() } else { "known".into() },
+        links,
+    }
+}
+
+/// 這個檔以前工具寫過的所有版本指紋（紀錄的歷史＋舊標記的歷史），寫進新標記。
+fn ctx_history(ctx: &Ctx, rel: &str) -> Vec<String> {
+    let mut history: Vec<String> = apply_record::load(&ctx.mc)
+        .ok()
+        .and_then(|r| r.files.get(rel).map(|e| {
+            let mut h = e.history.clone();
+            h.push(e.sha256.clone());
+            h
+        }))
+        .unwrap_or_default();
+    if let Some(old) = super::mcpl_marker::read_file_marker(&ctx.mc, rel) {
+        history.extend(old.tool_history);
+        history.push(old.tool_sha256);
+    }
+    history.sort();
+    history.dedup();
+    history
+}
+
+fn write_item(item: &apply_plan::PlanItem) -> Result<(), String> {
+    let dest = &item.dest;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(long_path(parent)).map_err(|e| e.to_string())?;
+    }
+    match &item.source {
+        ItemSource::File(src) => apply_record::copy_atomic(src, dest).map_err(|e| {
+            format!(
+                "套用複製失敗（請關遊戲後重試）{} → {}：{e}",
+                src.display(),
+                dest.display()
+            )
+        }),
+        ItemSource::Bytes(bytes) => apply_record::write_atomic(dest, bytes)
+            .map_err(|e| format!("寫入 {} 失敗：{e}", dest.display())),
+    }
+}
+
+fn describe_applied(
+    plan: &apply_plan::ApplyPlan,
+    result: &ApplyResult,
+    policy: BackupPolicy,
+    uncertain: Option<&str>,
+) -> String {
+    let mut lines = vec!["已把翻譯裝進遊戲，直接開遊戲就是繁體中文。".to_string()];
+    if let Some(zip) = &plan.zip_name {
+        lines.push(format!("• 翻譯資源包「{zip}」：已啟用並排在最高優先"));
+    }
+    if result.lang_set {
+        lines.push(format!(
+            "• 遊戲語言：已設成繁體中文（台灣）（原本是 {}，移除翻譯時會改回來）",
+            language_display_name(result.original_lang.as_deref())
+        ));
+    } else {
+        lines.push("• 遊戲語言：本來就是繁體中文（台灣）".into());
+    }
+    if result.jars_copied > 0 {
+        lines.push(format!("• 翻譯後的模組檔：{} 個", result.jars_copied));
+    }
+    if !result.outdated_mods.is_empty() {
+        lines.push(format!(
+            "• 模組已更新，需重新翻譯：{} 個模組在翻譯之後被更新、改名或刪除，舊的翻譯沒有放進遊戲，\
+原本的模組檔沒有動（{}）",
+            result.outdated_mods.len(),
+            preview(&result.outdated_mods)
+        ));
+    }
+    let text_files = plan.items.len()
+        - plan.count(Group::Zip)
+        - plan.count(Group::ZipMeta)
+        - plan.count(Group::Mods);
+    if text_files > 0 {
+        lines.push(format!("• 任務、手冊與其他文字檔：{text_files} 個"));
+    }
+    lines.push(match policy {
+        BackupPolicy::Backup if result.backup_reused => {
+            "• 備份：已確認這個整合包目前的原檔都有有效備份".to_string()
+        }
+        BackupPolicy::Backup if result.backup_created => "• 備份：已備份會被覆蓋的原檔".to_string(),
+        BackupPolicy::Backup => "• 備份：這次沒有需要備份的原檔".to_string(),
+        _ => "• 備份：依你的選擇沒有備份".to_string(),
+    });
+    if let Some(reason) = uncertain {
+        lines.push(format!(
+            "\n{reason}，工具無法確定遊戲裡哪些檔案是原本的、哪些是以前翻譯過的，\
+所以這些檔案沒有當成原檔備份，而是先移到隔離區再換成新的翻譯。"
+        ));
+    }
+    if !result.quarantined_files.is_empty() {
+        lines.push(format!(
+            "\n以下 {} 個檔案無法確定是不是工具以前改的，覆蓋前已先移到隔離區保存（在工具資料夾裡，不會自動放回）：\n{}",
+            result.quarantined_files.len(),
+            preview(&result.quarantined_files)
+        ));
+    }
+    lines.push(
+        "\n想回到原版：按「移除翻譯」（工具加的檔案會刪掉、設定會改回來）。\n\
+萬一遊戲開不起來，多半是模組整合包本身缺模組；可以先按「移除翻譯」再開一次，排除是不是翻譯造成的。"
+            .into(),
+    );
+    let mut summary = lines.join("\n");
+    if !result.warnings.is_empty() {
+        summary.push_str(&format!("\n\n注意：\n• {}", result.warnings.join("\n• ")));
+    }
+    summary
+}
+
+/// 識別碼認回時的說明（例如部分檔案被整合包更新改過）放在結果最前面。
+fn with_notice(notice: Option<&str>, summary: String) -> String {
+    match notice {
+        Some(notice) => format!("{notice}\n\n{summary}"),
+        None => summary,
+    }
+}
+
+fn preview(items: &[String]) -> String {
+    let mut shown: Vec<String> =
+        items.iter().take(10).map(|s| format!("  - {}", apply_restore::display_rel(s))).collect();
+    if items.len() > 10 {
+        shown.push(format!("  …另有 {} 個", items.len() - 10));
+    }
+    shown.join("\n")
 }
 
 fn resolve_pack_name(work: &Path, hint: Option<&str>) -> String {
@@ -1016,144 +848,6 @@ fn find_zip_in_layout(layout: &ResultLayout, pack_name: &str) -> Option<PathBuf>
     None
 }
 
-fn backup_stamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
-}
-
-fn dir_has_files(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .any(|e| e.path().is_file())
-}
-
-fn count_files(dir: &Path) -> usize {
-    if !dir.is_dir() {
-        return 0;
-    }
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_file())
-        .count()
-}
-
-/// 只備份 work 裡會覆寫到 dest 的相對路徑（避免整包 kubejs 過大）
-fn backup_matching_tree(src: &Path, dest: &Path, bak_root: &Path) -> Result<(), String> {
-    if !src.is_dir() || !dest.is_dir() {
-        return Ok(());
-    }
-    for entry in walkdir::WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let rel = path.strip_prefix(src).unwrap_or(path);
-        let existing = dest.join(rel);
-        if existing.is_file() {
-            let bak = bak_root.join(rel);
-            if let Some(parent) = bak.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            // 備份失敗必須讓整個套用停下來，不能吞掉。
-            //
-            // 這個函式備份的是使用者的 config、kubejs 與**原始 mod JAR**，
-            // 呼叫端接下來就會覆寫它們。舊版用 `let _ =` 忽略複製失敗，於是
-            // 檔案被鎖住（遊戲還開著）、磁碟滿、或沒有寫入權限時，工具會
-            // 「沒有備份卻照樣覆蓋」並回報成功——使用者事後按「還原上一次套用」
-            // 才發現原始檔案已經永久消失。使用者選了備份就是要這份保障。
-            fs::copy(&existing, &bak).map_err(|e| {
-                format!(
-                    "備份 {} 失敗：{e}\n為了不讓原始檔案在沒有備份的情況下被覆蓋，已停止套用。\
-常見原因是遊戲還開著把檔案鎖住，或磁碟空間不足。",
-                    existing.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    if !src.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in walkdir::WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        let rel = path.strip_prefix(src).unwrap_or(path);
-        let target = dst.join(rel);
-        if path.is_dir() {
-            fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-        } else if path.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::copy(path, &target).map_err(|e| format!("備份複製失敗 {}: {e}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// 把 src 樹合併進 dst（覆蓋同名檔）；記錄每個寫入檔是新增或覆蓋（供還原）。
-fn merge_copy_dir(
-    src: &Path,
-    dst: &Path,
-    mc: &Path,
-    manifest: &mut ApplyManifest,
-) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in walkdir::WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        cancel::check()?;
-        let path = entry.path();
-        let rel = path.strip_prefix(src).unwrap_or(path);
-        let target = dst.join(rel);
-        if path.is_dir() {
-            fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-        } else if path.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let existed = target.is_file();
-            fs::copy(path, &target).map_err(|e| {
-                format!(
-                    "套用複製失敗（請關遊戲後重試）{} → {}：{e}",
-                    path.display(),
-                    target.display()
-                )
-            })?;
-            record_written(manifest, mc, &target, existed);
-        }
-    }
-    Ok(())
-}
-
-/// 記錄一個寫入的檔到套用清單。
-fn record_written(manifest: &mut ApplyManifest, mc: &Path, target: &Path, existed_before: bool) {
-    let rel = rel_to(mc, target);
-    if existed_before {
-        manifest.overwritten.push(rel);
-    } else {
-        manifest.added.push(rel);
-    }
-}
-
 /// 套用後檢查：多個工具 zip、options 未啟用本次包等。
 fn collect_post_apply_warnings(
     mc: &Path,
@@ -1175,14 +869,14 @@ fn collect_post_apply_warnings(
         }
         if tool_count >= 2 {
             out.push(format!(
-                "遊戲 resourcepacks 內有 {tool_count} 個「模組包翻譯工具+*」資源包；請在遊戲設定裡只啟用最新一個，並停用舊版以免混亂。"
+                "遊戲的資源包資料夾裡有 {tool_count} 個本工具做的翻譯資源包（名稱開頭是「模組包翻譯工具+」）；請在遊戲的資源包畫面只啟用最新一個，停用舊的以免混亂。"
             ));
         }
     }
     if let Some(zip_name) = applied_zip_name {
         if !options_lists_resource_pack(mc, zip_name) {
             out.push(format!(
-                "options.txt 似乎未啟用本次套用的「{zip_name}」；若進遊戲後沒看到繁中，請在資源包列表手動啟用。"
+                "遊戲設定檔裡似乎沒有啟用這次的「{zip_name}」；若進遊戲後沒看到繁中，請在遊戲的資源包畫面手動啟用。"
             ));
         }
     }
@@ -1201,86 +895,105 @@ fn options_lists_resource_pack(mc: &Path, zip_name: &str) -> bool {
     })
 }
 
-fn enable_resource_pack(
+/// 設定檔要怎麼改（寫入前算好，連同清單項目與語言設定的標記一起先存）。
+struct OptionsPlan {
+    original: String,
+    edit: options_txt::OptionsEdit,
+    entry: Option<String>,
+    marker: super::mcpl_marker::OptionsMarker,
+    ids: Vec<String>,
+}
+
+impl OptionsPlan {
+    fn marker_ids(&self) -> Vec<String> {
+        self.ids.clone()
+    }
+}
+
+/// 準備設定檔的修改：資源包清單項目標記 ↔ 資源包檔標記互指、語言設定標記記下原語言、
+/// 設定檔旁的另存檔也有自己的遊戲檔標記。全部只改記憶體，由呼叫端一起先存。
+fn plan_options(
+    ctx: &Ctx,
     mc: &Path,
-    zip_name: &str,
-    backup_root: Option<&Path>,
-    manifest: &mut ApplyManifest,
-) -> Result<(), String> {
+    zip_name: Option<&str>,
+    record: &mut ApplyRecord,
+    markers: &mut Vec<super::mcpl_marker::FileMarker>,
+) -> Result<OptionsPlan, String> {
+    use super::mcpl_marker as mk;
     let options = mc.join("options.txt");
-    let existed = options.is_file();
-    let original = if existed {
-        fs::read_to_string(&options).map_err(|e| format!("讀取 options.txt 失敗：{e}"))?
-    } else {
-        String::new()
-    };
-    if let Some(backup_root) = backup_root {
-        if existed {
-            fs::copy(&options, backup_root.join("options.txt"))
-                .map_err(|e| format!("備份 options.txt 失敗：{e}"))?;
-        }
-    }
-    // options.txt 一律另存一份，不受「要不要備份」選項影響。
-    //
-    // 它只有幾 KB，但壞掉的代價是整個遊戲開不起來：使用者實測遇過資源包清單
-    // 被清空，導致字體找不到材質 → 資源重載失敗 → 模型沒烘焙 → 標題畫面閃退。
-    // 這種東西不該跟「要不要備份翻譯結果」綁在一起。
-    if existed {
-        let _ = fs::write(options.with_extension("txt.mcpl-bak"), &original);
-    }
-    // 動之前先記下清單，動完之後要驗證一個都沒少
-    let packs_before = super::resource_pack_guard::parse_pack_list(&original);
+    let original = fs::read_to_string(long_path(&options)).map_err(|e| format!("讀取遊戲設定檔失敗：{e}"))?;
+    let entry = zip_name.map(options_txt::pack_entry);
+    let edit = options_txt::enable_pack_last(&original, entry.as_deref(), true);
+    let mut marker = mk::read_options_marker(mc);
+    let mut ids = Vec::new();
 
-    let entry = format!("file/{zip_name}");
-    let mut found = false;
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        if let Some(value) = line.strip_prefix("resourcePacks:") {
-            found = true;
-            let mut list = value.trim().to_string();
-            if !list.contains(&format!("\"{entry}\"")) {
-                if list == "[]" {
-                    list = format!("[\"{entry}\"]");
-                } else if list.ends_with(']') {
-                    list.pop();
-                    if !list.ends_with('[') {
-                        list.push(',');
-                    }
-                    list.push_str(&format!("\"{entry}\"]"));
-                }
+    if let (Some(entry), Some(zip)) = (entry.as_deref(), zip_name) {
+        // 舊版工具啟用過的翻譯資源包也算工具加的（移除翻譯時要從清單拿掉）
+        let tool_named = is_tool_resource_pack(zip.trim_end_matches(".zip"));
+        if (edit.pack_added || tool_named) && !record.options.packs_added.iter().any(|e| e == entry) {
+            record.options.packs_added.push(entry.to_string());
+        }
+        if record.options.packs_added.iter().any(|e| e == entry) {
+            let zip_rel = format!("resourcepacks/{zip}");
+            if let Some(zip_marker) = markers.iter_mut().find(|m| m.rel == zip_rel) {
+                let entry_id = marker
+                    .entries
+                    .iter()
+                    .find(|e| e.entry == entry)
+                    .map(|e| e.id.clone())
+                    .unwrap_or_else(mk::new_marker_id);
+                marker.entries.retain(|e| e.entry != entry);
+                marker.entries.push(mk::EntryMarker {
+                    id: entry_id.clone(),
+                    entry: entry.to_string(),
+                    links: vec![mk::link(&zip_marker.id, mk::REL_GAME_FILE), mk::link(&ctx.batch_id, mk::REL_BATCH)],
+                });
+                mk::set_link(&mut zip_marker.links, mk::REL_PACK_ENTRY, &entry_id);
+                ids.push(entry_id);
             }
-            lines.push(format!("resourcePacks:{list}"));
-        } else {
-            lines.push(line.to_string());
         }
     }
-    if !found {
-        lines.push(format!("resourcePacks:[\"{entry}\"]"));
+    if edit.lang_changed && !record.options.lang_changed {
+        record.options.lang_changed = true;
+        record.options.original_lang = edit.original_lang.clone();
     }
-    let mut updated = lines.join("\n");
-    updated.push('\n');
-    fs::write(&options, &updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
+    if record.options.lang_changed {
+        let id = marker.lang.as_ref().map(|l| l.id.clone()).unwrap_or_else(mk::new_marker_id);
+        marker.lang = Some(mk::LangMarker {
+            id: id.clone(),
+            original_lang: record.options.original_lang.clone(),
+            links: vec![mk::link(&ctx.batch_id, mk::REL_BATCH)],
+        });
+        record.options.lang_marker_id = id.clone();
+        record.options.lang_batch = ctx.batch_id.clone();
+        ids.push(id);
+    }
+    // 設定檔旁的另存檔：只在第一次建立，並先有自己的遊戲檔標記
+    markers.extend(super::pack_repair::options_bak_marker(ctx, record, &original, ""));
+    Ok(OptionsPlan { original, edit, entry, marker, ids })
+}
 
-    // 寫完馬上重讀驗證：原本清單裡的每一個資源包都必須還在。
-    //
-    // 這道驗證是使用者那次閃退換來的——工具動了 options.txt 卻沒有確認結果，
-    // 等到遊戲缺材質、字體載入失敗、模型烘焙不完、標題畫面空指標才發現。
-    // 少掉任何一項就把原檔寫回去並回報失敗，寧可不啟用翻譯包，也不能讓
-    // 使用者的遊戲開不起來。
-    let after_text = fs::read_to_string(&options).unwrap_or_default();
-    let packs_after = super::resource_pack_guard::parse_pack_list(&after_text);
-    let diff = super::resource_pack_guard::diff_pack_lists(&packs_before, &packs_after);
-    if !diff.is_safe() {
-        let _ = fs::write(&options, &original);
+/// 紀錄與標記都存好之後才寫設定檔。寫完重讀驗證：原本清單的每一項都還在、翻譯包排最後、
+/// 語言是繁中；不對就把原檔寫回去並回報——寧可不啟用翻譯包，也不能讓遊戲開不起來。
+fn write_options(mc: &Path, plan: &OptionsPlan, zip_name: Option<&str>) -> Result<(bool, Option<String>), String> {
+    let options = mc.join("options.txt");
+    // 只在第一次建立（已存在就不覆寫），這樣它的內容永遠是工具第一次動之前的樣子
+    options_txt::backup_beside_once(&options, &plan.original)
+        .map_err(|e| format!("另存遊戲設定檔失敗，已停止：{e}"))?;
+    if plan.edit.text != plan.original {
+        apply_record::write_atomic(&options, plan.edit.text.as_bytes())
+            .map_err(|e| format!("寫入遊戲設定檔失敗：{e}"))?;
+    }
+    let after = fs::read_to_string(long_path(&options)).unwrap_or_default();
+    if let Err(problem) = options_txt::verify_enabled(&plan.original, &after, plan.entry.as_deref(), true) {
+        let _ = apply_record::write_atomic(&options, plan.original.as_bytes());
         return Err(format!(
-            "啟用翻譯資源包時偵測到原本的資源包清單少了 {} 項（{}），已還原 options.txt 不做修改。\
-請手動在遊戲的資源包畫面啟用「{zip_name}」。",
-            diff.missing.len(),
-            diff.missing.join("、")
+            "設定翻譯資源包時發現問題（{problem}），已把遊戲設定還原成原本的樣子。\n\
+請在遊戲的資源包畫面手動啟用「{}」，語言選繁體中文（台灣）。",
+            zip_name.unwrap_or("翻譯資源包")
         ));
     }
-    record_written(manifest, mc, &options, existed);
-    Ok(())
+    Ok((plan.edit.lang_changed, plan.edit.original_lang.clone()))
 }
 
 /// 已啟用且含 `assets/*/font/` 的資源包可能蓋掉翻譯／自訂字體 → 警告（不做 codec 重寫）。
@@ -1394,297 +1107,29 @@ mod apply_font_warn_tests {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "apply_instance_tests.rs"]
+mod tests;
 
-    #[test]
-    fn backup_failure_stops_the_apply_instead_of_overwriting_unprotected() {
-        // 這條釘死一個會造成永久資料遺失的缺陷：
-        // backup_matching_tree 備份的是使用者的原始 mod JAR／config，呼叫端接著
-        // 就會覆寫它們。舊版用 `let _ =` 吞掉複製失敗，於是檔案被鎖住（遊戲還開著）
-        // 或磁碟滿的時候，會「沒有備份卻照樣覆蓋」並回報成功——使用者事後想還原
-        // 才發現原始檔案已經沒了。備份失敗必須讓整個套用停下來。
-        let root = std::env::temp_dir().join(format!("apply_bakfail_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let src = root.join("src");
-        let dest = root.join("dest");
-        fs::create_dir_all(&src).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-        fs::write(src.join("a.jar"), b"new").unwrap();
-        fs::write(dest.join("a.jar"), b"original").unwrap();
+#[cfg(test)]
+#[path = "apply_instance_safety_tests.rs"]
+mod safety_tests;
 
-        // 正常情況：備份得起來就成功，而且備份內容是「原始」那一份
-        let bak_ok = root.join("bak_ok");
-        backup_matching_tree(&src, &dest, &bak_ok).unwrap();
-        assert_eq!(fs::read(bak_ok.join("a.jar")).unwrap(), b"original");
+#[cfg(test)]
+#[path = "apply_instance_review_tests.rs"]
+mod review_tests;
 
-        // 失敗情況：備份根目錄被一個同名檔案佔住，建立子目錄／複製一定失敗
-        let blocked = root.join("blocked");
-        fs::write(&blocked, b"I am a file, not a directory").unwrap();
-        let result = backup_matching_tree(&src, &dest, &blocked);
-        assert!(result.is_err(), "備份失敗時必須回傳錯誤，不能靜默繼續");
-        // 原始檔案必須原封不動——呼叫端會因為這個錯誤而中止，不會覆寫它
-        assert_eq!(fs::read(dest.join("a.jar")).unwrap(), b"original");
+#[cfg(test)]
+#[path = "apply_instance_round5_tests.rs"]
+mod round5_tests;
 
-        let _ = fs::remove_dir_all(&root);
-    }
+#[cfg(test)]
+#[path = "apply_instance_round5b_tests.rs"]
+mod round5b_tests;
 
-    #[test]
-    fn enables_pack_and_keeps_existing_resource_packs() {
-        let root = std::env::temp_dir().join(format!("apply_options_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let backup = root.join("backup");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(&backup).unwrap();
-        fs::write(mc.join("options.txt"), "guiScale:3\nresourcePacks:[\"vanilla\"]\n").unwrap();
-        let mut manifest = ApplyManifest::default();
-        enable_resource_pack(&mc, "pack.zip", Some(&backup), &mut manifest).unwrap();
-        let options = fs::read_to_string(mc.join("options.txt")).unwrap();
-        assert!(options.contains("\"vanilla\""));
-        assert!(options.contains("\"file/pack.zip\""));
-        assert!(backup.join("options.txt").is_file());
-        assert!(manifest.overwritten.contains(&"options.txt".to_string()));
-        let _ = fs::remove_dir_all(root);
-    }
+#[cfg(test)]
+#[path = "apply_instance_final_tests.rs"]
+mod final_tests;
 
-    /// 建一個「有東西可套用」的最小場景，回傳 (root, mc, work)。
-    fn stage_applyable(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("apply_gate_{tag}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
-        (root, mc, work)
-    }
-
-    #[test]
-    fn game_running_blocks_apply_with_zero_writes() {
-        // P0-02：後端是最後一道關卡。遊戲開著時必須拒絕，而且**一個檔案都不能動**。
-        let (root, mc, work) = stage_applyable("yes");
-        let err = apply_to_instance_with_game_state(
-            &mc,
-            &work,
-            None,
-            true,
-            GameRunning::Yes { detail: "偵測到這個整合包的遊戲行程正在執行。".into() },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("Minecraft 正在使用這個整合包"), "訊息要說得出發生什麼：{err}");
-        assert!(err.contains("關閉遊戲"), "要告訴使用者下一步怎麼做：{err}");
-
-        // 零寫入：原始檔沒被換掉，也沒有留下任何備份資料夾
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"original");
-        let leftovers: Vec<_> = fs::read_dir(&work)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("翻譯套用備份_"))
-            .collect();
-        assert!(leftovers.is_empty(), "被擋下時不得留下半成品備份目錄");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unknown_game_state_proceeds_but_says_so() {
-        // 偵測不出來時失效方向朝放行（不能把「查不到」變成新的卡關），
-        // 但不得偽裝成已確認關閉——使用者要看得到這次沒能確認。
-        let (root, mc, work) = stage_applyable("unknown");
-        let result =
-            apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::Unknown).unwrap();
-
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated", "Unknown 應放行");
-        assert!(
-            result.warnings.iter().any(|w| w.contains("無法確認")),
-            "Unknown 必須留下未確認的紀錄，實際警告：{:?}",
-            result.warnings
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn confirmed_closed_game_has_no_unconfirmed_warning() {
-        // 確定沒開時不該冒出「無法確認」這種讓人以為有問題的字。
-        let (root, mc, work) = stage_applyable("no");
-        let result =
-            apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-        assert!(!result.warnings.iter().any(|w| w.contains("無法確認")));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn only_yes_blocks_apply() {
-        assert!(GameRunning::Yes { detail: String::new() }.blocks_apply());
-        assert!(!GameRunning::No.blocks_apply());
-        // 這條是刻意的：查不出來不擋，否則沒有 PowerShell 的環境永遠套用不了
-        assert!(!GameRunning::Unknown.blocks_apply());
-    }
-
-    #[test]
-    fn applies_translated_jars_after_backing_up_originals() {
-        let root = std::env::temp_dir().join(format!("apply_jars_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
-
-        let result = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-        assert_eq!(result.jars_copied, 1);
-        assert!(result.backup_created);
-        assert!(!result.backup_reused);
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
-        assert!(PathBuf::from(&result.backup_dir).starts_with(&work));
-        assert_eq!(
-            fs::read(PathBuf::from(&result.backup_dir).join("mods/example.jar")).unwrap(),
-            b"original"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reuses_matching_backup_on_repeated_apply() {
-        let root = std::env::temp_dir().join(format!("apply_reuse_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated-v1").unwrap();
-
-        let first = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-        let first_backup = first.backup_dir.clone();
-        fs::write(work.join("jar-translated/example.jar"), b"translated-v2").unwrap();
-        let second = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-
-        assert!(!second.backup_created);
-        assert!(second.backup_reused);
-        assert_eq!(second.backup_dir, first_backup);
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated-v2");
-        let backup_count = fs::read_dir(&work)
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("翻譯套用備份_")
-            })
-            .count();
-        assert_eq!(backup_count, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn skips_backup_when_player_disables_it() {
-        let root = std::env::temp_dir().join(format!("apply_no_backup_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
-
-        let result = apply_to_instance_with_game_state(&mc, &work, None, false, GameRunning::No).unwrap();
-        assert!(!result.backup_created);
-        assert!(result.backup_dir.is_empty());
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
-        let backup_count = fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("翻譯套用備份_")
-            })
-            .count();
-        assert_eq!(backup_count, 0);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn deletes_only_tool_backup_directories() {
-        let root = std::env::temp_dir().join(format!("delete_backups_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(root.join("翻譯套用備份_20260811_1")).unwrap();
-        fs::create_dir_all(root.join("翻譯套用備份_20260811_2")).unwrap();
-        fs::create_dir_all(root.join("player-backup")).unwrap();
-
-        let result = delete_apply_backups_in(&mc, None).unwrap();
-        assert_eq!(result.deleted, 2);
-        assert!(root.join("player-backup").is_dir());
-        assert!(!root.join("翻譯套用備份_20260811_1").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn applies_and_detects_config_text_overlays() {
-        let root = std::env::temp_dir().join(format!("apply_config_overlay_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(mc.join("config/unknown_display_mod")).unwrap();
-        fs::create_dir_all(work.join("config/unknown_display_mod")).unwrap();
-        fs::write(mc.join("config/unknown_display_mod/start.txt"), "原文").unwrap();
-        fs::write(work.join("config/unknown_display_mod/start.txt"), "繁中").unwrap();
-
-        let result = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-        assert!(result.backup_created);
-        assert_eq!(
-            fs::read_to_string(mc.join("config/unknown_display_mod/start.txt")).unwrap(),
-            "繁中"
-        );
-        assert!(has_apply_backups_in(&mc, Some(&work)).unwrap());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn restore_rejects_manifest_for_different_mc_dir() {
-        let root = std::env::temp_dir().join(format!("restore_mismatch_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let other = root.join("other_minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(other.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
-
-        let applied = apply_to_instance_with_game_state(&mc, &work, None, true, GameRunning::No).unwrap();
-        let err = restore_last_apply_in(&other, Some(&work)).unwrap_err();
-        assert!(err.contains("不符"));
-        assert!(PathBuf::from(&applied.backup_dir).is_dir());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn does_not_copy_work_data_into_minecraft_data() {
-        let root = std::env::temp_dir().join(format!("apply_no_mc_data_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mc = root.join("minecraft");
-        let work = root.join("翻譯結果");
-        fs::create_dir_all(mc.join("mods")).unwrap();
-        fs::create_dir_all(work.join("jar-translated")).unwrap();
-        fs::create_dir_all(work.join("data/example")).unwrap();
-        fs::write(mc.join("mods/example.jar"), b"original").unwrap();
-        fs::write(work.join("jar-translated/example.jar"), b"translated").unwrap();
-        fs::write(work.join("data/example/book.json"), b"{}").unwrap();
-
-        apply_to_instance_with_game_state(&mc, &work, None, false, GameRunning::No).unwrap();
-        assert!(!mc.join("data/example/book.json").exists());
-        assert_eq!(fs::read(mc.join("mods/example.jar")).unwrap(), b"translated");
-        let _ = fs::remove_dir_all(root);
-    }
-}
+#[cfg(test)]
+#[path = "apply_instance_readonly_tests.rs"]
+mod readonly_tests;

@@ -149,6 +149,94 @@ pub fn migrate_legacy_to_portable() -> Result<(usize, u64), String> {
     Ok((files, bytes))
 }
 
+/// 超過這個長度才轉成 Windows 長路徑形式。留一段餘裕：資料夾本身不能超過 248 字元。
+const LONG_PATH_THRESHOLD: usize = 240;
+
+/// 備份與套用用的路徑：太長（接近 Windows 260 字元上限）時轉成 `\\?\` 長路徑形式。
+///
+/// 只給「實際讀寫檔案」的那一步用；顯示給玩家、寫進套用紀錄的相對路徑一律用原本的形式，
+/// 不然紀錄裡會混進 `\\?\` 前綴，之後比對不到同一個檔案。
+pub fn long_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if !cfg!(windows) || raw.len() < LONG_PATH_THRESHOLD {
+        return path.to_path_buf();
+    }
+    PathBuf::from(verbatim_form(&raw))
+}
+
+/// 純字串轉換（抽出來讓非 Windows 也能測）：
+/// `C:\a\b` → `\\?\C:\a\b`；`\\server\share\x` → `\\?\UNC\server\share\x`；
+/// 已經是長路徑形式或相對路徑則不動。長路徑形式不會幫你處理 `.`／`..`，所以這裡先正規化。
+fn verbatim_form(raw: &str) -> String {
+    let unified = raw.replace('/', "\\");
+    if unified.starts_with("\\\\?\\") {
+        return unified;
+    }
+    let (prefix, rest) = if let Some(rest) = unified.strip_prefix("\\\\") {
+        ("\\\\?\\UNC\\".to_string(), rest.to_string())
+    } else {
+        let bytes = unified.as_bytes();
+        let is_drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        if !is_drive {
+            return raw.to_string();
+        }
+        (format!("\\\\?\\{}\\", &unified[..2]), unified[3..].to_string())
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    format!("{prefix}{}", parts.join("\\"))
+}
+
+#[cfg(test)]
+mod long_path_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn verbatim_form_handles_drive_unc_and_dots() {
+        assert_eq!(verbatim_form("C:\\Games\\pack"), "\\\\?\\C:\\Games\\pack");
+        assert_eq!(verbatim_form("C:/Games/./a/../pack"), "\\\\?\\C:\\Games\\pack");
+        assert_eq!(verbatim_form("\\\\nas\\share\\mc"), "\\\\?\\UNC\\nas\\share\\mc");
+        assert_eq!(verbatim_form("\\\\?\\C:\\x"), "\\\\?\\C:\\x");
+        assert_eq!(verbatim_form("relative\\x"), "relative\\x");
+    }
+
+    #[test]
+    fn short_paths_are_left_alone() {
+        let p = Path::new("C:/short/path");
+        assert_eq!(long_path(p), p.to_path_buf());
+    }
+
+    #[test]
+    fn long_paths_can_be_created_written_and_copied() {
+        let mut dir = std::env::temp_dir().join(format!("mcpl-long-{}", std::process::id()));
+        let root = dir.clone();
+        let _ = fs::remove_dir_all(long_path(&root));
+        while dir.to_string_lossy().len() < 300 {
+            dir = dir.join("very_long_folder_name_for_mcpl_test");
+        }
+        let file = dir.join("config.json");
+        assert!(file.to_string_lossy().len() > 260);
+        fs::create_dir_all(long_path(&dir)).unwrap();
+        fs::write(long_path(&file), b"hello").unwrap();
+        let copy = dir.join("copy.json");
+        fs::copy(long_path(&file), long_path(&copy)).unwrap();
+        assert_eq!(fs::read(long_path(&copy)).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(long_path(&root));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

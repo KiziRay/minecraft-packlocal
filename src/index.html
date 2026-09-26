@@ -136,10 +136,25 @@
                     <input id="instance" type="text" placeholder="選取 Minecraft 實例資料夾" autocomplete="off" />
                     <button type="button" id="btn-inst" class="small-button">瀏覽…</button>
                   </div>
-                  <p class="field-help path-hint">需包含 mods（內有模組），以及 config／options.txt／resourcepacks 或啟動器實例特徵之一。</p>
+                  <p class="field-help path-hint">要選有 mods 資料夾（放模組的地方）的遊戲資料夾；通常旁邊也會有 config、資源包資料夾或啟動器的設定檔。</p>
                   <p id="instance-validate-status" class="field-status path-validate" aria-live="polite">尚未選擇遊戲資料夾。</p>
                   <p class="path-gate-hint" id="path-gate-hint">先選資料夾就好。選到含 mods 的遊戲資料夾、通過檢查後，其餘選項才會出現。</p>
                 </div>
+
+                <!--
+                  翻譯已完成、還沒裝進遊戲（遊戲開著、還沒啟動過遊戲、沒選備份、不備份要確認覆蓋）。
+                  這不是翻譯失敗：處理完原因後按「套用到遊戲」即可，不用重翻。
+                -->
+                <section id="apply-pending-card" class="local-cache-card" hidden aria-labelledby="apply-pending-title">
+                  <header class="local-cache-head">
+                    <h2 id="apply-pending-title" class="options-group-title">已翻完，還沒裝進遊戲</h2>
+                  </header>
+                  <p id="apply-pending-message" class="local-cache-message"></p>
+                  <div class="action-row local-cache-actions">
+                    <button type="button" id="btn-apply-pending" class="secondary-button">套用到遊戲</button>
+                    <button type="button" id="btn-apply-pending-dismiss" class="text-button">稍後再說</button>
+                  </div>
+                </section>
 
                 <section id="local-cache-card" class="local-cache-card" hidden aria-labelledby="local-cache-title">
                   <header class="local-cache-head">
@@ -387,7 +402,7 @@
                     <input id="font-output" type="text" placeholder="選取要放「字體結果」的根目錄" autocomplete="off" />
                     <button type="button" id="btn-font-out" class="small-button">瀏覽…</button>
                   </div>
-                  <p class="field-help path-hint">工具會在此建立「字體結果/resourcepacks/」，不會寫進翻譯結果。</p>
+                  <p class="field-help path-hint">工具會在這裡建立「字體結果」資料夾放字體資源包，不會混進翻譯結果。</p>
                   <p id="font-output-validate-status" class="field-status path-validate" aria-live="polite">尚未選擇輸出位置。</p>
                 </div>
 
@@ -429,8 +444,11 @@
                   <label class="option-row compact-option" for="font-apply-current">
                     <input type="checkbox" id="font-apply-current" />
                     <span class="check-box" aria-hidden="true"></span>
-                    <span><strong>建立後套用到目前整合包 resourcepacks</strong><small>需先在翻譯頁選好整合包；同名包會先備份並置頂啟用。</small></span>
+                    <span><strong>建立後直接裝進目前的模組整合包</strong><small>需先在翻譯頁選好遊戲資料夾；同名的舊字體包會先備份，新的會啟用並排在最上面。</small></span>
                   </label>
+                  <div class="action-row">
+                    <button type="button" id="btn-font-remove" class="secondary-button">移除字體包</button>
+                  </div>
                 </div>
                 <p class="footnote"><span>i</span>字體檔只會被複製進資源包，不會修改原始檔。</p>
               </section>
@@ -466,7 +484,7 @@
                   </div>
                   <div class="action-row secondary-actions">
                     <button type="button" id="btn-diagnose-latest" class="secondary-button">讀取最近記錄</button>
-                    <button type="button" id="btn-restore" class="text-button">還原上一次套用</button>
+                    <button type="button" id="btn-restore" class="text-button">移除翻譯</button>
                     <button type="button" id="btn-delete-backups" class="text-button danger-text-button">刪除全部備份</button>
                   </div>
                 </div>
@@ -745,7 +763,8 @@
           </div>
           <div id="translation-options">
           <div class="option-list">
-          <label class="option-row" for="backup-before-apply">
+          <!-- 備份選擇改到設定視窗「資料與備份」（第一次套用時會問）；這個舊勾選保留 id 給相容程式碼，不再顯示 -->
+          <label class="option-row" for="backup-before-apply" hidden>
           <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
           <span><strong>套用前建立備份</strong><span class="settings-tier tier-recommended">建議開著</span></span>
           </label>
@@ -1024,7 +1043,7 @@
         </section>
         <section class="consent-card consent-card-wide">
           <h3>免責</h3>
-          <p>這是機器翻譯輔助工具：AI 與社群資料都可能翻錯或翻不完整，套用與分享前請自行檢查。圖片上的字翻不到屬正常。遇到閃退先用「還原上一次套用」，再到診斷頁分析。</p>
+          <p>這是機器翻譯輔助工具：AI 與社群資料都可能翻錯或翻不完整，套用與分享前請自行檢查。圖片上的字翻不到屬正常。遇到閃退先用「移除翻譯」，再到診斷頁分析。</p>
         </section>
         <label class="option-row compact-option consent-check" for="consent-dont-show">
           <input type="checkbox" id="consent-dont-show" />

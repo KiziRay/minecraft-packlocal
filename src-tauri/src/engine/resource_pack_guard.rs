@@ -206,22 +206,19 @@ fn read_backup_pack_list(mc: &Path) -> (Vec<String>, String) {
     (Vec::new(), String::new())
 }
 
-/// 把資料夾裡有、但清單沒啟用的資源包加回 `options.txt`。
+/// 算出修復後的 `options.txt` 內容（只算、不寫）；不需要修復回傳 `None`。
+/// 寫入由 pack_repair.rs 走前置檢查、紀錄、標記流程。
 ///
 /// 刻意**只加不減**：使用者可能是刻意停用某些包的，我們無從分辨。
 /// 但「清單全空」這種明顯壞掉的狀態一定要救回來。
 /// 加回去的順序照檔名排序，工具自己的翻譯包放最後（優先權最高）。
-pub fn repair_pack_list(mc: &Path) -> Result<usize, String> {
+pub fn repaired_options(mc: &Path, original: &str) -> Option<(String, usize)> {
     let report = check_pack_health(mc);
     if report.present_but_disabled.is_empty() {
-        return Ok(0);
+        return None;
     }
-    let options = mc.join("options.txt");
-    let original = fs::read_to_string(&options).unwrap_or_default();
-    // 修改前先留一份，救錯了還能回去
-    let _ = fs::write(options.with_extension("txt.mcpl-bak"), &original);
 
-    let mut enabled = parse_pack_list(&original);
+    let mut enabled = parse_pack_list(original);
     let mut added = 0usize;
     let mut tool_packs = Vec::new();
     for name in &report.present_but_disabled {
@@ -263,13 +260,16 @@ pub fn repair_pack_list(mc: &Path) -> Result<usize, String> {
     }
     let mut updated = lines.join("\n");
     updated.push('\n');
-    fs::write(&options, updated).map_err(|e| format!("寫入 options.txt 失敗：{e}"))?;
-    Ok(added)
+    Some((updated, added))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repair_pack_list(mc: &Path) -> Result<usize, String> {
+        super::super::pack_repair::repair_pack_list_with_game_state(mc, super::super::game_process::GameRunning::No)
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mcpl-packguard-{tag}-{}", std::process::id()));

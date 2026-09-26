@@ -169,6 +169,26 @@ export function setSetting(localStorageKey, value) {
   void patchFile([op]);
 }
 
+/** 讀一個設定檔路徑（沒有對應 localStorage 鍵的新設定）；沒有值回 fallback。 */
+export function getSettingPath(dotted, fallback = null) {
+  const value = cache ? getPath(cache, dotted) : undefined;
+  return value === undefined || value === null ? fallback : value;
+}
+
+/**
+ * 直接寫一個設定檔路徑（沒有對應 localStorage 鍵的新設定，例如 translate.backupChoice）。
+ * 跟 setSetting 不同：這裡要等寫入完成，失敗就拋錯——呼叫端接著要依這個值做事
+ * （後端套用時會讀設定檔的備份選擇），不能靜默當作成功。
+ */
+export async function setSettingPath(dotted, value) {
+  const op = value === null || value === undefined ? opDelete(dotted) : opSet(dotted, value);
+  const result = await invoke("patch_app_settings_cmd", { ops: [op] });
+  if (!cache) cache = { version: 1 };
+  if (result && result.settings && typeof result.settings === "object") cache = result.settings;
+  else applyOps(cache, [op]);
+  return cache;
+}
+
 /**
  * 另一個視窗（設定視窗）已經把值寫進設定檔了，這裡只同步本視窗的快取與
  * localStorage，不再寫檔。回傳對應的 localStorage 鍵（沒有對應就回空字串）。

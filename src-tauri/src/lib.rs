@@ -49,7 +49,7 @@ use engine::{
     user_glossary_path, validate_instance_path, validate_open_url, verify_turnstile_blocking, consistency_suggestions_path, consistency_suggestions_status, merge_consistency_suggestions, write_consistency_hints, write_coverage_report,
     write_gap_summary_file,
     map_stage_progress, CoverageSourceFlags,
-    ApiSettingsPublic, ApplyResult, BuildOptions, PackVersionInfo,
+    ApiSettingsPublic, ApplyResult, ApplyStatus, BuildOptions, PackVersionInfo,
     CoverageStats, DiscordAuthStatus, FontPackApplyResult, FontPackOptions, FontPackResult,
     InstanceValidation, JarDocumentationReport, JarTranslationReport,
     LangMap, LaunchDiagnosis, ShareUploadResult, LangSource, ProvenanceMap,
@@ -309,7 +309,9 @@ struct LogPayload {
 }
 
 fn backup_status(applied: &ApplyResult) -> String {
-    if applied.backup_reused {
+    if !applied.is_applied() {
+        "尚未裝進遊戲（見上方說明）".into()
+    } else if applied.backup_reused {
         format!("沿用既有備份：{}", applied.backup_dir)
     } else if applied.backup_created {
         format!("新建備份：{}", applied.backup_dir)
@@ -784,6 +786,44 @@ struct OneClickResult {
     run_plan: engine::run_plan::RunPlan,
     /// 是否有任何欄位與使用者的選擇不同。UI 用它決定要不要顯示說明區塊。
     run_plan_has_overrides: bool,
+    /// 套用到遊戲的結果。不是 `applied` 時＝翻譯已完成、還沒裝進遊戲（遊戲開著、
+    /// 還沒啟動過遊戲、還沒選備份、不備份要確認覆蓋），前端顯示原因並提供「套用到遊戲」。
+    apply_status: ApplyStatus,
+    /// 還沒套用時給玩家看的說明；已套用時為空
+    apply_message: String,
+    /// 不備份模式下，等玩家確認才會覆蓋的原檔
+    pending_overwrites: Vec<String>,
+}
+
+/// 把套用狀態接到翻譯結果上；還沒裝進遊戲時，結論的第一句就要講這件事。
+fn with_apply_notice(mut result: OneClickResult, applied: &ApplyResult) -> OneClickResult {
+    result.apply_status = applied.status;
+    result.pending_overwrites = applied.pending_overwrites.clone();
+    if !applied.is_applied() {
+        result.apply_message = applied.player_summary.clone();
+        result.player_summary = format!(
+            "【翻譯已完成，還沒裝進遊戲】\n{}\n\n{}",
+            applied.player_summary, result.player_summary
+        );
+    }
+    result
+}
+
+/// 翻譯流程最後的套用：備份做法照設定（第一次會先問），遊戲開著等情況回「已翻完、未套用」，
+/// 不算翻譯失敗。
+fn apply_after_run(
+    app: &AppHandle,
+    instance: &Path,
+    work: &Path,
+    pack_name: &str,
+) -> Result<ApplyResult, String> {
+    // 開始翻譯時「保留／不保留翻譯結果」只管結果資料夾；備份一律照設定
+    let policy = engine::apply_record::policy_for_run(false);
+    let applied = apply_to_instance(instance, work, Some(pack_name), policy)?;
+    if !applied.is_applied() {
+        emit_warn(app, &applied.player_summary);
+    }
+    Ok(applied)
 }
 
 /// 套用成功後順手檢查一次：同一個上層資料夾底下有沒有其他資料夾的模組內容
@@ -1257,7 +1297,8 @@ async fn one_click_translate(
     output_dir: String,
     pack_name: String,
     use_ai: bool,
-    backup_before_apply: bool,
+    // 開始翻譯時選「保留翻譯結果」＝true；只管結果資料夾，不影響備份
+    keep_results: bool,
     reference_pack: Option<String>,
     target_version: Option<String>,
     translation_mode: Option<String>,
@@ -1316,7 +1357,7 @@ async fn one_click_translate(
             out,
             pack_name,
             use_ai,
-            backup_before_apply,
+            keep_results,
             reference_pack,
             target_version,
             translation_mode,
@@ -1656,6 +1697,27 @@ async fn delete_apply_backups_cmd(
     Ok(result)
 }
 
+/// 套用紀錄損壞時的出口：把壞掉的紀錄改名保留（`.broken-時間戳`），重新開始記錄。
+#[tauri::command]
+fn reset_apply_record_cmd(instance_path: String) -> Result<String, String> {
+    let inst = normalize_path_strict(&instance_path)?;
+    let mc = resolve_minecraft_dir(&inst)?;
+    let kept = engine::apply_record::reset_record(&mc)?;
+    Ok(format!(
+        "已重設套用紀錄，之後會重新開始記錄。壞掉的那份已改名保留：\n{}",
+        kept.display()
+    ))
+}
+
+/// 把複製出來（或原位置已永久不在）的遊戲資料夾當成新的整合包：建立新的識別碼與紀錄。
+#[tauri::command]
+fn fork_apply_instance_cmd(instance_path: String) -> Result<String, String> {
+    let inst = normalize_path_strict(&instance_path)?;
+    let mc = resolve_minecraft_dir(&inst)?;
+    engine::apply_identity::fork_instance(&mc)?;
+    Ok("已把這份當成新的模組整合包，之後的套用與移除翻譯只會記在這份自己的紀錄裡。現在可以按「套用到遊戲」。".into())
+}
+
 /// 檢查目前實例／結果位置是否有可還原的工具備份；只讀取，不會修改檔案。
 #[tauri::command]
 fn has_apply_backups_cmd(
@@ -1715,7 +1777,7 @@ fn run_one_click(
     out: PathBuf,
     pack_name: String,
     use_ai: bool,
-    backup_before_apply: bool,
+    keep_results: bool,
     reference_pack: Option<String>,
     target_version: Option<String>,
     translation_mode: Option<String>,
@@ -2170,11 +2232,13 @@ fn run_one_click(
             translation_quality: quality.value().into(),
             coverage_tier: tier.value().into(),
             mods_fingerprint: engine::mods_fingerprint(&instance),
-            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇，
-            // 不能退回設定裡的預設值（使用者選了不備份，續翻卻又備份出檔案）。
+            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇。
+            // skip_result_folder＝開始時選了「不保留翻譯結果」，只管結果資料夾；
+            // 備份不在這裡決定，一律照設定（translate.backupChoice）。
+            // backup_before_apply 是舊版工作階段欄位，保留相容、固定為 true（＝照設定）。
             run_preferences: engine::RunPreferences {
-                skip_result_folder: !backup_before_apply,
-                backup_before_apply,
+                skip_result_folder: !keep_results,
+                backup_before_apply: true,
                 ai_mode: if use_ai { get_ai_mode() } else { String::new() },
                 ..Default::default()
             },
@@ -2469,6 +2533,8 @@ fn run_one_click(
     }
 
     let mc_for_fmt = resolve_minecraft_dir(&instance).unwrap_or_else(|_| instance.clone());
+    // 模組 JAR 自帶的 zh_tw：資源包只輸出工具補的條目，不整份抄一次模組自帶的翻譯
+    let bundled_zh = engine::collect_mod_zh_tw(&mc_for_fmt);
     // 使用者指定版本 → 用它；否則偵測。用來決定 pack.mcmeta 相容宣告。
     let resolved_version = target_version
         .clone()
@@ -2497,7 +2563,7 @@ fn run_one_click(
         Some(map_stage_progress(75, 7, 100)),
         "正在寫出資源包 zip…",
     );
-    let mut built = build_resource_pack(
+    let mut built = engine::build_resource_pack_skipping_bundled(
         &zh,
         &BuildOptions {
             pack_folder_name: pack_name.clone(),
@@ -2506,6 +2572,7 @@ fn run_one_click(
             pack_format,
             target_version: resolved_version.clone(),
         },
+        &bundled_zh,
     )?;
     emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
 
@@ -2819,7 +2886,7 @@ fn run_one_click(
 
     // 步驟 4 後重建 zip（含補充寫入）
     if rem_n > 0 || supplement_filled > 0 {
-        built = build_resource_pack(
+        built = engine::build_resource_pack_skipping_bundled(
             &zh,
             &BuildOptions {
                 pack_folder_name: pack_name.clone(),
@@ -2828,6 +2895,7 @@ fn run_one_click(
                 pack_format,
                 target_version: resolved_version.clone(),
             },
+            &bundled_zh,
         )?;
         emit_pruned_tool_pack_log(app, &built.pruned_tool_packs);
     }
@@ -2943,11 +3011,13 @@ fn run_one_click(
             translation_quality: quality.value().into(),
             coverage_tier: tier.value().into(),
             mods_fingerprint: engine::mods_fingerprint(&instance),
-            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇，
-            // 不能退回設定裡的預設值（使用者選了不備份，續翻卻又備份出檔案）。
+            // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇。
+            // skip_result_folder＝開始時選了「不保留翻譯結果」，只管結果資料夾；
+            // 備份不在這裡決定，一律照設定（translate.backupChoice）。
+            // backup_before_apply 是舊版工作階段欄位，保留相容、固定為 true（＝照設定）。
             run_preferences: engine::RunPreferences {
-                skip_result_folder: !backup_before_apply,
-                backup_before_apply,
+                skip_result_folder: !keep_results,
+                backup_before_apply: true,
                 ai_mode: if use_ai { get_ai_mode() } else { String::new() },
                 ..Default::default()
             },
@@ -3052,11 +3122,7 @@ fn run_one_click(
         );
     }
 
-    let apply_progress = if backup_before_apply {
-        "正在備份並套用翻譯 JAR／資源包到遊戲…"
-    } else {
-        "正在套用翻譯 JAR／資源包到遊戲（不建立備份）…"
-    };
+    let apply_progress = "正在把翻譯裝進遊戲（備份照你的設定）…";
     emit_progress_stage(
         app,
         dev_progress::STAGE_APPLY,
@@ -3067,7 +3133,7 @@ fn run_one_click(
     dev_progress::leave("pack_out");
     dev_progress::enter("apply");
     probe_apply_targets(&instance)?;
-    let applied = apply_to_instance(&instance, &work, Some(&pack_name), backup_before_apply)?;
+    let applied = apply_after_run(app, &instance, &work, &pack_name)?;
     // 套用完才清空資料夾：套用要從 config／minemenu 讀來源，清早了會少複製東西。
     // 這裡只刪「整個流程跑完仍然一個檔案都沒有」的目錄，避免使用者看到空資料夾
     // 以為「這裡本來該有東西卻沒產出」。
@@ -3082,16 +3148,18 @@ fn run_one_click(
             ),
         );
     }
-    emit_log(
-        app,
-        "info",
-        &format!(
-            "已直接套用到遊戲：{}；翻譯 JAR {} 個。備份位置：{}",
-            applied.zip_copied.as_deref().unwrap_or("已建立其他翻譯檔"),
-            applied.jars_copied,
-            backup_status(&applied)
-        ),
-    );
+    if applied.is_applied() {
+        emit_log(
+            app,
+            "info",
+            &format!(
+                "已裝進遊戲：{}；翻譯過的模組檔 {} 個。備份：{}",
+                applied.zip_copied.as_deref().unwrap_or("其他翻譯檔"),
+                applied.jars_copied,
+                backup_status(&applied)
+            ),
+        );
+    }
     let sibling_instance_warning = detect_sibling_instance_warning(&instance);
     if let Some(ref w) = sibling_instance_warning {
         emit_warn(app, w);
@@ -3168,10 +3236,11 @@ fn run_one_click(
         emit_log(app, "warn", &format!("完整性檢查：{line}"));
     }
     let stage_failures = stage_ledger.player_summary();
-    let headline = if !stage_ledger.has_total_failure() {
-        "完成！目標＝整合包可遊玩文字→台灣繁中（除圖片）；原始 JAR 只讀，翻譯副本已套用。"
-    } else {
-        "這一輪沒有全部完成。已完成的部分都已套用，但有內容完全沒翻到（見下方）。"
+    let headline = match (stage_ledger.has_total_failure(), applied.is_applied()) {
+        (false, true) => "完成！整合包裡玩得到的文字已翻成台灣繁體中文（圖片上的字除外），並已裝進遊戲。",
+        (false, false) => "翻好了，還沒裝進遊戲（原因與下一步見最上面）。",
+        (true, true) => "這一輪沒有全部完成。已完成的部分都已裝進遊戲，但有內容完全沒翻到（見下方）。",
+        (true, false) => "這一輪沒有全部完成，而且還沒裝進遊戲；有內容完全沒翻到（見下方）。",
     };
     let player_summary = format!(
         "{headline}\n\
@@ -3187,8 +3256,7 @@ fn run_one_click(
 • 資源包 zip：\n{}\n\
 • 詳見「覆蓋範圍說明.txt」\n\n\
 【請你】\n\
-1. 這次已直接套用到遊戲；請確認 Minecraft 已關閉後再重新啟動\n\
-2. 語言繁中（台灣）並啟用資源包\n\
+{}\n\
 3. 補翻／修復時「結果存哪」選你設的根目錄（會找到「{}」）",
         process_note,
         translated_count_note,
@@ -3203,10 +3271,11 @@ fn run_one_click(
         pack_format,
         work.display(),
         built.pack_path,
+        engine::apply_notice::after_run_next_steps(&applied),
         RESULT_DIR_NAME,
     );
 
-    Ok(OneClickResult {
+    Ok(with_apply_notice(OneClickResult {
         run_plan: plan.clone(),
         run_plan_has_overrides: plan.has_overrides(),
         report,
@@ -3224,7 +3293,10 @@ fn run_one_click(
         player_summary,
         sibling_instance_warning,
         stays_unchanged: skipped_untranslatable,
-    })
+            apply_status: applied.status,
+            apply_message: String::new(),
+            pending_overwrites: Vec::new(),
+        }, &applied))
 }
 
 /// AI 是本次翻譯的明確選項時，所有入口都必須先做和正式批次相同的真實請求。
@@ -3431,7 +3503,6 @@ async fn supplement_translate(
     app: AppHandle,
     output_dir: String,
     use_ai: bool,
-    backup_before_apply: bool,
     translation_mode: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_progress_emit_state();
@@ -3443,7 +3514,6 @@ async fn supplement_translate(
             &app2,
             out,
             use_ai,
-            backup_before_apply,
             translation_mode,
         )
     })
@@ -3459,7 +3529,6 @@ fn run_supplement(
     app: &AppHandle,
     out: PathBuf,
     use_ai: bool,
-    backup_before_apply: bool,
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_contribute_tracker();
@@ -3723,17 +3792,13 @@ fn run_supplement(
             },
         );
         let instance = PathBuf::from(session.instance_path.trim());
-        let applied = apply_to_instance(
-            &instance,
-            &work,
-            Some(&session.pack_name),
-            backup_before_apply,
-        )?;
+        let applied = apply_after_run(app, &instance, &work, &session.pack_name)?;
         emit_log(
             app,
             "info",
             &format!(
-                "複查後已重新套用；備份位置：{}",
+                "{}備份位置：{}",
+                engine::apply_notice::reapply_log_line(&applied, "複查"),
                 backup_status(&applied)
             ),
         );
@@ -3741,7 +3806,7 @@ fn run_supplement(
         if let Some(ref w) = sibling_instance_warning {
             emit_warn(app, w);
         }
-        return Ok(OneClickResult {
+        return Ok(with_apply_notice(OneClickResult {
              run_plan: supplement_plan.clone(),
              run_plan_has_overrides: supplement_plan.has_overrides(),
              report: empty_report(
@@ -3794,7 +3859,10 @@ fn run_supplement(
               },
             sibling_instance_warning,
             stays_unchanged: 0,
-        });
+            apply_status: applied.status,
+            apply_message: String::new(),
+            pending_overwrites: Vec::new(),
+        }, &applied));
     }
 
     // 補翻使用目前選擇的 AI 來源（自訂 API／GPT）；翻譯前已另閘 Discord。
@@ -4051,17 +4119,13 @@ fn run_supplement(
     );
 
     let instance = PathBuf::from(session.instance_path.trim());
-    let applied = apply_to_instance(
-        &instance,
-        &work,
-        Some(&session.pack_name),
-        backup_before_apply,
-    )?;
+    let applied = apply_after_run(app, &instance, &work, &session.pack_name)?;
     emit_log(
         app,
         "info",
         &format!(
-            "複查後已重新套用；備份位置：{}",
+            "{}備份位置：{}",
+            engine::apply_notice::reapply_log_line(&applied, "複查"),
             backup_status(&applied)
         ),
     );
@@ -4081,7 +4145,7 @@ fn run_supplement(
         "• 這次只使用本機資料與既有翻譯，未使用線上翻譯服務".to_string()
     };
 
-    Ok(OneClickResult {
+    Ok(with_apply_notice(OneClickResult {
         run_plan: supplement_plan.clone(),
         run_plan_has_overrides: supplement_plan.has_overrides(),
         report: empty_report(
@@ -4108,15 +4172,16 @@ fn run_supplement(
         jar_translation,
         minemenu_msg: None,
         player_summary: format!(
-            "補翻完成！目標＝整合包可遊玩文字→台灣繁中（除圖片）；原始 JAR 只讀，翻譯副本已套用。\n\
+            "補翻完成！\n{}\n\
 {}\n\
 • 資源包現在約 {} 條中文\n\
 • 尚可補約 {} 條\n\
 • 結果資料夾：\n{}\n\
 • zip：\n{}\n\
 • {}\n\
-• 見「覆蓋範圍說明.txt」；這次已直接套用到遊戲\n\
+• 見「覆蓋範圍說明.txt」\n\
 （任務／覆寫在結果資料夾 config、patchouli_books、kubejs 等）",
+            engine::apply_notice::after_run_next_steps(&applied),
             ai_result_line,
             built.keys_total,
             still_n,
@@ -4130,7 +4195,10 @@ fn run_supplement(
         ),
         sibling_instance_warning,
         stays_unchanged: 0,
-    })
+            apply_status: applied.status,
+            apply_message: String::new(),
+            pending_overwrites: Vec::new(),
+        }, &applied))
 }
 
 /// 修復翻譯資源包／工作階段（不修遊戲世界閃退）
@@ -4143,7 +4211,6 @@ async fn repair_translation_pack(
     app: AppHandle,
     output_dir: String,
     use_ai: bool,
-    backup_before_apply: bool,
     translation_mode: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_progress_emit_state();
@@ -4155,7 +4222,6 @@ async fn repair_translation_pack(
             &app2,
             out,
             use_ai,
-            backup_before_apply,
             translation_mode,
         )
     })
@@ -4171,7 +4237,6 @@ fn run_repair(
     app: &AppHandle,
     out: PathBuf,
     use_ai: bool,
-    backup_before_apply: bool,
     translation_mode_override: Option<String>,
 ) -> Result<OneClickResult, String> {
     reset_contribute_tracker();
@@ -4447,17 +4512,13 @@ fn run_repair(
     }
 
     let instance = PathBuf::from(session.instance_path.trim());
-    let applied = apply_to_instance(
-        &instance,
-        &work,
-        Some(&session.pack_name),
-        backup_before_apply,
-    )?;
+    let applied = apply_after_run(app, &instance, &work, &session.pack_name)?;
     emit_log(
         app,
         "info",
         &format!(
-            "修復後已重新套用；備份位置：{}",
+            "{}備份位置：{}",
+            engine::apply_notice::reapply_log_line(&applied, "修復"),
             backup_status(&applied)
         ),
     );
@@ -4482,8 +4543,7 @@ fn run_repair(
 • 結果資料夾：\n{}\n\
 • zip：\n{}\n\n\
 【接下來】\n\
-1. 這次已直接套用到遊戲；請重新啟動 Minecraft\n\
-2. 語言選繁中（台灣）並啟用資源包\n\
+{}\n\
 3. 若還有英文 → 同一根目錄按「只補缺漏」",
         actions
             .iter()
@@ -4494,10 +4554,11 @@ fn run_repair(
         repair_translation_line,
         still_n,
         work.display(),
-        built.pack_path
+        built.pack_path,
+        engine::apply_notice::after_run_next_steps(&applied)
     );
 
-    Ok(OneClickResult {
+    Ok(with_apply_notice(OneClickResult {
         run_plan: repair_plan.clone(),
         run_plan_has_overrides: repair_plan.has_overrides(),
         report: empty_report(
@@ -4526,7 +4587,10 @@ fn run_repair(
         player_summary,
         sibling_instance_warning,
         stays_unchanged: 0,
-    })
+            apply_status: applied.status,
+            apply_message: String::new(),
+            pending_overwrites: Vec::new(),
+        }, &applied))
 }
 
 fn rebuild_zh_from_instance(
@@ -5247,16 +5311,23 @@ fn verify_resource_packs_cmd(instance_path: String) -> Result<engine::PackHealth
 fn repair_resource_packs_cmd(instance_path: String) -> Result<serde_json::Value, String> {
     let instance = normalize_path_strict(&instance_path)?;
     let mc = resolve_minecraft_dir(&instance).unwrap_or(instance);
-    let added = engine::repair_pack_list(&mc)?;
+    let outcome = engine::repair_pack_list(&mc)?;
+    let added = outcome.added;
     let after = engine::check_pack_health(&mc);
+    let summary = if added == 0 {
+        "資源包清單本來就是完整的，沒有做任何修改。".to_string()
+    } else {
+        format!("已把 {added} 個資源包加回清單，請重新啟動遊戲確認。")
+    };
+    // 識別碼認回的說明（部分檔案被整合包更新改過）放在最前面，玩家才看得到
+    let summary = match outcome.notice {
+        Some(notice) => format!("{notice}\n\n{summary}"),
+        None => summary,
+    };
     Ok(serde_json::json!({
         "added": added,
         "enabledCount": after.enabled_count,
-        "summary": if added == 0 {
-            "資源包清單本來就是完整的，沒有做任何修改。".to_string()
-        } else {
-            format!("已把 {added} 個資源包加回清單，請重新啟動遊戲確認。")
-        },
+        "summary": summary,
     }))
 }
 
@@ -5889,6 +5960,15 @@ async fn apply_font_pack_to_current_instance(
     result
 }
 
+/// 移除字體包：只拿掉字體工具裝進遊戲的字體包（翻譯不動）。
+#[tauri::command]
+async fn remove_font_pack_cmd(instance_path: String) -> Result<String, String> {
+    let instance = normalize_path_strict(&instance_path)?;
+    tauri::async_runtime::spawn_blocking(move || engine::font_restore::remove_font_pack_in(&instance))
+        .await
+        .map_err(|e| describe_worker_failure(&e))?
+}
+
 #[tauri::command]
 fn save_api_key(key: String) -> Result<String, String> {
     let cur = get_api_settings_public();
@@ -6485,7 +6565,7 @@ async fn apply_translation_to_game(
     instance_path: String,
     output_dir: String,
     pack_name: Option<String>,
-    backup_before_apply: bool,
+    overwrite_confirmed: Option<bool>,
 ) -> Result<ApplyResult, String> {
     let instance = match normalize_path_strict(&instance_path) {
         Ok(p) => p,
@@ -6512,19 +6592,14 @@ async fn apply_translation_to_game(
             "warn",
             "【警告】請先完全關閉 Minecraft，再套用（避免檔案被鎖）",
         );
-        let message = if backup_before_apply {
-            "套用：備份後複製資源包／任務…"
-        } else {
-            "套用：不建立備份，直接複製資源包／任務…"
-        };
-        emit_progress(&app2, 40, message);
-        let r = apply_to_instance(
-            &instance,
-            &out,
-            pack_name.as_deref(),
-            backup_before_apply,
-        );
+        emit_progress(&app2, 40, "套用：把翻譯裝進遊戲（備份照你的設定）…");
+        let policy = engine::apply_record::policy_for_run(overwrite_confirmed.unwrap_or(false));
+        let r = apply_to_instance(&instance, &out, pack_name.as_deref(), policy);
         match &r {
+            Ok(ok) if !ok.is_applied() => {
+                emit_warn(&app2, &ok.player_summary);
+                emit_progress(&app2, 0, "還沒裝進遊戲");
+            }
             Ok(ok) => {
                 for w in &ok.warnings {
                     emit_warn(&app2, w);
@@ -6648,6 +6723,7 @@ pub fn run() {
             create_font_pack,
             read_font_file_base64,
             apply_font_pack_to_current_instance,
+            remove_font_pack_cmd,
             save_api_key,
             save_api_settings_cmd,
             test_custom_api_key_cmd,
@@ -6693,6 +6769,8 @@ pub fn run() {
             submit_issue_report_cmd,
             delete_apply_backups_cmd,
             has_apply_backups_cmd,
+            reset_apply_record_cmd,
+            fork_apply_instance_cmd,
             check_update,
             download_update,
             submit_usage_feedback_cmd,

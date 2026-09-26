@@ -4,8 +4,21 @@ import {
   getSettingsHealthNotice,
   getSetting,
   setSetting,
+  setSettingPath,
+  getSettingPath,
   applyExternalSetting,
 } from "./core/settings-store.js";
+import {
+  BACKUP_CHOICE_PATH,
+  createApplyPendingFlow,
+  isApplyPending,
+  isBrokenRecordError,
+  isForkableError,
+  keepOptionDetail,
+  offerForkInstance,
+  offerRecordReset,
+  skipOptionDetail,
+} from "./ui/apply-pending.js";
 import {
   BACKUP_STORAGE_KEY,
   CACHE_REMIND_KEY,
@@ -651,8 +664,41 @@ function initWinbarChrome() {
   syncMaxIcon();
 }
 
+/**
+ * 要不要備份改由設定檔的 translate.backupChoice 決定（第一次套用時後端回「需要詢問」，
+ * 由 applyPending 問一次並寫回設定）。這裡固定回 true＝「照設定」；
+ * 只有開始翻譯時選「不保留、直接覆蓋」會傳 false。
+ */
 function shouldBackupBeforeApply() {
-  return $("backup-before-apply") ? $("backup-before-apply").checked : true;
+  return true;
+}
+
+/** 翻譯完成但還沒裝進遊戲時的後續處理（備份選擇、覆蓋確認、遊戲開著、還沒啟動過遊戲）。 */
+const applyPending = createApplyPendingFlow({
+  $,
+  invoke,
+  confirmDialog,
+  choiceDialog,
+  appendLog: (text, level) => appendLog(text, level),
+  setBusy: (busy, kind) => setBusy(busy, kind),
+  saveBackupChoice: async (value) => {
+    await setSettingPath(BACKUP_CHOICE_PATH, value);
+    void Promise.resolve(
+      emit(SETTINGS_UPDATED_EVENT, { path: BACKUP_CHOICE_PATH, value, source: "main" })
+    ).catch(() => {});
+  },
+  onApplied: async () => {
+    setTranslationState("complete");
+    await refreshBackupState();
+  },
+});
+
+function applyContextFromUi(outputDir) {
+  return {
+    instancePath: ($("instance")?.value || "").trim(),
+    outputDir,
+    packName: packNameForTranslate() || null,
+  };
 }
 
 /** 套用後若後端偵測到同模組內容的其他資料夾，這裡統一抽出提醒文字。 */
@@ -966,24 +1012,30 @@ async function applyCachedTranslation() {
     packNameForTranslate() ||
     null;
   setBusy(true, "apply");
+  let pendingApply = null;
   try {
     appendLog("正在把本機翻譯結果再次套用到遊戲…");
     const result = await invoke("apply_translation_to_game", {
       instancePath,
       outputDir,
       packName,
-      backupBeforeApply: shouldBackupBeforeApply(),
     });
     const summary = result?.playerSummary || result?.player_summary || result?.message || "套用完成。";
-    appendLog(summary);
-    logApplyWarnings(result);
-    setTranslationState("complete");
+    if (isApplyPending(result)) {
+      pendingApply = result;
+    } else {
+      appendLog(summary);
+      logApplyWarnings(result);
+      setTranslationState("complete");
+    }
     await refreshShareableState();
   } catch (e) {
     appendError("再次套用失敗：" + formatInvokeError(e));
+    offerRecordResetIfBroken(e, instancePath);
   } finally {
     setBusy(false);
   }
+  if (pendingApply) await applyPending.handle(pendingApply, { instancePath, outputDir, packName });
 }
 
 function wireLocalCacheCard() {
@@ -1595,7 +1647,31 @@ function isCancellation(e) {
 }
 
 /** 統一處理各流程的失敗／取消收尾 */
+function currentBackupChoice() {
+  const value = getSettingPath(BACKUP_CHOICE_PATH, "");
+  return value === "always" || value === "never" ? value : "";
+}
+
+/** 套用紀錄損壞時給「重設套用紀錄」的出口（不在失敗訊息裡要玩家自己找檔案）。 */
+function offerRecordResetIfBroken(e, instancePath) {
+  if (isForkableError(e)) {
+    void offerForkInstance(
+      { confirmDialog, invoke, appendLog: (text, level) => appendLog(text, level) },
+      instancePath || ($("instance")?.value || "").trim()
+    );
+    return;
+  }
+  if (!isBrokenRecordError(e)) return;
+  void offerRecordReset(
+    { confirmDialog, invoke, appendLog: (text, level) => appendLog(text, level) },
+    instancePath || ($("instance")?.value || "").trim()
+  ).then((done) => {
+    if (done) void refreshBackupState();
+  });
+}
+
 function handleRunFailure(e, whatFailed) {
+  offerRecordResetIfBroken(e);
   if (isCancellation(e)) {
     // 這裡是「已經停下來了」的收尾，不是「正在停」。舊版把訊息寫「已停止」
     // 卻同時掛上 cancelling 徽章（顯示「取消中」），畫面上兩個互相矛盾的狀態
@@ -2640,6 +2716,7 @@ function setBusy(busy, jobKind) {
     "btn-cancel-login",
     "btn-font-pick",
     "btn-font-out",
+    "btn-font-remove",
     "btn-font-build",
     "btn-reference-pick",
     "btn-reference-file",
@@ -3885,7 +3962,7 @@ async function checkResourcePackHealth(instancePath) {
     body:
       (report.summary || "") +
       "\n\n【為什麼要修】\n" +
-      "遊戲的資源包清單（options.txt）少了項目。翻譯包不在清單裡，遊戲就讀不到翻譯，" +
+      "遊戲設定檔裡的資源包清單少了項目。翻譯包不在清單裡，遊戲就讀不到翻譯，" +
       "你會看到全部都還是英文。\n" +
       "\n【怎麼會這樣】\n" +
       "多半是遊戲或啟動器在套用之後重新寫過這個檔案，把清單蓋掉了；也可能是手動改過。" +
@@ -3895,7 +3972,7 @@ async function checkResourcePackHealth(instancePath) {
       "\n**整合包原本就關著的資源包不會被啟用**——那是整合包作者刻意關掉的，工具不動它。" +
       "\n\n【不修會怎樣】\n" +
       "翻譯不會生效。先前實測還遇過資源包遺失導致字體載入失敗、進而開不了遊戲。" +
-      "\n\n修改前會先備份 options.txt，改壞了可以還原。",
+      "\n\n修改前會先另存一份遊戲設定檔，改壞了可以還原。",
     confirmLabel: "修復資源包清單",
     cancelLabel: "先不要",
     danger: !!report.listEmpty,
@@ -5060,7 +5137,9 @@ async function onRunInner() {
     }
   }
 
-  if (!(await ensureGameClosed(instancePath, "翻譯並套用"))) return;
+  // 遊戲開著也照常翻譯：只有最後「裝進遊戲」那一步需要關遊戲，
+  // 後端會回「已翻完、還沒裝進遊戲」，到時再按「套用到遊戲」即可。
+  applyPending.hideCard();
 
   writeLastInstancePath(instancePath);
   let useAi = !!$("use-ai").checked;
@@ -5121,12 +5200,12 @@ async function onRunInner() {
       {
         value: "keep",
         label: "保留（建議）",
-        detail: "先備份遊戲原始檔案，翻譯結果也留著。之後可以「分享給其他玩家」或用「補充漏翻」接續。",
+        detail: keepOptionDetail(currentBackupChoice()),
       },
       {
         value: "skip",
-        label: "不保留，直接覆蓋遊戲檔案",
-        detail: "不備份、不留翻譯結果。套用後無法還原，完成後也不能再分享給其他玩家。",
+        label: "不保留翻譯結果",
+        detail: skipOptionDetail(currentBackupChoice()),
       },
     ],
     cancelLabel: "取消，先不要翻譯",
@@ -5146,25 +5225,28 @@ async function onRunInner() {
   // 只有「開始翻譯」（全新一輪）才清空步驟計時；修復／補充漏翻是接續同一輪，時間要繼續累加。
   resetStepTimings();
   if ($("btn-package")) $("btn-package").disabled = true;
-  const effectiveBackupBeforeApply = skipResultFolder ? false : shouldBackupBeforeApply();
+  // 「不保留」只管翻譯結果資料夾；備份一律照設定（後端讀 translate.backupChoice）
+  const backupNote = {
+    always: "裝進遊戲前會先備份遊戲原本的檔案。",
+    never: "依你的設定不備份；覆蓋遊戲原本的檔案前會再問你。",
+  }[currentBackupChoice()] || "第一次裝進遊戲前會問你要不要備份。";
   appendLog(
-    skipResultFolder
-      ? "已選擇不保留翻譯結果：這次會直接套用、不備份，完成後也不留下可分享的翻譯結果。"
-      : effectiveBackupBeforeApply
-      ? "翻譯完成後會先備份，再直接套用到這個遊戲實例。"
-      : "翻譯完成後會直接套用，不建立備份。"
+    (skipResultFolder
+      ? "翻譯完成後會直接裝進遊戲，裝好後不保留這次的翻譯結果。"
+      : "翻譯完成後會直接裝進遊戲，翻譯結果也會留著。") + backupNote
   );
   setProgress(1, "準備中…");
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
+  let applyFollowUp = null;
   try {
     const result = await invoke("one_click_translate", {
       instancePath,
       outputDir,
       packName: packNameForTranslate(),
       useAi,
-      backupBeforeApply: effectiveBackupBeforeApply,
+      keepResults: !skipResultFolder,
       referencePack: (($('reference-pack')?.value || "").trim() || null),
       targetVersion: targetVersion || null,
       coverageTier: "max",
@@ -5198,9 +5280,15 @@ async function onRunInner() {
       }
     );
     let msg = result.playerSummary || result.player_summary || "翻譯完成，請看日誌。";
+    const notYetApplied = isApplyPending(result);
+    if (notYetApplied) {
+      applyFollowUp = { result, ctx: { instancePath, outputDir, packName: packNameForTranslate() || null } };
+    }
     // 結論先行：完成訊息本身偏技術，先給一句人話，讓使用者知道「現在就能玩」，
     // 不用讀完整份報告才敢開遊戲。少數原文保留是正常的，一併先講清楚。
-    const headline = staysUnchangedCount > 0
+    const headline = notYetApplied
+      ? "翻譯已完成，但還沒裝進遊戲（原因與下一步見下方）。"
+      : staysUnchangedCount > 0
       ? "可以直接開遊戲了，主要遊戲文字都已是繁體中文。\n少數專有名詞、單位符號與附魔等級維持原文是正常的，翻了反而會出錯。"
       : "可以直接開遊戲了，主要遊戲文字都已是繁體中文。";
     msg = headline + "\n\n" + msg;
@@ -5218,11 +5306,14 @@ async function onRunInner() {
     consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
-    if (skipResultFolder) {
+    if (notYetApplied) {
+      // 還沒裝進遊戲：翻譯結果是之後「套用到遊戲」的來源，不能照「不保留」刪掉
+      appendLog("翻譯已完成，還沒裝進遊戲；翻譯結果先保留，等你按「套用到遊戲」。", "warn");
+    } else if (skipResultFolder) {
       appendLog("已依你的選擇不保留翻譯結果，正在清理暫存資料夾…");
       try {
         await invoke("delete_result_folder_cmd", { outputDir });
-        appendLog("翻譯已完成並直接套用；未保留翻譯結果，也未建立備份。");
+        appendLog("翻譯已完成並裝進遊戲；依你的選擇沒有保留翻譯結果（備份照你的設定處理）。");
       } catch (cleanupErr) {
         appendLog(
           "翻譯已完成並直接套用，但清理翻譯結果資料夾時發生問題：" +
@@ -5255,6 +5346,7 @@ async function onRunInner() {
     refreshBackupState();
     void releaseLocalModelAfterRun();
   }
+  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
 
 /** 舊版共用 work／work\\翻譯結果 → 應改走 per-instance */
@@ -5326,11 +5418,11 @@ async function onRepairInner() {
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
+  let applyFollowUp = null;
   try {
     const result = await invoke("repair_translation_pack", {
       outputDir,
       useAi,
-      backupBeforeApply: shouldBackupBeforeApply(),
       translationMode: supplementTranslationMode(),
     });
     setProgress(100, "修復完成！");
@@ -5344,6 +5436,7 @@ async function onRepairInner() {
       setLogFinal(msg);
     }
     setTranslationState("complete");
+    if (isApplyPending(result)) applyFollowUp = { result, ctx: applyContextFromUi(outputDir) };
   } catch (e) {
     if (isCancellation(e)) {
       setTranslationState("idle");
@@ -5362,6 +5455,7 @@ async function onRepairInner() {
     refreshBackupState();
     void releaseLocalModelAfterRun();
   }
+  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
 
 /** 只補缺漏：不重掃 mods，讀工作階段 + AI */
@@ -5415,11 +5509,11 @@ async function onSupplementInner() {
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
+  let applyFollowUp = null;
   try {
     const result = await invoke("supplement_translate", {
       outputDir,
       useAi,
-      backupBeforeApply: shouldBackupBeforeApply(),
       translationMode: supplementTranslationMode(),
     });
     const pendingCount = Number(result.pendingCount ?? result.pending_count ?? 0) || 0;
@@ -5445,7 +5539,11 @@ async function onSupplementInner() {
     consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
-    appendLog("複查完成，結果已重新套用到遊戲。", "info");
+    if (isApplyPending(result)) {
+      applyFollowUp = { result, ctx: applyContextFromUi(outputDir) };
+    } else {
+      appendLog("複查完成，結果已重新套用到遊戲。", "info");
+    }
     await cleanupPreparedTranslationHelper();
   } catch (e) {
     if (isCancellation(e)) {
@@ -5465,6 +5563,7 @@ async function onSupplementInner() {
     refreshBackupState();
     void releaseLocalModelAfterRun();
   }
+  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
 
 /** 停止：後端在下一個檢查點乾淨收尾，已完成的檔案保留 */
@@ -5718,7 +5817,7 @@ function showDiagnosis(result) {
     evidence.length ? `證據：\n- ${evidence.join("\n- ")}` : "",
     nextSteps.length ? `建議下一步：\n- ${nextSteps.join("\n- ")}` : "",
     result?.translationRelated || result?.translation_related
-      ? "翻譯關聯：記錄指向翻譯輸出，可試「還原上一次套用」。"
+      ? "翻譯關聯：記錄指向翻譯輸出，可試「移除翻譯」。"
       : "翻譯關聯：目前沒有直接證據顯示是翻譯造成。",
     packRoot ? `解析目錄：${packRoot}` : "",
     source ? `資料來源：${source}` : "",
@@ -5733,7 +5832,7 @@ function showDiagnosis(result) {
   appendDiagnoseLog("分析完成：" + (errorCode || verdictLabel));
   appendDiagnoseLog(text);
   if ((result?.translationRelated || result?.translation_related) && hasApplyBackups) {
-    appendDiagnoseLog("可直接按「還原上一次套用」排除翻譯輸出。", "warn");
+    appendDiagnoseLog("可直接按「移除翻譯」排除是不是翻譯造成的。", "warn");
   }
 }
 
@@ -5931,8 +6030,9 @@ async function deleteAllBackupsFlow() {
   const ok = await confirmDialog({
     title: "刪除全部備份？",
     body:
-      "會刪掉下列位置中由工具建立的所有備份，之後就無法再「還原上一次套用」。\n" +
-      "翻譯結果本身不會被刪除。",
+      "會刪掉工具建立的所有備份。之後「移除翻譯」仍能拿掉工具加的檔案、改回設定，\n" +
+      "但被翻譯覆蓋的原檔就無法還原了。\n" +
+      "也會刪掉清單確認屬於這個整合包的舊版工具備份：刪除後將無法還原舊版工具改過的檔案。無法確認屬於這個整合包的備份不會刪，會列出來。翻譯結果本身不會被刪除。",
     affected: backupRoot ? [backupRoot] : [],
     danger: true,
     confirmLabel: "刪除備份",
@@ -6053,6 +6153,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     wireLocalCacheCard();
   } catch (e) {
     console.warn("[boot] wireLocalCacheCard", e);
+  }
+  try {
+    applyPending.wire();
+  } catch (e) {
+    console.warn("[boot] applyPending.wire", e);
   }
   try {
     wireResumeCard();
@@ -6397,6 +6502,28 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     };
   }
+  if ($("btn-font-remove")) {
+    // 只拿掉字體工具裝進遊戲的字體包；翻譯由「移除翻譯」另外處理
+    $("btn-font-remove").onclick = async () => {
+      const instancePath = ($("instance")?.value || "").trim();
+      if (!instancePath) return appendFontLog("請先在翻譯頁選好遊戲資料夾。");
+      if (progressBusy) return appendFontLog("其他工作進行中，請稍候。");
+      const ok = await confirmDialog({
+        title: "移除字體包？",
+        body: "會拿掉工具裝進這個模組整合包的字體包，並從資源包清單移除。翻譯不受影響。",
+        affected: [instancePath],
+        confirmLabel: "移除字體包",
+        cancelLabel: "先不要",
+      });
+      if (!ok) return;
+      try {
+        const summary = await invoke("remove_font_pack_cmd", { instancePath });
+        appendFontLog(String(summary || "已移除字體包。"));
+      } catch (e) {
+        appendFontLog("移除字體包失敗：" + formatInvokeError(e), "error");
+      }
+    };
+  }
   if ($("btn-font-out")) {
     $("btn-font-out").onclick = async () => {
       try {
@@ -6622,15 +6749,15 @@ window.addEventListener("DOMContentLoaded", async () => {
       const instancePath =
         ($("diagnose-pack-path")?.value || "").trim() || ($("instance")?.value || "").trim();
       if (!instancePath) return log("請先選擇遊戲資料夾或診斷頁的整合包資料夾。");
-      if (!(await ensureGameClosed(instancePath, "還原上一次套用"))) return;
+      if (!(await ensureGameClosed(instancePath, "移除翻譯"))) return;
       const ok = await confirmDialog({
-        title: "還原上一次套用？",
+        title: "移除翻譯？",
         body:
-          "會把這個整合包回到備份對應的「套用前」狀態。\n" +
-          "若你曾多次套用而重用同一份備份，這一步可能一次跨過好幾次的變更。",
+          "會刪掉工具加進遊戲的檔案，並把資源包清單與遊戲語言改回原本的設定。\n" +
+          "被翻譯覆蓋的原檔：有備份的會還原；沒有備份的無法還原，會列出來給你看。",
         affected: [instancePath],
         danger: true,
-        confirmLabel: "還原",
+        confirmLabel: "移除翻譯",
         cancelLabel: "先不要",
       });
       if (!ok) return;
@@ -6639,14 +6766,15 @@ window.addEventListener("DOMContentLoaded", async () => {
           instancePath,
           outputDir: selectedOutputDir() || null,
         });
-        const summary = result.playerSummary || result.player_summary || "已還原上一次套用。";
+        const summary = result.playerSummary || result.player_summary || "已移除翻譯。";
         const warnings = result.warnings || [];
         appendDiagnoseLog(summary, "warn");
         appendDiagnoseLog("若譯文可疑，補翻時勾選「重新翻譯缺漏」再跑一次。", "warn");
-        if (warnings.length) appendDiagnoseLog("還原警告：\n" + warnings.join("\n"), "warn");
+        if (warnings.length) appendDiagnoseLog("移除翻譯時的提醒：\n" + warnings.join("\n"), "warn");
         await refreshBackupState();
       } catch (e) {
-        appendDiagnoseLog("還原失敗：" + formatInvokeError(e), "error");
+        appendDiagnoseLog("移除翻譯失敗：" + formatInvokeError(e), "error");
+        offerRecordResetIfBroken(e, instancePath);
       }
     };
   }

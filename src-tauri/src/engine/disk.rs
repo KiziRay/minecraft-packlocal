@@ -88,8 +88,10 @@ pub fn probe_apply_targets(minecraft_or_instance: &Path) -> Result<(), String> {
         mc.join("mods"),
     ];
     for t in &targets {
+        // 路徑超過 260 字元時一般寫法會失敗，改用長路徑形式探測
+        let t = super::paths::long_path(t);
         if t.exists() || t.parent().map(|p| p.exists()).unwrap_or(false) {
-            probe_writable(t)?;
+            probe_writable(&t)?;
         }
     }
     Ok(())

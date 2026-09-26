@@ -45,6 +45,7 @@ pub fn rewrite_translated_jars(
         fs::remove_dir_all(&output_root)
             .map_err(|e| format!("無法清理舊的 JAR 翻譯副本：{e}"))?;
     }
+    super::jar_sources::reset(work_root);
     fs::create_dir_all(&output_root).map_err(|e| e.to_string())?;
 
     let mut report = JarTranslationReport {
@@ -73,6 +74,7 @@ pub fn rewrite_translated_jars(
                 let mods = mods.clone();
                 let values = &values;
                 let translated = translated;
+                let work_root = work_root.to_path_buf();
                 handles.push(scope.spawn(move || {
                     let relative = match jar.strip_prefix(&mods) {
                         Ok(r) => r.to_path_buf(),
@@ -87,7 +89,12 @@ pub fn rewrite_translated_jars(
                         .unwrap_or("unknown.jar")
                         .to_string();
                     match rewrite_one_jar(&jar, &output, values, translated) {
-                        Ok(stats) if stats.changed => Ok(Some((stem, stats))),
+                        Ok(stats) if stats.changed => {
+                            // 記下這份翻譯版是從哪個模組檔做的，套用前確認遊戲裡還是同一個
+                            super::jar_sources::record_source(&work_root, &relative, &jar)
+                                .map_err(|e| format!("{stem}：{e}"))?;
+                            Ok(Some((stem, stats)))
+                        }
                         Ok(_) => {
                             let _ = remove_empty_parent(&output, &output_root);
                             Ok(None)
@@ -522,6 +529,13 @@ mod tests {
             .unwrap();
         assert!(lang.contains("範例"));
         assert!(archive.by_name("META-INF/mods.toml").is_ok());
+        // 第五輪 #3：記下翻譯版是從哪個模組檔做的（檔名＋指紋），套用前用來確認模組沒被更新
+        let sources: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("work").join(super::super::jar_sources::SOURCES_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sources["example.jar"]["name"], "example.jar");
+        assert_eq!(sources["example.jar"]["sha256"], crate::engine::hashutil::sha256_hex(&original));
         let _ = fs::remove_dir_all(root);
     }
 

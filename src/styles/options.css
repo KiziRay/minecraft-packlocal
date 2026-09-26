@@ -11,6 +11,7 @@
   background: var(--panel);
   cursor: pointer;
 }
+.option-row[hidden] { display: none; }
 .option-row input { margin-top: 2px; accent-color: var(--accent); }
 .option-row strong { display: block; font-size: 13px; }
 .option-row small { display: block; margin-top: 2px; color: var(--faint); font-size: 12px; line-height: 1.4; }

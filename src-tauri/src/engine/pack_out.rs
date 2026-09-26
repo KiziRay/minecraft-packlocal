@@ -20,9 +20,13 @@ const FALLBACK_PACK_FORMAT: u32 = 15;
 /// 版本對不上時遊戲會把資源包標成「不相容」，玩家得手動點「仍要載入」，
 /// 很多人就以為翻譯失敗了。所以這裡值得認真判斷，而不是寫死一個數字。
 ///
-/// 對照表僅列各版本線的**起始版**；查表時取「不大於目標版本」的最後一筆。
-/// 只列到 1.21.8（單一 `pack_format` 整數制的最後一段）；1.21.9＋與年份版（26.x）
-/// 改用 `min_format`/`max_format` 範圍制，見 [`is_modern_pack_version`] 與 [`pack_mcmeta_value`]。
+/// 對照表僅列各版本線的**起始版**；查表時取「不大於目標版本」的最後一筆，
+/// 比表中最新版還新的版本（含之後的年份版）一律用最後一筆，並由範圍制欄位放寬相容範圍。
+///
+/// 1.21.6 之後的號碼已用兩個獨立來源查證（2026-09）：1.21.6＝63、1.21.7～1.21.8＝64、
+/// 1.21.9～1.21.10＝69、1.21.11＝75、26.1＝84、26.2＝88。
+/// 26.3＝97 目前只有一個來源；就算不準，範圍制欄位仍涵蓋它，遊戲不會標成不相容。
+/// 1.21.9 起新版讀 `min_format`/`max_format`，見 [`is_modern_pack_version`] 與 [`pack_mcmeta_value`]。
 const VERSION_TO_FORMAT: &[(&str, u32)] = &[
     ("1.13", 4),
     ("1.14", 4),
@@ -43,7 +47,12 @@ const VERSION_TO_FORMAT: &[(&str, u32)] = &[
     ("1.21.4", 46),
     ("1.21.5", 55),
     ("1.21.6", 63),
-    ("1.21.9", 68),
+    ("1.21.7", 64),
+    ("1.21.9", 69),
+    ("1.21.11", 75),
+    ("26.1", 84),
+    ("26.2", 88),
+    ("26.3", 97), // 僅一個來源，見上方說明
 ];
 
 /// 偵測 `pack_format`：先讀遊戲實例的版本，再退回既有資源包的 mcmeta。
@@ -64,7 +73,7 @@ pub fn detect_pack_format(minecraft_dir: &Path) -> u32 {
 /// 同時保留 legacy `pack_format` 給 1.21.8 以下。這樣不必硬編每個 26.x 的確切格式號
 /// （Mojang 2026 起改年份制、格式號還在往上跑），未來版本也自動涵蓋。
 const MODERN_MIN_FORMAT: u32 = 6; // 涵蓋 1.16 之後的整個現代區間
-const MODERN_MAX_FORMAT: u32 = 999; // 遠高於目前（26.1≈84），未來多年不必動
+const MODERN_MAX_FORMAT: u32 = 999; // 遠高於目前（26.3≈97），未來多年不必動
 
 /// 目標版本是否屬於「範圍制」（1.21.9＋ 或年份制 26.x…）。
 ///
@@ -85,7 +94,9 @@ pub fn is_modern_pack_version(version: &str) -> bool {
 
 /// 產生 `pack.mcmeta` 的 `pack` 物件。
 /// - 舊版（≤1.21.8）：單一 `pack_format`（與過去完全一致，零回歸風險）。
-/// - 新版（1.21.9＋／年份制）：`min_format`/`max_format` 範圍 ＋ 保留 legacy `pack_format`。
+/// - 新版（1.21.9＋／年份制）：官方做法是新欄位 `min_format`/`max_format`；範圍往下涵蓋
+///   舊格式時，還要同時給舊客戶端讀的 `pack_format` 與 `supported_formats`，兩種範圍寫成一致。
+///   舊客戶端不認得新欄位，會讀 `pack_format`／`supported_formats`。
 pub fn pack_mcmeta_value(
     target_version: Option<&str>,
     legacy_format: u32,
@@ -101,6 +112,10 @@ pub fn pack_mcmeta_value(
         serde_json::json!({
             "pack": {
                 "pack_format": fmt,
+                "supported_formats": {
+                    "min_inclusive": MODERN_MIN_FORMAT,
+                    "max_inclusive": MODERN_MAX_FORMAT
+                },
                 "min_format": [MODERN_MIN_FORMAT, 0],
                 "max_format": [MODERN_MAX_FORMAT, 0],
                 "description": description
@@ -116,12 +131,12 @@ pub fn pack_mcmeta_value(
     }
 }
 
-/// 由版本字串（`1.20.1`、`1.21.4`）查出 pack_format。年份制（26.x）回 `None`
-/// （交給範圍制的 mcmeta 處理），呼叫端據此不要當成確切整數用。
+/// 由版本字串（`1.20.1`、`1.21.4`、`26.1`）查出 pack_format。
+/// 比表中最新版還新的版本回最後一筆（新版另有範圍制欄位保證相容）。
 pub fn pack_format_for_version(version: &str) -> Option<u32> {
     let target = parse_version(version)?;
-    if target[0] != 1 {
-        return None; // 年份制沒有單一整數格式號
+    if target[0] != 1 && target[0] < 26 {
+        return None;
     }
     let mut best: Option<(Vec<u32>, u32)> = None;
     for (v, fmt) in VERSION_TO_FORMAT {
@@ -396,6 +411,9 @@ pub struct BuildResult {
     pub namespaces: usize,
     pub files_written: usize,
     pub keys_total: usize,
+    /// 與模組自帶 zh_tw 相同、所以沒寫進資源包的條目數
+    #[serde(default)]
+    pub bundled_skipped: usize,
     /// 本次清掉的舊版工具資源包檔名
     #[serde(default)]
     pub pruned_tool_packs: Vec<String>,
@@ -416,6 +434,16 @@ pub fn resourcepacks_root(work_root: &Path) -> PathBuf {
 }
 
 pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildResult, String> {
+    build_resource_pack_skipping_bundled(lang, opts, &LangMap::new())
+}
+
+/// 同 [`build_resource_pack`]，但與模組 JAR 自帶 zh_tw 完全相同的條目不寫進資源包
+/// （見 `native_lang.rs`）。`keys_total` 仍計入全部條目，覆蓋率算法不變。
+pub fn build_resource_pack_skipping_bundled(
+    lang: &LangMap,
+    opts: &BuildOptions,
+    bundled: &LangMap,
+) -> Result<BuildResult, String> {
     cancel::check()?;
     // opts.output_dir = 工作根（翻譯結果），不是使用者隨便選的任意層
     let work_root = PathBuf::from(&opts.output_dir);
@@ -444,6 +472,7 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
 
     let mut files = 1usize;
     let mut keys = 0usize;
+    let mut bundled_skipped = 0usize;
     for (ns, map) in lang {
         cancel::check()?;
         if map.is_empty() {
@@ -453,9 +482,17 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
             continue;
         };
         keys += map.len();
+        let bundled_ns = bundled.get(ns);
+        let mut pairs: Vec<_> = map
+            .iter()
+            .filter(|(k, v)| bundled_ns.and_then(|b| b.get(*k)) != Some(*v))
+            .collect();
+        bundled_skipped += map.len() - pairs.len();
+        if pairs.is_empty() {
+            continue;
+        }
         let dir = pack_dir.join("assets").join(&safe_ns).join("lang");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut pairs: Vec<_> = map.iter().collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
         let obj: serde_json::Map<String, serde_json::Value> = pairs
             .into_iter()
@@ -486,9 +523,7 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
 
     // 必為壓縮檔
     let zip_path = rp_root.join(format!("{safe_name}.zip"));
-    if zip_path.exists() {
-        let _ = fs::remove_file(&zip_path);
-    }
+    // 先寫暫存檔再改名：中途失敗或被取消時，上一份完整的 zip 仍在
     zip_dir_to_file(&pack_dir, &zip_path)?;
 
     let pruned_tool_packs = prune_stale_tool_packs(&rp_root, &safe_name)?;
@@ -499,11 +534,24 @@ pub fn build_resource_pack(lang: &LangMap, opts: &BuildOptions) -> Result<BuildR
         namespaces: lang.len(),
         files_written: files,
         keys_total: keys,
+        bundled_skipped,
         pruned_tool_packs,
     })
 }
 
 fn zip_dir_to_file(dir: &Path, zip_path: &Path) -> Result<(), String> {
+    let tmp = zip_path.with_extension("zip.mcpl-tmp");
+    if let Err(error) = write_zip(dir, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fs::rename(&tmp, zip_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("無法完成 zip（{}）：{e}", zip_path.display())
+    })
+}
+
+fn write_zip(dir: &Path, zip_path: &Path) -> Result<(), String> {
     let file = File::create(zip_path).map_err(|e| format!("無法建立 zip：{e}"))?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -571,10 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn year_based_versions_have_no_single_integer_format() {
-        // 26.x 是範圍制，沒有單一整數格式號
-        assert_eq!(pack_format_for_version("26.2"), None);
-        assert_eq!(pack_format_for_version("27.1"), None);
+    fn verified_formats_for_recent_versions() {
+        assert_eq!(pack_format_for_version("1.21.6"), Some(63));
+        assert_eq!(pack_format_for_version("1.21.7"), Some(64));
+        assert_eq!(pack_format_for_version("1.21.8"), Some(64));
+        assert_eq!(pack_format_for_version("1.21.9"), Some(69));
+        assert_eq!(pack_format_for_version("1.21.10"), Some(69));
+        assert_eq!(pack_format_for_version("1.21.11"), Some(75));
+        assert_eq!(pack_format_for_version("26.1"), Some(84));
+        assert_eq!(pack_format_for_version("26.1.2"), Some(84));
+        assert_eq!(pack_format_for_version("26.2"), Some(88));
+    }
+
+    #[test]
+    fn unknown_newer_versions_use_the_latest_known_format() {
+        assert_eq!(pack_format_for_version("27.1"), Some(97));
+        assert!(is_modern_pack_version("27.1"));
+        let v = pack_mcmeta_value(Some("27.1"), pack_format_for_version("27.1").unwrap(), "x");
+        assert_eq!(v["pack"]["max_format"][0], MODERN_MAX_FORMAT, "未知新版要寬範圍");
     }
 
     #[test]
@@ -605,8 +667,10 @@ mod tests {
         // 新版讀範圍
         assert_eq!(v["pack"]["min_format"][0], MODERN_MIN_FORMAT);
         assert_eq!(v["pack"]["max_format"][0], MODERN_MAX_FORMAT);
-        // 同時保留 legacy 給 1.21.8 以下
+        // 同時保留舊客戶端讀的欄位，範圍與新欄位一致
         assert_eq!(v["pack"]["pack_format"], 68);
+        assert_eq!(v["pack"]["supported_formats"]["min_inclusive"], MODERN_MIN_FORMAT);
+        assert_eq!(v["pack"]["supported_formats"]["max_inclusive"], MODERN_MAX_FORMAT);
     }
 
     #[test]
@@ -620,8 +684,8 @@ mod tests {
     fn unlisted_patch_versions_fall_back_to_their_line() {
         // 1.20.4 沒有單獨列，應沿用 1.20.3 那一線
         assert_eq!(pack_format_for_version("1.20.4"), Some(22));
-        // 比表格最新版還新 → 取最後一筆，而不是回到保底的 15
-        assert_eq!(pack_format_for_version("1.99.0"), Some(68));
+        // 比 1.x 最新版還新 → 取 1.x 最後一筆，而不是回到保底的 15
+        assert_eq!(pack_format_for_version("1.99.0"), Some(75));
     }
 
     #[test]
@@ -653,6 +717,41 @@ mod tests {
     fn missing_instance_falls_back_instead_of_panicking() {
         let fmt = detect_pack_format(Path::new("Z:/definitely/not/here"));
         assert_eq!(fmt, FALLBACK_PACK_FORMAT);
+    }
+
+    #[test]
+    fn pack_only_contains_entries_the_tool_added() {
+        let root = std::env::temp_dir().join(format!("pack_bundled_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut lang: LangMap = HashMap::new();
+        let ns = lang.entry("modx".into()).or_default();
+        ns.insert("item.same".into(), "模組自帶".into());
+        ns.insert("item.fixed".into(), "工具修正".into());
+        ns.insert("item.new".into(), "工具補的".into());
+        lang.entry("onlybundled".into()).or_default().insert("k".into(), "自帶".into());
+        let mut bundled: LangMap = HashMap::new();
+        let b = bundled.entry("modx".into()).or_default();
+        b.insert("item.same".into(), "模組自帶".into());
+        b.insert("item.fixed".into(), "模組原本的錯字".into());
+        bundled.entry("onlybundled".into()).or_default().insert("k".into(), "自帶".into());
+        let opts = BuildOptions {
+            output_dir: root.display().to_string(),
+            pack_folder_name: "bundled".into(),
+            pack_description: "t".into(),
+            pack_format: 15,
+            target_version: Some("1.20.1".into()),
+        };
+        let built = build_resource_pack_skipping_bundled(&lang, &opts, &bundled).unwrap();
+        let text = fs::read_to_string(PathBuf::from(&built.pack_dir).join("assets/modx/lang/zh_tw.json")).unwrap();
+        assert!(!text.contains("item.same"), "與模組自帶相同的不輸出");
+        assert!(text.contains("工具修正") && text.contains("工具補的"));
+        assert!(!PathBuf::from(&built.pack_dir).join("assets/onlybundled").exists());
+        assert_eq!(built.bundled_skipped, 2);
+        assert_eq!(built.keys_total, 4, "覆蓋率計算仍算全部條目");
+        assert!(PathBuf::from(&built.pack_path).is_file());
+        assert!(!root.join("resourcepacks/bundled.zip.mcpl-tmp").exists(), "zip 寫完不留暫存檔");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

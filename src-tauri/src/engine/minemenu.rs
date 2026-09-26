@@ -11,7 +11,7 @@ use super::glossary::load_phrase_dict;
 use super::translation_quality::{is_still_english, is_usable_zh};
 use super::translation_scope::TranslationScope;
 
-/// 翻譯 MineMenu 標題並寫入工作目錄；可選回寫實例（unicode escape）。
+/// 翻譯 MineMenu 標題並寫入翻譯結果資料夾（unicode escape）；不直接改遊戲資料夾。
 pub fn translate_minemenu<F>(
     minecraft_dir: &Path,
     output_dir: &Path,
@@ -93,17 +93,11 @@ where
     }
 
     apply_titles(&mut data, &map);
+    // 只寫進翻譯結果資料夾；放進遊戲一律由「套用到遊戲」處理（先備份、記錄、標記）
     let out_note = write_minemenu_outputs(minecraft_dir, output_dir, &data)?;
-    // 回寫實例（與舊行為一致：直接修正遊戲內 menu，並留 .bak）
-    let final_s = to_ascii_json(&data);
-    let bak = menu.with_extension("json.bak");
-    if !bak.exists() {
-        let _ = fs::copy(&menu, &bak);
-    }
-    fs::write(&menu, final_s.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(format!(
-        "快捷選單：翻譯 {}／待譯 {} 條標題，已寫 unicode 並套用（{out_note}）。",
+        "快捷選單：翻譯 {}／待譯 {} 條標題，已寫進翻譯結果，套用到遊戲時才會放進去（{out_note}）。",
         map.len(),
         need.len()
     ))
@@ -227,6 +221,23 @@ mod tests {
         assert_eq!(v["main"][1]["title"], "Jade Settings");
         let ascii = to_ascii_json(&json!("介面"));
         assert!(ascii.contains("\\u"));
+    }
+
+    #[test]
+    fn translating_never_writes_the_game_menu() {
+        let tmp = std::env::temp_dir().join(format!("minemenu-nowrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mc = tmp.join("mc");
+        let out = tmp.join("out");
+        fs::create_dir_all(mc.join("minemenu")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        let original = "{ \"main\": [ { \"title\": \"Jade Settings\" } ] }";
+        fs::write(mc.join("minemenu/menu.json"), original).unwrap();
+        translate_minemenu(&mc, &out, false, None, |_, _| {}).unwrap();
+        assert_eq!(fs::read_to_string(mc.join("minemenu/menu.json")).unwrap(), original, "翻譯不能直接改遊戲資料夾");
+        assert!(!mc.join("minemenu/menu.json.bak").exists(), "不能在遊戲資料夾留 .bak");
+        assert!(out.join("minemenu/menu.json").is_file(), "結果要寫進翻譯結果資料夾");
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

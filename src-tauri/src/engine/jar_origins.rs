@@ -130,7 +130,12 @@ where
         };
         let stage = stage_root.join("jars").join(&item.jar_key);
         match rebuild_jar(base, &output, &translated, &stage) {
-            Ok(()) => report.files_written += count_files(&translated),
+            Ok(()) => {
+                report.files_written += count_files(&translated);
+                if let Err(e) = super::jar_sources::record_source(work_root, relative, &item.source_jar) {
+                    report.skipped.push(format!("{}：{e}", item.source_jar.display()));
+                }
+            }
             Err(error) => report
                 .skipped
                 .push(format!("{}：{error}", item.source_jar.display())),
