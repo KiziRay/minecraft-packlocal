@@ -69,6 +69,12 @@ mod tests {
             quarantined_files: Vec::new(),
             unconfirmed_files: Vec::new(),
             outdated_mods: Vec::new(),
+            outdated_texts: Vec::new(),
+            stale_outputs: Vec::new(),
+            retired_files: Vec::new(),
+            retire_skipped: Vec::new(),
+            source_removed_texts: Vec::new(),
+            unverifiable_texts: Vec::new(),
             player_summary: String::new(),
             warnings: Vec::new(),
         }

@@ -41,7 +41,7 @@ pub struct ScanReport {
 pub type LangMap = HashMap<String, HashMap<String, String>>;
 
 /// ns -> locale -> map
-type RawLang = HashMap<String, HashMap<String, HashMap<String, String>>>;
+pub(crate) type RawLang = HashMap<String, HashMap<String, HashMap<String, String>>>;
 
 pub fn resolve_minecraft_dir(instance_or_mc: &Path) -> Result<PathBuf, String> {
     let p = instance_or_mc;
@@ -91,6 +91,10 @@ where
     // `translation_scope::remember_mod_identities`。
     let mut mod_identity: HashMap<String, String> = HashMap::new();
 
+    // B3：讀遊戲裡的檔前先確認是原檔（工具寫的讀備份；無法確認的不當已有內容）
+    let tool_index = std::rc::Rc::new(super::tool_products::ToolIndex::for_game(&mc));
+    let _scan_index = super::tool_products::ScanIndexGuard::set(tool_index.clone());
+
     // ─── 1) mods jar / zip（平行掃描；含 Essential 等雙 jar，只讀 lang 不拆包）───
     on_progress(6, "本地整理：列出模組檔…");
     let jar_paths = list_archive_files(&mc.join("mods"), 2);
@@ -109,15 +113,18 @@ where
         let n_workers = worker_count(jar_paths.len(), available, configured);
         let chunk_size = (jar_paths.len() + n_workers - 1) / n_workers;
         let mut handles = Vec::with_capacity(n_workers);
-        for chunk in jar_paths.chunks(chunk_size) {
-            let chunk: Vec<PathBuf> = chunk.to_vec();
+        // B3#7／F5：工具翻過的 JAR 改讀原檔備份；沒有原檔時 zh_tw 只留模組自帶的 key
+        let jar_reads: Vec<super::tool_products::JarRead> = jar_paths.iter().map(|p| tool_index.jar_read(p)).collect();
+        for chunk in jar_reads.chunks(chunk_size) {
+            let chunk: Vec<super::tool_products::JarRead> = chunk.to_vec();
             handles.push(thread::spawn(move || {
                 let mut local_raw: RawLang = HashMap::new();
                 let mut local_errors: Vec<String> = Vec::new();
                 let mut local_skips = 0usize;
                 let mut local_jars = 0usize;
                 let mut local_identity: HashMap<String, String> = HashMap::new();
-                for path in &chunk {
+                for read in &chunk {
+                    let path = &read.path;
                     if cancel::is_cancelled() {
                         break;
                     }
@@ -127,14 +134,21 @@ where
                         local_errors.push(format!("{}: {}", name, e));
                         continue;
                     }
+                    let mut tool_jar_raw: RawLang = HashMap::new();
+                    let target = if read.keep_zh_tw_only.is_some() { &mut tool_jar_raw } else { &mut local_raw };
                     if let Err(e) = harvest_archive(
                         path,
-                        &mut local_raw,
+                        target,
                         &mut local_errors,
                         &mut local_skips,
                         &mut local_identity,
+                        true,
                     ) {
                         local_errors.push(format!("{}: {}", name, e));
+                    }
+                    if let Some(keep) = &read.keep_zh_tw_only {
+                        super::lang_overlay::keep_native_zh_tw_only(&mut tool_jar_raw, keep);
+                        merge_raw_lang(&mut local_raw, tool_jar_raw);
                     }
                 }
                 (local_raw, local_errors, local_jars, local_skips, local_identity)
@@ -187,6 +201,10 @@ where
         .filter_map(|(ns, locales)| locales.get("zh_tw").map(|tw| (ns.clone(), tw.clone())))
         .collect();
 
+    // B3#7 來源階層：資源包 ＞ 鬆散語言檔 ＞ 模組（遊戲實際載入的順序），各層分開收再疊上去
+    let mut pack_raw: RawLang = HashMap::new();
+    let mut loose_raw: RawLang = HashMap::new();
+
     // ─── 2) resourcepacks（資料夾 + zip）───
     on_progress(23, "本地整理：讀資源包語言…");
     let rp_root = mc.join("resourcepacks");
@@ -219,8 +237,12 @@ where
                     truncate_name(&file_name_str(path), 36)
                 ),
             );
+            // B3#7：本工具自己的翻譯資源包（機翻）不當成已有中文
+            if !tool_index.is_original(path) {
+                continue;
+            }
             if path.is_dir() {
-                match harvest_folder_pack(path, &mut raw, &mut errors, &mut non_priority_lang_skips)
+                match harvest_folder_pack(path, &mut pack_raw, &mut errors, &mut non_priority_lang_skips)
                 {
                     Ok(n) => loose += n,
                     Err(e) => errors.push(format!("{}: {}", file_name_str(path), e)),
@@ -234,10 +256,11 @@ where
                 let mut ignored_identity: HashMap<String, String> = HashMap::new();
                 if let Err(e) = harvest_archive(
                     path,
-                    &mut raw,
+                    &mut pack_raw,
                     &mut errors,
                     &mut non_priority_lang_skips,
                     &mut ignored_identity,
+                    false,
                 ) {
                     errors.push(format!("{}: {}", file_name_str(path), e));
                 }
@@ -270,7 +293,7 @@ where
         }
         match harvest_loose_lang_tree(
             &root,
-            &mut raw,
+            &mut loose_raw,
             *depth,
             &mut errors,
             &mut non_priority_lang_skips,
@@ -309,7 +332,7 @@ where
         }
         match harvest_loose_lang_tree(
             &root,
-            &mut raw,
+            &mut loose_raw,
             12,
             &mut errors,
             &mut non_priority_lang_skips,
@@ -319,6 +342,9 @@ where
             Err(e) => errors.push(format!("{}: {e}", root.display())),
         }
     }
+
+    super::lang_overlay::overlay_raw(&mut raw, loose_raw);
+    super::lang_overlay::overlay_raw(&mut raw, pack_raw);
 
     let cache_hits = scan_cache.hits();
     if let Err(error) = scan_cache.save() {
@@ -874,6 +900,10 @@ fn harvest_loose_lang_tree(
         {
             continue;
         }
+        // B3#7：本工具寫進遊戲的語言檔（有標記、內容未被改過）不收
+        if (s.contains("/lang/") || s.contains(r"\lang\")) &&super::tool_products::is_tool_written_file(path) {
+            continue;
+        }
         if let Some(cached) = cache.get(path) {
             raw.entry(cached.namespace)
                 .or_default()
@@ -912,6 +942,9 @@ fn try_ingest_lang_file(
         return false;
     }
     if !(lower.ends_with(".json") || lower.ends_with(".lang")) {
+        return false;
+    }
+    if super::tool_products::is_tool_written_file(path) {
         return false;
     }
     let parts: Vec<&str> = lower.split('/').collect();
@@ -995,6 +1028,7 @@ fn harvest_archive(
     errors: &mut Vec<String>,
     non_priority_skips: &mut usize,
     mod_identity: &mut HashMap<String, String>,
+    allow_nested: bool,
 ) -> Result<(), String> {
     // 這個 jar 的識別＝**含版本**的檔名（去掉副檔名）。
     // 共享庫要靠它分辨「不同整合包但同一個模組的同一版本」，
@@ -1005,6 +1039,21 @@ fn harvest_archive(
         .unwrap_or_default();
     let f = File::open(path).map_err(|e| e.to_string())?;
     let mut zip = ZipArchive::new(f).map_err(|e| e.to_string())?;
+    harvest_zip(&mut zip, &file_name_str(path), &jar_identity, raw, errors, non_priority_skips, mod_identity, allow_nested)
+}
+
+/// B3#2：`harvest_archive` 的本體，子 JAR（`META-INF/jars/*.jar`，只遞迴一層）也用它。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn harvest_zip<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    label: &str,
+    jar_identity: &str,
+    raw: &mut RawLang,
+    errors: &mut Vec<String>,
+    non_priority_skips: &mut usize,
+    mod_identity: &mut HashMap<String, String>,
+    allow_nested: bool,
+) -> Result<(), String> {
     if zip.len() > 80_000 {
         return Err("壓縮包條目過多，已略過。".into());
     }
@@ -1019,6 +1068,10 @@ fn harvest_archive(
         }
         let name = name_raw.replace('\\', "/");
         let lower = name.to_ascii_lowercase();
+        if allow_nested && super::jar_nested::is_nested_jar(&lower) {
+            super::jar_nested::harvest(&mut file, label, &name, raw, errors, non_priority_skips, mod_identity);
+            continue;
+        }
         if !lower.contains("/lang/") {
             continue;
         }
@@ -1053,7 +1106,7 @@ fn harvest_archive(
         if !jar_identity.is_empty() {
             mod_identity
                 .entry(ns.clone())
-                .or_insert_with(|| jar_identity.clone());
+                .or_insert_with(|| jar_identity.to_string());
         }
         let fname = parts[li + 1];
         let locale = fname
@@ -1097,7 +1150,7 @@ fn harvest_archive(
                         &locale,
                         format!(
                             "語言檔解析失敗（已略過）：{}!{} — {e}",
-                            file_name_str(path),
+                            label,
                             name
                         ),
                         errors,

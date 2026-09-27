@@ -325,6 +325,11 @@ pub fn backup_container(mc: &Path) -> PathBuf {
     store_root().join("apply-backups").join(instance_key(mc))
 }
 
+/// B3 審查 F-c：`.mcpl` 被刪、依紀錄認回的識別碼對應的原檔備份區（只讀用）。
+pub fn instance_backup_dir_for_id(id: &str) -> PathBuf {
+    store_root().join("apply-backups").join(id).join(INSTANCE_BACKUP_DIR)
+}
+
 pub fn instance_backup_dir(mc: &Path) -> PathBuf {
     backup_container(mc).join(INSTANCE_BACKUP_DIR)
 }

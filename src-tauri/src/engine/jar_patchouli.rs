@@ -57,6 +57,7 @@ where
         return Ok(report);
     }
 
+    let tool_index = super::tool_products::ToolIndex::for_game(&mc);
     let stage_root = work_root.join(".jar-patchouli-stage");
     let translated_root = work_root.join(".jar-patchouli-translated");
     let _ = fs::remove_dir_all(&stage_root);
@@ -71,8 +72,11 @@ where
             1 + ((index * 40) / jars.len().max(1)) as u8,
             &format!("JAR 書本：模組 {}/{}", index + 1, jars.len()),
         );
-        match extract_patchouli(jar, &stage_root) {
-            Ok(Some(item)) => {
+        // B3#7：工具翻過的 JAR 改讀原檔備份；沒有原檔就不收它的 zh_tw 書頁（可能是機翻）
+        let read = tool_index.jar_read(jar);
+        match extract_patchouli(&read.path, &stage_root, read.keep_zh_tw_only.is_some()) {
+            Ok(Some(mut item)) => {
+                item.source_jar = jar.clone();
                 report.books_found += item.entries_scanned;
                 extracted.push(item);
             }
@@ -89,6 +93,8 @@ where
         on_progress(42 + pct.saturating_mul(40) / 100, msg);
     })?;
     report.strings_translated = overlay.strings_translated;
+    // B3#5：assets/ 底下的書本 zh_tw 放進主資源包（不改寫模組 JAR）；data/ 書本仍需重建 JAR
+    report.files_written += super::pack_assets::move_into(&translated_root, work_root)?;
 
     for (index, item) in extracted.iter().enumerate() {
         cancel::check()?;
@@ -182,7 +188,7 @@ fn list_jars(mods: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn extract_patchouli(source_jar: &Path, stage_root: &Path) -> Result<Option<ExtractedJar>, String> {
+fn extract_patchouli(source_jar: &Path, stage_root: &Path, drop_zh_tw: bool) -> Result<Option<ExtractedJar>, String> {
     check_jar_size(source_jar)?;
     let file = File::open(source_jar).map_err(|e| e.to_string())?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("JAR 不是有效 ZIP：{e}"))?;
@@ -203,6 +209,9 @@ fn extract_patchouli(source_jar: &Path, stage_root: &Path) -> Result<Option<Extr
             has_signature = true;
         }
         if !is_patchouli_book_entry(&name) || entry.size() > MAX_ZIP_ENTRY_BYTES {
+            continue;
+        }
+        if drop_zh_tw && name.to_ascii_lowercase().split('/').any(|seg| seg == "zh_tw") {
             continue;
         }
         let target = stage.join(&name);
@@ -241,9 +250,11 @@ fn is_patchouli_book_entry(name: &str) -> bool {
     // （單一整合包內就有 13 個、合計 2400+ 條書頁文字）全數略過不翻，
     // 是「掃描/整合不夠全面」回報的主要根因。rebuild_jar() 只按相對路徑比對，
     // 不假設根目錄，所以這裡放寬不需要動其他地方。
-    (lower.starts_with("data/") || lower.starts_with("assets/"))
+    ((lower.starts_with("data/") || lower.starts_with("assets/"))
         && lower.contains("/patchouli_books/")
-        && (lower.ends_with(".json") || lower.ends_with(".txt"))
+        && (lower.ends_with(".json") || lower.ends_with(".txt")))
+        // B3#4：GuideME（AE2 指南）／Lavender 手冊頁，翻譯後放進主資源包
+        || super::markdown_text::is_guide_md_entry(&lower)
 }
 
 fn copy_translated_data_for_debug(translated_root: &Path, destination: &Path) -> Result<usize, String> {
@@ -441,19 +452,41 @@ mod tests {
         assert!(report.books_found >= 1, "{report:?}");
         assert!(report.strings_translated >= 1, "{}", report.note);
 
-        let out_jar = work.join("jar-translated/assets_guidebook.jar");
-        assert!(out_jar.is_file(), "{}", report.note);
-        let file = File::open(&out_jar).unwrap();
-        let mut zip = ZipArchive::new(file).unwrap();
-        let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().replace('\\', "/"))
-            .collect();
-        assert!(
-            names
-                .iter()
-                .any(|n| n.contains("assets/example/patchouli_books/guide/zh_tw/categories/village.json")),
-            "assets/ 根目錄的書頁應該也要被翻譯並寫回：{names:?}"
-        );
+        // B3#5：assets/ 書本改放進主資源包（pack-assets），不再重建模組 JAR
+        let zh = work.join("pack-assets/assets/example/patchouli_books/guide/zh_tw/categories/village.json");
+        let text = fs::read_to_string(&zh)
+            .unwrap_or_else(|_| panic!("assets/ 根目錄的書頁要翻譯並放進主資源包：{}", report.note));
+        assert!(text.contains("村莊"), "{text}");
+        assert!(!work.join("jar-translated/assets_guidebook.jar").exists(), "只有 assets 書本時不改寫 JAR");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b3_jar_book_with_human_zh_tw_is_not_overwritten() {
+        let root = std::env::temp_dir().join(format!("jar_patchouli_human_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("work");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        {
+            let file = File::create(mc.join("mods/human.jar")).unwrap();
+            let mut writer = ZipWriter::new(file);
+            for (name, body) in [
+                ("assets/h/patchouli_books/g/zh_cn/entries/e.json", r#"{"name":"简体说明"}"#),
+                ("assets/h/patchouli_books/g/zh_tw/entries/e.json", r#"{"name":"人工繁中"}"#),
+                ("assets/h/patchouli_books/g/zh_cn/entries/f.json", r#"{"name":"简体另一页"}"#),
+            ] {
+                writer.start_file(name, SimpleFileOptions::default()).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        translate_jar_patchouli(&mc, &work, false, None, |_, _| {}).unwrap();
+        let base = work.join("pack-assets/assets/h/patchouli_books/g/zh_tw/entries");
+        assert!(!base.join("e.json").exists(), "已有人工 zh_tw 的書頁不覆蓋");
+        let f = fs::read_to_string(base.join("f.json")).expect("缺的頁用簡中轉繁補");
+        assert!(f.contains("簡體另一頁"), "{f}");
         let _ = fs::remove_dir_all(root);
     }
 

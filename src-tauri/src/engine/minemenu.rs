@@ -22,12 +22,20 @@ pub fn translate_minemenu<F>(
 where
     F: FnMut(u8, &str),
 {
+    // 審查 F1：本輪產出清單（先清掉快捷選單上一輪的條目）
+    super::text_sources::begin(output_dir, "minemenu");
+    // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    let round: Result<_, String> = (|| {
     let menu = minecraft_dir.join("minemenu").join("menu.json");
     if !menu.is_file() {
         return Ok("此整合包沒有快捷選單設定，已跳過（正常）。".into());
     }
     on_progress(5, "快捷選單：讀取 menu.json…");
-    let text = fs::read_to_string(&menu).map_err(|e| e.to_string())?;
+    // 審查 F2：讀原檔（遊戲裡是工具寫的版本就讀原檔備份；沒有就不翻並列出）
+    let index = super::tool_products::ToolIndex::for_game(minecraft_dir);
+    let Some((read, text)) = super::tool_products::read_game_text(&index, minecraft_dir, &menu) else {
+        return Ok("快捷選單：遊戲裡是本工具先前寫入的版本、又沒有原檔備份，這次不翻（需要原檔才能翻譯）。".into());
+    };
     let mut data: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
     let mut titles = Vec::new();
@@ -44,7 +52,7 @@ where
 
     if need.is_empty() {
         // 仍確保 unicode 寫出，避免既有中文亂碼
-        let out = write_minemenu_outputs(minecraft_dir, output_dir, &data)?;
+        let out = write_minemenu_outputs(minecraft_dir, output_dir, &data, &read)?;
         return Ok(format!(
             "快捷選單：標題皆已可用中文；已寫出 unicode 副本（{out}）。"
         ));
@@ -95,27 +103,35 @@ where
 
     apply_titles(&mut data, &map);
     // 只寫進翻譯結果資料夾；放進遊戲一律由「套用到遊戲」處理（先備份、記錄、標記）
-    let out_note = write_minemenu_outputs(minecraft_dir, output_dir, &data)?;
+    let out_note = write_minemenu_outputs(minecraft_dir, output_dir, &data, &read)?;
 
     Ok(format!(
         "快捷選單：翻譯 {}／待譯 {} 條標題，已寫進翻譯結果，套用到遊戲時才會放進去（{out_note}）。",
         map.len(),
         need.len()
     ))
+    })();
+    if round.is_ok() {
+        super::text_sources::commit(output_dir, "minemenu", minecraft_dir);
+    }
+    round
 }
 
 fn write_minemenu_outputs(
-    _minecraft_dir: &Path,
+    minecraft_dir: &Path,
     output_dir: &Path,
     data: &Value,
+    read: &Path,
 ) -> Result<String, String> {
     let out_menu = output_dir.join("minemenu");
     fs::create_dir_all(&out_menu).map_err(|e| e.to_string())?;
     let dest = out_menu.join("menu.json");
     let final_s = to_ascii_json(data);
-    let original = fs::read(_minecraft_dir.join("minemenu").join("menu.json")).unwrap_or_default();
+    let original = fs::read(read).unwrap_or_default();
     let bytes = super::output_guard::finish_file("minemenu/menu.json", &original, final_s.into_bytes());
     fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    let game_menu = minecraft_dir.join("minemenu").join("menu.json");
+    super::text_sources::record(output_dir, &dest, minecraft_dir, &game_menu, read, "minemenu");
     Ok(dest.display().to_string())
 }
 

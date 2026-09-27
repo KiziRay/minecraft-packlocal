@@ -126,6 +126,8 @@ pub struct DisplaySafety {
     pub unverified_count: usize,
     /// 缺原文未完整檢查的明細（代碼 missing_source）
     pub unverified: Vec<Rejected>,
+    /// B3：遊戲裡是本工具寫的版本、又沒有原檔備份，所以沒拿來當原文翻譯的檔（遊戲相對路徑）
+    pub needs_original: Vec<String>,
 }
 
 // ─── 本輪紀錄 ───────────────────────────────────────────────
@@ -187,6 +189,21 @@ fn record_unverified(file: &str, key: &str, translated: &str) {
             });
         }
     });
+}
+
+/// B3：「需要原檔才能翻譯」——遊戲裡是工具內容、又沒有原檔，這個檔沒有翻（不拿工具內容當原文）。
+pub fn record_needs_original(rel: &str) {
+    with_log(|log| {
+        if !log.needs_original.iter().any(|r| r == rel) {
+            log.needs_original.push(rel.to_string());
+        }
+    });
+}
+
+/// 測試：目前記下的「需要原檔」清單（不清空）。
+#[cfg(test)]
+pub fn peek_needs_original() -> Vec<String> {
+    with_log(|log| log.needs_original.clone())
 }
 
 /// 取出本輪紀錄並清空（翻譯結果收尾時呼叫一次）。同一個檔案裡重複的同一條只列一次。
@@ -352,6 +369,11 @@ fn check_entry_with(source: &str, translated: &str, allow_long: bool) -> Result<
 /// 檢查並記錄一條譯文；回傳要寫出的文字（不合格時就是原文）。
 pub fn check(file: &str, key: &str, source: &str, translated: &str) -> String {
     check_with(file, key, source, translated, false)
+}
+
+/// B3：整合包裡本來就有的人工中文（人工 zh_tw、簡中轉繁）：只免長度，其餘照常檢查（同參考包 G2.25）。
+pub fn check_human(file: &str, key: &str, source: &str, translated: &str) -> String {
+    check_with(file, key, source, translated, true)
 }
 
 fn check_with(file: &str, key: &str, source: &str, translated: &str, allow_long: bool) -> String {

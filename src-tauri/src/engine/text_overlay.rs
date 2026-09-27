@@ -113,6 +113,12 @@ where
             minecraft_dir.display()
         ));
     }
+    // 審查 F1：本輪產出清單（先清掉覆寫文字上一輪的條目）
+    super::text_sources::begin(output_dir, "overlay");
+    // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    let round: Result<_, String> = (|| {
+    // 審查 F2：來源必須是原檔
+    let index = super::tool_products::ToolIndex::for_game(minecraft_dir);
 
     on_progress(
         3,
@@ -141,8 +147,32 @@ where
     let mut ns_by_src: HashMap<String, String> = HashMap::new();
     let mut parse_failures: Vec<String> = Vec::new();
 
+    // B3#7：語言檔不再原地改寫，改由 lang_overlay 依英文檔產出 zh_tw
+    let lang_jobs = super::lang_overlay::collect_jobs(minecraft_dir, &files);
+    for job in &lang_jobs {
+        for s in super::lang_overlay::candidates(std::slice::from_ref(job)) {
+            if seen.insert(s.clone(), ()).is_none() {
+                super::shared_identity::remember_ns(&mut ns_by_src, &s, &job.en_path, scope);
+                unique.push(s);
+            }
+        }
+    }
     for path in &files {
-        match load_payload(path) {
+        if super::lang_overlay::is_lang_file(path) {
+            continue;
+        }
+        let read = match index.read_source(path) {
+            super::tool_products::ReadSource::Use(read) => read,
+            super::tool_products::ReadSource::NeedsOriginal => {
+                super::output_guard::record_needs_original(&super::apply_record::rel_key(minecraft_dir, path));
+                continue;
+            }
+        };
+        match load_payload(&read).map(|mut p| {
+            p.read = read.clone();
+            p.path = path.clone();
+            p
+        }) {
             Ok(payload) => {
                 for s in payload.collect_strings() {
                     if should_translate_overlay_string(&s) && seen.insert(s.clone(), ()).is_none() {
@@ -181,7 +211,7 @@ where
         ),
     );
 
-    if unique.is_empty() {
+    if unique.is_empty() && lang_jobs.is_empty() {
         return Ok(OverlayTranslateResult {
             files_written: 0,
             strings_translated: 0,
@@ -284,7 +314,7 @@ where
         on_progress(50, "覆寫文字：未勾 AI，僅 OpenCC 處理既有中文");
     }
 
-    if map.is_empty() {
+    if map.is_empty() && lang_jobs.iter().all(|job| job.fixed.is_empty()) {
         return Ok(OverlayTranslateResult {
             files_written: 0,
             strings_translated: 0,
@@ -321,33 +351,46 @@ where
                 .path
                 .strip_prefix(minecraft_dir)
                 .unwrap_or(payload.path.as_path());
-            let out_path = output_dir.join(rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            // B3#5／#7：有語系資料夾的書頁只寫 zh_tw 版本，不原地改寫英文（或其他語系）原檔
+            let target = book_locale_to_zh_tw_rel(rel).or_else(|| super::markdown_text::guide_zh_tw_rel(rel));
+            let Some((zh_rel, priority)) = target else {
+                let out_path = output_dir.join(rel);
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&out_path, &new_bytes)
+                    .map_err(|e| format!("{}: {e}", out_path.display()))?;
+                super::text_sources::record(output_dir, &out_path, minecraft_dir, &payload.path, &payload.read, "overlay");
+                written += 1;
+                continue;
+            };
+            // 已有人工 zh_tw（不是本工具寫的）就不覆蓋
+            let game_zh = minecraft_dir.join(&zh_rel);
+            if zh_rel != rel && game_zh.is_file() && index.is_original(&game_zh) {
+                continue;
             }
-            fs::write(&out_path, &new_bytes)
-                .map_err(|e| format!("{}: {e}", out_path.display()))?;
-            written += 1;
-            if let Some((zh_rel, priority)) = book_locale_to_zh_tw_rel(rel) {
-                let better = match zh_tw_written.get(&zh_rel) {
-                    Some(&existing) => priority < existing,
-                    None => true,
-                };
-                if better {
-                    let zh_out = output_dir.join(&zh_rel);
-                    if let Some(parent) = zh_out.parent() {
-                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                    }
-                    fs::write(&zh_out, &new_bytes)
-                        .map_err(|e| format!("{}: {e}", zh_out.display()))?;
-                    if zh_tw_written.insert(zh_rel, priority).is_none() {
-                        patchouli_zh_tw += 1;
-                        written += 1;
-                    }
+            let better = match zh_tw_written.get(&zh_rel) {
+                Some(&existing) => priority < existing,
+                None => true,
+            };
+            if better {
+                // assets 類書本放進主資源包（pack-assets），不寫回遊戲裡別人的資料夾
+                let zh_out = output_dir.join(super::pack_assets::book_destination(&zh_rel));
+                if let Some(parent) = zh_out.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&zh_out, &new_bytes)
+                    .map_err(|e| format!("{}: {e}", zh_out.display()))?;
+                super::text_sources::record(output_dir, &zh_out, minecraft_dir, &payload.path, &payload.read, "overlay");
+                if zh_tw_written.insert(zh_rel, priority).is_none() {
+                    patchouli_zh_tw += 1;
+                    written += 1;
                 }
             }
         }
     }
+
+    written += super::lang_overlay::write_outputs(minecraft_dir, &lang_jobs, &map, output_dir)?;
 
     let coverage_hint = if unique.is_empty() {
         String::new()
@@ -379,6 +422,11 @@ where
         strings_translated: map.len(),
         note,
     })
+    })();
+    if round.is_ok() {
+        super::text_sources::commit(output_dir, "overlay", minecraft_dir);
+    }
+    round
 }
 
 /// 把覆寫檔的解析失敗追加到結果目錄的錯誤日誌，讓使用者查得到（不再靜默）。
@@ -438,6 +486,8 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
         mc.join("data"),
         mc.join("assets"),
         mc.join("kubejs").join("data"),
+        // B3#6：KubeJS 以資源包方式載入的 assets（書本、手冊）
+        mc.join("kubejs").join("assets"),
     ];
     for root in &data_pack_roots {
         if !root.is_dir() {
@@ -450,6 +500,12 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
         }
         for p in walk_files(root, &["txt"]) {
             if is_book_locale_txt(&p) {
+                push(p);
+            }
+        }
+        // B3#4：GuideME（AE2 指南）／Lavender 手冊頁
+        for p in walk_files(root, &["md"]) {
+            if super::markdown_text::is_guide_md_path(&p) {
                 push(p);
             }
         }
@@ -466,12 +522,9 @@ fn collect_overlay_files(mc: &Path) -> Vec<PathBuf> {
                 .map(|s| s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("json5"))
                 .unwrap_or(false);
             let is_known_text_root = is_config_text_path(&p);
-            let is_properties = p
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("properties"));
+            // B3#8：.properties 只收已知的顯示文字路徑（一般設定檔的值是選項，翻了會壞）
             if (is_json && is_pack_text_json(&p))
-                || ((is_known_text_root || is_properties) && looks_text_file(&p))
+                || (is_known_text_root && looks_text_file(&p))
             {
                 push(p);
             }
@@ -793,6 +846,8 @@ enum StringMode {
 
 struct FilePayload {
     path: PathBuf,
+    /// 實際讀的原檔（遊戲裡的原檔或原檔備份）
+    read: PathBuf,
     kind: FileKind,
     mode: StringMode,
     raw: String,
@@ -829,12 +884,8 @@ impl FilePayload {
                     .filter_map(|c| c.get(1).map(|m| unescape_json_str(m.as_str())))
                     .collect()
             }
-            FileKind::Markdown => self
-                .raw
-                .lines()
-                .filter(|line| !line.trim().is_empty() && line.trim() != "```")
-                .map(str::to_string)
-                .collect(),
+            // B3#4：只取散文，標籤、連結、程式碼、frontmatter id 不動
+            FileKind::Markdown => super::markdown_text::segments(&self.raw),
             FileKind::WholeText => {
                 let t = self.raw.trim();
                 if t.is_empty() {
@@ -907,27 +958,7 @@ impl FilePayload {
                     Ok(None)
                 }
             }
-            FileKind::Markdown => {
-                let mut changed = false;
-                let mut output = String::with_capacity(self.raw.len());
-                for line in self.raw.split_inclusive('\n') {
-                    let has_newline = line.ends_with('\n');
-                    let content = line.strip_suffix('\n').unwrap_or(line);
-                    let replacement = map.get(content).map(String::as_str).unwrap_or(content);
-                    if replacement != content {
-                        changed = true;
-                    }
-                    output.push_str(replacement);
-                    if has_newline {
-                        output.push('\n');
-                    }
-                }
-                if changed {
-                    Ok(Some(output.into_bytes()))
-                } else {
-                    Ok(None)
-                }
-            }
+            FileKind::Markdown => Ok(super::markdown_text::apply(&self.raw, map).map(String::into_bytes)),
             FileKind::WholeText => {
                 let trimmed = self.raw.trim();
                 let Some(replacement) = map.get(trimmed).or_else(|| map.get(&self.raw)) else {
@@ -1059,6 +1090,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
             .map_err(|e| format!("{} 解析失敗：{e}", path.display()))?;
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Json,
             mode: string_mode_for_path(path),
             raw,
@@ -1068,6 +1100,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     if ext == "md" {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Markdown,
             mode: StringMode::All,
             raw,
@@ -1077,6 +1110,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     if ext == "properties" || ext == "local" {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Properties,
             mode: StringMode::All,
             raw,
@@ -1096,6 +1130,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Properties,
             mode: StringMode::FancyMenuDisplayKeys,
             raw,
@@ -1106,6 +1141,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     if path_has_segment(path, "starterkit") && (ext == "txt" || ext.is_empty()) {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Markdown,
             mode: StringMode::All,
             raw,
@@ -1116,6 +1152,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     if is_book_prose_txt(path) {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::WholeText,
             mode: StringMode::All,
             raw,
@@ -1126,6 +1163,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     if super::lenient_json::parse(&raw).is_ok() {
         return Ok(FilePayload {
             path: path.to_path_buf(),
+            read: path.to_path_buf(),
             kind: FileKind::Json,
             mode: string_mode_for_path(path),
             raw,
@@ -1133,6 +1171,7 @@ fn load_payload(path: &Path) -> Result<FilePayload, String> {
     }
     Ok(FilePayload {
         path: path.to_path_buf(),
+        read: path.to_path_buf(),
         kind: FileKind::QuotedText,
         mode: StringMode::All,
         raw,
@@ -1575,13 +1614,14 @@ fn is_locale_folder_name(seg: &str) -> bool {
 
 /// 同一個 `zh_tw` 目的地可能有好幾個來源語系搶著寫，數字小的優先。
 ///
-/// 英文原文最準（模組作者寫的就是它），簡中次之（轉繁品質可預期），
+/// 簡中轉繁最優先（人工譯文，轉換品質可預期），英文送 AI 次之，
 /// 其他語言（烏克蘭文、俄文…）只在完全沒有更好的來源時才拿來墊底。
 fn book_locale_priority(locale: &str) -> u8 {
+    // B3#5：簡中轉台灣繁（人工翻譯＋固定轉換）優先於英文送 AI
     match locale {
-        "en_us" => 0,
-        "zh_cn" => 1,
-        "zh_hk" => 2,
+        "zh_cn" => 0,
+        "zh_hk" => 1,
+        "en_us" => 2,
         _ => 3,
     }
 }
@@ -2014,6 +2054,7 @@ mod tests {
             "assets/alexsmobs/book/animal_dictionary/zh_cn/root.txt"
         )));
         let payload = FilePayload {
+            read: PathBuf::new(),
             path: PathBuf::from("assets/alexsmobs/book/animal_dictionary/en_us/root.txt"),
             kind: FileKind::WholeText,
             mode: StringMode::All,
@@ -2117,6 +2158,7 @@ custom_element_layer_name = Side Bar Left
 [groups:][instances:]
 ";
         let payload = FilePayload {
+            read: PathBuf::new(),
             path: PathBuf::from("config/fancymenu/customization/Prominence.txt"),
             kind: FileKind::Properties,
             mode: StringMode::FancyMenuDisplayKeys,
@@ -2152,6 +2194,7 @@ source = [source:local]/config/fancymenu/assets/welcome_screen/who_you_are.png
 label = Start Journey
 ";
         let payload = FilePayload {
+            read: PathBuf::new(),
             path: PathBuf::from("config/fancymenu/customization/welcomescreen_welcome_layout.txt"),
             kind: FileKind::Properties,
             mode: StringMode::FancyMenuDisplayKeys,

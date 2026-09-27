@@ -56,7 +56,18 @@ pub fn rewrite_translated_jars(
     let mut guarded = translated.clone();
     super::output_guard::guard_langmap("模組內建語言檔", &mut guarded, Some(fallback_english));
     let values = merge_values(&guarded, fallback_english);
-    let jars = list_jars(&mods);
+    // 審查 F2：改寫 JAR 必須以原檔為底（遊戲裡是工具翻過的版本就讀原檔備份；沒有就不改寫並列出）
+    let tool_index = super::tool_products::ToolIndex::for_game(&mc);
+    let jars: Vec<(PathBuf, PathBuf)> = list_jars(&mods)
+        .into_iter()
+        .filter_map(|jar| match tool_index.read_source(&jar) {
+            super::tool_products::ReadSource::Use(read) => Some((jar, read)),
+            super::tool_products::ReadSource::NeedsOriginal => {
+                super::output_guard::record_needs_original(&super::apply_record::rel_key(&mc, &jar));
+                None
+            }
+        })
+        .collect();
     report.jars_scanned = jars.len();
 
     let workers = std::thread::available_parallelism()
@@ -71,8 +82,9 @@ pub fn rewrite_translated_jars(
         cancel::check()?;
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for jar in chunk {
+            for (jar, read) in chunk {
                 let jar = jar.clone();
+                let read = read.clone();
                 let output_root = output_root.clone();
                 let mods = mods.clone();
                 let values = &values;
@@ -91,11 +103,16 @@ pub fn rewrite_translated_jars(
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown.jar")
                         .to_string();
-                    match rewrite_one_jar(&jar, &output, values, translated) {
+                    match rewrite_one_jar(&read, &output, values, translated) {
                         Ok(stats) if stats.changed => {
-                            // 記下這份翻譯版是從哪個模組檔做的，套用前確認遊戲裡還是同一個
-                            super::jar_sources::record_source(&work_root, &relative, &jar)
-                                .map_err(|e| format!("{stem}：{e}"))?;
+                            // 記下這份翻譯版是從哪個原檔做的（指紋以原檔為準），以及原檔自帶的 zh_tw key（F5）
+                            super::jar_sources::record_source_with_native(
+                                &work_root,
+                                &relative,
+                                &read,
+                                Some(stats.native_zh_tw.clone()),
+                            )
+                            .map_err(|e| format!("{stem}：{e}"))?;
                             Ok(Some((stem, stats)))
                         }
                         Ok(_) => {
@@ -137,10 +154,28 @@ pub fn rewrite_translated_jars(
 
 #[derive(Debug, Default)]
 struct RewriteStats {
+    /// 原檔自帶的 zh_tw key（ns → keys），審查 F5
+    native_zh_tw: BTreeMap<String, Vec<String>>,
     changed: bool,
     files_written: usize,
     keys_written: usize,
     fallback_keys_kept: usize,
+}
+
+/// 原檔 zh_tw 語言檔裡的 key（json 或舊式 .lang）。讀不懂回空。
+fn native_keys_of(bytes: &[u8], extension: &str) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim_start_matches('\u{FEFF}');
+    let mut keys: Vec<String> = if extension == "json" {
+        super::lenient_json::parse_object_strings(text).map(|m| m.into_keys().collect()).unwrap_or_default()
+    } else {
+        text.lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
+            .collect()
+    };
+    keys.sort();
+    keys
 }
 
 fn merge_values(translated: &LangMap, fallback_english: &LangMap) -> HashMap<String, BTreeMap<String, String>> {
@@ -208,9 +243,13 @@ fn rewrite_one_jar(
         if let Some((namespace, _, extension)) = parse_language_path(&name) {
             jar_namespaces.insert(namespace.clone());
             if let Some((directory, _)) = name.rsplit_once('/') {
-                language_templates
+                // B3#8：新增 zh_tw 時優先照 json 範本（舊式 .lang 只在沒有 json 時才用）
+                let slot = language_templates
                     .entry(namespace.clone())
                     .or_insert_with(|| (directory.to_string(), extension.clone()));
+                if slot.1 != "json" && extension == "json" {
+                    *slot = (directory.to_string(), extension.clone());
+                }
             }
         }
         if let Some((namespace, extension)) = parse_zh_tw_path(&name) {
@@ -287,6 +326,7 @@ fn rewrite_one_jar(
             }
             let mut original = Vec::new();
             entry.read_to_end(&mut original).map_err(|e| e.to_string())?;
+            let native_keys = native_keys_of(&original, &extension);
             let content = render_language_file(map, &extension, Some(&original))?;
             let content = super::output_guard::finish_file(&name, &original, content);
             let options = entry.options();
@@ -295,6 +335,7 @@ fn rewrite_one_jar(
                 .map_err(|e| format!("寫入 JAR 項目失敗：{e}"))?;
             output_zip.write_all(&content).map_err(|e| e.to_string())?;
             written_names.insert(name);
+            stats.native_zh_tw.entry(namespace.clone()).or_default().extend(native_keys);
             stats.files_written += 1;
             if counted_namespaces.insert(namespace.clone()) {
                 stats.keys_written += map.len();
@@ -541,6 +582,29 @@ mod tests {
         .unwrap();
         assert_eq!(sources["example.jar"]["name"], "example.jar");
         assert_eq!(sources["example.jar"]["sha256"], crate::engine::hashutil::sha256_hex(&original));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b3_new_zh_tw_prefers_json_template_over_legacy_lang() {
+        let root = std::env::temp_dir().join(format!("jar_translate_jsonpref_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("minecraft/mods")).unwrap();
+        let file = File::create(root.join("minecraft/mods/example.jar")).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("assets/example/lang/de_de.lang", options).unwrap();
+        zip.write_all(b"item.example=Hallo
+").unwrap();
+        zip.start_file("assets/example/lang/en_us.json", options).unwrap();
+        zip.write_all(br#"{"item.example":"Hello"}"#).unwrap();
+        zip.finish().unwrap();
+        let mut translated = LangMap::new();
+        translated.entry("example".into()).or_default().insert("item.example".into(), "範例".into());
+        rewrite_translated_jars(&root.join("minecraft"), &translated, &LangMap::new(), &root.join("work"), |_, _, _| {}).unwrap();
+        let mut archive = ZipArchive::new(File::open(root.join("work/jar-translated/example.jar")).unwrap()).unwrap();
+        assert!(archive.by_name("assets/example/lang/zh_tw.json").is_ok(), "新語言檔優先用 json 範本");
+        assert!(archive.by_name("assets/example/lang/zh_tw.lang").is_err());
         let _ = fs::remove_dir_all(root);
     }
 

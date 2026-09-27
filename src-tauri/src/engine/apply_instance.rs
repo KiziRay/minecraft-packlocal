@@ -66,6 +66,18 @@ pub struct ApplyResult {
     pub unconfirmed_files: Vec<String>,
     /// 翻譯之後模組被更新、改名或刪除：舊翻譯沒有放進遊戲（模組已更新，需重新翻譯）
     pub outdated_mods: Vec<String>,
+    /// B3：翻譯之後來源被改過的文字檔（任務、語言檔、腳本…）：舊譯文沒有放進遊戲，需重新翻譯
+    pub outdated_texts: Vec<String>,
+    /// B3 審查 F1：翻譯結果裡不是這一輪產出的檔（舊版產物、產出後被改過）：沒有放進遊戲
+    pub stale_outputs: Vec<String>,
+    /// B3 審查 F1：上次由工具放進遊戲、這一輪沒有產出的檔：已還原原檔或刪除（前置條件同移除翻譯）
+    pub retired_files: Vec<String>,
+    /// 上一項中條件不符、沒有動的檔（被改過、無法確認、沒有備份）
+    pub retire_skipped: Vec<String>,
+    /// 第四輪 A：來源已被整合包移除的譯文（沒有放進遊戲）
+    pub source_removed_texts: Vec<String>,
+    /// 第四輪 A：讀不到來源、無法確認，未處理（維持遊戲現狀）
+    pub unverifiable_texts: Vec<String>,
     pub player_summary: String,
     pub warnings: Vec<String>,
 }
@@ -93,6 +105,12 @@ impl ApplyResult {
             quarantined_files: Vec::new(),
             unconfirmed_files: Vec::new(),
             outdated_mods: Vec::new(),
+            outdated_texts: Vec::new(),
+            stale_outputs: Vec::new(),
+            retired_files: Vec::new(),
+            retire_skipped: Vec::new(),
+            source_removed_texts: Vec::new(),
+            unverifiable_texts: Vec::new(),
             player_summary: message,
             warnings: Vec::new(),
         }
@@ -194,6 +212,21 @@ pub fn restore_last_apply_with_game_state(
 
 /// 存紀錄前把「目前知道的」併進去：舊版清單提過的檔（舊備份刪掉後仍記得），
 /// 以及這份紀錄開始時就無法判斷的狀態。
+/// 會被「這輪沒產出就還原」處理的位置：文字產出（模組檔另有指紋檢查、主資源包每輪重建）。
+fn is_retirable_text(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    match parts.first().copied() {
+        // resourcepacks/<檔>＝主翻譯資源包與它的標記檔；資料夾型資源包裡的檔才算文字產出
+        Some("resourcepacks") => parts.len() > 2,
+        Some(
+            "config" | "kubejs" | "scripts" | "datapacks" | "defaultconfigs" | "global_packs" | "paxi"
+            | "patchouli_books" | "data" | "assets" | "guideme" | "hqm" | "minemenu",
+        ) => parts.len() > 1,
+        // 模組檔（另有指紋檢查）、options.txt 備份等其他工具檔不在這裡處理
+        _ => false,
+    }
+}
+
 fn remember_knowledge(knowledge: &mut Knowledge) {
     let touched = apply_knowledge::legacy_touched_set(&knowledge.legacy);
     knowledge.record.legacy_touched.extend(touched);
@@ -414,6 +447,11 @@ pub fn apply_to_instance_with_game_state(
 
     // 前置條件：翻譯後的模組檔只放在「翻譯時用的同一個模組」上
     let outdated_mods = super::jar_sources::drop_outdated(work, &mc, &mut plan, &knowledge.record);
+    // B3：整檔替換／新增的文字檔同樣只放在「翻譯時用的同一份來源」上
+    // 審查 F-b：stale、outdated 只列出、維持遊戲現狀（它們不在退休名單上，退休只收
+    // text_sources 確認「產出者跑完、來源已不在」的檔）
+    // 審查 F1：只放「確認過的產出、內容未動、來源未變」的文字檔
+    let dropped_texts = super::text_sources::drop_unconfirmed(work, &mc, &mut plan, &knowledge.record);
 
     // ── 2a. 逐檔判斷「原本是什麼」──
     let mut decisions = Vec::new();
@@ -596,6 +634,42 @@ pub fn apply_to_instance_with_game_state(
     }
     let (lang_set, original_lang) = write_options(&mc, &options_plan, plan.zip_name.as_deref())?;
 
+    // 審查 F-a：退休（把遊戲裡上一版譯文拿掉）必須先確認「確定不再產出」：
+    // 產出者本輪完整跑完、而且來源檔已不在遊戲（text_sources 的退休名單）。
+    // 再走「移除翻譯」同一套前置條件：內容仍是工具版本、備份屬本包才還原／刪除。
+    let mut retired_files = Vec::new();
+    let mut retire_skipped = Vec::new();
+    {
+        // 這次要放進遊戲的檔絕不退休
+        let placing: std::collections::HashSet<String> =
+            plan.items.iter().map(|item| apply_record::rel_key(&mc, &item.dest)).collect();
+        // 套用當下再確認：產出清單屬於這個遊戲資料夾、來源現在仍確定不在（審查第三輪 2）
+        let candidates = super::text_sources::confirm_retire(work, &mc);
+        let retire: std::collections::HashSet<String> = knowledge
+            .record
+            .files
+            .iter()
+            .filter(|(rel, entry)| {
+                entry.owner.is_empty()
+                    && candidates.contains(*rel)
+                    && !placing.contains(*rel)
+                    && is_retirable_text(rel)
+            })
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        if !retire.is_empty() {
+            let outcome = apply_restore::restore_only(&ctx, &mut knowledge, "", &retire);
+            apply_record::save(&mc, &mut knowledge.record)?;
+            retired_files.extend(outcome.restored_files);
+            retired_files.extend(outcome.removed_files);
+            retire_skipped.extend(outcome.skipped_modified);
+            retire_skipped.extend(outcome.uncertain);
+            retire_skipped.extend(outcome.unrestorable);
+            retire_skipped.extend(outcome.backup_deleted);
+            warnings.extend(outcome.failures);
+        }
+    }
+
     if let Some(name) = plan.zip_name.as_deref() {
         warnings.extend(warn_enabled_packs_covering_font(&mc, name));
         warnings.extend(collect_post_apply_warnings(&mc, work, Some(name)));
@@ -629,6 +703,12 @@ pub fn apply_to_instance_with_game_state(
         quarantined_files,
         unconfirmed_files: unconfirmed,
         outdated_mods,
+        outdated_texts: dropped_texts.outdated,
+        stale_outputs: dropped_texts.stale,
+        retired_files,
+        retire_skipped,
+        source_removed_texts: dropped_texts.source_removed,
+        unverifiable_texts: dropped_texts.unconfirmed,
         player_summary: String::new(),
         warnings,
     };
@@ -743,6 +823,48 @@ fn describe_applied(
 原本的模組檔沒有動（{}）",
             result.outdated_mods.len(),
             preview(&result.outdated_mods)
+        ));
+    }
+    if !result.outdated_texts.is_empty() {
+        lines.push(format!(
+            "• 整合包已更新，需重新翻譯：{} 個文字檔的來源在翻譯之後被改過，舊的翻譯沒有放進遊戲（{}）",
+            result.outdated_texts.len(),
+            preview(&result.outdated_texts)
+        ));
+    }
+    if !result.retired_files.is_empty() {
+        lines.push(format!(
+            "• 整合包已移除原文、不再需要的舊翻譯已從遊戲拿掉（還原原檔或刪除工具加的檔）：{} 個（{}）",
+            result.retired_files.len(),
+            preview(&result.retired_files)
+        ));
+    }
+    if !result.source_removed_texts.is_empty() {
+        lines.push(format!(
+            "• 有 {} 個譯文的英文原文已被整合包移除，沒有放進遊戲（{}）",
+            result.source_removed_texts.len(),
+            preview(&result.source_removed_texts)
+        ));
+    }
+    if !result.unverifiable_texts.is_empty() {
+        lines.push(format!(
+            "• 有 {} 個譯文讀不到它的英文原文（可能是網路磁碟暫時讀不到），無法確認，這次沒有處理，遊戲裡保持原樣（{}）",
+            result.unverifiable_texts.len(),
+            preview(&result.unverifiable_texts)
+        ));
+    }
+    if !result.retire_skipped.is_empty() {
+        lines.push(format!(
+            "• 舊翻譯中有 {} 個檔無法確認或被改過，保持原樣沒有動（{}）",
+            result.retire_skipped.len(),
+            preview(&result.retire_skipped)
+        ));
+    }
+    if !result.stale_outputs.is_empty() {
+        lines.push(format!(
+            "• 翻譯結果裡有 {} 個檔沒有放進遊戲：它們是舊版工具留下的產物，或產出之後又被改過，無法確認是這次翻譯的結果。遊戲裡那份沒有動——如果它是舊版工具寫的中文，要回到英文請按「移除翻譯」（{}）",
+            result.stale_outputs.len(),
+            preview(&result.stale_outputs)
         ));
     }
     let text_files = plan.items.len()
@@ -1133,3 +1255,7 @@ mod final_tests;
 #[cfg(test)]
 #[path = "apply_instance_readonly_tests.rs"]
 mod readonly_tests;
+
+#[cfg(test)]
+#[path = "apply_instance_b3_tests.rs"]
+mod b3_tests;

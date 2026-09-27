@@ -172,6 +172,13 @@ pub fn is_mechanism_path_segment(lower_slash_path: &str) -> bool {
     const SKIP: &[&str] = &[
         "/recipes/",
         "/loot_tables/",
+        // B3#8：1.21 起資料包資料夾改單數
+        "/recipe/",
+        "/loot_table/",
+        "/function/",
+        "/predicate/",
+        "/item_modifier/",
+        "/structure/",
         "/tags/",
         "/structures/",
         "/worldgen/",
@@ -210,6 +217,22 @@ pub fn is_origins_powers_path(lower_slash_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn b3_singular_1_21_mechanism_paths_are_skipped() {
+        for p in [
+            "data/x/recipe/a.json",
+            "data/x/loot_table/a.json",
+            "data/x/function/a.mcfunction",
+            "data/x/predicate/a.json",
+            "data/x/item_modifier/a.json",
+            "data/x/structure/a.nbt",
+            "data/x/tags/item/a.json",
+        ] {
+            assert!(is_mechanism_path_segment(p), "{p}");
+        }
+        assert!(!is_mechanism_path_segment("data/x/advancement/a.json"));
+    }
 
     #[test]
     fn enum_token_rejects_snake_ids() {

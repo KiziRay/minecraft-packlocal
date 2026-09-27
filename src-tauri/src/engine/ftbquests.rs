@@ -11,12 +11,13 @@ use walkdir::WalkDir;
 use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
 use super::deepseek::translate_plain_strings_with_scope;
-use super::mech_tokens::{is_ascii_enum_token, is_poisoned_mech_translation, is_resource_path_token};
+use super::mech_tokens::{is_identifier_token, is_poisoned_mech_translation, is_resource_path_token};
 use super::placeholder::{self, GuardStats};
 use super::translation_scope::TranslationScope;
 
 /// 可翻譯的顯示欄位（鍵名小寫比對）。
-const DISPLAY_KEYS: &[&str] = &["title", "description", "subtitle"];
+/// B3：補 item_name（獎勵／物品任務的自訂名稱）、hover（滑鼠提示）、lock_message（鎖定說明）。
+const DISPLAY_KEYS: &[&str] = &["title", "description", "subtitle", "item_name", "hover", "lock_message"];
 
 /// 結構欄：值是 ResourceLocation／enum，翻成中文會讓遊戲崩潰。
 const STRUCT_KEYS: &[&str] = &[
@@ -68,6 +69,10 @@ pub fn translate_ftbquests<F>(
 where
     F: FnMut(u8, &str),
 {
+    // 審查 F1：本輪產出清單（先清掉任務上一輪的條目）
+    super::text_sources::begin(output_dir, "ftbquests");
+    // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    let round: Result<_, String> = (|| {
     let mc_src = minecraft_dir.join("config").join("ftbquests");
     if !mc_src.is_dir() {
         return Ok(QuestTranslateResult {
@@ -81,8 +86,8 @@ where
         });
     }
 
-    let work_src = output_dir.join("config").join("ftbquests");
-    let prefer_work = work_src.is_dir();
+    // 審查 F2：一律讀遊戲裡的原檔（工具版本改讀原檔備份），不再拿上次的譯文當底稿
+    let index = super::tool_products::ToolIndex::for_game(minecraft_dir);
 
     on_progress(5, "任務：掃描 FTB Quests（.snbt）…");
     let mut files: Vec<PathBuf> = Vec::new();
@@ -98,26 +103,20 @@ where
         }
     }
 
-    let mut file_texts: Vec<(PathBuf, String)> = Vec::new();
+    let mut file_texts: Vec<(PathBuf, PathBuf, String)> = Vec::new();
     let mut all_strings: Vec<String> = Vec::new();
     let mut string_set: HashMap<String, ()> = HashMap::new();
     let mut strings_found = 0usize;
-    let mut from_work = 0usize;
 
     for path in &files {
         let rel = path.strip_prefix(&mc_src).unwrap_or(path.as_path());
-        let read_path = if prefer_work {
-            let candidate = work_src.join(rel);
-            if candidate.is_file() {
-                from_work += 1;
-                candidate
-            } else {
-                path.clone()
-            }
-        } else {
-            path.clone()
+        // B3：新格式任務語言檔由 ftbquests_lang 產出 zh_tw，英文檔本身不改寫
+        if super::ftbquests_lang::is_lang_file(rel) {
+            continue;
+        }
+        let Some((read_path, text)) = super::tool_products::read_game_text(&index, minecraft_dir, path) else {
+            continue;
         };
-        let text = fs::read_to_string(&read_path).map_err(|e| format!("{}: {e}", read_path.display()))?;
         let extracted = extract_display_strings(&text);
         strings_found += extracted.len();
         for s in extracted {
@@ -125,8 +124,14 @@ where
                 all_strings.push(s);
             }
         }
-        // 以實際讀到的內容為 rewrite 底稿（工作副本優先）
-        file_texts.push((path.clone(), text));
+        file_texts.push((path.clone(), read_path, text));
+    }
+    let lang_jobs = super::ftbquests_lang::collect_jobs(minecraft_dir, &mc_src);
+    for s in super::ftbquests_lang::candidates(&lang_jobs) {
+        strings_found += 1;
+        if string_set.insert(s.clone(), ()).is_none() {
+            all_strings.push(s);
+        }
     }
 
     on_progress(
@@ -136,11 +141,7 @@ where
             files.len(),
             strings_found,
             all_strings.len(),
-            if from_work > 0 {
-                format!("；沿用工作目錄 {from_work} 檔")
-            } else {
-                String::new()
-            }
+            String::new()
         ),
     );
 
@@ -250,7 +251,7 @@ where
     let mut written = 0usize;
     let mut applied = 0usize;
 
-    for (src_path, text) in &file_texts {
+    for (src_path, read_path, text) in &file_texts {
         let rel = src_path.strip_prefix(&mc_src).unwrap_or(src_path.as_path());
         let (new_text, n) = rewrite_display_strings(text, &map);
         applied += n;
@@ -261,17 +262,12 @@ where
             }
             let bytes = super::output_guard::finish_file(&out_path.to_string_lossy(), text.as_bytes(), new_text.into_bytes());
             fs::write(&out_path, bytes).map_err(|e| e.to_string())?;
-            written += 1;
-        } else if prefer_work && !dest_root.join(rel).is_file() {
-            // 工作目錄有內容但未變更時仍確保輸出存在（方便套用）
-            let out_path = dest_root.join(rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::write(&out_path, text.as_bytes()).map_err(|e| e.to_string())?;
+            super::text_sources::record(output_dir, &out_path, minecraft_dir, src_path, read_path, "ftbquests");
             written += 1;
         }
     }
+
+    written += super::ftbquests_lang::write_outputs(&lang_jobs, &map, &dest_root, minecraft_dir, output_dir)?;
 
     let readme = output_dir.join("【任務翻譯】請複製到遊戲.txt");
     let _ = fs::write(
@@ -312,6 +308,11 @@ where
             written
         ),
     })
+    })();
+    if round.is_ok() {
+        super::text_sources::commit(output_dir, "ftbquests", minecraft_dir);
+    }
+    round
 }
 
 /// 仍需送 AI 的顯示字串：未在 map、且非「純繁中」。
@@ -552,11 +553,18 @@ pub fn rewrite_display_strings(text: &str, map: &HashMap<String, String>) -> (St
     (joined, applied)
 }
 
+/// B3：任務語言檔（ftbquests_lang）共用：顯示字串的譯文（文字元件只換 text）。
+pub(crate) fn translate_display_value(s: &str, map: &HashMap<String, String>) -> Option<String> {
+    rewrite_json_component_string(s, map)
+        .map(|(rewritten, _)| rewritten)
+        .or_else(|| map.get(s).cloned())
+}
+
 fn is_display_key(key: &str) -> bool {
     DISPLAY_KEYS.iter().any(|k| *k == key)
 }
 
-fn push_display_candidates(s: &str, out: &mut Vec<String>) {
+pub(crate) fn push_display_candidates(s: &str, out: &mut Vec<String>) {
     if let Some(texts) = json_component_texts(s) {
         out.extend(texts);
         return;
@@ -694,8 +702,9 @@ fn should_translate_quest_string(s: &str) -> bool {
     if looks_mostly_code(t) {
         return false;
     }
-    // 全小寫 snake_case 單 token（checkmark／item／command）不當顯示文翻
-    if is_ascii_enum_token(t) || is_resource_path_token(t) {
+    // B3：這裡只會收到顯示欄（title／description…）的值，結構欄（type 等）由 key 擋掉。
+    // 一般小寫單字（done、start）照翻；帶 _／-／數字的機制 id 與資源路徑不翻。
+    if is_identifier_token(t) || is_resource_path_token(t) {
         return false;
     }
     let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
@@ -705,7 +714,7 @@ fn should_translate_quest_string(s: &str) -> bool {
 
 fn is_safe_display_translation(src: &str, zh: &str) -> bool {
     !is_poisoned_mech_translation(src, zh)
-        && !(is_ascii_enum_token(src) && looks_chinese(zh))
+        && !(is_identifier_token(src) && looks_chinese(zh))
 }
 
 fn has_latin_letter(s: &str) -> bool {
@@ -819,9 +828,11 @@ mod tests {
 
     #[test]
     fn enum_tokens_not_translatable() {
-        assert!(!should_translate_quest_string("checkmark"));
-        assert!(!should_translate_quest_string("item"));
-        assert!(!should_translate_quest_string("command"));
+        // B3（延後清單 B2→B3）：顯示欄裡的一般小寫字要翻；結構欄的 checkmark／item 由 key 擋
+        // （見 extract_skips_struct_enums_keeps_titles）。機制 id 與路徑仍不翻。
+        assert!(!should_translate_quest_string("has_iron"));
+        assert!(!should_translate_quest_string("tier2"));
+        assert!(should_translate_quest_string("done"));
         assert!(!should_translate_quest_string("root.txt"));
         assert!(should_translate_quest_string("Click when done"));
     }

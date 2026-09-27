@@ -506,6 +506,9 @@ pub fn build_resource_pack_skipping_bundled(
         files += 1;
     }
 
+    // B3#5：assets 類書本／手冊的 zh_tw（翻譯端已過 output guard）一併放進主資源包
+    files += super::pack_assets::copy_into_pack(&work_root, &pack_dir)?;
+
     let readme = pack_dir.join("使用說明.txt");
     let mut f = fs::File::create(&readme).map_err(|e| e.to_string())?;
     writeln!(

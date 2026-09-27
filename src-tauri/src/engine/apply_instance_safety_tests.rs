@@ -3,6 +3,21 @@
 use super::*;
 use super::tests::{Stage, BACKUP, ORIGINAL_OPTIONS};
 
+/// B3 審查 F1：套用只收「本輪產出」的文字檔。這些測試直接放檔模擬翻譯結果，套用前先登記成本輪產出。
+#[allow(dead_code)]
+fn apply_to_instance_with_game_state(
+    mc: &Path,
+    work: &Path,
+    hint: Option<&str>,
+    policy: BackupPolicy,
+    running: GameRunning,
+) -> Result<ApplyResult, String> {
+    let game = crate::engine::jar_scan::resolve_minecraft_dir(mc).unwrap_or_else(|_| mc.to_path_buf());
+    crate::engine::text_sources::mark_all_produced_for_test(work, &game);
+    super::apply_to_instance_with_game_state(mc, work, hint, policy, running)
+}
+
+
 // ─── 第三輪：原則 A（只備份確定的原檔）、B（只刪／蓋確定是工具寫的）、C（紀錄）───
 
 fn legacy_dir_in(container: &Path, stamp: &str, mc: &Path, overwritten: &[&str], added: &[&str]) -> PathBuf {

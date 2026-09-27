@@ -70,6 +70,10 @@ pub fn translate_quests_books<F>(
 where
     F: FnMut(u8, &str),
 {
+    // 審查 F1：本輪產出清單（先清掉任務書／手冊上一輪的條目）
+    super::text_sources::begin(output_dir, "quests_books");
+    // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    let round: Result<_, String> = (|| {
     on_progress(2, "任務／書本：掃描 Better Questing／HQM／Heracles／Modonomicon…");
     let files = collect_files(minecraft_dir);
     if files.is_empty() {
@@ -85,11 +89,14 @@ where
     let mut ns_by_src: HashMap<String, String> = HashMap::new();
     let mut parse_failures: Vec<String> = Vec::new();
 
+    // 審查 F2：來源必須是原檔
+    let index = super::tool_products::ToolIndex::for_game(minecraft_dir);
+    let mut reads: HashMap<PathBuf, PathBuf> = HashMap::new();
     for path in &files {
-        let raw = match fs::read_to_string(path) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Some((read, raw)) = super::tool_products::read_game_text(&index, minecraft_dir, path) else {
+            continue;
         };
+        reads.insert(path.clone(), read);
         let v = match super::lenient_json::parse(&raw) {
             Ok(v) => v,
             Err(e) => {
@@ -210,8 +217,10 @@ where
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let s = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let bytes = super::output_guard::finish_file(&path.to_string_lossy(), &fs::read(&path).unwrap_or_default(), (s + "\n").into_bytes());
+        let read = reads.get(&path).cloned().unwrap_or_else(|| path.clone());
+        let bytes = super::output_guard::finish_file(&path.to_string_lossy(), &fs::read(&read).unwrap_or_default(), (s + "\n").into_bytes());
         fs::write(&out_path, bytes).map_err(|e| format!("{}: {e}", out_path.display()))?;
+        super::text_sources::record(output_dir, &out_path, minecraft_dir, &path, &read, "quests_books");
         written += 1;
     }
 
@@ -226,6 +235,11 @@ where
             ""
         ),
     })
+    })();
+    if round.is_ok() {
+        super::text_sources::commit(output_dir, "quests_books", minecraft_dir);
+    }
+    round
 }
 
 // ─── 檔案收集 ───────────────────────────────────────────────

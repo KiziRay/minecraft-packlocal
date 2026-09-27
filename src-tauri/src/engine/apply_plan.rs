@@ -30,6 +30,8 @@ pub enum Group {
     Defaultconfigs,
     GlobalPacks,
     Paxi,
+    /// B3#3：CraftTweaker 腳本（scripts/*.zs）
+    Scripts,
     Mods,
     /// 遊戲資料夾裡的 data/、assets/、guideme/、hqm/ 與資料夾型資源包的文字覆寫
     GameTextOverlay,
@@ -144,6 +146,7 @@ pub fn build_plan(
         ("defaultconfigs", Group::Defaultconfigs),
         ("global_packs", Group::GlobalPacks),
         ("paxi", Group::Paxi),
+        ("scripts", Group::Scripts),
     ] {
         plan.push_tree(&work.join(name), &mc.join(name), group);
     }
@@ -288,6 +291,18 @@ mod tests {
         }
         assert!(!targets.iter().any(|t| t.contains("繁體中文翻譯")), "{targets:?}");
         assert!(!targets.iter().any(|t| t.contains("fromjar")), "{targets:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b3_crafttweaker_scripts_are_applied() {
+        let root = std::env::temp_dir().join(format!("mcpl-plan-zs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mc = root.join("minecraft");
+        let work = root.join("work");
+        write(&work.join("scripts/tip.zs"), "x");
+        let plan = build_plan(&mc, &layout_for(&work), "p", None, None);
+        assert!(plan.targets().contains(&mc.join("scripts").join("tip.zs")));
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -36,12 +36,20 @@ use Guard::*;
 const WRITERS: &[(&str, &str, Guard)] = &[
     ("pack_out.rs", "build_resource_pack_skipping_bundled", Direct),
     ("ftbquests.rs", "translate_ftbquests", Direct),
+    // B3#1：新格式任務語言檔 zh_tw.snbt（map 已在 translate_ftbquests 過 guard_map；本體再過檔案層）
+    ("ftbquests_lang.rs", "write_outputs", Direct),
+    // B3#7：散落語言檔的 zh_tw（英文檔只讀；人工／簡中值過 check_human，檔案過 finish_file）
+    ("lang_overlay.rs", "write_outputs", Direct),
+    // B3 審查 F7：書本／手冊複製進主資源包也要過檔案層檢查
+    ("pack_assets.rs", "copy_tree", Direct),
+    ("pack_assets.rs", "copy_into_pack", Via("copy_tree")),
+    ("pack_assets.rs", "move_into", Via("copy_tree")),
     ("text_overlay.rs", "translate_text_overlays", Direct),
     ("script_literals.rs", "translate_kubejs_literals", Direct),
     ("jar_translate.rs", "rewrite_translated_jars", Direct),
     ("jar_translate.rs", "rewrite_one_jar", Direct),
     // 上游把關：translate_text_overlays（本體內呼叫，產生 zip 內要換的檔）
-    ("archive_overlay.rs", "process_archive", Upstream(&["translate_text_overlays"])),
+    ("archive_overlay.rs", "process_archive", Upstream(&["translate_text_overlays", "translate_origins"])),
     // 上游把關：translate_text_overlays／translate_origins（各呼叫端先翻完再重建）
     ("jar_display.rs", "rebuild_jar", Upstream(&["translate_text_overlays", "translate_origins"])),
     ("jar_patchouli.rs", "translate_jar_patchouli", Via("rebuild_jar")),
@@ -230,7 +238,8 @@ fn b2_no_unregistered_translation_writer() {
         let src = read(&file);
         let code = non_test(&src);
         let produces = PRODUCERS.iter().any(|p| code.contains(p));
-        let writes = code.contains("fs::write(") || code.contains("write_all(");
+        // B3 審查 F7：整檔複製（fs::copy）也算寫出
+        let writes = code.contains("fs::write(") || code.contains("write_all(") || code.contains("fs::copy(");
         if !(produces && writes) {
             continue;
         }

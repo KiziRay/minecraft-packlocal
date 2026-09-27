@@ -233,6 +233,10 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
                 continue;
             }
         }
+        // 第三輪 4：主翻譯資源包以外的 zip 必須是確認過的產出
+        if !is_shareable_path(work_root, &path) {
+            continue;
+        }
         fs::copy(&path, dest_rp.join(&name))
             .map_err(|e| format!("複製失敗 {}：{e}", path.display()))?;
         existing_zips.push(name_str.to_ascii_lowercase());
@@ -263,7 +267,8 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
         {
             continue;
         }
-        zip_directory_contents(&path, &dest_rp.join(&zip_name))?;
+        // 第三輪 4／第四輪 B：資料夾型資源包只帶確認過的產出，並帶遊戲原包的 pack.mcmeta（及 pack.png）
+        zip_folder_pack(work_root, &path, &folder_str, &dest_rp.join(&zip_name))?;
     }
 
     if let Some(ref canon) = canonical {
@@ -286,7 +291,57 @@ fn stage_resourcepacks_as_zips(work_root: &Path, stage: &Path) -> Result<(), Str
     Ok(())
 }
 
+const PACK_META_FILES: &[&str] = &["pack.mcmeta", "pack.png"];
+
+/// 資料夾型資源包（不是主翻譯資源包）：只收確認過的產出；一個都沒有就不產生。
+/// 資源包必須有 pack.mcmeta 才合法：從遊戲原包取（沒有就不產生，避免分享出不合法的包）。
+fn zip_folder_pack(work_root: &Path, folder: &Path, folder_name: &str, zip_path: &Path) -> Result<(), String> {
+    let confirmed: Vec<PathBuf> = WalkDir::new(folder)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            let at_root_meta = p.parent() == Some(folder)
+                && p.file_name().is_some_and(|n| PACK_META_FILES.iter().any(|m| n.eq_ignore_ascii_case(m)));
+            !at_root_meta && is_shareable_path(work_root, p)
+        })
+        .collect();
+    if confirmed.is_empty() {
+        return Ok(());
+    }
+    let Some(game_pack) = super::text_sources::game_root(work_root).map(|root| root.join("resourcepacks").join(folder_name)) else {
+        return Ok(());
+    };
+    if !game_pack.join("pack.mcmeta").is_file() {
+        return Ok(());
+    }
+    let file = File::create(zip_path).map_err(|e| format!("無法建立資源包 zip：{e}"))?;
+    let mut zip = ZipWriter::new(file);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for meta in PACK_META_FILES {
+        let src = game_pack.join(meta);
+        if src.is_file() {
+            zip.start_file(*meta, opts).map_err(|e| e.to_string())?;
+            let bytes = fs::read(&src).map_err(|e| format!("讀取失敗 {}：{e}", src.display()))?;
+            zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    for path in confirmed {
+        let rel = path.strip_prefix(folder).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        zip.start_file(rel, opts).map_err(|e| e.to_string())?;
+        let bytes = fs::read(&path).map_err(|e| format!("讀取失敗 {}：{e}", path.display()))?;
+        zip.write_all(&bytes).map_err(|e| e.to_string())?;
+    }
+    zip.finish().map_err(|e| format!("打包資源包失敗：{e}"))?;
+    Ok(())
+}
+
 fn zip_directory_contents(src: &Path, zip_path: &Path) -> Result<(), String> {
+    zip_directory_filtered(src, zip_path, &|_| true)
+}
+
+fn zip_directory_filtered(src: &Path, zip_path: &Path, keep: &dyn Fn(&Path) -> bool) -> Result<(), String> {
     let file = File::create(zip_path).map_err(|e| format!("無法建立資源包 zip：{e}"))?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -301,6 +356,9 @@ fn zip_directory_contents(src: &Path, zip_path: &Path) -> Result<(), String> {
         if path.is_dir() {
             let _ = zip.add_directory(format!("{}/", rel_str.trim_end_matches('/')), opts);
         } else if path.is_file() {
+            if !keep(path) {
+                continue;
+            }
             zip.start_file(rel_str, opts).map_err(|e| e.to_string())?;
             let bytes = fs::read(path).map_err(|e| format!("讀取失敗 {}：{e}", path.display()))?;
             zip.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -428,6 +486,19 @@ fn zip_dir(src: &Path, zip_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 主翻譯資源包（每輪由建包重建，不在產出清單上）：`resourcepacks/<主包>.zip`、`<主包>.meta.json`、`<主包>/…`。
+fn is_main_pack_path(root: &Path, relative: &Path) -> bool {
+    let mut parts = relative.components().map(|c| c.as_os_str().to_string_lossy().to_string());
+    if parts.next().as_deref() != Some("resourcepacks") {
+        return false;
+    }
+    let Some(second) = parts.next() else { return false };
+    let Some(main) = resolve_canonical_tool_zip(root) else { return false };
+    let Some(main_name) = main.file_name().map(|n| n.to_string_lossy().to_string()) else { return false };
+    let stem = main_name.trim_end_matches(".zip").trim_end_matches(".ZIP").to_string();
+    second == main_name || second == stem || second == format!("{stem}.zip") || second == format!("{stem}.meta.json")
+}
+
 fn is_shareable_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -436,6 +507,18 @@ fn is_shareable_path(root: &Path, path: &Path) -> bool {
     let Some(first) = components.next().and_then(|part| part.as_os_str().to_str()) else {
         return false;
     };
+    // B3 審查 F6：伺服器腳本、含私有字串（.tell 類）的腳本產物不分享
+    let rel_str = relative.to_string_lossy().replace('\\', "/");
+    if rel_str.starts_with("kubejs/server_scripts/") || rel_str == "kubejs/server_scripts" {
+        return false;
+    }
+    if super::text_sources::is_private_output(root, &rel_str) {
+        return false;
+    }
+    // 審查 F-e／第三輪 4：只豁免主翻譯資源包（與它的標記檔）；其餘檔只帶確認過的產出
+    if path.is_file() && !is_main_pack_path(root, relative) && !super::text_sources::is_confirmed_output(root, path) {
+        return false;
+    }
     // 嚴格白名單：只裝對方可安裝的翻譯產物（不含 JAR 副本／extra／備份／日誌／說明）
     match first {
         "resourcepacks" | "patchouli_books" | "kubejs" | "minemenu" | "datapacks"
@@ -480,6 +563,7 @@ mod tests {
         fs::write(work.join("覆蓋範圍說明.txt"), "coverage").unwrap();
 
         let dest = root.join("out");
+        crate::engine::text_sources::mark_all_produced_for_test(&work, &work.join("_no_game")); // 審查 F-e：分享只帶確認過的產出
         let zip = package_translation(&work, &dest, "我的分享包").unwrap();
         assert!(zip.is_file());
         assert!(zip.file_name().unwrap().to_string_lossy().ends_with(".zip"));
@@ -519,6 +603,7 @@ mod tests {
         fs::create_dir_all(work.join("resourcepacks")).unwrap();
         fs::write(work.join("resourcepacks/pack.zip"), b"x").unwrap();
         fs::write(work.join("a.txt"), "x").unwrap();
+        crate::engine::text_sources::mark_all_produced_for_test(&work, &work.join("_no_game")); // 審查 F-e：分享只帶確認過的產出
         let zip = package_translation(&work, &root.join("out"), "///").unwrap();
         assert_eq!(zip.file_name().unwrap().to_string_lossy(), "模組包翻譯分享.zip");
         let _ = fs::remove_dir_all(&root);
@@ -565,6 +650,10 @@ mod tests {
         fs::write(work.join("config/ftbquests/chapter.snbt"), "title: \"Hi\"").unwrap();
 
         fs::create_dir_all(&stage).unwrap();
+        crate::engine::text_sources::mark_all_produced_for_test(&work, &work.join("_no_game")); // 審查 F-e：分享只帶確認過的產出
+        // 第四輪 B：資料夾型資源包的 pack.mcmeta 取自遊戲原包
+        fs::create_dir_all(work.join("_no_game/resourcepacks/字體包")).unwrap();
+        fs::write(work.join("_no_game/resourcepacks/字體包/pack.mcmeta"), b"{\"pack\":{}}").unwrap();
         stage_shareable_files(&work, &stage).unwrap();
 
         let staged_rp = stage.join("resourcepacks");
@@ -642,6 +731,7 @@ mod tests {
 
         let stage = root.join("stage");
         fs::create_dir_all(&stage).unwrap();
+        crate::engine::text_sources::mark_all_produced_for_test(&work, &work.join("_no_game")); // 審查 F-e：分享只帶確認過的產出
         stage_shareable_files(&work, &stage).unwrap();
 
         let staged_rp = stage.join("resourcepacks");
@@ -653,5 +743,56 @@ mod tests {
         assert!(names[0].contains("0827"));
         assert!(!names[0].contains("0823"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn b3_r3_resourcepacks_other_than_the_main_pack_need_confirmation() {
+        let root = scratch("b3-r3-rp");
+        let work = root.join("翻譯結果");
+        fs::create_dir_all(work.join("resourcepacks/UserPack/assets/x/lang")).unwrap();
+        fs::write(work.join("resourcepacks/Stale.zip"), b"old").unwrap();
+        fs::write(work.join("resourcepacks/UserPack/assets/x/lang/zh_tw.json"), "{}").unwrap();
+        fs::write(work.join("resourcepacks/UserPack/assets/x/lang/en_us.json"), "{}").unwrap();
+        let mc = root.join("mc");
+        let zh = work.join("resourcepacks/UserPack/assets/x/lang/zh_tw.json");
+        crate::engine::text_sources::record(&work, &zh, &mc, &zh, &zh, "overlay");
+        assert!(is_shareable_path(&work, &zh));
+        assert!(!is_shareable_path(&work, &work.join("resourcepacks/Stale.zip")), "不是主翻譯資源包、也沒確認的 zip 不分享");
+        assert!(!is_shareable_path(&work, &work.join("resourcepacks/UserPack/assets/x/lang/en_us.json")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b3_r4_folder_pack_without_confirmed_files_is_not_zipped_and_keeps_game_pack_mcmeta() {
+        let root = scratch("b3-r4-folder");
+        let _ = fs::remove_dir_all(&root);
+        let work = root.join("翻譯結果");
+        let mc = root.join("mc");
+        let stage = root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        // 遊戲原包
+        fs::create_dir_all(mc.join("resourcepacks/UserPack/assets/x/lang")).unwrap();
+        fs::write(mc.join("resourcepacks/UserPack/pack.mcmeta"), br#"{"pack":{"pack_format":15}}"#).unwrap();
+        fs::write(mc.join("resourcepacks/UserPack/pack.png"), b"png").unwrap();
+        fs::write(mc.join("resourcepacks/UserPack/assets/x/lang/en_us.json"), "{}").unwrap();
+        // 翻譯結果：只有 zh_tw 是確認過的產出（pack.mcmeta 不登記）
+        fs::create_dir_all(work.join("resourcepacks/UserPack/assets/x/lang")).unwrap();
+        fs::create_dir_all(work.join("resourcepacks/OldPack/assets/y/lang")).unwrap();
+        fs::write(work.join("resourcepacks/UserPack/assets/x/lang/zh_tw.json"), "{}").unwrap();
+        fs::write(work.join("resourcepacks/UserPack/old.json"), "{}").unwrap();
+        fs::write(work.join("resourcepacks/OldPack/assets/y/lang/en_us.json"), "{}").unwrap();
+        let zh = work.join("resourcepacks/UserPack/assets/x/lang/zh_tw.json");
+        crate::engine::text_sources::record(&work, &zh, &mc, &mc.join("resourcepacks/UserPack/assets/x/lang/en_us.json"), &mc.join("resourcepacks/UserPack/assets/x/lang/en_us.json"), "overlay");
+        stage_shareable_files(&work, &stage).unwrap();
+        assert!(!stage.join("resourcepacks/OldPack.zip").exists(), "一個確認檔都沒有就不產生");
+        let mut archive = zip::ZipArchive::new(fs::File::open(stage.join("resourcepacks/UserPack.zip")).unwrap()).unwrap();
+        let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+        assert!(names.contains(&"pack.mcmeta".to_string()) && names.contains(&"pack.png".to_string()), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("lang/zh_tw.json")), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("old.json")), "{names:?}");
+        let mut meta = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("pack.mcmeta").unwrap(), &mut meta).unwrap();
+        assert!(meta.contains("pack_format"), "帶的是遊戲原包的 pack.mcmeta：{meta}");
+        let _ = fs::remove_dir_all(root);
     }
 }

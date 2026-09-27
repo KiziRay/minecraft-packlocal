@@ -27,6 +27,10 @@ pub struct JarSource {
     pub name: String,
     /// 翻譯時遊戲裡模組檔的指紋
     pub sha256: String,
+    /// B3 審查 F5：模組原檔自帶的 zh_tw key（ns → keys）。遊戲裡是工具翻過的 JAR、又沒有原檔備份時，
+    /// 掃描靠它分辨「作者的 zh_tw」與「工具補的 zh_tw」。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_zh_tw: BTreeMap<String, Vec<String>>,
 }
 
 fn sources_path(work_root: &Path) -> PathBuf {
@@ -52,15 +56,50 @@ pub fn reset(work_root: &Path) {
 
 /// 記下 `jar-translated/<relative>` 是從哪個模組檔做出來的（同一個位置以最新一次為準）。
 pub fn record_source(work_root: &Path, relative: &Path, source_jar: &Path) -> Result<(), String> {
+    record_source_with_native(work_root, relative, source_jar, None)
+}
+
+/// 同 [`record_source`]，並記下原檔自帶的 zh_tw key（`None`＝沿用同一來源先前記下的）。
+/// `source_jar` 是實際讀的原檔（遊戲裡的原檔或原檔備份），指紋以原檔為準。
+pub fn record_source_with_native(
+    work_root: &Path,
+    relative: &Path,
+    source_jar: &Path,
+    native: Option<BTreeMap<String, Vec<String>>>,
+) -> Result<(), String> {
     let sha256 = apply_record::file_sha256(source_jar)
         .ok_or_else(|| format!("讀不到模組檔，無法記下它的指紋：{}", source_jar.display()))?;
     let name = source_jar.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map = read(work_root);
-    map.insert(key_of(relative), JarSource { name, sha256 });
+    let native_zh_tw = match native {
+        Some(n) => n,
+        None => map
+            .get(&key_of(relative))
+            .filter(|old| old.sha256 == sha256)
+            .map(|old| old.native_zh_tw.clone())
+            .unwrap_or_default(),
+    };
+    map.insert(key_of(relative), JarSource { name, sha256, native_zh_tw });
     let text = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
     apply_record::write_atomic(&sources_path(work_root), text.as_bytes())
         .map_err(|e| format!("無法記下模組檔的指紋：{e}"))
+}
+
+/// F5：`rel`（遊戲相對路徑 `mods/…`）在任一翻譯結果裡記下的「原檔自帶 zh_tw key」。
+pub fn native_zh_tw_keys(
+    work_roots: &[PathBuf],
+    rel: &str,
+) -> Option<std::collections::HashMap<String, std::collections::HashSet<String>>> {
+    let key = rel.strip_prefix("mods/")?;
+    work_roots.iter().find_map(|root| {
+        read(root).get(key).map(|s| {
+            s.native_zh_tw
+                .iter()
+                .map(|(ns, keys)| (ns.clone(), keys.iter().cloned().collect()))
+                .collect()
+        })
+    })
 }
 
 /// 從套用清單拿掉「遊戲裡的模組已經不是翻譯時那一個」的翻譯後模組檔，回傳被拿掉的遊戲相對路徑。
@@ -106,3 +145,4 @@ fn game_matches(mc: &Path, rel: &str, dest: &Path, source: &JarSource, record: &
         None => true,
     }
 }
+

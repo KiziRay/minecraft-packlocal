@@ -194,6 +194,8 @@ pub fn guard_share_entries(entries: &[SharedTmEntry]) -> Vec<SharedTmEntry> {
     entries
         .iter()
         .filter(|e| super::output_guard::passes(&e.source, &e.translated))
+        // B3#3：伺服器腳本、.tell 類字串登記為不上傳（share_policy）
+        .filter(|e| !super::share_policy::is_private(&e.source))
         .cloned()
         .collect()
 }

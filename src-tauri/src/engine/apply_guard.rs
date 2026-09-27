@@ -102,6 +102,11 @@ pub fn backup_file_path(mc: &Path, rel: &str) -> PathBuf {
     apply_record::instance_backup_dir(mc).join(rel)
 }
 
+/// B3 審查 F-c：指定備份區裡某個原檔備份的（檔案, 標記）位置（`.mcpl` 被刪時用認回的識別碼找）。
+pub fn backup_paths_at(backup_dir: &Path, rel: &str) -> (PathBuf, PathBuf) {
+    (backup_dir.join(rel), backup_dir.join(format!("{rel}{BACKUP_MARKER_SUFFIX}")))
+}
+
 pub fn read_backup_marker(mc: &Path, rel: &str) -> Option<BackupMarker> {
     read_json(&backup_marker_path(mc, rel))
 }

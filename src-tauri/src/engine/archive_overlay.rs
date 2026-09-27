@@ -49,6 +49,12 @@ pub fn translate_archive_overlays<F>(
 where
     F: FnMut(u8, &str),
 {
+    // 審查 F1：本輪產出清單（先清掉 ZIP 上一輪的條目）
+    super::text_sources::begin(work_root, "archive");
+    // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    let round: Result<_, String> = (|| {
+    // 審查 F3：遊戲裡的 ZIP 可能是本工具上次改寫的版本，必須先確認是原檔
+    let tool_index = super::tool_products::ToolIndex::for_game(minecraft_dir);
     let archives = collect_archives(minecraft_dir);
     let mut report = ArchiveOverlayReport {
         archives_scanned: archives.len(),
@@ -78,9 +84,18 @@ where
             report.skipped_resourcepack_zips += 1;
             continue;
         }
+        let read = match tool_index.read_source(archive) {
+            super::tool_products::ReadSource::Use(read) => read,
+            super::tool_products::ReadSource::NeedsOriginal => {
+                super::output_guard::record_needs_original(&super::apply_record::rel_key(minecraft_dir, archive));
+                report.skipped.push(format!("{name}：遊戲裡是本工具先前寫入的版本，又沒有原檔備份，不拿來當原文（需要原檔才能翻譯）"));
+                continue;
+            }
+        };
         match process_archive(
             minecraft_dir,
             archive,
+            &read,
             &stage_root,
             work_root,
             use_ai,
@@ -99,6 +114,11 @@ where
 
     on_progress(100, "ZIP 文字檢查完成");
     Ok(report)
+    })();
+    if round.is_ok() {
+        super::text_sources::commit(work_root, "archive", minecraft_dir);
+    }
+    round
 }
 
 struct TempDirGuard(PathBuf);
@@ -151,17 +171,18 @@ fn collect_archives(mc: &Path) -> Vec<PathBuf> {
 fn process_archive(
     mc: &Path,
     archive_path: &Path,
+    read_path: &Path,
     stage_root: &Path,
     work_root: &Path,
     use_ai: bool,
     scope: Option<&TranslationScope>,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<(usize, usize), String> {
-    let metadata = fs::metadata(archive_path).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(read_path).map_err(|e| e.to_string())?;
     if metadata.len() == 0 || metadata.len() > MAX_ARCHIVE_BYTES {
         return Err(format!("ZIP 超過 {} MB 大小上限", MAX_ARCHIVE_BYTES / 1024 / 1024));
     }
-    let source_file = File::open(archive_path).map_err(|e| e.to_string())?;
+    let source_file = File::open(read_path).map_err(|e| e.to_string())?;
     let mut source = ZipArchive::new(source_file).map_err(|e| format!("ZIP 格式錯誤：{e}"))?;
     if source.len() > MAX_ARCHIVE_ENTRIES {
         return Err(format!("ZIP 項目超過 {} 個上限", MAX_ARCHIVE_ENTRIES));
@@ -225,9 +246,13 @@ fn process_archive(
         };
         on_progress(10 + pct.saturating_mul(70) / 100, &rewritten);
     })?;
-    if overlay.files_written == 0 {
+    // B3#6：資料包 ZIP 裡的 Origins／Apoli 能力文字（覆寫文字刻意不碰 powers，交給 origins）
+    let origins = super::origins::translate_origins(&stage, &translated_root, use_ai, scope, |_, _| {})?;
+    if overlay.files_written == 0 && origins.files_written == 0 {
         return Ok((0, 0));
     }
+    // B3#5：ZIP 裡 assets 類書本的 zh_tw 放進主資源包
+    super::pack_assets::move_into(&translated_root, work_root)?;
 
     let relative_text = relative.to_string_lossy().replace('\\', "/");
     let output_path = archive_output_path(work_root, &relative_text, archive_path);
@@ -238,19 +263,19 @@ fn process_archive(
     if temporary.exists() {
         fs::remove_file(&temporary).map_err(|e| e.to_string())?;
     }
-    let source_file = File::open(archive_path).map_err(|e| e.to_string())?;
+    let source_file = File::open(read_path).map_err(|e| e.to_string())?;
     let mut source = ZipArchive::new(source_file).map_err(|e| e.to_string())?;
     let output_file = File::create(&temporary).map_err(|e| e.to_string())?;
     let mut writer = ZipWriter::new(output_file);
     let mut rewritten = 0usize;
+    let mut source_names = std::collections::HashSet::new();
     for index in 0..source.len() {
         cancel::check()?;
         let entry = source.by_index(index).map_err(|e| e.to_string())?;
         let name = entry.name().replace('\\', "/");
-        let candidate = translated_root
-            .join("resourcepacks")
-            .join(&id)
-            .join(&name);
+        source_names.insert(name.clone());
+        // B3#7：掃描器以 `stage` 為根，輸出相對於它（以前多接了 resourcepacks/<id>，一個都對不上）
+        let candidate = translated_root.join(&name);
         let options = entry.options();
         if entry.is_file() && candidate.is_file() && super::output_guard::zip_entry_ok(&name) {
             let bytes = fs::read(candidate).map_err(|e| e.to_string())?;
@@ -265,6 +290,15 @@ fn process_archive(
                 .map_err(|e| format!("複製 ZIP 項目失敗：{e}"))?;
         }
     }
+    // B3#7：新產出的 zh_tw（語言檔、書頁）原本不在 ZIP 裡，要新增進去
+    for (name, path) in new_zip_entries(&translated_root, &source_names) {
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        writer
+            .start_file(&name, zip::write::SimpleFileOptions::default())
+            .map_err(|e| format!("新增 ZIP 項目失敗：{e}"))?;
+        writer.write_all(&bytes).map_err(|e| e.to_string())?;
+        rewritten += 1;
+    }
     writer
         .finish()
         .map_err(|e| format!("完成 ZIP 重建失敗：{e}"))?;
@@ -272,7 +306,30 @@ fn process_archive(
         fs::remove_file(&output_path).map_err(|e| e.to_string())?;
     }
     fs::rename(&temporary, &output_path).map_err(|e| e.to_string())?;
-    Ok((rewritten, overlay.strings_translated))
+    super::text_sources::record(work_root, &output_path, mc, archive_path, read_path, "archive");
+    Ok((rewritten, overlay.strings_translated + origins.strings_translated))
+}
+
+/// 翻譯輸出裡、原 ZIP 沒有的檔（新產出的 zh_tw）。`pack-assets/` 是給主資源包的，不放進 ZIP。
+fn new_zip_entries(translated_root: &Path, source_names: &std::collections::HashSet<String>) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(translated_root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(translated_root) else { continue };
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if source_names.contains(&name)
+            || name.starts_with(super::pack_assets::PACK_ASSETS_DIR)
+            || !name.to_ascii_lowercase().contains("zh_tw")
+            || !super::output_guard::zip_entry_ok(&name)
+        {
+            continue;
+        }
+        out.push((name, entry.path().to_path_buf()));
+    }
+    out.sort();
+    out
 }
 
 fn is_under_resourcepacks(mc: &Path, archive: &Path) -> bool {

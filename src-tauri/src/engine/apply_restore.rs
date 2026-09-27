@@ -66,9 +66,38 @@ fn forget(ctx: &Ctx, knowledge: &mut Knowledge, rel: &str) {
     mk::remove_file_marker(&ctx.mc, rel);
 }
 
+/// B3 審查 F1：只處理 `only` 裡的檔（上次由工具寫進遊戲、這一輪沒有產出的檔）。
+/// 每個檔的前置條件與「移除翻譯」完全相同：工具新增且內容未動 → 刪；工具覆蓋且有有效備份 → 放回；
+/// 其餘不動並列出。設定檔（資源包清單、語言）不在這裡處理。
+pub fn restore_only(
+    ctx: &Ctx,
+    knowledge: &mut Knowledge,
+    owner: &str,
+    only: &std::collections::HashSet<String>,
+) -> RecordRestore {
+    let mut out = RecordRestore::default();
+    restore_recorded_files_in(ctx, knowledge, &mut out, owner, Some(only));
+    out
+}
+
 fn restore_recorded_files(ctx: &Ctx, knowledge: &mut Knowledge, out: &mut RecordRestore, owner: &str) {
-    let rels: Vec<String> =
-        knowledge.record.files.iter().filter(|(_, e)| e.owner == owner).map(|(rel, _)| rel.clone()).collect();
+    restore_recorded_files_in(ctx, knowledge, out, owner, None)
+}
+
+fn restore_recorded_files_in(
+    ctx: &Ctx,
+    knowledge: &mut Knowledge,
+    out: &mut RecordRestore,
+    owner: &str,
+    only: Option<&std::collections::HashSet<String>>,
+) {
+    let rels: Vec<String> = knowledge
+        .record
+        .files
+        .iter()
+        .filter(|(rel, e)| e.owner == owner && only.is_none_or(|o| o.contains(*rel)))
+        .map(|(rel, _)| rel.clone())
+        .collect();
     for rel in rels {
         let target = ctx.mc.join(&rel);
         if !long_path(&target).is_file() {
