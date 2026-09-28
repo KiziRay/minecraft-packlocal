@@ -43,22 +43,19 @@
         <div class="workbench-nav-brand">
           <span id="section-workbench" class="workbench-nav-title">工作台</span>
         </div>
-        <!--
-          唯一的主要動作，搬到頂欄置中：不必捲頁就看得到，且切到字體／診斷分頁或
-          還沒選好遊戲資料夾時自動隱藏（邏輯不變，只是移了位置，見 syncUiState）。
-        -->
-        <div class="workbench-nav-primary">
-          <button type="button" id="btn-run" class="primary-button start-translate" disabled>
-            <span class="start-label">開始翻譯</span>
-          </button>
-          <button type="button" id="btn-stop" class="danger-button run-control-stop" hidden>停止翻譯</button>
-        </div>
         <nav id="workbench-tabs" class="workbench-page-tabs" aria-label="工作台功能" role="tablist">
-          <button type="button" id="tab-translate" class="workbench-page-tab active" data-page="translate" aria-selected="true" role="tab">翻譯</button>
-          <button type="button" id="tab-font" class="workbench-page-tab" data-page="font" aria-selected="false" role="tab">字體</button>
-          <button type="button" id="tab-diagnose" class="workbench-page-tab" data-page="diagnose" aria-selected="false" role="tab">診斷</button>
+          <button type="button" id="tab-translate" class="workbench-page-tab active" data-page="translate" aria-selected="true" role="tab">翻譯<span id="tab-translate-badge" class="tab-badge" hidden>翻譯中</span></button>
+          <button type="button" id="tab-font" class="workbench-page-tab" data-page="font" aria-selected="false" role="tab">字體工具</button>
         </nav>
       </div>
+    </div>
+
+    <!-- B 區：橫幅（規格 §3.4）。同時最多 2 則，可關閉；內容由 ui/banner.js 產生。 -->
+    <div id="banner-area" class="banner-area" hidden></div>
+    <!-- 翻譯中切到其他分頁時的共用一行：現況＋同一顆 #btn-stop（翻譯分頁可見時不顯示，停止鈕搬回狀態卡） -->
+    <div id="run-elsewhere" class="run-elsewhere" hidden>
+      <p id="run-elsewhere-text" class="run-elsewhere-text" aria-live="polite"></p>
+      <span id="run-elsewhere-slot" class="run-elsewhere-slot"></span>
     </div>
 
     <main id="top" class="workspace">
@@ -68,9 +65,7 @@
               <section class="main-stage" aria-labelledby="translation-title">
                 <header class="stage-intro">
                   <p class="stage-kicker">工作台 · 翻譯</p>
-                  <h1 id="translation-title">模組包翻譯<button type="button" class="help-tip" data-help="translate-start" aria-label="說明">?</button></h1>
-                  <p class="stage-sub stage-sub-ready">選遊戲資料夾即可開始。完成後會自動套用到遊戲，可直接開整合包。</p>
-                  <p class="stage-sub stage-sub-empty">現在只要選資料夾。通過檢查後才會出現 AI 設定與開始翻譯。</p>
+                  <h1 id="translation-title">模組包翻譯<button type="button" class="help-tip" data-help="translate-start" aria-label="說明：怎麼開始翻譯">?</button></h1>
                 </header>
 
                 <p class="coverage-honest inline-honest">會盡量掃齊可讀文字來源（含進階解包）；圖片與硬編碼英文可能仍留下，只寫入翻譯結果副本。</p>
@@ -108,20 +103,6 @@
                   </div>
                 </section>
 
-                <!--
-                  設定檔壞掉時的提醒。舊版讀不到設定就靜靜地全部回到預設值，
-                  使用者只會覺得工具在亂改他的設定。
-                -->
-                <section id="settings-health-card" class="local-cache-card settings-health-card" hidden aria-labelledby="settings-health-title">
-                  <header class="local-cache-head">
-                    <h2 id="settings-health-title" class="options-group-title"></h2>
-                  </header>
-                  <p id="settings-health-message" class="local-cache-message"></p>
-                  <div class="action-row local-cache-actions">
-                    <button type="button" id="btn-settings-health-dismiss" class="text-button">知道了</button>
-                  </div>
-                </section>
-
                 <div class="path-block">
                   <div class="path-block-head">
                     <label for="instance">遊戲資料夾（實例資料夾）</label>
@@ -136,10 +117,46 @@
                     <input id="instance" type="text" placeholder="選取 Minecraft 實例資料夾" autocomplete="off" />
                     <button type="button" id="btn-inst" class="small-button">瀏覽…</button>
                   </div>
-                  <p class="field-help path-hint">要選有 mods 資料夾（放模組的地方）的遊戲資料夾；通常旁邊也會有 config、資源包資料夾或啟動器的設定檔。</p>
-                  <p id="instance-validate-status" class="field-status path-validate" aria-live="polite">尚未選擇遊戲資料夾。</p>
-                  <p class="path-gate-hint" id="path-gate-hint">先選資料夾就好。選到含 mods 的遊戲資料夾、通過檢查後，其餘選項才會出現。</p>
+                  <!-- 「要選有 mods 的資料夾」只在狀態卡 S01 說一次（一件事只在一處說） -->
+                  <p id="instance-validate-status" class="field-status path-validate" hidden></p>
+                  <!-- S20：翻譯中整區停用，原因寫在這裡（規格 §2.2） -->
+                  <p id="folder-lock-reason" class="field-status folder-lock-reason" hidden></p>
+                  <!-- 「移除翻譯」全工具唯一入口（規格 §1.1 D 區）；結果在狀態卡 S19 -->
+                  <div id="remove-translation-row" class="action-row remove-translation-row" hidden>
+                    <button type="button" id="btn-restore" class="secondary-button">移除翻譯</button>
+                    <small id="restore-status" class="field-status" hidden></small>
+                  </div>
                 </div>
+
+                <!--
+                  E 區：狀態卡（規格 §1.1、§2）。一句現況＋唯一主要按鈕；整個翻譯頁只有這裡有主要按鈕。
+                  #btn-run／#btn-stop 沿用既有 id 與接線（onRun／onStop）。停用用 aria-disabled，原因寫在下一行。
+                -->
+                <section id="status-card" class="status-card" data-tone="neutral" aria-labelledby="status-card-sentence">
+                  <div class="status-card-head">
+                    <p id="status-card-sentence" class="status-card-sentence" aria-live="polite"></p>
+                    <button type="button" id="btn-status-extra-help" class="help-tip" aria-label="說明：怎麼找到遊戲資料夾" hidden>?</button>
+                  </div>
+                  <p id="status-card-extra" class="status-card-extra" hidden>
+                    <span id="status-card-extra-text"></span>
+                    <button type="button" id="btn-status-extra-dismiss" class="text-button">不再顯示</button>
+                  </p>
+                  <p id="status-card-detail" class="status-card-detail" hidden></p>
+                  <div class="status-card-actions">
+                    <button type="button" id="btn-card-pick" class="primary-button" hidden>選擇遊戲資料夾</button>
+                    <button type="button" id="btn-run" class="primary-button start-translate" hidden>
+                      <span class="start-label">開始翻譯</span>
+                    </button>
+                    <button type="button" id="btn-stop" class="danger-button run-control-stop" hidden>停止翻譯</button>
+                    <button type="button" id="btn-card-apply" class="primary-button" hidden>套用到遊戲</button>
+                    <span id="status-card-secondary" class="status-card-secondary"></span>
+                  </div>
+                  <p id="status-card-reason" class="field-status status-card-reason" hidden></p>
+                  <details id="status-card-more" class="status-card-more" hidden>
+                    <summary>更多</summary>
+                    <div id="status-card-more-list" class="status-card-more-list"></div>
+                  </details>
+                </section>
 
                 <!--
                   翻譯已完成、還沒裝進遊戲（遊戲開著、還沒啟動過遊戲、沒選備份、不備份要確認覆蓋）。
@@ -171,10 +188,6 @@
                     <button type="button" id="btn-cache-supplement" class="text-button" hidden>接續補翻</button>
                     <button type="button" id="btn-cache-share" class="secondary-button share-cta" hidden>打包分享</button>
                   </div>
-                  <!-- 不滿意目前結果時的出口：刪掉重來，跟上面「接續補翻」是兩種不同的訴求。 -->
-                  <p class="local-cache-restart-row">
-                    <button type="button" id="btn-cache-restart" class="text-button danger-text-button">不滿意？刪除既有翻譯，重新完整翻譯</button>
-                  </p>
                 </section>
 
                 <section id="pack-meta-card" class="pack-meta-card" hidden aria-labelledby="pack-meta-title">
@@ -183,7 +196,7 @@
                     <div class="pack-meta-head-actions">
                       <span class="share-button-row">
                         <button type="button" id="btn-package" class="text-button share-cta" disabled hidden>分享給其他玩家</button>
-                        <button type="button" class="help-tip" data-help="share" aria-label="說明">?</button>
+                        <button type="button" class="help-tip" data-help="share" aria-label="說明：分享給朋友">?</button>
                       </span>
                       <span class="share-button-row">
                         <button type="button" id="btn-copy-failed" class="text-button" hidden>複製沒翻到的</button>
@@ -233,7 +246,7 @@
 
                 <section id="ai-options-group" class="ai-home-panel options-group" aria-labelledby="opt-group-ai">
                   <div class="ai-home-head">
-                    <h2 id="opt-group-ai" class="options-group-title">AI 輔助翻譯<button type="button" class="help-tip" data-help="ai-source" aria-label="說明">?</button></h2>
+                    <h2 id="opt-group-ai" class="options-group-title">AI 輔助翻譯<button type="button" class="help-tip" data-help="ai-source" aria-label="說明：用哪種 AI 翻">?</button></h2>
                     <!--
                       「啟用 AI」以前是獨立的勾選框，跟下面的來源選擇是兩個控制項
                       在講同一件事——使用者得先勾這個、再選來源，還要自己想通
@@ -284,7 +297,7 @@
                           <div class="managed-auth-compact">
                             <div class="auth-status-line">
                               <strong id="discord-auth-title">Discord 尚未驗證</strong>
-                              <button type="button" class="help-tip" data-help="discord" aria-label="說明">?</button>
+                              <button type="button" class="help-tip" data-help="discord" aria-label="說明：為什麼要登入 Discord">?</button>
                               <p id="discord-auth-note">翻譯前請登入並加入官方伺服器，方便維護、收集建議與調整工具。</p>
                             </div>
                             <div class="managed-auth-actions">
@@ -363,11 +376,7 @@
                   </div>
                 </section>
 
-                <!--
-                  開始翻譯／停止翻譯已搬到頂欄置中（workbench-nav-primary），跟翻譯／字體／
-                  診斷分頁平起平坐：這是整個工具唯一的主要動作，值得一個不必捲頁就看得到的
-                  固定位置。本包選項已搬到「遊戲資料夾」欄位旁邊（見上）。
-                -->
+                <!-- 開始翻譯／停止翻譯在上面的狀態卡（唯一位置）。 -->
                 <div class="action-area primary-action">
                   <div class="action-row secondary-actions">
                     <button type="button" id="btn-repair" class="text-button" hidden>修復工作階段</button>
@@ -382,7 +391,7 @@
               <section class="main-stage" aria-labelledby="font-title">
                 <header class="stage-intro">
                   <p class="stage-kicker">工作台 · 字體</p>
-                  <h1 id="font-title">字體資源包<button type="button" class="help-tip" data-help="font" aria-label="說明">?</button></h1>
+                  <h1 id="font-title">字體資源包<button type="button" class="help-tip" data-help="font" aria-label="說明：字體工具">?</button></h1>
                   <p class="stage-sub">把你有權使用的字體打包進 Minecraft（不翻譯文字）。輸出到「字體結果/」，與翻譯完全分開。</p>
                 </header>
                 <p class="coverage-honest inline-honest">支援 <code>.ttf</code>／<code>.otf</code>（拒 TTC）。建立後請在遊戲資源包列表<strong>置頂</strong>，並關閉 Force Unicode。</p>
@@ -454,107 +463,6 @@
               </section>
           </div>
 
-          <div id="page-diagnose" class="page-panel" data-page="diagnose" hidden>
-              <section class="main-stage" aria-labelledby="diagnose-title">
-                <header class="stage-intro">
-                  <p class="stage-kicker">工作台 · 診斷</p>
-                  <h1 id="diagnose-title">錯誤分析<button type="button" class="help-tip" data-help="diagnose" aria-label="說明">?</button></h1>
-                  <p class="stage-sub">貼上閃退報告，或選整合包資料夾做記錄＋mods 交叉驗證；不會把一切歸咎於翻譯。</p>
-                </header>
-                <p class="coverage-honest inline-honest">分析只在本機進行。優先貼完整 crash report；也可選實例資料夾讓工具讀 crash／latest 並對照 mods。</p>
-
-                <div class="path-block">
-                  <label for="diagnose-pack-path">整合包／實例資料夾（可選）</label>
-                  <div class="input-row">
-                    <input id="diagnose-pack-path" type="text" placeholder="貼路徑，或按右側瀏覽…" autocomplete="off" />
-                    <button type="button" id="btn-diagnose-pack-pick" class="small-button">瀏覽…</button>
-                  </div>
-                  <p class="field-help path-hint">可留空，改貼下方錯誤報告文字。</p>
-                </div>
-
-                <div class="field-block">
-                  <label for="error-input">錯誤報告</label>
-                  <textarea id="error-input" rows="12" placeholder="請從 Description、Caused by 或第一個 ERROR 開始貼上…"></textarea>
-                </div>
-
-                <div class="action-area primary-action">
-                  <button type="button" id="btn-diagnose" class="primary-button start-translate">開始分析</button>
-                  <div class="action-row run-control-row">
-                    <button type="button" id="btn-diagnose-stop" class="danger-button run-control-stop" hidden>停止</button>
-                  </div>
-                  <div class="action-row secondary-actions">
-                    <button type="button" id="btn-diagnose-latest" class="secondary-button">讀取最近記錄</button>
-                    <button type="button" id="btn-restore" class="text-button">移除翻譯</button>
-                    <button type="button" id="btn-delete-backups" class="text-button danger-text-button">刪除全部備份</button>
-                  </div>
-                </div>
-
-                <details class="advanced-details options-group-fold diagnose-report-panel" aria-labelledby="diagnose-report-title">
-                  <summary id="diagnose-report-title">送出診斷回報</summary>
-                  <div class="advanced-body">
-                    <p class="footnote">這裡只收<strong>遊戲端</strong>的問題：閃退、亂碼、譯文不對、套用或還原失敗（需 Discord）。工具本身當掉、介面或縮放問題，請改用頁尾的「回報」。打包白名單檔上傳後 3 天刪除；開發者只收到連結，不含你的路徑。</p>
-                    <p class="footnote"><button type="button" id="btn-goto-issue-report" class="text-button">工具本身的問題 → 開啟頁尾回報</button></p>
-                    <div class="field-block">
-                      <label for="report-category">類別（必選）</label>
-                      <select id="report-category">
-                        <option value="">請選擇</option>
-                        <optgroup label="閃退／當機">
-                          <option value="crash_after_apply">套用後閃退</option>
-                          <option value="crash_on_world">開世界閃退</option>
-                          <option value="crash_on_book_quest">開書／任務閃退</option>
-                        </optgroup>
-                        <optgroup label="畫面文字">
-                          <option value="ui_mojibake">亂碼</option>
-                          <option value="ui_tofu">方框缺字</option>
-                          <option value="still_english">仍是英文</option>
-                          <option value="bad_translation">譯文不佳</option>
-                          <option value="shared_lib_suspect">懷疑共享庫</option>
-                          <option value="placeholder_broken">佔位符／紅字</option>
-                        </optgroup>
-                        <optgroup label="整合包">
-                          <option value="pack_unsupported">不支援</option>
-                          <option value="pack_partial_support">部分支援</option>
-                          <option value="loader_version">載入器／版本</option>
-                          <option value="missing_source">找不到來源</option>
-                        </optgroup>
-                        <!--
-                          「工具」類別已移到頁尾「回報」。兩份選單各自涵蓋對方的領域時，
-                          使用者無從判斷該用哪一個；這裡只留與遊戲／整合包有關的類別。
-                        -->
-                        <optgroup label="套用相關">
-                          <option value="tool_apply_fail">套用失敗</option>
-                          <option value="tool_restore_fail">還原失敗</option>
-                        </optgroup>
-                        <optgroup label="其他">
-                          <option value="other_feature">功能建議</option>
-                          <option value="other_docs">說明文件</option>
-                          <option value="other_privacy">隱私</option>
-                          <option value="other">其他</option>
-                        </optgroup>
-                      </select>
-                    </div>
-                    <label class="option-row compact-option" for="report-unrelated">
-                      <input type="checkbox" id="report-unrelated" />
-                      <span class="check-box" aria-hidden="true"></span>
-                      <span><strong>與整合包無關</strong><small>工具本身或說明問題</small></span>
-                    </label>
-                    <div class="field-block">
-                      <label for="report-pack-name">整合包名稱</label>
-                      <input id="report-pack-name" type="text" placeholder="例如 ATM10；與包無關可留空" autocomplete="off" />
-                    </div>
-                    <div class="field-block">
-                      <label for="report-note">補充說明（選填）</label>
-                      <textarea id="report-note" rows="3" placeholder="你做了什麼、看到什麼…"></textarea>
-                    </div>
-                    <div class="action-row">
-                      <button type="button" id="btn-diagnose-report" class="secondary-button">送出回報</button>
-                      <small id="report-status" class="field-status" aria-live="polite"></small>
-                    </div>
-                  </div>
-                </details>
-              </section>
-          </div>
-
         </div>
 
         <aside class="run-dock side-column" aria-label="執行面板">
@@ -605,13 +513,13 @@
                 <h2 id="log-title" class="side-heading">日誌</h2>
                 <button type="button" id="btn-clear-log" class="text-button">清除</button>
               </div>
-              <pre id="log" class="log log-empty" aria-live="polite">尚未開始</pre>
+              <pre id="log" class="log log-empty" tabindex="0">尚未開始</pre>
             </section>
 
             <div id="rail-actions" class="side-actions rail-panel" data-rail="translate">
               <div class="side-action-combo">
                 <button type="button" id="btn-open" class="side-action-btn">開啟輸出</button>
-                <button type="button" id="btn-open-report" class="side-action-link" title="開啟覆蓋範圍說明或錯誤日誌">報告</button>
+                <button type="button" id="btn-open-report" class="side-action-link" title="開啟覆蓋範圍說明或錯誤日誌">開啟完整紀錄</button>
               </div>
             </div>
 
@@ -636,7 +544,7 @@
                 <h2 id="font-log-title" class="side-heading">日誌</h2>
                 <button type="button" id="btn-clear-font-log" class="text-button">清除</button>
               </div>
-              <pre id="font-log" class="log log-empty" aria-live="polite">選好字體檔與輸出位置後，按「建立字體資源包」。</pre>
+              <pre id="font-log" class="log log-empty" tabindex="0">選好字體檔與輸出位置後，按「建立字體資源包」。</pre>
             </section>
 
             <div id="rail-font-actions" class="side-actions rail-panel" data-rail="font" hidden>
@@ -645,29 +553,6 @@
               </div>
             </div>
 
-            <section id="rail-diagnose" class="side-block step-card rail-panel" data-rail="diagnose" hidden aria-labelledby="diagnose-rail-title">
-              <div class="completeness-head run-status-head">
-                <h2 id="diagnose-rail-title" class="side-heading">步驟</h2>
-                <strong id="diagnose-prog-pct" class="prog-pct">0%</strong>
-              </div>
-              <ol class="linear-steps" id="diagnose-linear-steps" aria-label="診斷流程">
-                <li class="lin-step" data-step="input"><span class="step-index" aria-hidden="true">1</span><span class="step-copy"><strong>輸入</strong><small>路徑或貼文</small></span></li>
-                <li class="lin-step" data-step="analyze"><span class="step-index" aria-hidden="true">2</span><span class="step-copy"><strong>分析</strong><small>本機規則</small></span></li>
-                <li class="lin-step" data-step="result"><span class="step-index" aria-hidden="true">3</span><span class="step-copy"><strong>結果</strong><small>摘要與建議</small></span></li>
-              </ol>
-              <div class="prog-bar"><div id="diagnose-prog-fill" class="prog-fill"></div></div>
-              <p id="diagnose-prog-count" class="prog-count" aria-live="polite">尚未分析</p>
-              <p class="status-message"><span class="status-dot"></span><span id="diagnose-prog-msg" aria-live="polite">貼上錯誤或讀取實例最近記錄。</span></p>
-              <div id="diagnose-rail-summary" class="rail-summary log-empty">尚未分析</div>
-            </section>
-
-            <section id="rail-diagnose-log" class="side-block log-card rail-panel" data-rail="diagnose" hidden aria-labelledby="diagnose-log-title">
-              <div class="log-head">
-                <h2 id="diagnose-log-title" class="side-heading">日誌</h2>
-                <button type="button" id="btn-clear-diagnose-log" class="text-button">清除</button>
-              </div>
-              <pre id="diagnose-log" class="log log-empty" aria-live="polite">診斷紀錄會顯示在這裡。</pre>
-            </section>
           </div>
         </aside>
       </div>
@@ -678,10 +563,10 @@
       <div class="footer-promo" aria-label="專案連結">
         <button type="button" class="promo-card" data-url="https://discord.gg/zeitfrei"><strong>Discord</strong></button>
         <button type="button" class="promo-card promo-support" data-url="https://zeitfrei.bobaboba.me" title="支持開發"><strong>支持開發</strong></button>
-        <button type="button" class="help-tip" data-help="footer-support" aria-label="說明">?</button>
+        <button type="button" class="help-tip" data-help="footer-support" aria-label="說明：支持開發">?</button>
       </div>
       <div class="footer-actions">
-        <button type="button" id="btn-issue-report" class="secondary-button footer-report" title="回報這個工具本身的問題">回報</button>
+        <button type="button" id="btn-issue-report" class="secondary-button footer-report">問題回報</button>
         <button type="button" id="btn-quit" class="text-button">離開</button>
       </div>
     </footer>
@@ -713,9 +598,6 @@
           <button type="button" id="btn-output-pick" class="small-button" hidden>選取</button>
           </div>
           <small id="output-status" class="field-status">工具會在這裡建立「翻譯結果」資料夾。</small>
-          <div class="output-danger-row">
-          <button type="button" id="btn-delete-output" class="text-button danger-text-button" hidden>刪除結果</button>
-          </div>
           </section>
 
           <section id="pack-version-group" class="options-group" aria-labelledby="opt-group-pack">
@@ -895,12 +777,12 @@
       <header class="issue-top">
         <div>
           <p class="stage-kicker">問題回報</p>
-          <h2 id="issue-title">回報給管理員</h2>
+          <h2 id="issue-title">問題回報</h2>
         </div>
         <button type="button" id="btn-issue-close" class="text-button">關閉</button>
       </header>
       <div class="issue-body">
-        <p class="field-help">請先在翻譯頁完成 Discord 登入。送出後會走「聯絡站長」開討論串；通道尚未接通時畫面會告訴你。</p>
+        <p class="field-help">送出後會在官方 Discord 開一個只有你和站長看得到的討論串。</p>
         <div id="issue-discord-gate" class="issue-gate" hidden>
           <p id="issue-discord-note">請先登入 Discord 並加入官方伺服器。</p>
           <div class="issue-gate-actions">
@@ -912,12 +794,24 @@
           <span>問題概要</span>
           <select id="issue-summary">
             <option value="">請選擇</option>
-            <option>翻譯結果不對或沒翻到</option>
-            <option>套用後遊戲異常</option>
-            <option>本地模型／AI 無法使用</option>
-            <option>介面或縮放</option>
-            <option>分享給其他玩家</option>
-            <option>其他</option>
+            <option value="遊戲內顯示問題">遊戲內顯示問題</option>
+            <option value="翻譯結果不對或沒翻到">翻譯結果不對或沒翻到</option>
+            <option value="套用後遊戲異常">套用後遊戲異常</option>
+            <option value="本地模型／AI 無法使用">本地模型／AI 無法使用</option>
+            <option value="介面或縮放">介面或縮放</option>
+            <option value="分享給其他玩家">分享給其他玩家</option>
+            <option value="其他">其他</option>
+          </select>
+        </label>
+        <label class="issue-field" id="issue-display-field" hidden>
+          <span>哪一種顯示問題</span>
+          <select id="issue-display-kind">
+            <option value="">請選擇</option>
+            <option value="方框">方框（中文變成方塊）</option>
+            <option value="亂碼">亂碼</option>
+            <option value="文字超出框">文字超出框</option>
+            <option value="閃退">閃退</option>
+            <option value="某些字沒翻">某些字沒翻</option>
           </select>
         </label>
         <label class="issue-field">
@@ -933,11 +827,21 @@
         </label>
         <label class="issue-field">
           <span>詳細說明（選填，若填寫需超過十個字）</span>
-          <textarea id="issue-detail" rows="4" maxlength="500" placeholder="可補充發生了什麼"></textarea>
+          <textarea id="issue-detail" rows="4" maxlength="400" placeholder="可補充發生了什麼"></textarea>
         </label>
+        <fieldset class="issue-attach">
+          <legend>一起附上（可取消）</legend>
+          <label class="option-row compact-option" for="issue-attach-mc"><input type="checkbox" id="issue-attach-mc" checked /><span class="check-box" aria-hidden="true"></span><span>Minecraft 版本</span></label>
+          <label class="option-row compact-option" for="issue-attach-pack"><input type="checkbox" id="issue-attach-pack" /><span class="check-box" aria-hidden="true"></span><span>模組整合包名稱</span></label>
+        </fieldset>
+        <div class="issue-preview-block">
+          <p class="issue-preview-title">送出的內容（預覽）</p>
+          <pre id="issue-preview" class="issue-preview" tabindex="0"></pre>
+        </div>
         <p id="issue-status" class="issue-status" aria-live="polite"></p>
       </div>
       <div class="issue-actions">
+        <button type="button" id="btn-issue-open-discord" class="secondary-button" hidden>開啟 Discord</button>
         <button type="button" id="btn-issue-submit" class="primary-button" disabled>送出</button>
       </div>
     </div>
@@ -970,7 +874,7 @@
       <header class="device-code-top">
         <div>
           <p class="stage-kicker">本地模型</p>
-          <h2 id="local-llm-overlay-title">同意後先偵測再下載<button type="button" class="help-tip" data-help="local-llm" aria-label="說明">?</button></h2>
+          <h2 id="local-llm-overlay-title">同意後先偵測再下載<button type="button" class="help-tip" data-help="local-llm" aria-label="說明：本地模型">?</button></h2>
         </div>
         <button type="button" id="btn-local-llm-overlay-close" class="text-button">關閉</button>
       </header>
@@ -1016,40 +920,29 @@
   </div>
 
   <div id="consent-overlay" class="consent-overlay" hidden aria-hidden="true">
-    <div class="consent-shell" role="dialog" aria-modal="true" aria-labelledby="consent-title">
+    <div class="consent-shell" role="dialog" aria-modal="true" aria-labelledby="consent-title" aria-describedby="consent-lines">
       <header class="consent-top">
         <div>
           <p class="stage-kicker">使用前確認</p>
-          <h2 id="consent-title">這個工具會做什麼</h2>
-          <p class="consent-lead">先掃描可讀文字、建立翻譯結果並保留備份；需要時才使用你選擇的 AI。原始檔案不會被直接改寫，完成後你仍可檢查結果再使用。</p>
+          <h2 id="consent-title">開始前先知道這幾件事？</h2>
         </div>
       </header>
       <div class="consent-body">
-        <section class="consent-card">
-          <h3>會做</h3>
-          <p>掃描可讀文字、建立繁中翻譯結果、套用前備份，並把有效譯文加入本機記憶與匿名共享庫。</p>
-        </section>
-        <section class="consent-card">
-          <h3>不做</h3>
-          <p>不修改原始 jar、不處理圖片文字、不保證 100%，也不替你確認第三方翻譯或分享授權。</p>
-        </section>
-        <section class="consent-card">
-          <h3>你的電腦</h3>
-          <p>翻譯結果、備份、API Key、GPT 憑證都存本機；請自行保管整合包與存檔。</p>
-        </section>
-        <section class="consent-card">
-          <h3>線上功能</h3>
-          <p>共享庫免登入即可查詢與貢獻。自訂 API、GPT 與本地模型翻譯前需 Discord 會籍（維護、收集建議、調整工具）。自訂 API／GPT 使用你自己的帳號或金鑰額度；本地模型在這台電腦執行。</p>
-        </section>
-        <section class="consent-card consent-card-wide">
-          <h3>免責</h3>
-          <p>這是機器翻譯輔助工具：AI 與社群資料都可能翻錯或翻不完整，套用與分享前請自行檢查。圖片上的字翻不到屬正常。遇到閃退先用「移除翻譯」，再到診斷頁分析。</p>
-        </section>
-        <label class="option-row compact-option consent-check" for="consent-dont-show">
-          <input type="checkbox" id="consent-dont-show" />
-          <span class="check-box" aria-hidden="true"></span>
-          <span><strong>下次不再顯示</strong><small>未勾選時，每次開啟工具都會再次提醒。</small></span>
-        </label>
+        <ul id="consent-lines" class="consent-lines">
+          <li>會翻成繁體中文並套用到遊戲（含放入翻好的模組檔），第一次會問要不要備份。</li>
+          <li>可能翻錯，圖片上的字翻不到。</li>
+          <li>翻好的句子會分享到共享庫，不含金鑰與帳號。</li>
+        </ul>
+        <details class="consent-details">
+          <summary>詳細說明</summary>
+          <div class="consent-details-body">
+            <p><strong>會做</strong>：掃描模組整合包裡看得到的文字，翻成繁體中文，建立翻譯結果並套用到遊戲。需要時會把翻好的模組檔放進遊戲，覆蓋前依你的選擇先備份。</p>
+            <p><strong>不做</strong>：不處理圖片上的字，不保證全部翻完，也不替你確認第三方翻譯或分享的授權。</p>
+            <p><strong>你的電腦</strong>：翻譯結果、備份、API 金鑰、ChatGPT 登入資料都存在這台電腦。</p>
+            <p><strong>線上功能</strong>：共享庫免登入就能查詢與分享。用 AI 翻之前要登入 Discord 並加入官方伺服器；自訂 API 與 ChatGPT 用的是你自己的額度，本地模型在這台電腦執行。</p>
+            <p><strong>遇到閃退</strong>：先按主畫面的「移除翻譯」，再用頁尾「問題回報」告訴我們。</p>
+          </div>
+        </details>
       </div>
       <div class="consent-actions">
         <button type="button" id="btn-consent-accept" class="primary-button">我了解，開始使用</button>
@@ -1061,7 +954,7 @@
     <div class="onboard-shade" id="onboard-shade" aria-hidden="true"></div>
     <div class="onboard-hole" id="onboard-hole" hidden></div>
     <div class="onboard-bubble" id="onboard-bubble" role="dialog" aria-modal="true" aria-labelledby="onboard-title">
-      <div class="onboard-meta" id="onboard-meta">1 / 5</div>
+      <div class="onboard-meta" id="onboard-meta">1 / 4</div>
       <h2 id="onboard-title">歡迎使用</h2>
       <div class="onboard-content"><p id="onboard-body">這裡會說明主畫面怎麼用。</p></div>
       <div class="onboard-actions">

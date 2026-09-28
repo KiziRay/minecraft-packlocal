@@ -318,23 +318,6 @@ code {
   min-width: 0;
   justify-self: start;
 }
-.workbench-nav-primary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  justify-self: center;
-}
-.workbench-nav-primary[hidden] { display: none; }
-.workbench-nav-primary .start-translate {
-  min-height: 36px;
-  padding: 0 20px;
-  width: auto;
-  max-width: none;
-}
-.workbench-nav-primary .run-control-stop {
-  min-height: 36px;
-  padding: 0 16px;
-}
 .workbench-nav-title {
   font-family: var(--font-ui);
   font-size: var(--type-ui);

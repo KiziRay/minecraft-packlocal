@@ -7,7 +7,11 @@
  * 3. 刪除類動作必須先把「會被刪掉的實際路徑」攤開給使用者看，原生對話框做不到。
  *
  * 破壞性動作（danger + ack）預設把確認鍵鎖住，勾了「我知道這會刪掉上面的資料夾」才解鎖。
+ *
+ * 焦點規範（規格 §6，B5a-1）：開啟時背景 inert、Tab 鎖在框內、Esc 與點背景＝取消、
+ * 關閉後焦點回觸發按鈕；危險對話框預設焦點在「取消」，Enter 只觸發目前焦點。
  */
+import { initialFocusRole, modalManager } from "./modal-scope.js";
 
 let activeResolve = null;
 let rootEl = null;
@@ -45,6 +49,7 @@ function close(result) {
   if (rootEl) {
     rootEl.hidden = true;
     rootEl.setAttribute("aria-hidden", "true");
+    modalManager().close(rootEl);
   }
   document.body.classList.remove("confirm-open");
   const resolve = activeResolve;
@@ -65,6 +70,7 @@ export function confirmDialog({
   confirmLabel = "確定",
   cancelLabel = "取消",
   ackLabel = "",
+  initialFocus = "",
 } = {}) {
   const root = build();
   // 同時只允許一個；後來者直接把前一個當成取消收掉，避免疊層卡死。
@@ -110,22 +116,17 @@ export function confirmDialog({
   root.hidden = false;
   root.setAttribute("aria-hidden", "false");
   document.body.classList.add("confirm-open");
-  window.requestAnimationFrame(() => {
-    (needsAck ? ackBox : okBtn).focus?.();
-  });
-
-  return new Promise((resolve) => {
+  const promise = new Promise((resolve) => {
     activeResolve = resolve;
   });
+  // 危險＝焦點在取消（按 Enter 不會誤刪）；一般＝主鈕。Esc＝取消。
+  const focusRole = initialFocusRole({ danger, initialFocus });
+  modalManager().open(root, {
+    onEscape: () => close(false),
+    initialFocus: focusRole === "cancel" ? cancelBtn : okBtn.disabled ? cancelBtn : okBtn,
+  });
+  return promise;
 }
-
-document.addEventListener("keydown", (event) => {
-  if (!isConfirmOpen()) return;
-  if (event.key === "Escape") {
-    event.preventDefault();
-    close(false);
-  }
-});
 
 /* ─── 多選項對話框 ───────────────────────────────────────────
  *
@@ -166,6 +167,7 @@ function closeChoice(value) {
   if (choiceRoot) {
     choiceRoot.hidden = true;
     choiceRoot.setAttribute("aria-hidden", "true");
+    modalManager().close(choiceRoot);
   }
   document.body.classList.remove("confirm-open");
   const resolve = choiceResolve;
@@ -220,19 +222,12 @@ export function choiceDialog({ title, body = "", options = [], cancelLabel = "�
   root.hidden = false;
   root.setAttribute("aria-hidden", "false");
   document.body.classList.add("confirm-open");
-  window.requestAnimationFrame(() => {
-    list.querySelector(".choice-option")?.focus?.();
-  });
-
-  return new Promise((resolve) => {
+  const promise = new Promise((resolve) => {
     choiceResolve = resolve;
   });
+  modalManager().open(root, {
+    onEscape: () => closeChoice(null),
+    initialFocus: () => list.querySelector(".choice-option"),
+  });
+  return promise;
 }
-
-document.addEventListener("keydown", (event) => {
-  if (!isChoiceOpen()) return;
-  if (event.key === "Escape") {
-    event.preventDefault();
-    closeChoice(null);
-  }
-});

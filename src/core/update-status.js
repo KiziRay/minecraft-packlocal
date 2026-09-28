@@ -22,3 +22,11 @@ export function describeUpdateCheck(info) {
   }
   return { kind: "available", message: String(info.message || ""), showModal: true };
 }
+
+/**
+ * 延後（翻譯中）的更新結果，翻譯結束後要開哪裡：玩家主動按「檢查更新」的一律開更新視窗
+ * （不受曾關閉過橫幅影響）；只有自動檢查才交給橫幅 N-01。
+ */
+export function pendingUpdateTarget({ interactive = false, hasBanner = false } = {}) {
+  return !interactive && hasBanner ? "banner" : "modal";
+}

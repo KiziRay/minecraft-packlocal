@@ -1,4 +1,5 @@
 import { parseCssZoom, visualToCssPx } from "../ui-scale-logic.js";
+import { TOUR_STEPS, tourAdvance, tourMeta, tourNextLabel, tourPlan } from "./tour-steps.js";
 
 const ONBOARDING_STORAGE_KEY = "modpack-i18n-onboarding-seen-v1.0.9";
 /** 舊鍵：看過就算看過，改版不該讓既有使用者被重播一次導覽。 */
@@ -15,41 +16,13 @@ function cssZoom() {
 }
 
 /**
- * 新手引導只教「完成第一次翻譯」需要的四件事。
- *
- * 舊版有 7 步，其中「錯誤分析」「字體資源包」「⋯ 設定」對第一次開工具的人
- * 來說是雜訊——那些是遇到問題才會用到的功能，開頭講只會讓人想按跳過。
- * 減到 4 步、每步只講一件事、隨時可跳過，而且中途關掉下次會從同一步接續。
+ * 新手引導（規格 §4.2 tour，B5a-1）：4 步、依狀態出現，步驟定義在 tour-steps.js。
+ * 還沒選資料夾時走完第 1 步先暫停（不算看完），選好資料夾後由主視窗呼叫
+ * resumeOnboarding() 從第 2 步接著。Esc／跳過＝整個跳過並記為看過，通知主視窗 toast。
  */
-const ONBOARD_STEPS = [
-  {
-    selector: ".path-block",
-    title: "第一步：選遊戲資料夾",
-    body: "先選你要翻譯的 Minecraft 整合包資料夾。通過檢查後，下面的 AI 選項與「開始翻譯」才會出現。",
-  },
-  {
-    selector: "#ai-options-group",
-    fallback: "#path-gate-hint",
-    title: "第二步：選翻譯來源",
-    body: "本地模型免費但要先下載一次；自訂 API 與 GPT 需要自己的帳號。不選也能翻，只是只用得到既有的中文資料。",
-  },
-  {
-    selector: "#btn-run",
-    fallback: "#path-gate-hint",
-    title: "第三步：按開始翻譯",
-    body: "翻完會自動套用到遊戲，中途可以隨時停止，已完成的部分都會保留。",
-  },
-  {
-    selector: "#btn-overflow",
-    title: "遇到問題時",
-    body: "右上角 ⋯ 裡有完整使用說明、錯誤分析與問題回報。中文變成方框是字體問題，那裡也有字體工具。",
-  },
-];
-
-export function createOnboarding({ $, closeGuideOverlaySafe }) {
+export function createOnboarding({ $, closeGuideOverlaySafe, isInstanceReady = () => false, onSkipped = () => {} }) {
   let onboardIndex = 0;
   let onboardActive = false;
-  let activeSteps = [];
   function hasSeenOnboarding() {
     try {
       if (localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1") return true;
@@ -87,18 +60,9 @@ export function createOnboarding({ $, closeGuideOverlaySafe }) {
     const fallback = step.fallback ? document.querySelector(step.fallback) : null;
     return isVisible(fallback) ? fallback : null;
   }
-  function resolveActiveSteps() {
-    activeSteps = ONBOARD_STEPS.filter((step) => !!resolveOnboardTarget(step));
-    return activeSteps;
-  }
   function layoutOnboarding() {
     if (!onboardActive) return;
-    if (!activeSteps.length) {
-      stopOnboarding(true);
-      return;
-    }
-    if (onboardIndex >= activeSteps.length) onboardIndex = activeSteps.length - 1;
-    const step = activeSteps[onboardIndex];
+    const step = TOUR_STEPS[onboardIndex];
     const root = $("onboard-root");
     const hole = $("onboard-hole");
     const bubble = $("onboard-bubble");
@@ -108,17 +72,13 @@ export function createOnboarding({ $, closeGuideOverlaySafe }) {
     const prev = $("onboard-prev");
     const next = $("onboard-next");
     if (!root || !bubble || !step) return;
-    if (meta) meta.textContent = `${onboardIndex + 1} / ${activeSteps.length}`;
+    if (meta) meta.textContent = tourMeta(onboardIndex);
     if (title) title.textContent = step.title;
     if (body) body.textContent = step.body;
-    if (prev) prev.disabled = onboardIndex <= 0;
-    if (next) next.textContent = onboardIndex >= activeSteps.length - 1 ? "完成" : "下一步";
+    // 第 2 步是選好資料夾後才接著出現的，回上一步會回到已經做完的第 1 步，沒有意義
+    if (prev) prev.disabled = onboardIndex <= 1;
+    if (next) next.textContent = tourNextLabel(onboardIndex);
     const target = resolveOnboardTarget(step);
-    if (!target) {
-      resolveActiveSteps();
-      layoutOnboarding();
-      return;
-    }
     const pad = 8;
     const vw = window.innerWidth || 800;
     const vh = window.innerHeight || 600;
@@ -149,22 +109,30 @@ export function createOnboarding({ $, closeGuideOverlaySafe }) {
     bubble.style.top = `${Math.round(visualToCssPx(top, z))}px`;
     bubble.style.visibility = "";
   }
-  function stopOnboarding(markSeen) {
+  function focusStepTarget(step) {
+    window.setTimeout(() => {
+      const target = resolveOnboardTarget(step);
+      if (target && typeof target.focus === "function") target.focus();
+    }, 0);
+  }
+  function hide() {
     onboardActive = false;
     const root = $("onboard-root");
     if (root) { root.hidden = true; root.classList.remove("is-active"); root.setAttribute("aria-hidden", "true"); }
-    if (markSeen) markOnboardingSeen();
     window.removeEventListener("resize", layoutOnboarding);
   }
-  function startOnboarding(opts = {}) {
-    const force = !!opts.force;
-    if (!force && hasSeenOnboarding()) return;
+  /** 結束引導。markSeen＝記為看過；skipped＝玩家跳過（主視窗會 toast 告知去哪找回）。 */
+  function stopOnboarding(markSeen, { skipped = false } = {}) {
+    const wasActive = onboardActive;
+    hide();
+    if (markSeen) markOnboardingSeen();
+    if (skipped && wasActive) onSkipped();
+  }
+  function show(index) {
     const root = $("onboard-root");
     if (!root) return;
     closeGuideOverlaySafe();
-    resolveActiveSteps();
-    // 重播（force）一律從頭；正常啟動則接續上次看到的那一步
-    onboardIndex = force ? 0 : Math.min(loadProgress(), Math.max(0, activeSteps.length - 1));
+    onboardIndex = index;
     onboardActive = true;
     root.hidden = false;
     root.classList.add("is-active");
@@ -172,17 +140,46 @@ export function createOnboarding({ $, closeGuideOverlaySafe }) {
     layoutOnboarding();
     window.addEventListener("resize", layoutOnboarding);
   }
+  function showPlanned(progress) {
+    const plan = tourPlan({ progress, instanceReady: !!isInstanceReady() });
+    if (plan.kind === "done") {
+      stopOnboarding(true);
+      return;
+    }
+    if (plan.kind === "pause") {
+      const pausedAt = TOUR_STEPS[Math.max(0, progress - 1)];
+      saveProgress(progress);
+      hide();
+      // 引導開著時背景是 inert，框住的按鈕按不到；收起引導後把焦點交給它，玩家直接按 Enter 就能選
+      focusStepTarget(pausedAt);
+      return;
+    }
+    show(plan.index);
+  }
+  function startOnboarding(opts = {}) {
+    const force = !!opts.force;
+    if (!force && hasSeenOnboarding()) return;
+    // 重播（force）一律從頭；正常啟動則接續上次看到的那一步
+    const progress = force ? 0 : loadProgress();
+    if (force) saveProgress(0);
+    showPlanned(progress);
+  }
+  /** 選好資料夾後呼叫：引導在第 1 步後暫停的話，從第 2 步接著。 */
+  function resumeOnboarding() {
+    if (onboardActive || hasSeenOnboarding()) return;
+    const progress = loadProgress();
+    if (progress <= 0) return;
+    showPlanned(progress);
+  }
   function previousOnboardingStep() {
-    if (onboardIndex <= 0) return;
+    if (onboardIndex <= 1) return;
     onboardIndex -= 1;
     saveProgress(onboardIndex);
     layoutOnboarding();
   }
   function nextOnboardingStep() {
-    if (onboardIndex >= activeSteps.length - 1) { stopOnboarding(true); return; }
-    onboardIndex += 1;
-    saveProgress(onboardIndex);
-    layoutOnboarding();
+    const progress = tourAdvance({ index: onboardIndex });
+    showPlanned(progress);
   }
-  return { startOnboarding, stopOnboarding, layoutOnboarding, isOnboardingActive: () => onboardActive, previousOnboardingStep, nextOnboardingStep };
+  return { startOnboarding, stopOnboarding, resumeOnboarding, layoutOnboarding, isOnboardingActive: () => onboardActive, previousOnboardingStep, nextOnboardingStep };
 }

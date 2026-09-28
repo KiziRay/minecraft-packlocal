@@ -299,11 +299,6 @@ textarea {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
   background: var(--danger-soft);
 }
-/* 設定檔壞掉是「有東西不對勁」，用警示色，跟一般資訊卡分開。 */
-.settings-health-card {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
-  background: var(--danger-soft);
-}
 .local-cache-head {
   display: flex;
   align-items: center;

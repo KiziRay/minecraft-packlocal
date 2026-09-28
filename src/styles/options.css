@@ -41,7 +41,6 @@
 .more-options-grid { grid-template-columns: 1fr; }
 .full-field, .full-range { grid-column: 1 / -1; }
 .field-block { min-width: 0; }
-.output-danger-row { margin-top: 8px; }
 
 .more-options-cta:not([hidden]) {
   display: flex;

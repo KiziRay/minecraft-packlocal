@@ -130,7 +130,7 @@ export function createApplyPendingFlow(deps) {
 
   async function confirmOverwrite(result) {
     return deps.confirmDialog({
-      title: "這次會覆蓋遊戲裡原本的檔案",
+      title: "要覆蓋遊戲裡原本的檔案嗎？",
       body: pendingMessageOf(result),
       affected: previewList(pendingOverwritesOf(result)),
       danger: true,

@@ -1,18 +1,21 @@
 // ───────────────────────── 檢查更新（主視窗）─────────────────────────
-// 啟動時自動檢查一次；有新版時跳更新視窗。手動「檢查更新」在設定視窗「關於」，
-// 有新版時由設定視窗請主視窗呼叫 window.zfCheckUpdate() 顯示同一個更新視窗。
+// 啟動時自動檢查一次；有新版時交給主視窗的橫幅 N-01（B5a-1：不再直接跳視窗，
+// 也不與同意頁疊），橫幅上的「更新」才開更新浮層。手動「檢查更新」在設定視窗「關於」，
+// 有新版時由設定視窗請主視窗呼叫 window.zfCheckUpdate() 直接顯示更新浮層（玩家主動問的）。
 // 契約：invoke("check_update") → { current, latest, updateAvailable, url, notes, ok, message, testBuild }
 //       invoke("download_update") → { path, launched, automatic, shouldExit, message }
-import { describeUpdateCheck } from "./update-status.js";
+import { describeUpdateCheck, pendingUpdateTarget } from "./update-status.js";
 
 export { describeUpdateCheck, TEST_BUILD_MESSAGE } from "./update-status.js";
 
-export function wireUpdateChecker({ appendLog = null, isBusy = () => false } = {}) {
+export function wireUpdateChecker({ appendLog = null, isBusy = () => false, onUpdateAvailable = null } = {}) {
   const _invoke =
     (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) || null;
   let latestUpdateInfo = null;
   let updateInFlight = false;
   let pendingUpdateInfo = null;
+  /** 延後的那次是不是玩家主動按「檢查更新」（是的話結束後直接開更新視窗）。 */
+  let pendingInteractive = false;
 
   function parseUpdateNotes(notes) {
     const raw = String(notes || "").trim();
@@ -78,8 +81,10 @@ export function wireUpdateChecker({ appendLog = null, isBusy = () => false } = {
     overlay.setAttribute("aria-hidden", "true");
   }
 
-  function setPendingUpdateInfo(info) {
-    if (info) pendingUpdateInfo = info;
+  function setPendingUpdateInfo(info, interactive = false) {
+    if (!info) return;
+    pendingUpdateInfo = info;
+    pendingInteractive = pendingInteractive || !!interactive;
   }
 
   // 給 setBusy 使用：翻譯/其他工作完成後，自動補回被延遲的更新。
@@ -87,10 +92,14 @@ export function wireUpdateChecker({ appendLog = null, isBusy = () => false } = {
     try {
       if (pendingUpdateInfo && !isBusy()) {
         const info = pendingUpdateInfo;
+        const interactive = pendingInteractive;
         pendingUpdateInfo = null;
+        pendingInteractive = false;
         latestUpdateInfo = info;
         window.__mcpl_latestUpdateInfo = latestUpdateInfo;
-        showUpdateModal(info);
+        const target = pendingUpdateTarget({ interactive, hasBanner: typeof onUpdateAvailable === "function" });
+        if (target === "banner") onUpdateAvailable(info);
+        else showUpdateModal(info);
       }
     } catch (_) {
       /* ignore */
@@ -153,11 +162,17 @@ export function wireUpdateChecker({ appendLog = null, isBusy = () => false } = {
       return;
     }
     if (isBusy()) {
-      setPendingUpdateInfo(info);
+      setPendingUpdateInfo(info, interactive);
       if (interactive && typeof appendLog === "function") appendLog("忙碌中：更新延遲顯示", "warn");
       return;
     }
     pendingUpdateInfo = null;
+    pendingInteractive = false;
+    // 自動檢查：交給橫幅 N-01（由主視窗決定何時顯示，不與同意頁疊）；手動檢查直接開視窗
+    if (pendingUpdateTarget({ interactive, hasBanner: typeof onUpdateAvailable === "function" }) === "banner") {
+      onUpdateAvailable(info);
+      return;
+    }
     showUpdateModal(info);
     if (interactive && typeof appendLog === "function") {
       appendLog("發現新版本 " + info.latest + "（目前 " + info.current + "）。", "warn");
@@ -248,4 +263,10 @@ export function wireUpdateChecker({ appendLog = null, isBusy = () => false } = {
     attach();
   }
   window.zfCheckUpdate = () => runUpdateCheck(true);
+  return {
+    /** 橫幅「更新」：開啟更新浮層（沿用既有的下載／手動下載流程）。 */
+    showUpdateModal: () => {
+      if (latestUpdateInfo) showUpdateModal(latestUpdateInfo);
+    },
+  };
 }

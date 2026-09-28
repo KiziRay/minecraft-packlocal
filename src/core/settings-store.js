@@ -52,6 +52,8 @@ const KEY_MAP = {
   "modpack-i18n-remember-api-key-v1": "privacy.rememberApiKey",
   "mcpl-webview-scale": "appearance.uiScale",
   "mcpl-webview-autoscale": "appearance.uiAutoScale",
+  "mcpl-disclosure-pick-folder": "ui.disclosure.pickFolder",
+  "mcpl-banner-update-dismissed": "ui.banner.updateDismissedVersion",
 };
 
 /** 舊版鍵名 → 目前鍵名。目前的鍵沒有值時，才用舊鍵的值搬進設定檔。 */
@@ -222,6 +224,9 @@ export function getSettingsHealthNotice() {
       level: "warn",
       title: "你的設定讀不出來，這次先用預設值",
       body: `設定檔的內容壞掉了（${health.detail || "格式不正確"}）。${where}。翻譯功能不受影響，只是主題、音量這些偏好回到預設；重新設定一次就好。`,
+      // 橫幅 N-02 用：原檔有沒有保留、要開哪個資料夾
+      backupKept: !!health.backup,
+      folder: health.backup || settingsPath,
     };
   }
   if (health.status === "unreadable") {
@@ -229,6 +234,9 @@ export function getSettingsHealthNotice() {
       level: "warn",
       title: "設定檔打不開，這次先用預設值",
       body: `${health.detail || "讀取失敗"}。多半是被防毒軟體或另一個視窗佔住了。翻譯功能不受影響。設定檔位置：${settingsPath}`,
+      // 打不開時工具不寫入，原檔一定還在
+      backupKept: true,
+      folder: settingsPath,
     };
   }
   return null;

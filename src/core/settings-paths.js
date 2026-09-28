@@ -31,6 +31,8 @@ export const SETTING_PATHS = [
   "usage.lastSubmitAt",
   "usage.lastNudgeAt",
   "developer.testMode",
+  "ui.disclosure.pickFolder",
+  "ui.banner.updateDismissedVersion",
 ];
 
 const FORBIDDEN_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);

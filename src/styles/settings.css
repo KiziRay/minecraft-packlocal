@@ -283,7 +283,6 @@
   max-height: none;
 }
 .run-control-row,
-.output-danger-row,
 .input-row,
 .guide-jump-row {
   flex-wrap: wrap;

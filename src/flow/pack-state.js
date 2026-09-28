@@ -1,0 +1,265 @@
+/**
+ * 流程狀態（規格 ux-spec §2）：依目前的遊戲資料夾算出「一句現況＋唯一主要按鈕」。
+ *
+ * 純函式、不碰 DOM，所以能單元測試 R-1（主要按鈕恰好 0 或 1，0 只在例外清單）。
+ * 畫面由 status-card.js 依這裡的結果畫；翻譯邏輯一律不在這裡。
+ *
+ * B5a-1 只實作：S00、S01、S02（暫行：資料夾檢查沒過）、S09（暫行：翻譯中只放停止鈕）、
+ * S19a／S19b、暫行「可開始」（READY）與 D 區停用原因 S20。其餘狀態由 B5d、B5b、B5c 加。
+ * 失效安全：輸入缺欄位時退回最保守的狀態（沒同意→S00、沒資料夾→S01）。
+ */
+
+export const STATE = Object.freeze({
+  consent: "S00",
+  noFolder: "S01",
+  folderNotRight: "S02",
+  translating: "S09",
+  removedWithResult: "S19a",
+  removedNoResult: "S19b",
+  /** 暫行「可開始」：一句現況＋「開始翻譯」（呼叫舊 onRun，之後的彈窗照舊，B5b 改）。 */
+  ready: "READY",
+  /** 暫行：舊的「已翻完未套用卡」出現時（主要動作由該卡提供，B5c 併入狀態卡 S11）。 */
+  pendingCard: "S11-card",
+  /** 暫行：舊的「上次沒翻完」接續卡出現時（主要動作由該卡提供，B5d 併入「上次：<包名>」）。 */
+  resumeCard: "RESUME-card",
+  busy: "BUSY",
+});
+
+/** 主要按鈕可以是 0 顆的狀態（規格 R-1 例外）。S20 不是狀態卡狀態，所以不在這裡。 */
+export const ZERO_PRIMARY_ALLOWED = Object.freeze(["S10", "S17", "S18", "S11-card", "RESUME-card"]);
+
+export const ACTION = Object.freeze({
+  acceptConsent: "accept-consent",
+  pickFolder: "pick-folder",
+  run: "run",
+  stop: "stop",
+  applyResult: "apply-result",
+  deleteAndRestart: "delete-and-restart",
+});
+
+/** 狀態句、附加行、停用原因的字數上限（規格 §5.2；包名不計）。 */
+export const SENTENCE_MAX = 40;
+/** 包名超長時截到 16 字加省略號（規格 §5.2 共用規則）。 */
+export const PACK_NAME_MAX = 16;
+
+export function shortPackName(name, max = PACK_NAME_MAX) {
+  const text = String(name || "").trim();
+  if (!text) return "";
+  const chars = Array.from(text);
+  return chars.length > max ? chars.slice(0, max).join("") + "…" : text;
+}
+
+/** 從路徑取最後一段當包名（「C:/x/ATM10/」→「ATM10」）。 */
+export function packNameFromPath(path) {
+  const parts = String(path || "")
+    .trim()
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+function clip(text, max = SENTENCE_MAX) {
+  const chars = Array.from(String(text || "").replace(/\s+/g, " ").trim());
+  return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : chars.join("");
+}
+
+function normalize(input) {
+  const src = input && typeof input === "object" ? input : {};
+  const instancePath = String(src.instancePath || "").trim();
+  const validation = src.validation && typeof src.validation === "object" ? src.validation : {};
+  const removal = src.removal && typeof src.removal === "object" ? src.removal : null;
+  return {
+    consentAccepted: !!src.consentAccepted,
+    instancePath,
+    packName: shortPackName(src.packName || packNameFromPath(instancePath)),
+    validated: !!validation.ok,
+    validationReason: String(validation.reason || "").trim(),
+    versionBlocked: !!src.versionBlocked,
+    versionBlockReason: String(src.versionBlockReason || "").trim(),
+    busy: !!src.busy,
+    busyKind: String(src.busyKind || ""),
+    hasResult: !!src.hasResult,
+    removal:
+      removal && String(removal.instancePath || "").trim() === instancePath && instancePath ? removal : null,
+    pickFolderFresh: src.pickFolderFresh !== false,
+    applyPendingShown: !!src.applyPendingShown,
+    resumeShown: !!src.resumeShown,
+    translationComplete: !!src.translationComplete,
+  };
+}
+
+function state(id, fields) {
+  return {
+    id,
+    tone: "neutral",
+    sentence: "",
+    extraLine: "",
+    disclosureKey: "",
+    detailLines: [],
+    primary: null,
+    secondary: [],
+    more: [],
+    disabledReason: "",
+    showAiRow: false,
+    ...fields,
+  };
+}
+
+function busyReason(kind) {
+  if (kind === "apply") return "正在套用到遊戲，完成後才能開始";
+  if (kind === "font") return "字體工具正在建立字體包，完成後才能開始";
+  return "正在處理，完成後才能開始";
+}
+
+function busySentence(kind) {
+  if (kind === "apply") return "正在套用到遊戲…";
+  if (kind === "font") return "字體工具正在建立字體包…";
+  return "正在處理…";
+}
+
+/** 移除翻譯結果的下一行：刪了幾個、放回幾個、幾個無法還原（規格 S19a 附加）。 */
+export function removalDetailLines(result) {
+  const r = result && typeof result === "object" ? result : {};
+  const count = (value) => (Array.isArray(value) ? value.length : Number(value) || 0);
+  const removed = count(r.removed ?? r.removedFiles ?? r.removed_files);
+  const restored = count(r.restored ?? r.restoredFiles ?? r.restored_files);
+  const unrestorable = count(r.unrestorable);
+  const lines = [`刪了 ${removed} 個檔、放回 ${restored} 個原檔、${unrestorable} 個無法還原`];
+  const quarantined = Array.isArray(r.quarantined) ? r.quarantined.filter(Boolean) : [];
+  if (quarantined.length) lines.push(`你原本的版本保存在隔離區（${quarantined.length} 個），詳見紀錄`);
+  return lines;
+}
+
+/**
+ * 算出目前的流程狀態。
+ *
+ * @param {{
+ *   consentAccepted?: boolean, instancePath?: string, packName?: string,
+ *   validation?: {ok?: boolean, reason?: string}, versionBlocked?: boolean, versionBlockReason?: string,
+ *   busy?: boolean, busyKind?: string, hasResult?: boolean,
+ *   removal?: {instancePath: string, result?: object, hasResult?: boolean} | null,
+ *   pickFolderFresh?: boolean,
+ * }} input
+ */
+export function computePackState(input) {
+  const i = normalize(input);
+  const name = i.packName || "這個模組整合包";
+
+  if (!i.consentAccepted) {
+    // 同意頁本身就是這個狀態的畫面；按鈕在同意頁上（唯一位置），狀態卡不重複畫。
+    return state(STATE.consent, {
+      sentence: "開始前先看完使用前說明",
+      primary: { action: ACTION.acceptConsent, label: "我了解，開始使用" },
+    });
+  }
+
+  if (i.busy && (i.busyKind === "translate" || !i.busyKind)) {
+    return state(STATE.translating, {
+      sentence: `正在翻「${name}」`,
+      primary: { action: ACTION.stop, label: "停止翻譯" },
+    });
+  }
+
+  if (i.busy) {
+    const reason = busyReason(i.busyKind);
+    return state(STATE.busy, {
+      sentence: busySentence(i.busyKind),
+      primary: { action: ACTION.run, label: "開始翻譯", disabled: true },
+      disabledReason: reason,
+    });
+  }
+
+  // 暫行（B5d 取代）：接續卡在畫面上時，下一步由那張卡提供，狀態卡不另出主要按鈕
+  if (i.resumeShown) {
+    return state(STATE.resumeCard, { sentence: "上次沒翻完" });
+  }
+
+  if (!i.instancePath) {
+    return state(STATE.noFolder, {
+      sentence: "選要翻譯的模組整合包遊戲資料夾（裡面有 mods）",
+      extraLine: i.pickFolderFresh ? "CurseForge：在整合包上按右鍵→開啟資料夾" : "",
+      disclosureKey: "pickFolder",
+      primary: { action: ACTION.pickFolder, label: "選擇遊戲資料夾" },
+    });
+  }
+
+  if (!i.validated || i.versionBlocked) {
+    const why = i.versionBlocked
+      ? i.versionBlockReason || "這個 Minecraft 版本太舊，無法翻譯"
+      : i.validationReason && i.validationReason !== "尚未選擇遊戲資料夾。"
+        ? i.validationReason
+        : "這個資料夾不能翻譯，請重新選擇";
+    return state(STATE.folderNotRight, {
+      tone: "block",
+      sentence: clip(why),
+      primary: { action: ACTION.pickFolder, label: "重新選擇" },
+    });
+  }
+
+  // 暫行（B5c 取代）：待套用卡在畫面上時，主要動作「套用到遊戲」在那張卡
+  if (i.applyPendingShown) {
+    return state(STATE.pendingCard, { sentence: "已翻完，還沒裝進遊戲" });
+  }
+
+  if (i.removal) {
+    const hasResult = i.removal.hasResult ?? i.hasResult;
+    const detailLines = removalDetailLines(i.removal.result);
+    const sentence = "已移除翻譯，遊戲回到原本的語言";
+    if (hasResult) {
+      return state(STATE.removedWithResult, {
+        sentence,
+        detailLines,
+        primary: { action: ACTION.applyResult, label: "套用到遊戲" },
+      });
+    }
+    return state(STATE.removedNoResult, {
+      sentence,
+      detailLines,
+      primary: { action: ACTION.run, label: "開始翻譯" },
+      showAiRow: true,
+    });
+  }
+
+  return state(STATE.ready, {
+    sentence: i.translationComplete ? "這個模組整合包已翻譯" : `已選好「${name}」，可以開始翻譯`,
+    primary: { action: ACTION.run, label: i.translationComplete ? "重新翻譯" : "開始翻譯" },
+    more: i.hasResult ? [{ action: ACTION.deleteAndRestart, label: "刪除結果並重翻", danger: true }] : [],
+    showAiRow: true,
+  });
+}
+
+/**
+ * D 區（整合包區）的停用原因：翻譯中整區停用，原因寫 S20 句（規格 §2.2 S20）。
+ * 其他工作進行中也鎖，但原因不同。
+ */
+export function folderAreaLock(input) {
+  const src = input && typeof input === "object" ? input : {};
+  if (!src.busy) return { locked: false, reason: "" };
+  const kind = String(src.busyKind || "");
+  if (kind === "translate" || !kind) {
+    const name = shortPackName(src.packName || packNameFromPath(src.instancePath)) || "這個模組整合包";
+    return { locked: true, reason: `正在翻「${name}」，翻完才能換資料夾` };
+  }
+  return { locked: true, reason: "正在處理，完成後才能換資料夾" };
+}
+
+/**
+ * D 區「移除翻譯」按鈕（全工具唯一入口）：有翻譯紀錄才出現；忙碌時停用並寫原因（R-4）。
+ */
+export function removeTranslationControl(input) {
+  const src = input && typeof input === "object" ? input : {};
+  const visible = !!src.instancePath && !!src.hasTranslationRecord;
+  if (!visible) return { visible: false, disabledReason: "" };
+  const lock = folderAreaLock(src);
+  return { visible: true, disabledReason: lock.locked ? lock.reason : "" };
+}
+
+/**
+ * 翻譯中切到其他分頁（字體工具）時的共用一行（審查中1）：「正在翻譯「<包名>」」＋同一顆停止鈕。
+ * 翻譯分頁可見時不顯示（狀態卡已經在說，一件事只在一處說）。
+ */
+export function runElsewhereLine({ page = "translate", state: current = null, packName = "" } = {}) {
+  if (page === "translate" || !current || current.id !== STATE.translating) return { shown: false, sentence: "" };
+  const name = shortPackName(packName) || "這個模組整合包";
+  return { shown: true, sentence: `正在翻譯「${name}」` };
+}

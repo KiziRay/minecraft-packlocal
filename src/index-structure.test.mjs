@@ -163,6 +163,46 @@ test("刪除全部備份、重看引導、檢查更新都交給主視窗執行",
   assert.ok(actions.includes('askMain("replay-onboarding")'));
   assert.ok(actions.includes("describeUpdateCheck("));
   assert.ok(app.includes("async function deleteAllBackupsFlow()"));
-  assert.ok(app.includes('$("btn-delete-backups").onclick = () => deleteAllBackupsFlow();'),
-    "診斷頁的舊按鈕先保留（B8 才刪），且與設定視窗走同一條流程");
+  // B5a-1：診斷分頁刪除，刪除全部備份只剩設定視窗一個入口（規格 §1.2）
+  assert.ok(!html.includes('id="btn-delete-backups"'), "主視窗不再有刪除全部備份的舊按鈕");
+  assert.ok(app.includes('"delete-backups": () => deleteAllBackupsFlow()') || app.includes("deleteAllBackupsFlow()"));
+});
+
+test("B5a-1：主視窗不再有診斷分頁（DOM 與分頁按鈕），翻譯頁的主要按鈕只在狀態卡", () => {
+  for (const id of ["tab-diagnose", "page-diagnose", "rail-diagnose", "rail-diagnose-log", "diagnose-log", "btn-diagnose"]) {
+    assert.ok(!html.includes(`id="${id}"`), `還有 #${id}`);
+  }
+  assert.ok(!html.includes('data-page="diagnose"'));
+  assert.ok(!html.includes("workbench-nav-primary"), "頂欄的開始／停止翻譯已移到狀態卡");
+  const card = html.slice(html.indexOf('id="status-card"'), html.indexOf("</section>", html.indexOf('id="status-card"')));
+  for (const id of ["btn-run", "btn-stop", "btn-card-pick", "btn-card-apply"]) {
+    assert.ok(card.includes(`id="${id}"`), `#${id} 要在狀態卡裡`);
+    assert.equal(html.split(`id="${id}"`).length - 1, 1, `#${id} 只能有一顆`);
+  }
+  assert.ok(!app.includes('showAppPage("diagnose")'));
+  // 問題回報的日誌收集留在後端（診斷回報與記錄讀取指令仍註冊），只拆掉前端分頁
+  assert.ok(lib.includes("fn submit_diagnose_report_cmd"));
+  assert.ok(lib.includes("fn diagnose_pack_dir_cmd"));
+});
+
+test("B5a-1：紀錄不當提示（移除 aria-live、可聚焦），狀態句 aria-live，「？」寫主題", () => {
+  assert.match(html, /<pre id="log" class="log log-empty" tabindex="0">/);
+  assert.match(html, /<pre id="font-log" class="log log-empty" tabindex="0">/);
+  assert.match(html, /id="status-card-sentence" class="status-card-sentence" aria-live="polite"/);
+  assert.ok(!html.includes('aria-label="說明">'), "「？」的 aria-label 要寫主題");
+});
+
+test("B5a-1 D-06：移除字體包是危險對話框（預設焦點取消），與移除翻譯分開（G1.26）", () => {
+  const block = app.slice(app.indexOf('$("btn-font-remove").onclick'), app.indexOf('remove_font_pack_cmd'));
+  assert.ok(block.includes('title: "移除字體包？"'));
+  assert.ok(block.includes("danger: true"));
+  assert.ok(html.includes('id="btn-font-remove"'), "移除字體包留在字體工具頁");
+});
+
+test("B5a-1：翻譯中 D 區用 aria-disabled＋原因（S20），不是直接 disabled", () => {
+  const hard = app.slice(app.indexOf("const hardLockIds = ["), app.indexOf("hardLockIds.forEach"));
+  assert.ok(!hard.includes('"btn-inst"'), "瀏覽…改由 D 區 aria-disabled 管");
+  assert.ok(!hard.includes('"btn-run"'), "開始翻譯改由狀態卡 aria-disabled 管");
+  assert.ok(html.includes('id="folder-lock-reason"'));
+  assert.ok(read("flow/pack-actions.js").includes("folderAreaLock("));
 });

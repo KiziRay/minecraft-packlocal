@@ -16,8 +16,7 @@ body[data-instance-ready="0"][data-app-page="translate"] .run-dock,
 body[data-instance-ready="0"] #ai-options-group,
 body[data-instance-ready="0"] .primary-action,
 body[data-instance-ready="0"] .inline-honest,
-body[data-instance-ready="0"][data-app-page="translate"] #pack-meta-card,
-body[data-instance-ready="0"][data-app-page="translate"] .stage-sub-ready {
+body[data-instance-ready="0"][data-app-page="translate"] #pack-meta-card {
   display: none !important;
 }
 /*
@@ -25,16 +24,6 @@ body[data-instance-ready="0"][data-app-page="translate"] .stage-sub-ready {
  * 資料夾搬過、外接碟沒接時檢查會失敗——那正是使用者最需要「打開結果／分享」的時候，
  * 舊版卻剛好在這時把唯一的出口藏起來。卡片本身由 JS 的 showLocalCacheCard 控制顯示。
  */
-body[data-instance-ready="1"] .stage-sub-empty,
-body:not([data-instance-ready="0"]) .stage-sub-empty {
-  display: none !important;
-}
-body[data-instance-ready="0"][data-app-page="translate"] .stage-sub-empty {
-  display: block !important;
-  max-width: 36rem;
-  font-size: 15px;
-  color: var(--ink);
-}
 body[data-instance-ready="0"][data-app-page="translate"] .path-block {
   max-width: 36rem;
   margin-top: 8px;
@@ -52,18 +41,6 @@ body[data-instance-ready="0"][data-app-page="translate"] .path-block > label {
 body[data-instance-ready="0"][data-app-page="translate"] #btn-inst {
   min-height: var(--btn-h-md);
   min-width: 88px;
-}
-.path-gate-hint[hidden] { display: none !important; }
-body[data-instance-ready="0"][data-app-page="translate"] .path-gate-hint {
-  display: block;
-  margin: 14px 0 0;
-  padding: 12px 14px;
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-sm);
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.5;
-  background: color-mix(in srgb, var(--panel) 70%, transparent);
 }
 @keyframes content-fade-in {
   from { opacity: 0.92; transform: translateY(2px); }

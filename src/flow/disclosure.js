@@ -1,0 +1,65 @@
+/**
+ * 說明漸進退場（規格 §4）：每則說明有獨立 key；第一次完整顯示，之後退場只留「？」。
+ *
+ * 熟手＝該說明對應的動作成功完成一次（或玩家按了「不再顯示」）。
+ * 存在設定檔 `ui.disclosure.<key>`（白名單在 src/core/settings-paths.js，前後端共用，G0.1、G0.2）。
+ * 這個模組不碰 DOM 也不直接讀檔：讀寫由呼叫端注入（主視窗用 getSetting／setSetting）。
+ */
+
+/** key → 設定檔路徑與 localStorage 鍵。新增一則說明要同步 settings-paths.js 與 settings-store.js 的 KEY_MAP。 */
+export const DISCLOSURES = Object.freeze({
+  pickFolder: Object.freeze({
+    storageKey: "mcpl-disclosure-pick-folder",
+    settingPath: "ui.disclosure.pickFolder",
+    topic: "怎麼找到遊戲資料夾",
+  }),
+});
+
+const RETIRED = "retired";
+
+export function createDisclosure({ read = () => null, write = () => {} } = {}) {
+  const known = (key) => Object.prototype.hasOwnProperty.call(DISCLOSURES, key);
+  /** 叫回一次（按「？」）：只影響這次畫面，不改退場紀錄。 */
+  const recalled = new Set();
+
+  function isFresh(key) {
+    if (!known(key)) return false;
+    try {
+      return read(DISCLOSURES[key].storageKey) !== RETIRED;
+    } catch (_) {
+      // 讀不到＝當第一次（失效安全：多說一次比少說好）
+      return true;
+    }
+  }
+
+  function retire(key) {
+    if (!known(key)) return;
+    recalled.delete(key);
+    try {
+      write(DISCLOSURES[key].storageKey, RETIRED);
+    } catch (_) {
+      /* 寫不進去只是下次再說一次 */
+    }
+  }
+
+  function recall(key) {
+    if (known(key)) recalled.add(key);
+  }
+
+  function isShown(key) {
+    return isFresh(key) || recalled.has(key);
+  }
+
+  function resetAll() {
+    recalled.clear();
+    for (const key of Object.keys(DISCLOSURES)) {
+      try {
+        write(DISCLOSURES[key].storageKey, "");
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  return { isFresh, isShown, retire, recall, resetAll };
+}

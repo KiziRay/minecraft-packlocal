@@ -103,6 +103,14 @@ test("不備份模式：每次覆蓋前都確認，取消就不套用", async ()
   assert.equal(no.calls.invoke.length, 0);
 });
 
+test("B5a-1 D-03：覆蓋無備份的確認標題是問句、危險（預設焦點在取消）", async () => {
+  const pending = { applyStatus: "needsOverwriteConfirm", pendingOverwrites: ["mods/a.jar"] };
+  const { flow, calls } = makeFlow({ confirm: false });
+  await flow.handle(pending, ctx);
+  assert.equal(calls.confirms[0].title, "要覆蓋遊戲裡原本的檔案嗎？");
+  assert.equal(calls.confirms[0].danger, true);
+});
+
 test("沒有 options.txt：請先啟動一次遊戲", () => {
   assert.equal(describeApplyPending({ status: "noOptionsTxt" }).title, "請先啟動一次遊戲");
 });

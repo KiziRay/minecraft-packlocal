@@ -24,9 +24,7 @@
   .side-actions,
   #rail-font,
   #rail-font-log,
-  #rail-font-actions,
-  #rail-diagnose,
-  #rail-diagnose-log {
+  #rail-font-actions {
     grid-column: 1 / -1;
   }
   .side-block.log-card { max-height: clamp(140px, 26vh, 200px); }
@@ -64,12 +62,8 @@
     padding: 8px;
   }
   .workbench-nav-brand,
-  .workbench-nav-primary,
   .workbench-page-tabs {
     justify-self: stretch;
-  }
-  .workbench-nav-primary {
-    justify-content: center;
   }
   .workbench-page-tabs {
     width: 100%;

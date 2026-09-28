@@ -55,6 +55,13 @@ import {
 } from "./core/settings-sync.js";
 import { wireHelpTips } from "./ui/help-tip.js";
 import { choiceDialog, confirmDialog, isConfirmOpen } from "./ui/confirm.js";
+import { settingsHealthBanner } from "./ui/banner.js";
+import { DISPLAY_CATEGORY, buildIssuePayload, describeIssueResult } from "./ui/issue-report.js";
+import { isAriaDisabled } from "./flow/status-card.js";
+import { createPackActions, describeImportReport } from "./flow/pack-actions.js";
+import { createDisclosure } from "./flow/disclosure.js";
+import { CONSENT_CONTENT_VERSION, TOUR_SKIPPED_TOAST, afterConsent, isConsentAccepted } from "./flow/first-run.js";
+import { createRemovalFlow } from "./flow/removal-flow.js";
 import { runExclusive } from "./ui/once.js";
 import { createLocalModelRounds } from "./core/local-model-round.js";
 import { STOP_LABELS, resetStopButton } from "./ui/stop-button.js";
@@ -77,11 +84,23 @@ import {
 const {
   startOnboarding,
   stopOnboarding,
+  resumeOnboarding,
   layoutOnboarding,
   isOnboardingActive,
   previousOnboardingStep,
   nextOnboardingStep,
-} = createOnboarding({ $, closeGuideOverlaySafe });
+} = createOnboarding({
+  $,
+  closeGuideOverlaySafe,
+  isInstanceReady: () => document.body.dataset.instanceReady === "1",
+  // 跳過引導（Esc／跳過／點背景）時告訴玩家去哪找回（規格 §3.6）
+  onSkipped: () => showAppToast(TOUR_SKIPPED_TOAST, 3000),
+});
+/** 說明漸進退場（規格 §4）：讀寫走設定檔（白名單 ui.disclosure.*）。 */
+const disclosure = createDisclosure({
+  read: (key) => getSetting(key, null),
+  write: (key, value) => setSetting(key, value),
+});
 const { initSfxControls, applySfxPrefs, maybePlaySfxError, maybePlaySfxSuccess } = createSfxControls();
 
 let latestAiStatus = null;
@@ -108,6 +127,8 @@ let pendingUsageFeedbackNudge = false;
 let usageFeedbackDelayTimerId = 0;
 let feedbackStep = 1;
 let issueSubmitBusy = false;
+/** 這次開啟的回報已經送出成功：送出鈕停用，避免重複開討論串。 */
+let issueSubmitted = false;
 let lastIssueStatus = "";
 let shareConfirmationOpen = false;
 let shareUploadInFlight = false;
@@ -127,7 +148,6 @@ let apiKeySavedMask = "";
 let apiKeyEditing = false;
 let gptLoginInFlight = false;
 let hasApplyBackups = false;
-let lastDiagnosisResult = null;
 let backupProbeToken = 0;
 let backupProbeTimer = 0;
 let translationHelperStatus = null;
@@ -499,39 +519,38 @@ function consumeCoverageMessage(message) {
   if (changed) renderCoverageMetrics();
 }
 
+/** 同意頁本版一次（規格 D-01）：存的是同意內容的版本，Esc 不算同意。 */
 function hasHiddenConsentOverlay() {
   try {
-    if (localStorage.getItem(CONSENT_STORAGE_KEY) === "1") return true;
-    // 舊鍵也算數：改鍵名不該讓既有使用者被要求重新同意一次。
-    return CONSENT_STORAGE_KEY_LEGACY.some((k) => localStorage.getItem(k) === "1");
+    return isConsentAccepted(getSetting(CONSENT_STORAGE_KEY, null));
   } catch (_) {
     return false;
   }
 }
 
 function showConsentOverlay() {
-  if (hasHiddenConsentOverlay()) return;
+  if (hasHiddenConsentOverlay()) return false;
   const ov = $("consent-overlay");
-  if (!ov) return;
+  if (!ov) return false;
   ov.hidden = false;
   ov.setAttribute("aria-hidden", "false");
+  return true;
 }
 
+/** 只由「我了解，開始使用」呼叫（Esc 與點背景都不會走到這裡）。按下後接新手引導。 */
 function hideConsentOverlay() {
   const ov = $("consent-overlay");
   if (!ov) return;
-  const dontShow = !!$("consent-dont-show")?.checked;
-  if (dontShow) {
-    try {
-      localStorage.setItem(CONSENT_STORAGE_KEY, "1");
-    } catch (_) {
-      /* ignore */
-    }
-  }
+  setSetting(CONSENT_STORAGE_KEY, CONSENT_CONTENT_VERSION);
   ov.hidden = true;
   ov.setAttribute("aria-hidden", "true");
+  syncUiState();
+  if (afterConsent({ tourSeen: false }) === "tour") {
+    // startOnboarding 自己會判斷看過沒；看過就什麼都不做
+    window.setTimeout(() => startOnboarding({ force: false }), 60);
+  }
+  packActions.maybeShowUpdateBanner();
 }
-
 
 /** 說明已整合進設定頁，沒有浮層要關；保留給新手引導呼叫，避免它需要知道這件事。 */
 function closeGuideOverlaySafe() {
@@ -695,6 +714,64 @@ const applyPending = createApplyPendingFlow({
   },
 });
 
+/** 移除翻譯（D-05）與刪除結果並重翻（D-08）：問→做→回結果，畫面由狀態卡畫。 */
+const removalFlow = createRemovalFlow({
+  invoke,
+  confirmDialog,
+  ensureGameClosed: (path, label) => ensureGameClosed(path, label),
+  formatError: (e) => formatInvokeError(e),
+});
+
+/**
+ * B5a-1 流程接線（狀態卡、D 區、S19、刪除結果並重翻、橫幅、浮層焦點）在 src/flow/pack-actions.js；
+ * 這裡只把 app.js 的狀態與既有函式交給它。
+ */
+const packActions = createPackActions({
+  $,
+  doc: document,
+  invoke,
+  getSetting,
+  setSetting,
+  disclosure,
+  removalFlow,
+  getState: () => ({
+    consentAccepted: hasHiddenConsentOverlay(),
+    validation: instanceValidation,
+    versionBlocked,
+    versionBlockReason,
+    progressBusy,
+    shareUploadInFlight,
+    busyJobKind: window.__busyJobKind || "",
+    localCacheProbe,
+    translationState,
+    hasApplyBackups,
+  }),
+  syncUiState: () => syncUiState(),
+  onPickInstance: () => onPickInstance(),
+  onRun: () => onRun(),
+  appendLog: (text, level) => appendLog(text, level),
+  appendError: (text) => appendError(text),
+  log: (text) => log(text),
+  formatInvokeError: (e) => formatInvokeError(e),
+  offerRecordResetIfBroken: (e, path) => offerRecordResetIfBroken(e, path),
+  selectedOutputDir: () => selectedOutputDir(),
+  resultWorkDir: (dir) => resultWorkDir(dir),
+  refreshBackupState: () => refreshBackupState(),
+  setTranslationState: (state) => setTranslationState(state),
+  hideLocalCacheCard: () => hideLocalCacheCard(),
+  clearShareableFiles: () => {
+    hasShareableFiles = false;
+  },
+  applyCachedTranslation: () => applyCachedTranslation(),
+  pathLeaf: (path) => pathLeaf(path),
+  stopOnboarding: (markSeen, opts) => stopOnboarding(markSeen, opts),
+  hideIssueOverlay: () => hideIssueOverlay(),
+  closeMoreDrawer: () => closeMoreDrawer(),
+  refreshIssueReportUi: () => refreshIssueReportUi(),
+  openIssueDiscord: () => openIssueDiscord(),
+  markWired: (el) => markWired(el),
+});
+
 function applyContextFromUi(outputDir) {
   return {
     instancePath: ($("instance")?.value || "").trim(),
@@ -749,8 +826,6 @@ function syncOutputField() {
   const hasInstance = !!($("instance")?.value || "").trim();
   const picker = $("btn-output-pick");
   if (picker) picker.hidden = !hasInstance || !custom || progressBusy;
-  const deleter = $("btn-delete-output");
-  if (deleter) deleter.hidden = !hasInstance || !selectedOutputDir() || progressBusy;
 }
 
 function setAutoOutputDir(path) {
@@ -896,10 +971,12 @@ function showLocalCacheCard(probe) {
   const card = $("local-cache-card");
   if (!card) return;
   // 正在翻譯時不顯示：進度條已經回答了「有沒有翻譯」這件事，卡片只會製造矛盾訊息。
+  // 剛移除翻譯（狀態卡 S19）時也不顯示：「套用到遊戲」只在狀態卡一處。
   if (
     !localCacheProbe ||
     !readCacheRemindEnabled() ||
-    translationState === "running"
+    translationState === "running" ||
+    packActions.isRemovalShownFor(($("instance")?.value || "").trim())
   ) {
     card.hidden = true;
     return;
@@ -1224,8 +1301,6 @@ function wireWriteAccessCard() {
 
 /** 設定檔壞掉時把原因講清楚，不要讓偏好無聲無息回到預設值。 */
 function showSettingsHealthNotice() {
-  const card = $("settings-health-card");
-  if (!card) return;
   let notice = null;
   try {
     notice = getSettingsHealthNotice();
@@ -1233,12 +1308,10 @@ function showSettingsHealthNotice() {
     notice = null;
   }
   if (!notice) return;
-  setCardText("settings-health-title", notice.title);
-  setCardText("settings-health-message", notice.body);
-  card.hidden = false;
+  // 完整說明進紀錄；畫面只留橫幅 N-02 一句（規格 §3.4）
   appendLog(`${notice.title}：${notice.body}`, "warn");
-  const dismiss = $("btn-settings-health-dismiss");
-  if (dismiss) dismiss.onclick = () => (card.hidden = true);
+  const banner = settingsHealthBanner(notice);
+  if (banner) packActions.bannerArea().show(banner);
 }
 
 /**
@@ -1306,7 +1379,6 @@ const DEV_TRACE_FILE = "開發進度偵測.txt";
 const RUN_LOG_MAX_BYTES = 256 * 1024;
 let errorLogCount = 0;
 const fontLogLines = [];
-const diagnoseLogLines = [];
 let fontPreviewFace = null;
 
 function nowStamp() {
@@ -1406,34 +1478,6 @@ function clearFontLog(seedMsg) {
 
 function appendFontLog(msg, level) {
   appendPanelLog(fontLogLines, msg, level, renderPanelLog, $("font-log"));
-}
-
-function clearDiagnoseLog(seedMsg) {
-  diagnoseLogLines.length = 0;
-  if (seedMsg) diagnoseLogLines.push("[" + nowStamp() + "] " + seedMsg);
-  renderPanelLog($("diagnose-log"), diagnoseLogLines);
-}
-
-function appendDiagnoseLog(msg, level) {
-  appendPanelLog(diagnoseLogLines, msg, level, renderPanelLog, $("diagnose-log"));
-}
-
-/**
- * 換了要分析的對象時，把上一次的分析結果收掉。
- *
- * 跟翻譯頁「換資料夾但步驟燈號沒歸零」是同一種問題：分析完 A 之後改成 B 的路徑，
- * 右側還掛著 A 的判定，看起來像是 B 的結論。診斷結果會直接影響使用者要不要
- * 去刪模組，掛錯對象比沒有結論更糟。
- */
-function resetDiagnosisForNewTarget() {
-  if (lastDiagnosisResult === null && !diagnoseLogLines.length) return;
-  lastDiagnosisResult = null;
-  clearDiagnoseLog();
-  const rail = $("diagnose-rail-summary");
-  if (rail) {
-    rail.classList.add("log-empty");
-    rail.textContent = "尚未分析。選好資料夾或貼上錯誤報告後按「開始分析」。";
-  }
 }
 
 async function flushFontLog(workDir) {
@@ -1868,6 +1912,25 @@ function issueDiscordReady(s = latestAiStatus) {
   return loggedIn && inGuild;
 }
 
+/** 問題回報浮層的欄位 → 實際送出的內容（預覽＝送出，規格 §9 待確認 16）。 */
+function issuePayloadFromForm() {
+  const version = String(document.querySelector("[data-app-version]")?.textContent || "").trim();
+  const mcVersion = ($("target-version")?.value || "").trim();
+  const instancePath = ($("instance")?.value || "").trim();
+  return buildIssuePayload({
+    summary: $("issue-summary")?.value || "",
+    displayKind: $("issue-display-kind")?.value || "",
+    cause: $("issue-cause")?.value || "",
+    detail: $("issue-detail")?.value || "",
+    attach: { mc: !!$("issue-attach-mc")?.checked, pack: !!$("issue-attach-pack")?.checked },
+    info: {
+      toolVersion: version && version !== "—" ? version : "",
+      mcVersion,
+      packName: instancePath ? pathLeaf(instancePath) : "",
+    },
+  });
+}
+
 function refreshIssueReportUi() {
   const ov = $("issue-overlay");
   if (!ov || ov.hidden) return;
@@ -1884,6 +1947,11 @@ function refreshIssueReportUi() {
   }
   if ($("btn-issue-login")) $("btn-issue-login").hidden = loggedIn;
   if ($("btn-issue-join")) $("btn-issue-join").hidden = !loggedIn || ready;
+  const displayField = $("issue-display-field");
+  if (displayField) displayField.hidden = ($("issue-summary")?.value || "") !== DISPLAY_CATEGORY;
+  const payload = issuePayloadFromForm();
+  const preview = $("issue-preview");
+  if (preview) preview.textContent = payload.preview;
   const detail = ($("issue-detail")?.value || "").trim();
   const status = $("issue-status");
   let hint = lastIssueStatus;
@@ -1893,7 +1961,7 @@ function refreshIssueReportUi() {
     status.classList.toggle("is-set", !!hint);
   }
   const submit = $("btn-issue-submit");
-  if (submit) submit.disabled = issueSubmitBusy;
+  if (submit) submit.disabled = issueSubmitBusy || issueSubmitted;
 }
 
 function hideIssueOverlay() {
@@ -1916,6 +1984,9 @@ function showIssueOverlay() {
   const ov = $("issue-overlay");
   if (!ov) return;
   lastIssueStatus = "";
+  issueSubmitted = false;
+  if ($("btn-issue-open-discord")) $("btn-issue-open-discord").hidden = true;
+  if ($("issue-display-kind")) $("issue-display-kind").value = "";
   // 同一張表單若因網路逾時重送，必須沿用同一把 key，讓 Worker 回第一次已建立
   // 的私人討論串結果而不是重開一條。每次重新開回報視窗才視為新的案件。
   issueReportIdempotencyKey = `mcpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
@@ -1930,59 +2001,56 @@ function showIssueOverlay() {
 }
 
 async function submitIssueReportFromOverlay() {
-  if (issueSubmitBusy) return;
-  const summary = $("issue-summary")?.value || "";
-  const cause = $("issue-cause")?.value || "";
-  const detailRaw = ($("issue-detail")?.value || "").trim();
+  if (issueSubmitBusy || issueSubmitted) return;
   if (!issueDiscordReady()) {
     setIssueStatus("請先登入並加入官方伺服器。");
     return;
   }
-  if (!summary || !cause) {
-    setIssueStatus("請選擇問題概要與原因。");
-    return;
-  }
-  if (detailRaw && detailRaw.length <= 10) {
-    setIssueStatus("詳細說明請超過十個字。");
+  const payload = issuePayloadFromForm();
+  if (!payload.ok) {
+    setIssueStatus(payload.error);
     return;
   }
   issueSubmitBusy = true;
   refreshIssueReportUi();
   setIssueStatus("送出中…");
+  let result = null;
   try {
-    const result = await invoke("submit_issue_report_cmd", {
-      summary,
-      cause,
-      detail: detailRaw || null,
+    result = await invoke("submit_issue_report_cmd", {
+      summary: payload.summary,
+      cause: payload.cause,
+      detail: payload.detail,
       idempotencyKey: issueReportIdempotencyKey,
     });
-    if (result && result.ok) {
-      const msg = result.message || "已送給站長，會在聯絡頻道開討論串。";
-      setIssueStatus(msg);
-      appendLog(msg);
-      await confirmDialog({
-        title: "已送出",
-        body: msg,
-        confirmLabel: "知道了",
-        cancelLabel: "關閉",
-      });
-      hideIssueOverlay();
-      return;
-    }
-    const msg = (result && result.message) || "目前無法自動送出。";
-    setIssueStatus(msg);
-    appendLog(msg, "warn");
-    await offerDiscordFallback(msg, { summary, cause, detail: detailRaw });
   } catch (e) {
     const raw = String(e?.message || e || "").trim();
-    const msg = raw && !raw.includes("invoke") ? raw : "目前無法自動送出。";
-    setIssueStatus(msg);
-    appendLog(msg, "warn");
-    await offerDiscordFallback(msg, { summary, cause, detail: detailRaw });
-  } finally {
-    issueSubmitBusy = false;
-    refreshIssueReportUi();
+    result = { ok: false, message: raw && !raw.includes("invoke") ? raw : "目前無法自動送出。" };
   }
+  let copied = false;
+  if (!result || !result.ok) {
+    // 沒送出：把填好的內容放進剪貼簿，玩家貼到 Discord 就好，不用重打
+    try {
+      await navigator.clipboard.writeText(payload.preview);
+      copied = true;
+    } catch (_) {
+      copied = false;
+    }
+  }
+  const view = describeIssueResult(result, { copied });
+  issueSubmitBusy = false;
+  issueSubmitted = view.ok;
+  // 結果就地寫在浮層裡（案件編號或如實說明），不再另開對話框
+  setIssueStatus(view.text);
+  appendLog(view.text, view.ok ? "info" : "warn");
+  if ($("btn-issue-open-discord")) $("btn-issue-open-discord").hidden = !view.showDiscord;
+  refreshIssueReportUi();
+}
+
+async function openIssueDiscord() {
+  const invite =
+    (latestAiStatus && (latestAiStatus.inviteUrl || latestAiStatus.invite_url)) ||
+    "https://discord.gg/zeitfrei";
+  await openExternalUrl(invite).catch(() => {});
 }
 
 function showFeedbackOverlay() {
@@ -2546,36 +2614,10 @@ function setFontProgress(percent, message, opts) {
   if (message && !(opts && opts.skipLog)) appendFontLog(Math.floor(p) + "%  " + message);
 }
 
-function setDiagnoseProgress(percent, message, opts) {
-  const p = Math.max(0, Math.min(100, Number(percent) || 0));
-  const fill = $("diagnose-prog-fill");
-  const pctEl = $("diagnose-prog-pct");
-  const msgEl = $("diagnose-prog-msg");
-  const countEl = $("diagnose-prog-count");
-  if (fill) fill.style.width = (p >= 100 ? 100 : p) + "%";
-  if (pctEl) pctEl.textContent = Math.floor(p >= 100 ? 100 : p) + "%";
-  if (countEl) countEl.textContent = p > 0 ? Math.floor(p) + "% 分析中" : "尚未分析";
-  if (msgEl && message) msgEl.textContent = message;
-  const activeStep = p >= 100 ? "result" : p > 0 ? "analyze" : "input";
-  document.querySelectorAll("#diagnose-linear-steps .lin-step").forEach((el) => {
-    const key = el.getAttribute("data-step");
-    const order = ["input", "analyze", "result"];
-    const idx = order.indexOf(key);
-    const activeIdx = order.indexOf(activeStep);
-    el.classList.toggle("active", idx === activeIdx && p < 100);
-    el.classList.toggle("done", idx >= 0 && idx < activeIdx);
-  });
-  if (message && !(opts && opts.skipLog)) appendDiagnoseLog(Math.floor(p) + "%  " + message);
-}
-
 function setProgress(percent, message, opts) {
   const job = window.__busyJobKind || document.body.dataset.appPage || "translate";
   if (job === "font") {
     setFontProgress(percent, message, opts);
-    return;
-  }
-  if (job === "diagnose") {
-    setDiagnoseProgress(percent, message, opts);
     return;
   }
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
@@ -2649,7 +2691,7 @@ function setBusy(busy, jobKind) {
     try {
       const overlay = document.getElementById("update-overlay");
       if (overlay && !overlay.hidden) {
-        if (typeof window.zfUpdateModalSetPending === "function") window.zfUpdateModalSetPending(window.__mcpl_latestUpdateInfo || null);
+        if (typeof window.zfUpdateModalSetPending === "function") window.zfUpdateModalSetPending(window.__mcpl_latestUpdateInfo || null, true);
         if (typeof window.zfUpdateModalHide === "function") window.zfUpdateModalHide();
       }
     } catch (_) {
@@ -2673,21 +2715,16 @@ function setBusy(busy, jobKind) {
   }
   const stop = $("btn-stop");
   const fontStop = $("btn-font-stop");
-  const diagnoseStop = $("btn-diagnose-stop");
   if (stop) {
     stop.hidden = !busy || kind !== "translate";
     resetStopButton(stop);
   }
   if (fontStop) fontStop.hidden = !busy || kind !== "font";
-  if (diagnoseStop) diagnoseStop.hidden = !busy || kind !== "diagnose";
   // 仍鎖定：開第二個重任務、改路徑、連線設定等
+  // btn-run、btn-inst 不在這裡：它們改用 aria-disabled＋就地原因（狀態卡、D 區 S20）
   const hardLockIds = [
-    "btn-run",
     "btn-repair",
-    "btn-delete-backups",
     "btn-output-pick",
-    "btn-delete-output",
-    "btn-inst",
     "btn-save-adv",
     "btn-test-api",
     "use-ai",
@@ -2731,15 +2768,6 @@ function setBusy(busy, jobKind) {
     "font-apply-current",
     "btn-glossary",
     "target-version",
-    "btn-diagnose",
-    "btn-diagnose-latest",
-    "btn-diagnose-report",
-    "error-input",
-    "diagnose-pack-path",
-    "report-category",
-    "report-pack-name",
-    "report-note",
-    "report-unrelated",
     "btn-helper-prepare",
     "btn-helper-rescan",
     "btn-helper-cleanup",
@@ -2759,7 +2787,7 @@ function setBusy(busy, jobKind) {
   if (updateLaterBtn) updateLaterBtn.disabled = false;
 
   // 忙碌中仍可切分頁瀏覽（開始鈕另由 syncUiState 看 progressBusy）
-  ["tab-translate", "tab-font", "tab-diagnose"].forEach((id) => {
+  ["tab-translate", "tab-font"].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = false;
   });
@@ -2775,6 +2803,7 @@ function setBusy(busy, jobKind) {
   syncStatusRail(document.body.dataset.appPage || "translate");
   syncUiState();
   if (!busy && typeof window.zfUpdateModalMaybeShowPending === "function") window.zfUpdateModalMaybeShowPending();
+  if (!busy) packActions.maybeShowUpdateBanner();
   if (!busy && pendingUsageFeedbackNudge && translationState === "complete" && !isBlockingOverlayOpen()) {
     pendingUsageFeedbackNudge = false;
     scheduleUsageFeedbackNudge();
@@ -2790,17 +2819,15 @@ function showAppSection(_section) {
   showAppPage(lastWorkbenchPage || "translate");
 }
 
-/** 分頁：translate | font | diagnose（設定是獨立視窗 settings.html，不是這裡的分頁） */
+/** 分頁：translate | font（診斷分頁已刪除；設定是獨立視窗 settings.html，不是這裡的分頁） */
 function showAppPage(page, opts = {}) {
-  const name = ["font", "diagnose"].includes(page) ? page : "translate";
+  const name = page === "font" ? "font" : "translate";
   const previous = document.body.dataset.appPage || "translate";
   const changed = previous !== name;
   const pageTr = $("page-translate");
   const pageFont = $("page-font");
-  const pageDiagnose = $("page-diagnose");
   const tabTr = $("tab-translate");
   const tabFont = $("tab-font");
-  const tabDiagnose = $("tab-diagnose");
   if (pageTr) {
     pageTr.hidden = name !== "translate";
     pageTr.classList.toggle("active", name === "translate");
@@ -2817,14 +2844,6 @@ function showAppPage(page, opts = {}) {
     tabFont.classList.toggle("active", name === "font");
     tabFont.setAttribute("aria-selected", name === "font" ? "true" : "false");
   }
-  if (pageDiagnose) {
-    pageDiagnose.hidden = name !== "diagnose";
-    pageDiagnose.classList.toggle("active", name === "diagnose");
-  }
-  if (tabDiagnose) {
-    tabDiagnose.classList.toggle("active", name === "diagnose");
-    tabDiagnose.setAttribute("aria-selected", name === "diagnose" ? "true" : "false");
-  }
   lastWorkbenchPage = name;
   document.body.dataset.appPage = name;
   document.body.dataset.appSection = "workbench";
@@ -2832,7 +2851,7 @@ function showAppPage(page, opts = {}) {
   if (workbench) workbench.hidden = false;
   syncStatusRail(name);
   syncUiState();
-  const activePanel = name === "font" ? pageFont : name === "diagnose" ? pageDiagnose : pageTr;
+  const activePanel = name === "font" ? pageFont : pageTr;
   if (changed && !opts.skipTransition) revealPagePanel(activePanel);
 }
 
@@ -2860,7 +2879,7 @@ function wireTablistKeyboard() {
 }
 
 function syncStatusRail(page) {
-  const name = ["font", "diagnose"].includes(page) ? page : "translate";
+  const name = page === "font" ? "font" : "translate";
   document.querySelectorAll(".rail-panel").forEach((el) => {
     const rail = el.getAttribute("data-rail") || "translate";
     el.hidden = rail !== name;
@@ -3014,18 +3033,11 @@ function wireShellChrome() {
   if ($("btn-consent-accept")) {
     $("btn-consent-accept").onclick = hideConsentOverlay;
   }
-  // 診斷頁只收遊戲端問題；工具本身的問題一鍵轉到頁尾回報，不用自己找。
-  if ($("btn-goto-issue-report")) {
-    $("btn-goto-issue-report").onclick = () => showIssueOverlay();
-  }
   window.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
+    // 同意頁按 Esc 不作用、不算同意（規格 D-01）；浮層的 Esc 由 ui/modal-scope.js 統一處理
     if (isMoreDrawerOpen()) {
       closeMoreDrawer();
-      return;
-    }
-    if ($("consent-overlay") && !$("consent-overlay").hidden) {
-      hideConsentOverlay();
     }
   });
 }
@@ -3049,13 +3061,11 @@ function syncUiState() {
   syncPackOptionsAvailability();
   ["field-output", "pack-version-group", "translation-method-group", "reference-details"]
     .forEach((id) => toggleHidden(id, !(hasInstance && !!instanceValidation.ok)));
-  const gateHint = $("path-gate-hint");
-  if (gateHint) {
-    gateHint.hidden = (hasInstance && !!instanceValidation.ok) || page !== "translate";
-  }
+  // 狀態卡（規格 §2）：一句現況＋唯一主要按鈕；AI 列只在狀態要求時出現
+  const packState = packActions.renderStatusCard();
   const aiGroup = $("ai-options-group");
   if (aiGroup) {
-    const showAi = hasInstance && !!instanceValidation.ok;
+    const showAi = packState.showAiRow && hasInstance && !!instanceValidation.ok;
     aiGroup.hidden = !showAi;
     aiGroup.setAttribute("aria-hidden", showAi ? "false" : "true");
   }
@@ -3066,21 +3076,7 @@ function syncUiState() {
     runDock.hidden =
       page === "translate" && !(hasInstance && !!instanceValidation.ok) && !progressBusy;
   }
-  const runBtn = $("btn-run");
-  if (runBtn) {
-    // 開始翻譯現在住在頂欄，跨頁常駐——但「開始一個新翻譯」只在翻譯分頁才有意義，
-    // 切到字體／診斷時要跟著隱藏。停止翻譯不受此限：翻譯在背景繼續跑，
-    // 使用者切去看字體設定時仍要能隨時按到停止（見 setBusy 的 kind !== "translate" 判斷）。
-    runBtn.hidden = progressBusy || !instanceReady || page !== "translate";
-    runBtn.disabled = !instanceReady || progressBusy;
-    runBtn.title = !hasInstance
-      ? "請先選擇遊戲資料夾"
-      : !instanceValidation.ok
-        ? instanceValidation.reason || "實例檢查未通過"
-        : versionBlocked
-          ? versionBlockReason || "Minecraft 版本過舊，無法翻譯"
-          : "";
-  }
+  // 開始翻譯／停止翻譯在狀態卡（renderStatusCard），這裡不再另外控制
   // 「補充漏翻」與「重新翻譯缺漏」已移除：補翻整併進「開始翻譯」的
   // 「接續補完」選項與同輪自動重試；兩顆按鈕留著只會讓人不知道該按哪個。
   toggleHidden("btn-repair", !failed || locked);
@@ -3117,10 +3113,7 @@ function syncUiState() {
   toggleHidden("btn-open", page !== "translate" || !translateOutReady);
   toggleHidden("btn-open-report", page !== "translate" || !translateOutReady);
   toggleHidden("btn-open-font", page !== "font" || !fontOutReady);
-  const diagnosePackPath = ($("diagnose-pack-path")?.value || "").trim();
-  toggleHidden("btn-diagnose-latest", !(hasInstance || diagnosePackPath) || locked);
-  toggleHidden("btn-restore", !(hasInstance || diagnosePackPath) || !hasApplyBackups || locked);
-  toggleHidden("btn-delete-backups", !(hasInstance || diagnosePackPath) || !hasApplyBackups || locked);
+  packActions.syncFolderArea();
 
   syncTranslationHelperPanel();
 
@@ -3289,8 +3282,7 @@ function scheduleBackupStateRefresh() {
 }
 
 async function refreshBackupState() {
-  const instancePath =
-    ($("instance")?.value || "").trim() || ($("diagnose-pack-path")?.value || "").trim();
+  const instancePath = ($("instance")?.value || "").trim();
   const outputDir = selectedOutputDir() || null;
   const token = ++backupProbeToken;
   if (!instancePath) {
@@ -3855,39 +3847,6 @@ async function ensureAiReadyForAction() {
  * 使用者剛打完一段詳細說明，被告知失敗卻沒有下一步，等於白打一次。這裡把他
  * 剛填的內容整理好複製到剪貼簿，再問要不要直接開 Discord——貼上去就好。
  */
-async function offerDiscordFallback(reason, form) {
-  const version = String(document.querySelector("[data-app-version]")?.textContent || "").trim();
-  const text = [
-    `【模組包翻譯工具${version ? " " + version : ""}】`,
-    `問題概要：${form?.summary || "未填"}`,
-    `可能原因：${form?.cause || "未填"}`,
-    String(form?.detail || "").trim() || "（未填詳細說明）",
-  ].join("\n");
-  let copied = false;
-  try {
-    await navigator.clipboard.writeText(text);
-    copied = true;
-  } catch (_) {
-    /* 沒有剪貼簿權限就只開 Discord，讓使用者自己重打 */
-  }
-  const go = await confirmDialog({
-    title: "無法自動送出",
-    body:
-      reason +
-      "\n\n" +
-      (copied
-        ? "你剛才填的內容已經複製到剪貼簿了，開啟 Discord 後直接貼上就好，不用重打。"
-        : "請到官方 Discord 告訴我們，內容可以照著剛才填的重述一次。"),
-    confirmLabel: "開啟 Discord",
-    cancelLabel: "稍後再說",
-  });
-  if (!go) return;
-  const invite =
-    (latestAiStatus && (latestAiStatus.inviteUrl || latestAiStatus.invite_url)) ||
-    "https://discord.gg/zeitfrei";
-  await openExternalUrl(invite).catch(() => {});
-}
-
 /** 金鑰是否落地。開關在設定視窗；主視窗只在啟動時把目前選擇告訴後端。 */
 const REMEMBER_KEY_STORAGE = "modpack-i18n-remember-api-key-v1";
 /** 本地翻不好時是否改用線上 AI 補完。後端讀同一個鍵（translate.localCloudTopUp）。 */
@@ -3983,13 +3942,8 @@ async function checkResourcePackHealth(instancePath) {
   if (!fix) return;
   try {
     const fixed = await invoke("repair_resource_packs_cmd", { instancePath });
-    appendLog(fixed?.summary || "已修復資源包清單。");
-    await confirmDialog({
-      title: "修復完成",
-      body: (fixed?.summary || "已修復。") + "\n\n請重新啟動遊戲確認。",
-      confirmLabel: "知道了",
-      cancelLabel: "關閉",
-    });
+    appendLog((fixed?.summary || "已修復資源包清單。") + "請重新啟動遊戲確認。");
+    showAppToast("已修復資源包清單，請重開遊戲", 3000);
   } catch (e) {
     appendLog("修復失敗：" + formatInvokeError(e), "warn");
   }
@@ -4046,16 +4000,12 @@ async function onCopyFailedItems() {
       return appendLog("這一包沒有待補項目，不需要匯出。");
     }
     await navigator.clipboard.writeText(csv);
-    appendLog(`已複製 ${formatCount(lines)} 條沒翻到的項目到剪貼簿。`);
-    await confirmDialog({
-      title: "已複製到剪貼簿",
-      body:
-        `共 ${formatCount(lines)} 條。貼到線上 AI 請它翻「譯文」那一欄，` +
-        "翻完把整張表（或「鍵<Tab>譯文」兩欄）複製起來，回來按「貼回翻譯」。\n\n" +
-        "工具會逐條檢查 %s、§ 這類格式符號，對不上的會退回不寫進遊戲。",
-      confirmLabel: "知道了",
-      cancelLabel: "關閉",
-    });
+    appendLog(
+      `已複製 ${formatCount(lines)} 條沒翻到的項目到剪貼簿。貼到線上 AI 請它翻「譯文」那一欄，` +
+        "翻完把整張表（或「鍵<Tab>譯文」兩欄）複製起來，回來按「貼回翻譯」。" +
+        "工具會逐條檢查 %s、§ 這類格式符號，對不上的會退回不寫進遊戲。"
+    );
+    showAppToast(`已複製沒翻到的 ${formatCount(lines)} 條`, 3000);
   } catch (e) {
     appendLog("匯出失敗：" + formatInvokeError(e), "warn");
   }
@@ -4085,22 +4035,10 @@ async function onImportTranslations() {
   if (!go) return;
   try {
     const report = await invoke("import_translations_cmd", { outputDir, text });
-    appendLog(report?.summary || "匯入完成。");
-    const rejected = Array.isArray(report?.rejected) ? report.rejected : [];
-    const unknown = Array.isArray(report?.unknownKeys) ? report.unknownKeys : [];
-    let detail = report?.summary || "";
-    if (rejected.length) {
-      detail += "\n\n格式檢查未過（保留原文）：\n" + rejected.slice(0, 8).join("\n");
-    }
-    if (unknown.length) {
-      detail += "\n\n找不到對應項目：\n" + unknown.slice(0, 8).join("\n");
-    }
-    await confirmDialog({
-      title: "匯入結果",
-      body: detail,
-      confirmLabel: "知道了",
-      cancelLabel: "關閉",
-    });
+    // 通知型對話框改成紀錄＋toast（規格 §1.2）；紀錄寫完整清單，toast 照實（沒併入就不說已併入）
+    const view = describeImportReport(report);
+    appendLog(view.log || "匯入完成。", view.level);
+    showAppToast(view.toast, 3000);
   } catch (e) {
     appendLog("匯入失敗：" + formatInvokeError(e), "warn");
   }
@@ -4125,6 +4063,8 @@ function showAppToast(message, ms = 2200) {
     el.id = "app-toast";
     el.className = "app-toast";
     el.setAttribute("role", "status");
+    // 對話框開著時背景會 inert，toast 要照樣讀得到（ui/modal-scope.js）
+    el.dataset.modalExempt = "1";
     document.body.appendChild(el);
   }
   el.textContent = String(message || "");
@@ -4559,9 +4499,6 @@ function wireCriticalUiDelegation() {
         case "tab-font":
           run(btn.id, () => showAppPage("font"));
           break;
-        case "tab-diagnose":
-          run(btn.id, () => showAppPage("diagnose"));
-          break;
         case "btn-inst":
           run(btn.id, () => onPickInstance());
           break;
@@ -4614,10 +4551,16 @@ async function adoptInstancePath(p, { silentProbe = false } = {}) {
   // 否則上一包的狀態會留在畫面上，看起來像這一包已經翻過。
   resetStepPanelForNewInstance();
   hideLocalCacheCard();
+  packActions.clearRemoval();
   $("instance").value = p;
   writeLastInstancePath(p);
   const ok = await validateSelectedInstance(p);
   setTranslationState(ok ? "ready" : "idle");
+  if (ok) {
+    // 選資料夾成功一次＝熟手：S01 的附加說明退場（規格 §4.2 pick-folder）
+    disclosure.retire("pickFolder");
+    resumeOnboarding();
+  }
   await detectVersionForInstance(p, false);
   await refreshPackTranslationName(p);
   await refreshReferencePack();
@@ -4651,6 +4594,11 @@ async function adoptInstancePath(p, { silentProbe = false } = {}) {
 }
 
 async function onPickInstance() {
+  // 翻譯中 D 區停用（規格 S20）：原因已常駐在欄位下方，這裡只是不動作
+  if (progressBusy || isAriaDisabled($("btn-inst"))) {
+    packActions.syncFolderArea();
+    return;
+  }
   try {
     const p = await pickDir("選擇遊戲／整合包資料夾", readLastInstancePath());
     if (p) {
@@ -4689,7 +4637,6 @@ function wireWorkbenchActions() {
     showAppPage("translate");
   });
   bind("tab-font", () => showAppPage("font"));
-  bind("tab-diagnose", () => showAppPage("diagnose"));
   bind("btn-inst", () => onPickInstance());
   bind("btn-quit", () => onQuitApp());
   bind("btn-run", () => onRun());
@@ -4852,6 +4799,8 @@ async function refreshInstanceTarget(instancePath) {
 function setInstanceValidateStatus(ok, reason, state) {
   const el = $("instance-validate-status");
   if (!el) return;
+  // 沒通過的原因只在狀態卡說（一件事只在一處說）；這裡只留通過後的補充
+  el.hidden = !ok;
   el.textContent = reason || "";
   el.dataset.state = state || (ok ? "ok" : reason ? "error" : "idle");
 }
@@ -5064,6 +5013,9 @@ async function ensureGameClosed(instancePath, actionLabel) {
  * （直接接線、文件委派保底、快取卡的捷徑按鈕），只守其中一條會漏。
  */
 async function onRun() {
+  // 狀態卡的主要按鈕停用時用 aria-disabled（仍可聚焦、讀得到原因），點了不動作
+  if (isAriaDisabled($("btn-run"))) return;
+  packActions.clearRemoval();
   return runExclusive("run", onRunInner, {
     onBusy: () => appendLog("「開始翻譯」已經在執行中，請稍候。", "warn"),
   });
@@ -5673,224 +5625,6 @@ async function onMergeConsistencySuggestions() {
   }
 }
 
-async function submitDiagnoseReport() {
-  const category = ($("report-category")?.value || "").trim();
-  const unrelated = !!$("report-unrelated")?.checked;
-  const packName = ($("report-pack-name")?.value || "").trim();
-  const note = ($("report-note")?.value || "").trim();
-  const status = $("report-status");
-  if (!category) {
-    if (status) status.textContent = "請先選類別。";
-    return appendDiagnoseLog("請先選擇回報類別。");
-  }
-  if (!unrelated && !packName) {
-    if (status) status.textContent = "請填整合包名稱，或勾選與包無關。";
-    return appendDiagnoseLog("請填整合包名稱，或勾選「與包無關」。");
-  }
-  const instancePath =
-    ($("diagnose-pack-path")?.value || "").trim() || ($("instance")?.value || "").trim();
-  const diagnosis = lastDiagnosisResult
-    ? JSON.stringify({
-        verdict: lastDiagnosisResult.verdict,
-        summary: lastDiagnosisResult.summary,
-        errorCode: lastDiagnosisResult.errorCode || lastDiagnosisResult.error_code,
-        confidence: lastDiagnosisResult.confidence,
-        nextSteps: lastDiagnosisResult.nextSteps || lastDiagnosisResult.next_steps,
-      })
-    : "";
-  if (status) status.textContent = "正在打包上傳…";
-  try {
-    const result = await invoke("submit_diagnose_report_cmd", {
-      request: {
-        reportCategory: category,
-        packName: unrelated ? "" : packName,
-        packUnrelated: unrelated,
-        packVersion: "",
-        errorCode: lastDiagnosisResult?.errorCode || lastDiagnosisResult?.error_code || "",
-        userNote: note,
-        instancePath: instancePath || null,
-        outputDir: selectedOutputDir() || null,
-        diagnosisJson: diagnosis || null,
-      },
-    });
-    const msg = result.message || result.playerSummary || "已送出（資料 3 天內刪除）。";
-    if (status) status.textContent = msg;
-    appendDiagnoseLog(msg, "info");
-  } catch (e) {
-    const err = formatInvokeError(e);
-    if (status) status.textContent = err;
-    appendDiagnoseLog("診斷回報失敗：" + err, "error");
-  }
-}
-
-const DIAGNOSIS_CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 };
-
-/**
- * 合併「資料夾交叉驗證」與「貼上的報告」兩份診斷。
- *
- * 主結論取信心較高的那一份（平手時以資料夾為主，因為它有 mods 清單可交叉驗證），
- * 另一份的摘要與下一步併進來，不丟掉使用者貼的東西。
- */
-function mergeDiagnoses(byDir, byText) {
-  const rank = (r) => DIAGNOSIS_CONFIDENCE_RANK[String(r?.confidence || "low")] || 0;
-  const [primary, secondary] = rank(byText) > rank(byDir) ? [byText, byDir] : [byDir, byText];
-  const listOf = (r, camel, snake) => {
-    const v = r?.[camel] ?? r?.[snake];
-    return Array.isArray(v) ? v.filter(Boolean) : [];
-  };
-  const dedupe = (arr) => Array.from(new Set(arr.map((x) => String(x))));
-  const secondarySummary = String(secondary?.summary || "").replace(/\*\*/g, "").trim();
-  const primaryLabel = primary === byDir ? "資料夾交叉驗證" : "你貼上的報告";
-  const secondaryLabel = primary === byDir ? "你貼上的報告" : "資料夾交叉驗證";
-  return {
-    ...primary,
-    analysisMode: "combined",
-    summary:
-      String(primary?.summary || "沒有足夠資料").replace(/\*\*/g, "") +
-      (secondarySummary ? `\n\n（主結論來自${primaryLabel}。${secondaryLabel}另外指出：${secondarySummary}）` : ""),
-    evidence: dedupe([...listOf(primary, "evidence", "evidence"), ...listOf(secondary, "evidence", "evidence")]),
-    missing: dedupe([...listOf(primary, "missing", "missing"), ...listOf(secondary, "missing", "missing")]),
-    suspectedMods: dedupe([
-      ...listOf(primary, "suspectedMods", "suspected_mods"),
-      ...listOf(secondary, "suspectedMods", "suspected_mods"),
-    ]),
-    nextSteps: dedupe([
-      ...listOf(primary, "nextSteps", "next_steps"),
-      ...listOf(secondary, "nextSteps", "next_steps"),
-    ]),
-  };
-}
-
-function showDiagnosis(result) {
-  lastDiagnosisResult = result || null;
-  const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
-  const missing = Array.isArray(result?.missing) ? result.missing : [];
-  const suspectedMods = Array.isArray(result?.suspectedMods)
-    ? result.suspectedMods
-    : Array.isArray(result?.suspected_mods)
-      ? result.suspected_mods
-      : [];
-  const nextSteps = Array.isArray(result?.nextSteps)
-    ? result.nextSteps
-    : Array.isArray(result?.next_steps)
-      ? result.next_steps
-      : [];
-  const confidence = result?.confidence || "low";
-  const confidenceLabel = { high: "高", medium: "中", low: "低" }[confidence] || confidence;
-  const verdictLabel = {
-    missing_mod: "缺少模組或前置",
-    runtime: "Java／JVM／顯示環境",
-    mod_loading: "模組載入或版本相容性",
-    world_content: "世界內容更新或建立世界",
-    maybe_our_files: "可能是翻譯輸出",
-    content_missing: "內容或註冊資料缺失",
-    content_data: "資料檔載入失敗",
-    unknown: "證據不足",
-    no_logs: "沒有可分析記錄",
-  }[result?.verdict] || result?.verdict || "未分類";
-  const modeRaw = result?.analysisMode || result?.analysis_mode || "";
-  const modeLabel =
-    modeRaw === "pack_dir"
-      ? "整合包目錄交叉驗證"
-      : modeRaw === "pasted_log"
-        ? "貼上的記錄"
-        : modeRaw === "combined"
-          ? "資料夾＋貼上的報告"
-          : "";
-  const summary = String(result?.summary || "沒有足夠資料").replace(/\*\*/g, "");
-  const gameExitCode = result?.gameExitCode ?? result?.game_exit_code;
-  const source = result?.source || "";
-  const packRoot = result?.packRoot || result?.pack_root || "";
-  const errorCode = result?.errorCode || result?.error_code || "";
-  const codeLabel = {
-    CLASS_MISSING: "缺少類別",
-    CLASS_MISSING_SRP: "缺少 SRParasites 類別",
-    GRAPHICS_RUNTIME: "顯示／原生崩潰",
-    INSUFFICIENT_EVIDENCE: "證據不足",
-    NO_LOGS: "沒有記錄",
-  }[errorCode];
-  const text = [
-    `判定：${verdictLabel}`,
-    summary,
-    modeLabel ? `分析模式：${modeLabel}` : "",
-    `證據強度：${confidenceLabel}`,
-    errorCode ? `分析代碼：${errorCode}${codeLabel ? `（${codeLabel}）` : ""}` : "",
-    gameExitCode ? `遊戲退出碼：${gameExitCode}` : "",
-    result?.primaryError || result?.primary_error ? `最接近的錯誤：${result.primaryError || result.primary_error}` : "",
-    missing.length ? `可能缺少：${missing.join(", ")}` : "",
-    suspectedMods.length ? `可疑模組：${suspectedMods.join(", ")}` : "",
-    evidence.length ? `證據：\n- ${evidence.join("\n- ")}` : "",
-    nextSteps.length ? `建議下一步：\n- ${nextSteps.join("\n- ")}` : "",
-    result?.translationRelated || result?.translation_related
-      ? "翻譯關聯：記錄指向翻譯輸出，可試「移除翻譯」。"
-      : "翻譯關聯：目前沒有直接證據顯示是翻譯造成。",
-    packRoot ? `解析目錄：${packRoot}` : "",
-    source ? `資料來源：${source}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const rail = $("diagnose-rail-summary");
-  if (rail) {
-    rail.classList.remove("log-empty");
-    rail.textContent = `${verdictLabel}｜證據${confidenceLabel}\n${summary}\n\n${text}`;
-  }
-  appendDiagnoseLog("分析完成：" + (errorCode || verdictLabel));
-  appendDiagnoseLog(text);
-  if ((result?.translationRelated || result?.translation_related) && hasApplyBackups) {
-    appendDiagnoseLog("可直接按「移除翻譯」排除是不是翻譯造成的。", "warn");
-  }
-}
-
-/**
- * 錯誤分析：同一件事正在跑時，重複點擊一律忽略。
- *
- * 守衛放在函式定義處而不是接線處，因為這些動作有多個呼叫端
- * （直接接線、文件委派保底、快取卡的捷徑按鈕），只守其中一條會漏。
- */
-async function diagnosePastedText() {
-  return runExclusive("diagnose", diagnosePastedTextInner, {
-    onBusy: () => appendLog("「錯誤分析」已經在執行中，請稍候。", "warn"),
-  });
-}
-
-async function diagnosePastedTextInner() {
-  const packPath = ($("diagnose-pack-path")?.value || "").trim();
-  const text = ($("error-input")?.value || "").trim();
-  if (!packPath && !text) return appendDiagnoseLog("請先選整合包資料夾，或貼上錯誤報告。");
-  if (progressBusy) return appendDiagnoseLog("其他工作進行中，請稍候。");
-  setBusy(true, "diagnose");
-  clearDiagnoseLog("開始分析…");
-  setProgress(5, "正在分析…");
-  try {
-    // 兩邊都填時舊版只跑資料夾、把貼上的 crash report 無聲丟掉——使用者做了最費力的事
-    // 反而被懲罰。現在兩份都分析，結果合併呈現。
-    let result;
-    if (packPath && text) {
-      appendDiagnoseLog("資料夾與貼上的報告都會分析，結果合併呈現。");
-      const [byDir, byText] = await Promise.all([
-        invoke("diagnose_pack_dir_cmd", { path: packPath }).catch((e) => ({
-          summary: "資料夾分析失敗：" + formatInvokeError(e),
-        })),
-        invoke("diagnose_error_text", { text }).catch((e) => ({
-          summary: "貼上內容分析失敗：" + formatInvokeError(e),
-        })),
-      ]);
-      result = mergeDiagnoses(byDir, byText);
-    } else if (packPath) {
-      result = await invoke("diagnose_pack_dir_cmd", { path: packPath });
-    } else {
-      result = await invoke("diagnose_error_text", { text });
-    }
-    setProgress(100, "分析完成");
-    showDiagnosis(result);
-  } catch (e) {
-    setProgress(0, "分析失敗", { failed: true });
-    showDiagnosis({ summary: "分析失敗：" + formatInvokeError(e) });
-  } finally {
-    setBusy(false);
-  }
-}
-
 async function loadUiPrefs() {
   try {
     const p = await invoke("get_ui_prefs");
@@ -6194,6 +5928,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     console.warn("[boot] wireWorkbenchActions", e);
   }
+  try {
+    packActions.wireStatusCardActions();
+  } catch (e) {
+    console.warn("[boot] wireStatusCardActions", e);
+  }
 
   // —— 以下全部為同步接線（不可插入 await）；syncUiState 失敗不得中斷 ——
   try {
@@ -6201,13 +5940,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     console.warn("[boot] syncUiState", e);
   }
-  ["instance", "output", "font-output", "diagnose-pack-path"].forEach((id) => {
+  ["instance", "output", "font-output"].forEach((id) => {
     const input = $(id);
     if (!input) return;
     input.addEventListener("input", () => {
       hasApplyBackups = false;
-      // 換了分析對象就把上一次的判定收掉，別讓 A 的結論掛在 B 的路徑底下
-      if (id === "diagnose-pack-path") resetDiagnosisForNewTarget();
       if (id === "instance" && !input.value.trim()) {
         instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" };
         setInstanceValidateStatus(false, instanceValidation.reason, "idle");
@@ -6229,10 +5966,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       scheduleBackupStateRefresh();
     });
   });
-  // 貼上的錯誤報告換了內容，一樣算換了分析對象
-  if ($("error-input")) {
-    $("error-input").addEventListener("input", () => resetDiagnosisForNewTarget());
-  }
   if ($("choose-output-dir")) {
     $("choose-output-dir").addEventListener("change", () => {
       const input = $("output");
@@ -6445,7 +6178,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     /* 使用說明已移到獨立設定視窗，主視窗沒有說明浮層要關 */
   }
   if ($("onboard-skip")) {
-    $("onboard-skip").onclick = () => stopOnboarding(true);
+    $("onboard-skip").onclick = () => stopOnboarding(true, { skipped: true });
   }
   if ($("onboard-prev")) {
     $("onboard-prev").onclick = () => {
@@ -6458,22 +6191,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   }
   if ($("onboard-shade")) {
-    $("onboard-shade").onclick = () => stopOnboarding(true);
+    $("onboard-shade").onclick = () => stopOnboarding(true, { skipped: true });
   }
-  // Escape；介面縮放快捷鍵由 ui-scale.js 處理
+  // Escape：引導與同意頁的 Esc 由 ui/modal-scope.js 處理（引導＝跳過＋toast；同意頁＝不作用）。
+  // 介面縮放快捷鍵由 ui-scale.js 處理
   window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") {
-      if (isOnboardingActive()) {
-        stopOnboarding(true);
-        return;
-      }
-      if ($("consent-overlay") && !$("consent-overlay").hidden) {
-        hideConsentOverlay();
-        return;
-      }
-      closeGuideOverlay();
-    }
+    if (ev.key === "Escape") closeGuideOverlay();
   });
+  packActions.wireOverlayFocus();
   // 推廣連結（若啟動早期已接線則略過）
   document.querySelectorAll(".promo-card[data-url], #btn-ai-support[data-url]").forEach((el) => {
     if (el.dataset.wired === "1") return;
@@ -6517,8 +6242,10 @@ window.addEventListener("DOMContentLoaded", async () => {
         title: "移除字體包？",
         body: "會拿掉工具裝進這個模組整合包的字體包，並從資源包清單移除。翻譯不受影響。",
         affected: [instancePath],
+        // D-06：不可逆、危險，預設焦點在「取消」
+        danger: true,
         confirmLabel: "移除字體包",
-        cancelLabel: "先不要",
+        cancelLabel: "取消",
       });
       if (!ok) return;
       try {
@@ -6718,155 +6445,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   ["share-confirm-reviewed", "share-confirm-private"].forEach((id) => {
     $(id)?.addEventListener("change", syncUiState);
   });
-  if ($("btn-diagnose")) $("btn-diagnose").onclick = diagnosePastedText;
-  if ($("btn-diagnose-pack-pick")) {
-    $("btn-diagnose-pack-pick").onclick = async () => {
-      try {
-        const p = await pickDir("選擇要診斷的整合包／實例資料夾");
-        if (!p) return;
-        if ($("diagnose-pack-path")) $("diagnose-pack-path").value = p;
-        scheduleBackupStateRefresh();
-        syncUiState();
-      } catch (e) {
-        log("選取資料夾失敗：" + formatInvokeError(e));
-      }
-    };
-  }
-  if ($("btn-diagnose-latest")) {
-    $("btn-diagnose-latest").onclick = async () => {
-      const diagnosePath = ($("diagnose-pack-path")?.value || "").trim();
-      const instancePath = diagnosePath || ($("instance")?.value || "").trim();
-      if (!instancePath) return log("請先在診斷頁選整合包資料夾，或到翻譯頁選擇遊戲資料夾。");
-      if (progressBusy) return log("翻譯或其他工作進行中，請等結束或按停止後再診斷。");
-      setBusy(true, "diagnose");
-      try {
-        const result = await invoke("diagnose_pack_dir_cmd", { path: instancePath });
-        showDiagnosis(result);
-      } catch (e) {
-        showDiagnosis({ summary: "讀取最近記錄失敗：" + formatInvokeError(e) });
-      } finally {
-        setBusy(false);
-      }
-    };
-  }
-  if ($("btn-restore")) {
-    $("btn-restore").onclick = async () => {
-      const instancePath =
-        ($("diagnose-pack-path")?.value || "").trim() || ($("instance")?.value || "").trim();
-      if (!instancePath) return log("請先選擇遊戲資料夾或診斷頁的整合包資料夾。");
-      if (!(await ensureGameClosed(instancePath, "移除翻譯"))) return;
-      const ok = await confirmDialog({
-        title: "移除翻譯？",
-        body:
-          "會刪掉工具加進遊戲的檔案，並把資源包清單與遊戲語言改回原本的設定。\n" +
-          "被翻譯覆蓋的原檔：有備份的會還原；沒有備份的無法還原，會列出來給你看。",
-        affected: [instancePath],
-        danger: true,
-        confirmLabel: "移除翻譯",
-        cancelLabel: "先不要",
-      });
-      if (!ok) return;
-      try {
-        const result = await invoke("restore_last_apply_cmd", {
-          instancePath,
-          outputDir: selectedOutputDir() || null,
-        });
-        const summary = result.playerSummary || result.player_summary || "已移除翻譯。";
-        const warnings = result.warnings || [];
-        appendDiagnoseLog(summary, "warn");
-        appendDiagnoseLog("若譯文可疑，補翻時勾選「重新翻譯缺漏」再跑一次。", "warn");
-        if (warnings.length) appendDiagnoseLog("移除翻譯時的提醒：\n" + warnings.join("\n"), "warn");
-        await refreshBackupState();
-      } catch (e) {
-        appendDiagnoseLog("移除翻譯失敗：" + formatInvokeError(e), "error");
-        offerRecordResetIfBroken(e, instancePath);
-      }
-    };
-  }
-  if ($("btn-diagnose-report")) {
-    $("btn-diagnose-report").onclick = submitDiagnoseReport;
-  }
-  if ($("btn-delete-backups")) {
-    $("btn-delete-backups").onclick = () => deleteAllBackupsFlow();
-  }
-  if ($("btn-cache-restart")) {
-    $("btn-cache-restart").onclick = async () => {
-      if (!localCacheProbe) return log("目前沒有偵測到本機翻譯結果。");
-      const outputDir = localCacheProbe.outputDir || localCacheProbe.output_dir || selectedOutputDir();
-      if (!outputDir) return log("找不到這份翻譯結果的位置。");
-      const workRoot = localCacheProbe.workRoot || localCacheProbe.work_root || resultWorkDir(outputDir);
-      const ok = await confirmDialog({
-        title: "刪除既有翻譯，重新完整翻譯？",
-        body:
-          "會完整刪除下列資料夾（翻譯結果、覆蓋範圍說明與所有備份），\n" +
-          "然後你可以按「開始翻譯」從頭做一次完整翻譯。這個動作無法復原。",
-        affected: [workRoot || outputDir].filter(Boolean),
-        danger: true,
-        confirmLabel: "刪除並重新翻譯",
-        cancelLabel: "取消",
-        ackLabel: "我知道這會刪掉上面的資料夾，且無法復原",
-      });
-      if (!ok) return;
-      try {
-        const result = await invoke("delete_result_folder_cmd", { outputDir });
-        const deleted = !!(result && (result.deleted || result.deleted === true));
-        appendLog(
-          deleted
-            ? "已刪除既有翻譯，按「開始翻譯」可以重新做一次完整翻譯。"
-            : "沒有刪除任何檔案。",
-          deleted ? "warn" : "info"
-        );
-        if (!deleted) return;
-        hideLocalCacheCard();
-        hasShareableFiles = false;
-        setTranslationState("ready");
-        syncUiState();
-      } catch (e) {
-        appendError("刪除翻譯結果失敗");
-        appendError(formatInvokeError(e));
-      }
-    };
-  }
-  if ($("btn-delete-output")) {
-    $("btn-delete-output").onclick = async () => {
-      const outputDir = selectedOutputDir();
-      if (!outputDir) return log("還沒有可刪除的翻譯結果資料夾。");
-      const workRoot = resultWorkDir(outputDir);
-      const ok = await confirmDialog({
-        title: "刪除整個翻譯結果？",
-        body:
-          "會完整刪除下列資料夾，包含裡面的翻譯結果、覆蓋範圍說明與所有備份。\n" +
-          "刪掉之後只能重跑一次翻譯，無法復原。",
-        affected: [workRoot || outputDir].filter(Boolean),
-        danger: true,
-        confirmLabel: "刪除結果資料夾",
-        cancelLabel: "取消",
-        ackLabel: "我知道這會刪掉上面的資料夾，且無法復原",
-      });
-      if (!ok) return;
-      try {
-        const result = await invoke("delete_result_folder_cmd", { outputDir });
-        const deleted = !!(result && (result.deleted || result.deleted === true));
-        appendLog(
-          result.playerSummary || result.player_summary || (deleted ? "翻譯結果資料夾已刪除。" : "沒有刪除任何檔案。"),
-          deleted ? "warn" : "info"
-        );
-        if (!deleted) return;
-        setTranslationState("ready");
-        const input = $("output");
-        if (input) {
-          input.dataset.autoPath = "";
-          input.dataset.customPath = "";
-          input.value = "";
-        }
-        hasApplyBackups = false;
-        syncUiState();
-      } catch (e) {
-        appendError("刪除翻譯結果失敗");
-        appendError(formatInvokeError(e));
-      }
-    };
-  }
   async function openResultFolder(fromFont) {
     const outputInput = fromFont ? $("font-output") : $("output");
     const outputDir = (outputInput?.value || "").trim();
@@ -6891,9 +6469,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
   if ($("btn-clear-font-log")) {
     $("btn-clear-font-log").onclick = () => clearFontLog("字體日誌已清除");
-  }
-  if ($("btn-clear-diagnose-log")) {
-    $("btn-clear-diagnose-log").onclick = () => clearDiagnoseLog("診斷日誌已清除");
   }
   ["font-size", "font-thickness", "font-shift-x", "font-shift-y"].forEach((id) => {
     $(id)?.addEventListener("input", () => {
@@ -6948,6 +6523,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   forceClearBlockingOverlays({ keepConsent: true });
   {
     showConsentOverlay();
+    // 啟動時的更新檢查可能比設定檔載入更早回來而被延後；同意頁狀態確定後再判斷一次 N-01
+    packActions.maybeShowUpdateBanner();
     window.setTimeout(() => {
       try {
         if ($("consent-overlay") && !$("consent-overlay").hidden) return;
@@ -7214,4 +6791,9 @@ async function onOutputStorageChangedExternally() {
 }
 
 // 更新檢查只由主視窗做（設定視窗不載入 app.js）。
-wireUpdateChecker({ appendLog, isBusy: () => progressBusy });
+packActions.setUpdateChecker(wireUpdateChecker({
+  appendLog,
+  isBusy: () => progressBusy,
+  // 自動檢查有新版 → 橫幅 N-01（不直接跳視窗、不與同意頁疊；測試版不會走到這裡，G0.4）
+  onUpdateAvailable: (info) => packActions.maybeShowUpdateBanner(info),
+}));

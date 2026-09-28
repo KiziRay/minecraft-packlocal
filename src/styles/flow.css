@@ -1,0 +1,181 @@
+/*
+  B5a-1：狀態卡（E 區）、橫幅（B 區）、D 區停用原因與移除翻譯、同意頁條列、問題回報預覽。
+  外觀相同＝意義相同（規格 §3.0）：狀態卡三色（中性／警示／錯誤）只用在狀態卡。
+*/
+
+/* ── E 區：狀態卡 ── */
+.status-card {
+  margin: 0 0 16px;
+  padding: 16px 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.status-card[hidden] { display: none !important; }
+.status-card[data-tone="block"] {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+.status-card[data-tone="error"] {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel));
+}
+.status-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+.status-card-sentence {
+  margin: 0;
+  font-size: var(--type-ui);
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.status-card-extra,
+.status-card-detail {
+  margin: 6px 0 0;
+  font-size: var(--type-body);
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-line;
+}
+.status-card-extra[hidden],
+.status-card-detail[hidden],
+.status-card-reason[hidden] { display: none; }
+.status-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.status-card-actions > [hidden] { display: none !important; }
+.status-card-actions .start-translate { width: auto; }
+.status-card-secondary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.status-card-secondary:empty { display: none; }
+/* 停用的主要按鈕仍可聚焦（aria-disabled），外觀看得出不能按 */
+.status-card [aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.status-card-reason {
+  margin: 6px 0 0;
+  font-size: var(--type-caption);
+  color: var(--muted);
+}
+.status-card-more { margin-top: var(--space-2); }
+.status-card-more[hidden] { display: none; }
+.status-card-more > summary {
+  cursor: pointer;
+  font-size: var(--type-caption);
+  color: var(--muted);
+}
+.status-card-more-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: 6px;
+}
+
+/* ── D 區：S20 停用原因、移除翻譯（唯一入口） ── */
+.folder-lock-reason[hidden],
+.remove-translation-row[hidden] { display: none !important; }
+.folder-lock-reason { color: var(--muted); }
+.remove-translation-row {
+  margin-top: var(--space-2);
+  align-items: center;
+  gap: var(--space-2);
+}
+#btn-inst[aria-disabled="true"],
+#btn-restore[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── B 區：橫幅 ── */
+.banner-area {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 var(--pad) 8px;
+}
+.banner-area[hidden] { display: none !important; }
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--canvas);
+}
+.banner-text {
+  flex: 1;
+  margin: 0;
+  font-size: var(--type-body);
+  color: var(--ink);
+}
+
+/* ── 同意頁三句 ── */
+.consent-lines {
+  margin: 0 0 var(--space-3);
+  padding-left: 1.2em;
+  line-height: 1.7;
+  font-size: var(--type-ui);
+}
+.consent-details > summary { cursor: pointer; color: var(--muted); }
+.consent-details-body p { margin: 8px 0 0; font-size: var(--type-body); line-height: 1.6; }
+
+/* ── 問題回報：附帶資料與預覽 ── */
+.issue-attach {
+  margin: 0;
+  padding: 8px 0 0;
+  border: 0;
+}
+.issue-attach > legend { font-size: var(--type-caption); color: var(--muted); }
+.issue-field[hidden] { display: none !important; }
+.issue-preview-title {
+  margin: 8px 0 4px;
+  font-size: var(--type-caption);
+  color: var(--muted);
+}
+.issue-preview {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--code-bg);
+  color: var(--code-ink);
+  font-family: var(--font-mono);
+  font-size: var(--type-caption);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── 翻譯中切到其他分頁的共用一行（審查中1） ── */
+.run-elsewhere {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 var(--pad) 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.run-elsewhere[hidden] { display: none !important; }
+.run-elsewhere-text { flex: 1; margin: 0; font-size: var(--type-body); color: var(--ink); }
+.tab-badge {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: var(--type-caption);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.tab-badge[hidden] { display: none; }
