@@ -135,7 +135,8 @@ select {
 .button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); font-weight: 700; }
 .button.secondary { background: transparent; color: var(--text); }
 .button:hover { filter: brightness(1.08); }
-.button:focus-visible, .tab:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; }
+/* 可見焦點（規格 §6，審查 F8）：所有可聚焦元素（按鈕、分頁、select、checkbox、range）實色外框 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .button:disabled { cursor: wait; opacity: 0.65; }
 .button.danger { border-color: var(--warn); background: transparent; color: var(--warn); font-weight: 700; }
 .path-row { padding: 12px 0; border-top: 1px solid var(--line); }
@@ -151,6 +152,61 @@ code {
   color: var(--text);
 }
 .prose li + li { margin-top: 7px; }
+
+/* 停用＝aria-disabled（仍可聚焦、讀得到原因，R-4）；原因寫在同列 .reason */
+.button[aria-disabled="true"] { cursor: not-allowed; opacity: 0.6; filter: none; }
+.row small.reason { color: var(--warn); }
+.ack-row { padding-left: 18px; border-top-style: dashed; }
+
+/* 工具自己的確認對話框（ui/confirm.js，與主視窗同一套焦點規範 G5a1.5／G5a1.6） */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, #000 52%, transparent);
+}
+.confirm-overlay[hidden], .confirm-affected[hidden], .confirm-ack[hidden] { display: none; }
+.confirm-shell {
+  width: min(30rem, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+.confirm-shell[data-danger="1"] { border-color: var(--warn); }
+.confirm-title { margin: 0 0 10px; font-size: 1.05rem; line-height: 1.4; }
+.confirm-message { margin: 0; white-space: pre-line; }
+.confirm-affected {
+  margin: 12px 0 0;
+  padding: 10px 12px 10px 26px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+.confirm-ack { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.confirm-ack .check-box { display: none; }
+.confirm-ack input { inline-size: 18px; block-size: 18px; accent-color: var(--accent); }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.confirm-actions button {
+  min-height: 36px;
+  padding: 7px 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.confirm-actions .primary-button { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.confirm-actions .danger-button { border-color: var(--warn); color: var(--warn); font-weight: 700; }
+.confirm-actions button:disabled { cursor: not-allowed; opacity: 0.6; }
 
 @media (max-width: 640px) {
   .settings-shell { padding: 18px; }

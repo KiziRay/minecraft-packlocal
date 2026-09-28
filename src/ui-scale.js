@@ -104,12 +104,6 @@ function applyCssZoom(percent) {
   return n;
 }
 
-function flash(msg) {
-  if (typeof window.flashAppSettingsSaved === "function") {
-    window.flashAppSettingsSaved(msg);
-  }
-}
-
 function ensureZoomHint() {
   let el = document.getElementById("zoom-hint");
   if (el) return el;
@@ -160,7 +154,7 @@ export async function setWebviewScalePercent(n, opts = {}) {
 
 /**
  * @param {boolean} on
- * @param {{ persist?: boolean, flash?: boolean }} [opts]
+ * @param {{ persist?: boolean }} [opts]
  */
 export async function setWebviewAutoScale(on, opts = {}) {
   autoScale = !!on;
@@ -169,9 +163,6 @@ export async function setWebviewAutoScale(on, opts = {}) {
     await applyAutoScale();
   } else {
     updateScaleControls();
-  }
-  if (opts.persist !== false && opts.flash !== false) {
-    flash(autoScale ? "已依螢幕大小縮放" : "已改為手動縮放");
   }
 }
 
@@ -188,7 +179,6 @@ export async function resetWebviewScale() {
   autoScale = false;
   persistScale(100, false);
   await setWebviewScalePercent(100, { persist: true, fromAuto: false });
-  flash("已重設為 100%");
 }
 
 function bumpScale(delta, ev) {

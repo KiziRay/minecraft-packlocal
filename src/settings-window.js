@@ -1,7 +1,6 @@
 import { opDelete, opSet, getPath as readPath } from "./core/settings-patch.js";
 import { SETTINGS_UPDATED_EVENT } from "./core/settings-sync.js";
 import {
-  CACHE_REMIND_KEY,
   OUTPUT_CUSTOM_ROOT_KEY,
   OUTPUT_STORAGE_MODE_KEY,
   SFX_MUTED_STORAGE_KEY,
@@ -10,7 +9,12 @@ import {
 } from "./core/storage.js";
 import { clampScalePercent, computeAutoScalePercent, parseStoredAuto } from "./ui-scale-logic.js";
 import { wireSettingsActions, refreshSettingsActions } from "./settings-window-actions.js";
-import { CLOUD_TOPUP_CONSENT, cloudTopUpConsentText } from "./core/cloud-topup-consent.js";
+import { CLOUD_TOPUP_CONSENT } from "./core/cloud-topup-consent.js";
+import { confirmDialog } from "./ui/confirm.js";
+import { ROW_COPY, SETTINGS_DIALOGS, describeOnlineAi } from "./settings/settings-copy.js";
+import { refreshDataPane, wireDataPane } from "./settings/data-pane.js";
+import { SETTINGS_NOTICE_EVENTS } from "./flow/main-state.js";
+import { wireTabKeys } from "./ui/tab-keys.js";
 
 const tauri = window.__TAURI__ || {};
 const invoke = tauri.core?.invoke || (() => Promise.reject(new Error("設定服務尚未就緒。")));
@@ -132,7 +136,7 @@ async function saveScale(percent, auto, message) {
 
 const OUTPUT_HINTS = {
   managed: "工具會替每個模組整合包建立獨立的資料夾。",
-  beside: "翻譯結果會放在模組整合包旁的「繁中翻譯輸出」資料夾。",
+  beside: "翻譯結果會放在模組整合包旁邊的翻譯輸出資料夾。",
   custom: "翻譯結果會放在你指定的資料夾裡，每個模組整合包分開存放。",
 };
 
@@ -156,6 +160,14 @@ async function pickOutputRoot() {
   return typeof selected === "string" && selected.trim() ? selected.trim() : "";
 }
 
+/** 改了結果位置：就地說明舊結果還在、工具仍找得到（規格 §1.3）。 */
+function showOutputNote(text) {
+  const note = $("output-storage-note");
+  if (!note) return;
+  note.textContent = text;
+  note.hidden = !text;
+}
+
 async function onOutputModeChange(mode) {
   const next = normalizeOutputMode(mode);
   if (next === "custom" && !readSetting("translate.outputCustomRoot", OUTPUT_CUSTOM_ROOT_KEY, "")) {
@@ -169,13 +181,13 @@ async function onOutputModeChange(mode) {
   }
   await saveSetting("translate.outputStorageMode", next, {
     localKey: OUTPUT_STORAGE_MODE_KEY,
-    message: "已更新翻譯結果的存放位置。",
+    message: "已更新翻譯結果放哪裡。",
   });
   renderOutputStorage();
+  showOutputNote(ROW_COPY.outputChanged);
 }
 
 function renderToggles() {
-  $("cache-remind").checked = readSetting("translate.cacheRemind", CACHE_REMIND_KEY, "1") !== "0";
   $("remember-api-key").checked = readSetting("privacy.rememberApiKey", REMEMBER_KEY, "0") === "1";
   renderCloudTopUp();
   const muted = readSetting("appearance.sfxMuted", SFX_MUTED_STORAGE_KEY, "0") === "1";
@@ -198,6 +210,30 @@ function renderCloudTopUp() {
       : "已關閉：翻不好的句子保留原文，文字不會送出。";
 }
 
+/** 補完會用哪個線上 AI、能不能用（自訂金鑰優先，其次已登入的 ChatGPT；與後端同一順序）。 */
+async function renderOnlineAi() {
+  const line = $("local-cloud-topup-ai");
+  if (!line) return;
+  let hasKey = false;
+  let provider = "";
+  let gptUsable = false;
+  try {
+    const api = await invoke("get_api_settings");
+    hasKey = !!(api?.hasKey ?? api?.has_key);
+    provider = String(api?.provider || "");
+  } catch (_) {
+    /* 讀不到當成沒有 */
+  }
+  if (!hasKey) {
+    try {
+      gptUsable = !!(await invoke("gpt_auth_status_cmd"))?.usable;
+    } catch (_) {
+      gptUsable = false;
+    }
+  }
+  line.textContent = describeOnlineAi({ hasKey, provider, gptUsable });
+}
+
 function switchPane(requested) {
   const aliases = { prefs: "general", legal: "help", guide: "help", ai: "translate" };
   const wanted = aliases[requested] || requested;
@@ -208,7 +244,11 @@ function switchPane(requested) {
     button.setAttribute("aria-selected", active ? "true" : "false");
   }
   for (const name of PANES) $(`pane-${name}`).hidden = name !== pane;
+  syncTabKeys();
 }
+
+/** 分頁方向鍵（規格 §6）；wireControls 接上後才有作用。 */
+let syncTabKeys = () => {};
 
 async function closeWindow() {
   try {
@@ -241,6 +281,7 @@ function wireControls() {
   document.querySelectorAll("[data-pane]").forEach((button) => {
     button.addEventListener("click", () => switchPane(button.dataset.pane));
   });
+  syncTabKeys = wireTabKeys(document.querySelector('[role="tablist"]'));
   $("close-window").addEventListener("click", () => void closeWindow());
   $("theme-select").addEventListener("change", async (event) => {
     const theme = normalizeTheme(event.target.value);
@@ -302,14 +343,12 @@ function wireControls() {
         await saveSetting("translate.outputStorageMode", "managed", { localKey: OUTPUT_STORAGE_MODE_KEY });
       }
       renderOutputStorage();
+      showOutputNote(ROW_COPY.outputCustomCleared);
       setStatus("已清除指定的資料夾，改回交給工具管理。", "ok");
     } catch (error) {
       setStatus(`無法清除：${String(error)}`, "warn");
     }
   });
-  onToggle("cache-remind", (on) =>
-    saveSetting("translate.cacheRemind", on ? "1" : "0", { localKey: CACHE_REMIND_KEY, message: "已更新提醒設定。" })
-  );
   onToggle("remember-api-key", async (on) => {
     await invoke("set_remember_api_key_cmd", { remember: on });
     await saveSetting("privacy.rememberApiKey", on ? "1" : "0", {
@@ -318,10 +357,15 @@ function wireControls() {
     });
   });
   $("clear-api-key").addEventListener("click", async () => {
-    if (!window.confirm("要清除這台電腦記住的 API 金鑰嗎？清除後要重新貼上金鑰才能用自訂 API。")) return;
+    // D-12：工具自己的確認框（危險，預設焦點在取消）
+    if (!(await confirmDialog({ ...SETTINGS_DIALOGS.clearKey }))) return;
     try {
       await invoke("clear_api_key_cmd");
-      setStatus("已清除記住的 API 金鑰。", "ok");
+      // 主畫面立即更新（金鑰欄、AI 狀態），不用等玩家切回去
+      await emit(SETTINGS_NOTICE_EVENTS.apiKeyCleared, {});
+      $("clear-api-key-result").textContent = ROW_COPY.keyCleared;
+      setStatus("已清除金鑰。", "ok");
+      await renderOnlineAi();
     } catch (error) {
       setStatus(`無法清除金鑰：${String(error)}`, "warn");
     }
@@ -329,8 +373,8 @@ function wireControls() {
   $("local-cloud-topup").addEventListener("change", async (event) => {
     const box = event.target;
     const on = !!box.checked;
-    // 打開前一定先看同一段同意說明（CLOUD_TOPUP_CONSENT）：會送出文字、會用到線上 AI 額度
-    if (on && !window.confirm(cloudTopUpConsentText())) {
+    // 打開前一定先同意（D-14，G0.6）：會送出文字、會用到線上 AI 額度；預設焦點在「只用本地」
+    if (on && !(await confirmDialog({ ...SETTINGS_DIALOGS.cloudTopUp }))) {
       box.checked = false;
       setStatus("沒有改動：本地翻不好時仍不會送到線上 AI。", "ok");
       return;
@@ -346,7 +390,8 @@ function wireControls() {
     }
     renderCloudTopUp();
   });
-  wireSettingsActions({ invoke, emit, $, setStatus, patchSettings, settingsSnapshot });
+  wireSettingsActions({ invoke, emit, $, setStatus });
+  wireDataPane({ invoke, emit, listen, $, setStatus, patchSettings, settingsSnapshot, confirmDialog });
 }
 
 async function boot() {
@@ -367,6 +412,8 @@ async function boot() {
     $("minimize-on-close").checked = prefs?.minimizeOnClose !== false;
     $("app-version").textContent = String(prefs?.appVersion || "—");
     await refreshSettingsActions(prefs);
+    await refreshDataPane();
+    await renderOnlineAi();
     setStatus("設定已載入。", "ok");
   } catch (error) {
     setStatus(`部分設定無法讀取：${String(error)}`, "warn");

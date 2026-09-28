@@ -1691,6 +1691,10 @@ async fn delete_apply_backups_cmd(
     instance_path: String,
     output_dir: Option<String>,
 ) -> Result<DeleteBackupResult, String> {
+    // B5a-2 審查 F2：翻譯或套用中不刪（套用正在寫備份）；設定視窗也會先停用按鈕
+    if TRANSLATION_ACTIVE.load(Ordering::Relaxed) {
+        return Err("正在翻譯或套用，完成後才能刪除備份。".into());
+    }
     let inst = normalize_path_strict(&instance_path)?;
     let result_root = output_dir
         .as_deref()
@@ -1729,6 +1733,14 @@ fn fork_apply_instance_cmd(instance_path: String) -> Result<String, String> {
     let mc = resolve_minecraft_dir(&inst)?;
     engine::apply_identity::fork_instance(&mc)?;
     Ok("已把這份當成新的模組整合包，之後的套用與移除翻譯只會記在這份自己的紀錄裡。現在可以按「套用到遊戲」。".into())
+}
+
+/// B5a-2：這個遊戲資料夾的備份實際放在哪（設定視窗 D-07 列出來）。只讀：不建立資料夾、不寫任何東西。
+#[tauri::command]
+fn apply_backup_location_cmd(instance_path: String) -> Result<String, String> {
+    let inst = normalize_path_strict(&instance_path)?;
+    let mc = resolve_minecraft_dir(&inst)?;
+    Ok(engine::apply_record::instance_backup_dir(&mc).display().to_string())
 }
 
 /// 檢查目前實例／結果位置是否有可還原的工具備份；只讀取，不會修改檔案。
@@ -5499,6 +5511,10 @@ fn data_root_info_cmd() -> serde_json::Value {
 /// 把舊資料（%APPDATA%）複製到工具旁的資料夾。舊的原地保留當備份。
 #[tauri::command]
 async fn migrate_data_root_cmd() -> Result<serde_json::Value, String> {
+    // B5a-2：翻譯中不搬（正在寫翻譯記憶與紀錄）。設定視窗也會先停用按鈕，這裡是最後一道
+    if TRANSLATION_ACTIVE.load(Ordering::Relaxed) {
+        return Err("正在翻譯，翻完才能搬移工具資料。".into());
+    }
     tauri::async_runtime::spawn_blocking(|| {
         engine::paths::migrate_legacy_to_portable().map(|(files, bytes)| {
             serde_json::json!({
@@ -6470,6 +6486,10 @@ fn local_llm_stop_cmd() {
 /// 放到背景執行緒跑，避免刪除大檔案時卡住 UI 執行緒。
 #[tauri::command]
 async fn local_llm_delete_cmd(install_dir: Option<String>) -> Result<String, String> {
+    // B5a-2 審查 F1：翻譯或套用中不刪（翻譯正在用本地模型）；設定視窗也會先停用按鈕
+    if TRANSLATION_ACTIVE.load(Ordering::Relaxed) {
+        return Err("正在翻譯或套用，完成後才能刪除本地模型。".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         engine::local_llm::delete_local_model(install_dir.as_deref())
     })
@@ -6822,7 +6842,7 @@ pub fn run() {
                         let _ = window
                             .dialog()
                             .message("工具已縮到背景，翻譯工作會繼續執行。要完全結束工具，請用畫面右下角的「離開」，或到設定取消勾選「關閉時縮到背景」。\n\n這個提醒只會出現這一次。")
-                            .title("模組包翻譯工具")
+                            .title("模組整合包翻譯工具")
                             .kind(MessageDialogKind::Info)
                             .blocking_show();
                     }
@@ -6936,6 +6956,7 @@ pub fn run() {
             submit_issue_report_cmd,
             delete_apply_backups_cmd,
             has_apply_backups_cmd,
+            apply_backup_location_cmd,
             reset_apply_record_cmd,
             fork_apply_instance_cmd,
             check_update,
@@ -6954,3 +6975,7 @@ pub fn run() {
 #[cfg(test)]
 #[path = "lib_b4_tests.rs"]
 mod lib_b4_tests;
+
+#[cfg(test)]
+#[path = "lib_b5a2_tests.rs"]
+mod lib_b5a2_tests;

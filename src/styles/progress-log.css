@@ -96,7 +96,7 @@
   border-radius: 999px;
   background: var(--panel);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
 }
 .state-badge[data-state="waiting"] {
@@ -171,15 +171,15 @@
   border-radius: 50%;
   background: var(--canvas);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
 }
 .step-copy { display: grid; gap: 1px; min-width: 0; }
 .step-copy strong { font-size: 13px; font-weight: 650; color: inherit; }
-.step-copy small { color: var(--muted); font-size: 11px; }
+.step-copy small { color: var(--muted); font-size: 12px; }
 .step-meta {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
 }
@@ -220,7 +220,7 @@
 .metric-audience {
   margin: 6px 0 0;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
 }
 .metric-grid {
   display: grid;
@@ -234,7 +234,7 @@
   border-radius: 8px;
   background: var(--panel);
 }
-.metric-grid span { display: block; color: var(--faint); font-size: 11px; }
+.metric-grid span { display: block; color: var(--faint); font-size: 12px; }
 .metric-grid strong {
   font-family: var(--font-mono);
   font-size: 14px;
@@ -261,7 +261,7 @@
   background: var(--paper);
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.45;
   white-space: pre-wrap;
 }

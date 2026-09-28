@@ -43,13 +43,13 @@ test("主題、縮放、自動縮放、結果位置都會分派到主視窗", ()
   assert.equal(routeSettingsUpdate({ path: "" }, handlers), "ignored");
 });
 
-test("只接受已知的設定視窗動作", () => {
+test("只接受已知的設定視窗動作（B5a-2：刪除全部備份 D-07 改在設定視窗內，不再請主視窗做）", () => {
   const seen = [];
   const handlers = { "delete-backups": () => seen.push("delete"), "replay-onboarding": () => seen.push("onboard") };
-  assert.equal(routeSettingsAction({ action: "delete-backups" }, handlers), "delete-backups");
+  assert.equal(routeSettingsAction({ action: "delete-backups" }, handlers), "ignored");
   assert.equal(routeSettingsAction({ action: "replay-onboarding" }, handlers), "replay-onboarding");
   assert.equal(routeSettingsAction({ action: "rm -rf" }, handlers), "ignored");
-  assert.deepEqual(seen, ["delete", "onboard"]);
+  assert.deepEqual(seen, ["onboard"]);
 });
 
 test("主視窗接上即時同步與設定視窗動作", () => {

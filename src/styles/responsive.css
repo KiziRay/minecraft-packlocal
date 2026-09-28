@@ -125,7 +125,7 @@
     grid-template-columns: 1fr;
     display: grid;
   }
-  .overflow-menu { right: 0; left: auto; min-width: min(240px, calc(100vw - 24px)); }
+  .overflow-menu { right: 0; left: auto; min-width: min(240px, calc(100vw / var(--ui-zoom, 1) - 24px)); }
 }
 
 @media (max-height: 640px) {
@@ -170,7 +170,7 @@
     min-height: 0;
     padding: 4px 0 6px;
     gap: 6px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .footer-promo .promo-card { min-height: 26px; padding: 0 6px; }
   .promo-support-hint { display: none; }

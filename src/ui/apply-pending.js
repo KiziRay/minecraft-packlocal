@@ -223,22 +223,6 @@ export function createApplyPendingFlow(deps) {
   return { handle, wire, hideCard, isPending: isApplyPending };
 }
 
-/** 開始翻譯時「保留翻譯結果」選項的說明：依目前備份設定講正確的話。 */
-export function keepOptionDetail(choice) {
-  const tail = "翻譯結果也留著，之後可以「分享給其他玩家」或用「補充漏翻」接續。";
-  if (choice === "always") return "裝進遊戲前會先備份遊戲原本的檔案；" + tail;
-  if (choice === "never") return "依你的設定不備份遊戲原本的檔案（覆蓋前會再問你一次）；" + tail;
-  return "第一次裝進遊戲前會問你要不要備份遊戲原本的檔案；" + tail;
-}
-
-/** 「不保留翻譯結果」選項的說明：只管結果資料夾，備份仍照設定。 */
-export function skipOptionDetail(choice) {
-  const head = "裝進遊戲後刪掉這次的翻譯結果，之後不能分享給其他玩家，也不能接續補翻。";
-  if (choice === "always") return head + "遊戲原本的檔案仍會先備份，之後按「移除翻譯」可以回到原版。";
-  if (choice === "never") return head + "依你的設定不備份遊戲原本的檔案，覆蓋前會再問你一次。";
-  return head + "要不要備份遊戲原本的檔案，第一次裝進遊戲前會問你。";
-}
-
 /** 後端回報套用紀錄損壞的錯誤（後端訊息固定以「套用紀錄損壞」開頭）。 */
 export function isBrokenRecordError(error) {
   const text = String((error && (error.message || error)) || "");

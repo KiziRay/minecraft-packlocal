@@ -4,10 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#14161a" />
-  <title>模組包翻譯工具</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@450;600&family=Noto+Sans+TC:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
+  <title>模組整合包翻譯工具</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body data-instance-ready="0" data-app-page="translate" data-app-section="workbench">
@@ -17,7 +14,7 @@
       <div class="winbar-left">
         <img class="winbar-logo" src="assets/app-logo.png" width="28" height="28" alt="" draggable="false" />
       </div>
-      <div class="winbar-title">模組包翻譯工具 · <span data-app-version>—</span></div>
+      <div class="winbar-title">模組整合包翻譯工具 · <span data-app-version>—</span></div>
       <div class="winbar-ctrl winbar-nodrag">
         <div class="overflow-wrap">
           <button type="button" id="btn-overflow" class="icon-button overflow-settings-btn" aria-haspopup="dialog" aria-expanded="false" title="設定" aria-label="開啟總設定">
@@ -44,8 +41,8 @@
           <span id="section-workbench" class="workbench-nav-title">工作台</span>
         </div>
         <nav id="workbench-tabs" class="workbench-page-tabs" aria-label="工作台功能" role="tablist">
-          <button type="button" id="tab-translate" class="workbench-page-tab active" data-page="translate" aria-selected="true" role="tab">翻譯<span id="tab-translate-badge" class="tab-badge" hidden>翻譯中</span></button>
-          <button type="button" id="tab-font" class="workbench-page-tab" data-page="font" aria-selected="false" role="tab">字體工具</button>
+          <button type="button" id="tab-translate" class="workbench-page-tab active" data-page="translate" aria-selected="true" aria-controls="page-translate" role="tab">翻譯<span id="tab-translate-badge" class="tab-badge" hidden>翻譯中</span></button>
+          <button type="button" id="tab-font" class="workbench-page-tab" data-page="font" aria-selected="false" aria-controls="page-font" role="tab">字體工具</button>
         </nav>
       </div>
     </div>
@@ -61,11 +58,11 @@
     <main id="top" class="workspace">
       <div class="workspace-frame service-layout">
         <div class="content-column">
-          <div id="page-translate" class="page-panel active" data-page="translate">
+          <div id="page-translate" class="page-panel active" data-page="translate" role="tabpanel" aria-labelledby="tab-translate">
               <section class="main-stage" aria-labelledby="translation-title">
                 <header class="stage-intro">
                   <p class="stage-kicker">工作台 · 翻譯</p>
-                  <h1 id="translation-title">模組包翻譯<button type="button" class="help-tip" data-help="translate-start" aria-label="說明：怎麼開始翻譯">?</button></h1>
+                  <h1 id="translation-title">模組整合包翻譯<button type="button" class="help-tip" data-help="translate-start" aria-label="說明：怎麼開始翻譯">?</button></h1>
                 </header>
 
                 <p class="coverage-honest inline-honest">會盡量掃齊可讀文字來源（含進階解包）；圖片與硬編碼英文可能仍留下，只寫入翻譯結果副本。</p>
@@ -105,7 +102,7 @@
 
                 <div class="path-block">
                   <div class="path-block-head">
-                    <label for="instance">遊戲資料夾（實例資料夾）</label>
+                    <label for="instance">遊戲資料夾</label>
                     <!--
                       本包選項（結果位置／資源包名稱／MC 版本）放在遊戲資料夾旁邊：
                       這是唯一決定「本包選項」有沒有意義的欄位，選好資料夾之後
@@ -114,7 +111,7 @@
                     <button type="button" id="btn-more-options" class="secondary-button more-options-cta" hidden>本包選項</button>
                   </div>
                   <div class="input-row">
-                    <input id="instance" type="text" placeholder="選取 Minecraft 實例資料夾" autocomplete="off" />
+                    <input id="instance" type="text" placeholder="選擇 Minecraft 遊戲資料夾" autocomplete="off" />
                     <button type="button" id="btn-inst" class="small-button">瀏覽…</button>
                   </div>
                   <!-- 「要選有 mods 的資料夾」只在狀態卡 S01 說一次（一件事只在一處說） -->
@@ -277,7 +274,7 @@
                     </label>
                     <label class="ai-source-seg" for="ai-source-gpt">
                       <input type="radio" id="ai-source-gpt" name="ai-source" value="gpt" />
-                      <span><strong>GPT</strong><small>用你自己的 GPT 帳號登入</small></span>
+                      <span><strong>ChatGPT</strong><small>用你自己的 ChatGPT 帳號登入</small></span>
                     </label>
                     <!--
                       「不使用 AI」程式碼上一直支援（use_ai=false），而且共享庫查詢
@@ -289,7 +286,7 @@
                       <span><strong>不使用 AI</strong><small>免下載 · 免登入 · 只用社群翻譯</small></span>
                     </label>
                   </div>
-                  <p id="ai-source-note" class="ai-source-note">三種 AI 都需要登入 Discord。「不使用 AI」不必登入也不必下載，直接套用社群已經翻好的內容——多數整合包這樣就能翻掉大部分。</p>
+                  <p id="ai-source-note" class="ai-source-note">三種 AI 都需要登入 Discord。「不使用 AI」不必登入也不必下載，只用共享庫裡其他玩家已翻好的內容——多數模組整合包這樣就能翻掉大部分。</p>
                   <div id="ai-panel" class="ai-panel">
                     <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
                     <div id="ai-config-card" class="ai-config-card">
@@ -320,17 +317,17 @@
                         <div id="gpt-auth-panel" class="managed-auth-panel" hidden>
                           <div class="managed-auth-compact">
                             <div class="auth-status-line">
-                              <strong id="gpt-auth-title">尚未登入 GPT</strong>
+                              <strong id="gpt-auth-title">尚未登入 ChatGPT</strong>
                               <p id="gpt-auth-note">用你的 ChatGPT 帳號登入（在瀏覽器輸入登入碼）。翻譯會消耗你的 ChatGPT 帳號額度；開始翻譯前會先試翻一句確認能用。登入資料只存在這台電腦。</p>
                             </div>
                             <div class="managed-auth-actions">
                               <button type="button" id="btn-gpt-login" class="small-button">登入／顯示裝置碼</button>
                               <button type="button" id="btn-gpt-refresh" class="text-button">重新檢查</button>
                               <button type="button" id="btn-gpt-cancel" class="text-button" hidden>取消</button>
-                              <button type="button" id="btn-gpt-logout" class="text-button" hidden>登出 GPT</button>
+                              <button type="button" id="btn-gpt-logout" class="text-button" hidden>登出 ChatGPT</button>
                             </div>
                             <p class="field-help">
-                              用 Luna 模型翻譯。ChatGPT 帳號只支援這一個，選其他的會被 OpenAI 直接退回，不用挑。
+                              ChatGPT 帳號只支援一個翻譯模型，工具已自動選好，不用挑。
                             </p>
                           </div>
                         </div>
@@ -344,7 +341,6 @@
                             <div class="managed-auth-actions">
                               <button type="button" id="btn-local-llm-setup" class="small-button">同意並偵測</button>
                               <button type="button" id="btn-local-llm-stop" class="text-button" hidden title="關閉本地模型服務，釋放記憶體與顯示記憶體">停用本地模型</button>
-                              <button type="button" id="btn-local-llm-delete" class="text-button danger-text-button" hidden title="刪除已下載的模型與執行程式檔案，釋放磁碟空間">刪除本地模型檔案</button>
                             </div>
                           </div>
                         </div>
@@ -360,7 +356,7 @@
                             </select>
                             <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商。</small>
                           </div>
-                          <div class="field-block"><label for="api-key">API Key</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
+                          <div class="field-block"><label for="api-key">API 金鑰</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
                           <small id="api-key-note" class="field-status">金鑰只存本機並用於翻譯／測試；畫面上的 ######## 只是遮罩，不是真金鑰。留空再儲存會保留已存金鑰。</small>
                           <div id="custom-endpoint-fields" hidden>
                             <div class="field-block"><label for="base-url">服務網址</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://api.example.com/v1" /></div>
@@ -379,7 +375,7 @@
                 <!-- 開始翻譯／停止翻譯在上面的狀態卡（唯一位置）。 -->
                 <div class="action-area primary-action">
                   <div class="action-row secondary-actions">
-                    <button type="button" id="btn-repair" class="text-button" hidden>修復工作階段</button>
+                    <button type="button" id="btn-repair" class="text-button" hidden>修復翻譯檔</button>
                     <button type="button" id="btn-merge-consistency" class="text-button" hidden title="把「用詞不一致建議.json」的建議譯名併入本機術語表（不會直接改遊戲檔）">併入用詞建議</button>
                   </div>
                   <p id="consistency-merge-hint" class="share-hint" hidden>結果資料夾有「用詞不一致建議.json」時可按「併入用詞建議」寫進術語表；預設不覆蓋你已有的譯名。</p>
@@ -387,7 +383,7 @@
               </section>
           </div>
 
-          <div id="page-font" class="page-panel" data-page="font" hidden>
+          <div id="page-font" class="page-panel" data-page="font" role="tabpanel" aria-labelledby="tab-font" hidden>
               <section class="main-stage" aria-labelledby="font-title">
                 <header class="stage-intro">
                   <p class="stage-kicker">工作台 · 字體</p>
@@ -633,26 +629,17 @@
           <option value="26.2">26.2</option>
           <option value="26.3">26.3</option>
           </select>
-          <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲實例</small>
+          <small id="version-status" class="field-status" aria-live="polite">尚未選擇遊戲資料夾</small>
           </div>
           </div>
           </section>
           </div>
 
-          <section id="translation-method-group" class="options-group" aria-labelledby="translation-options-heading">
-          <div id="translation-options-heading" class="options-group-head">
-          <h3 class="options-group-title">翻譯方式</h3>
-          </div>
-          <div id="translation-options">
-          <div class="option-list">
-          <!-- 備份選擇改到設定視窗「資料與備份」（第一次套用時會問）；這個舊勾選保留 id 給相容程式碼，不再顯示 -->
+          <!-- 備份選擇在設定視窗「資料與備份」；這個舊勾選保留 id 給相容程式碼（app.js、settings-store KEY_MAP），不顯示，B5b 取代後才刪 -->
           <label class="option-row" for="backup-before-apply" hidden>
           <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
           <span><strong>套用前建立備份</strong><span class="settings-tier tier-recommended">建議開著</span></span>
           </label>
-          </div>
-          </div>
-          </section>
 
           <section id="translation-helper-group" class="options-group" aria-labelledby="opt-group-helper">
           <details class="advanced-details options-group-fold">
@@ -685,7 +672,7 @@
           <summary>參考翻譯（選用）</summary>
           <div class="advanced-body">
           <div class="input-row"><input id="reference-pack" type="text" readonly placeholder="尚未指定參考翻譯資料夾或 zip" autocomplete="off" /><button type="button" id="btn-reference-pick" class="small-button">選資料夾</button><button type="button" id="btn-reference-file" class="small-button">選 zip</button></div>
-          <div class="action-row"><button type="button" id="btn-cfpa-download" class="secondary-button">嘗試下載 CFPA（對應 MC 版本）</button></div>
+          <div class="action-row"><button type="button" id="btn-cfpa-download" class="secondary-button">嘗試下載社群簡中翻譯（對應 MC 版本）</button></div>
           <small id="reference-status" class="field-status">尚未指定參考翻譯；可手動選取或略過。</small>
           <label class="option-row compact-option" for="reference-ack-license">
           <input type="checkbox" id="reference-ack-license" />
@@ -851,7 +838,7 @@
     <div class="device-code-shell" role="dialog" aria-modal="true" aria-labelledby="gpt-login-overlay-title">
       <header class="device-code-top">
         <div>
-          <p class="stage-kicker">GPT 登入</p>
+          <p class="stage-kicker">ChatGPT 登入</p>
           <h2 id="gpt-login-overlay-title">裝置授權碼</h2>
         </div>
         <button type="button" id="btn-gpt-overlay-close" class="text-button">關閉</button>

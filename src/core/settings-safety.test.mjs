@@ -78,10 +78,13 @@ test("設定檔寫成功後才寫 localStorage", () => {
   assert.ok(patchAt > 0 && localAt > patchAt, "要先 patchSettings 成功才寫 localStorage");
 });
 
-test("改回每次詢問會通知主視窗更新快取", () => {
-  const actions = read("../settings-window-actions.js");
-  const handler = actions.slice(actions.indexOf(`$("reset-backup-choice").addEventListener`));
-  assert.ok(handler.slice(0, 600).includes("SETTINGS_UPDATED_EVENT"), "要送設定同步事件");
+test("改套用前要不要備份會通知主視窗更新快取（B5a-2：三選一，「每次詢問」＝刪除設定）", () => {
+  const pane = read("../settings/data-pane.js");
+  const handler = pane.slice(pane.indexOf("async function onBackupChoiceChange"));
+  assert.ok(handler.slice(0, 1200).includes("saveAndAnnounce("), "要經合併寫入後送設定同步事件");
+  assert.ok(handler.slice(0, 1200).includes("opDelete(BACKUP_CHOICE_PATH)"), "每次詢問＝刪除設定，不寫空值");
+  const announce = pane.slice(pane.indexOf("async function saveAndAnnounce"));
+  assert.ok(announce.slice(0, 900).includes("SETTINGS_UPDATED_EVENT"));
 });
 
 test("縮放值經合併寫入設定檔，主視窗快捷鍵調整也會同步給設定視窗", () => {

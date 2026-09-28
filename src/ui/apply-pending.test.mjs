@@ -123,22 +123,13 @@ test("覆蓋清單過長時只列前幾個", () => {
 });
 
 import { readFileSync } from "node:fs";
-import { keepOptionDetail, skipOptionDetail, isBrokenRecordError } from "./apply-pending.js";
+import { isBrokenRecordError } from "./apply-pending.js";
+import { ROW_COPY } from "../settings/settings-copy.js";
 
-test("開始翻譯的「保留」說明依備份設定講正確的話", () => {
-  assert.match(keepOptionDetail("always"), /先備份/);
-  assert.doesNotMatch(keepOptionDetail("never"), /先備份/);
-  assert.match(keepOptionDetail("never"), /不備份/);
-  assert.match(keepOptionDetail(""), /第一次.*問/);
-});
-
-test("「不保留」只管翻譯結果，不代表不備份", () => {
-  for (const choice of ["always", "never", ""]) {
-    const text = skipOptionDetail(choice);
-    assert.doesNotMatch(text, /不備份、不留/);
-    assert.match(text, /翻譯結果/);
-  }
-  assert.match(skipOptionDetail("always"), /仍會先備份/);
+// B5a-2：開始前的「保留／不保留」三選一刪除，改成設定「翻完刪除翻譯結果」（唯一位置）。
+test("「翻完刪除翻譯結果」只管翻譯結果，不代表不備份（G1.8）", () => {
+  assert.match(ROW_COPY.deleteResultsHelp, /翻譯結果/);
+  assert.match(ROW_COPY.deleteResultsHelp, /備份照「套用前要不要備份」，不受影響/);
 });
 
 test("套用紀錄損壞的錯誤要能被辨認出來", () => {

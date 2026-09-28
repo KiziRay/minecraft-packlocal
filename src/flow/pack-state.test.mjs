@@ -220,10 +220,10 @@ test("G0.2：說明退場的設定路徑在前後端共用白名單，且 KEY_MA
 });
 
 // ── 審查修正 中2：狀態卡不得與暫留的舊卡矛盾（B5b／B5c 取代前的保守分支）──
-test("中2：待套用卡出現時，狀態句「已翻完，還沒裝進遊戲」且狀態卡不出主要按鈕（主要動作在該卡）", () => {
+test("中2：待套用卡出現時，狀態句「已翻完，還沒套用到遊戲」且狀態卡不出主要按鈕（主要動作在該卡）", () => {
   const s = computePackState({ ...base, applyPendingShown: true, translationComplete: true });
   assert.equal(s.id, STATE.pendingCard);
-  assert.equal(s.sentence, "已翻完，還沒裝進遊戲");
+  assert.equal(s.sentence, "已翻完，還沒套用到遊戲");
   assert.equal(s.primary, null);
   assert.ok(ZERO_PRIMARY_ALLOWED.includes(s.id));
   const plan = planStatusCard(s);

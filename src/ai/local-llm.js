@@ -1,6 +1,5 @@
 import { $, dialog, invoke, listen } from "../core/dom.js";
 import { LOCAL_LLM_CONSENT_KEY, LOCAL_LLM_DIR_KEY } from "../core/storage.js";
-import { confirmDialog } from "../ui/confirm.js";
 import { isRunning, runExclusive } from "../ui/once.js";
 import { GPT_COPY } from "./copy.js";
 
@@ -584,35 +583,6 @@ export function wireLocalLlm({ refreshAiStatus, appendLog, onReadyToTranslate } 
       if (typeof refreshAiStatus === "function") await refreshAiStatus();
     };
   }
-  if ($("btn-local-llm-delete")) {
-    $("btn-local-llm-delete").onclick = () =>
-      runExclusive("local-llm-delete", async () => {
-        const dir = currentDir();
-        const ok = await confirmDialog({
-          title: "刪除本地模型檔案？",
-          body:
-            "會刪除已下載的翻譯模型與執行程式，釋放磁碟空間。之後要用本地模型翻譯，\n" +
-            "需要重新下載。不會影響已經翻好的翻譯結果。",
-          affected: dir ? [dir] : [],
-          danger: true,
-          confirmLabel: "刪除",
-          cancelLabel: "取消",
-        });
-        if (!ok) return;
-        try {
-          const msg = await invoke("local_llm_delete_cmd", { installDir: dir || null });
-          log(String(msg || "已刪除。"), "info");
-          cacheProbe(null);
-          lastInstallError = "";
-          showInstalledState(false);
-          showInstallButton(false);
-          setHidden($("local-llm-probe-summary"), true);
-        } catch (e) {
-          log("刪除失敗：" + String(e?.message || e), "warn");
-        }
-        if (typeof refreshAiStatus === "function") await refreshAiStatus();
-      });
-  }
   if ($("btn-local-llm-cancel")) {
     $("btn-local-llm-cancel").onclick = async () => {
       try {
@@ -627,6 +597,18 @@ export function wireLocalLlm({ refreshAiStatus, appendLog, onReadyToTranslate } 
     const p = (ev && ev.payload) || {};
     setProgress(p.percent, p.message);
   }).catch(() => {});
+}
+
+/**
+ * 設定視窗刪掉了本地模型檔案（B5a-2：刪除本地模型只在設定→資料與備份）：
+ * 主畫面清掉偵測快取並回到「尚未安裝」，AI 狀態由呼叫端接著重讀。
+ */
+export function forgetLocalLlmAfterExternalDelete() {
+  cacheProbe(null);
+  lastInstallError = "";
+  showInstalledState(false);
+  showInstallButton(false);
+  setHidden($("local-llm-probe-summary"), true);
 }
 
 export async function ensureLocalLlmReady({ refreshAiStatus, appendLog, silent } = {}) {

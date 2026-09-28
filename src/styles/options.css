@@ -83,7 +83,7 @@
   display: flex;
   flex-direction: column;
   width: min(760px, 100%);
-  max-height: min(780px, calc(100vh - 48px));
+  max-height: min(780px, calc(100vh / var(--ui-zoom, 1) - 48px));
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -108,7 +108,7 @@
 .pack-options-modal-body > .more-options-body { min-height: min-content; }
 @media (max-width: 640px) {
   .pack-options-modal { padding: 10px; }
-  .pack-options-modal-shell { max-height: calc(100vh - 20px); }
+  .pack-options-modal-shell { max-height: calc(100vh / var(--ui-zoom, 1) - 20px); }
   .pack-options-modal-head, .pack-options-modal-body { padding-left: 12px; padding-right: 12px; }
 }
 
@@ -165,7 +165,7 @@
 .managed-ai-usage-indicator .usage-reset {
   margin-top: 10px;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
 }
 
@@ -264,7 +264,7 @@
   background: var(--panel);
 }
 .range-field strong { margin: 0 0 2px; font-size: 13px; }
-.range-field small { display: block; color: var(--faint); font-size: 11px; }
+.range-field small { display: block; color: var(--faint); font-size: 12px; }
 .range-value {
   color: var(--muted);
   font-family: var(--font-mono);
@@ -280,17 +280,6 @@
 .update-notes-list li + li { margin-top: 6px; }
 .update-version-line { margin: 0; font-weight: 600; }
 .update-footnote { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
-.update-button { align-items: flex-start; }
-.update-button > span:first-child { flex: 0 0 auto; }
-.update-button .update-status {
-  min-width: 0;
-  max-width: min(58%, 420px);
-  overflow: visible;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  text-align: right;
-  line-height: 1.35;
-}
 .diagnose-report-panel {
   margin-top: 18px;
   padding-top: 14px;
@@ -446,7 +435,7 @@
   color: var(--ink);
 }
 .promo-support-hint {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
   font-weight: 500;
 }
@@ -497,8 +486,6 @@
   margin-top: 8px;
 }
 
-#translation-options[hidden],
-#translation-options-heading[hidden],
 #reference-details[hidden],
 #share-confirm-panel[hidden],
 #coverage-tier-block[hidden],

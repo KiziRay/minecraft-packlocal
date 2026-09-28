@@ -9,7 +9,7 @@
 import { isAllowedSettingPath } from "./settings-paths.js";
 
 export const SETTINGS_UPDATED_EVENT = "mcpl:settings-updated";
-/** 設定視窗請主視窗執行動作（重看引導、刪除全部備份、顯示更新）。 */
+/** 設定視窗請主視窗執行動作（重看引導與說明、顯示更新）。 */
 export const SETTINGS_ACTION_EVENT = "mcpl:settings-action";
 
 const truthy = (value) => value === true || value === "1" || value === "true";
@@ -49,9 +49,6 @@ export function routeSettingsUpdate(update, handlers = {}) {
     case "translate.outputCustomRoot":
       call("outputStorage");
       return "outputStorage";
-    case "translate.cacheRemind":
-      call("cacheRemind", truthy(value));
-      return "cacheRemind";
     case "privacy.rememberApiKey":
       call("rememberApiKey", truthy(value));
       return "rememberApiKey";
@@ -60,8 +57,8 @@ export function routeSettingsUpdate(update, handlers = {}) {
   }
 }
 
-/** 設定視窗可以請主視窗做的事。其他名稱一律忽略。 */
-export const SETTINGS_ACTIONS = ["replay-onboarding", "delete-backups", "show-update"];
+/** 設定視窗可以請主視窗做的事。其他名稱一律忽略。（刪除全部備份 D-07 已改在設定視窗內做，B5a-2） */
+export const SETTINGS_ACTIONS = ["replay-onboarding", "show-update"];
 
 export function routeSettingsAction(payload, handlers = {}) {
   const action = String(payload?.action || "");

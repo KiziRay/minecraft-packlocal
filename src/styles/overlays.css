@@ -428,7 +428,7 @@ body.content-fade-in .service-tabs > *,
 .guide-toc p {
   margin: 0 8px 10px;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.12em;
 }
 .guide-toc a {
@@ -481,7 +481,7 @@ body.content-fade-in .service-tabs > *,
   border-radius: 50%;
   color: var(--accent);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   flex: 0 0 auto;
 }
 .guide-steps p { margin: 1px 0 0; }
@@ -516,7 +516,7 @@ body.content-fade-in .service-tabs > *,
 .eyebrow {
   margin: 0 0 6px;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.12em;
 }
@@ -652,7 +652,7 @@ body.content-fade-in .service-tabs > *,
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   cursor: help;
   vertical-align: middle;
@@ -666,7 +666,7 @@ h2 .help-tip,
 .options-group-title .help-tip,
 .auth-status-line .help-tip {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
 }
 body[data-instance-ready="0"] .help-tip[data-help="translate-start"] {
@@ -756,7 +756,7 @@ body[data-instance-ready="0"] .help-tip[data-help="translate-start"] {
   border-radius: var(--radius-sm);
   background: var(--bg);
   font-family: var(--mono, monospace);
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.7;
   word-break: break-all;
 }
@@ -808,7 +808,6 @@ body[data-instance-ready="0"] .help-tip[data-help="translate-start"] {
 .choice-option:focus-visible {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
-  outline: none;
 }
 
 .choice-option-label {

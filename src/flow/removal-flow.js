@@ -35,6 +35,8 @@ export function createRemovalFlow({
   confirmDialog,
   ensureGameClosed = async () => true,
   formatError = errorText,
+  // 真的呼叫後端移除時算「套用中」（審查 F3）：主視窗 setBusy，設定視窗的刪備份等同步停用
+  onBusy = () => {},
 } = {}) {
   /**
    * @returns {Promise<{status: "cancelled"} | {status: "removed", result: object} | {status: "failed", message: string, error: unknown}>}
@@ -45,11 +47,14 @@ export function createRemovalFlow({
     if (!(await ensureGameClosed(path, "移除翻譯"))) return { status: "cancelled" };
     const ok = await confirmDialog({ ...D05, affected: [path] });
     if (!ok) return { status: "cancelled" };
+    onBusy(true);
     try {
       const result = await invoke("restore_last_apply_cmd", { instancePath: path, outputDir: outputDir || null });
       return { status: "removed", result: result || {} };
     } catch (error) {
       return { status: "failed", message: formatError(error), error };
+    } finally {
+      onBusy(false);
     }
   }
 

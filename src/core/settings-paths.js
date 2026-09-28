@@ -19,10 +19,13 @@ export const SETTING_PATHS = [
   "translate.backupChoice",
   "translate.outputStorageMode",
   "translate.outputCustomRoot",
+  // 已停用（B5a-2 刪除「發現已翻過時提醒我」）：留在清單讓舊設定檔照常讀寫，值一律忽略
   "translate.cacheRemind",
   "translate.localCloudTopUp",
   "translate.lastInstancePath",
   "translate.coverageAck",
+  "translate.deleteResultsAfterApply",
+  "translate.deleteResultsAck",
   "localModel.consented",
   "localModel.installDir",
   "onboarding.seenVersion",

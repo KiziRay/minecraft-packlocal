@@ -39,7 +39,6 @@ const KEY_MAP = {
   "modpack-i18n-sfx-muted-v1": "appearance.sfxMuted",
   "modpack-i18n-output-storage-mode-v1": "translate.outputStorageMode",
   "modpack-i18n-output-custom-root-v1": "translate.outputCustomRoot",
-  "modpack-i18n-cache-remind-v1": "translate.cacheRemind",
   "modpack-i18n-local-cloud-topup-v1": "translate.localCloudTopUp",
   "modpack-i18n-last-instance-path-v1": "translate.lastInstancePath",
   "modpack-i18n-local-llm-consent-v1": "localModel.consented",
@@ -54,6 +53,8 @@ const KEY_MAP = {
   "mcpl-webview-autoscale": "appearance.uiAutoScale",
   "mcpl-disclosure-pick-folder": "ui.disclosure.pickFolder",
   "mcpl-banner-update-dismissed": "ui.banner.updateDismissedVersion",
+  "mcpl-delete-results-after-apply": "translate.deleteResultsAfterApply",
+  "mcpl-delete-results-ack": "translate.deleteResultsAck",
 };
 
 /** 舊版鍵名 → 目前鍵名。目前的鍵沒有值時，才用舊鍵的值搬進設定檔。 */
@@ -63,7 +64,11 @@ const LEGACY_ALIASES = {
 };
 
 /** 已移除的設定：不再有任何程式讀它，啟動時順手清掉。 */
-const REMOVED_LOCAL_KEYS = ["modpack-i18n-keep-local-model-v1"];
+const REMOVED_LOCAL_KEYS = [
+  "modpack-i18n-keep-local-model-v1",
+  // B5a-2：「發現已翻過時提醒我」刪除（狀態卡永遠顯示現況），設定檔裡的舊值一律忽略
+  "modpack-i18n-cache-remind-v1",
+];
 
 export { KEY_MAP, LEGACY_ALIASES };
 

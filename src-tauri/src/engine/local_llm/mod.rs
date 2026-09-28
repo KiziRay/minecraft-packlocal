@@ -60,8 +60,16 @@ pub fn status_view() -> serde_json::Value {
         log_install_dir_mismatch(&dir);
     }
     let ready = state.port >= PORT_BASE && health_ok(state.port);
+    // B5a-2：設定→資料與備份顯示「佔用 GB」（只讀；只算刪除時會刪的 models／runtime 兩個子目錄）
+    let size_bytes = if installed {
+        crate::engine::paths::dir_size_bytes(&dir.join("models"))
+            + crate::engine::paths::dir_size_bytes(&dir.join("runtime"))
+    } else {
+        0
+    };
     serde_json::json!({
         "installed": installed,
+        "sizeBytes": size_bytes,
         "ready": ready,
         "port": state.port,
         "pid": state.pid,

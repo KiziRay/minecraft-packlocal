@@ -108,12 +108,14 @@ function state(id, fields) {
 function busyReason(kind) {
   if (kind === "apply") return "正在套用到遊戲，完成後才能開始";
   if (kind === "font") return "字體工具正在建立字體包，完成後才能開始";
+  if (kind === "migrate") return "正在搬移工具資料，搬完才能開始";
   return "正在處理，完成後才能開始";
 }
 
 function busySentence(kind) {
   if (kind === "apply") return "正在套用到遊戲…";
   if (kind === "font") return "字體工具正在建立字體包…";
+  if (kind === "migrate") return "正在搬移工具資料…";
   return "正在處理…";
 }
 
@@ -177,7 +179,7 @@ export function computePackState(input) {
   if (!i.instancePath) {
     return state(STATE.noFolder, {
       sentence: "選要翻譯的模組整合包遊戲資料夾（裡面有 mods）",
-      extraLine: i.pickFolderFresh ? "CurseForge：在整合包上按右鍵→開啟資料夾" : "",
+      extraLine: i.pickFolderFresh ? "CurseForge：在模組整合包上按右鍵→開啟資料夾" : "",
       disclosureKey: "pickFolder",
       primary: { action: ACTION.pickFolder, label: "選擇遊戲資料夾" },
     });
@@ -198,7 +200,7 @@ export function computePackState(input) {
 
   // 暫行（B5c 取代）：待套用卡在畫面上時，主要動作「套用到遊戲」在那張卡
   if (i.applyPendingShown) {
-    return state(STATE.pendingCard, { sentence: "已翻完，還沒裝進遊戲" });
+    return state(STATE.pendingCard, { sentence: "已翻完，還沒套用到遊戲" });
   }
 
   if (i.removal) {
@@ -224,6 +226,8 @@ export function computePackState(input) {
     sentence: i.translationComplete ? "這個模組整合包已翻譯" : `已選好「${name}」，可以開始翻譯`,
     primary: { action: ACTION.run, label: i.translationComplete ? "重新翻譯" : "開始翻譯" },
     more: i.hasResult ? [{ action: ACTION.deleteAndRestart, label: "刪除結果並重翻", danger: true }] : [],
+    // 原本在開始前「保留結果」詢問裡的提醒（B5a-2 刪了那個詢問）；B5b 開始前確認卡取代
+    detailLines: i.translationComplete ? [] : ["建議先啟動一次遊戲再翻譯：有些模組第一次啟動才產生語言檔。"],
     showAiRow: true,
   });
 }

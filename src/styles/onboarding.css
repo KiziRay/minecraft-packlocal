@@ -75,7 +75,7 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
-  width: min(320px, calc(100vw - 24px));
+  width: min(320px, calc(100vw / var(--ui-zoom, 1) - 24px));
   max-height: min(86dvh, 560px);
   padding: 14px 14px 12px;
   border-radius: 12px;
@@ -109,7 +109,7 @@
 .onboard-meta {
   margin-bottom: 10px;
   color: var(--faint, #7a8190);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.04em;
 }
 .onboard-actions {
@@ -170,7 +170,7 @@
 .ai-source-seg small {
   display: block;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
 }
 .ai-config-card {
   margin-top: 10px;

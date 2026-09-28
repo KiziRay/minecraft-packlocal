@@ -1,3 +1,6 @@
+/* 字型（B5a-2，規格 §6；保守方案 A，待使用者確認）：只用 Windows 內建字型，不連外網、離線也正常。
+   中文 Microsoft JhengHei UI／Microsoft JhengHei；拉丁 Segoe UI Variable／Segoe UI；等寬 Cascadia Mono／Consolas。
+   備案：內建 Noto Sans TC（SIL OFL 1.1，約 +9 MB）。 */
 :root {
   color-scheme: dark;
   --paper: #14161a;
@@ -11,6 +14,10 @@
   --accent: #c4783a;
   --accent-hover: #ad6830;
   --accent-soft: #2a2218;
+  /* 主要按鈕：白字要 ≥4.5:1（規格 §6），比 --accent 深一階 */
+  --primary-bg: #9a5a24;
+  --primary-bg-hover: #8a4f1d;
+  --primary-ink: #fff8f2;
   --ok: #6f9e7a;
   --ok-soft: #1a2420;
   --danger: #d07a6c;
@@ -36,7 +43,7 @@
   --btn-h-lg: 48px;
   --btn-h-md: 40px;
   --btn-h-sm: 36px;
-  --type-kicker: 11px;
+  --type-kicker: 12px;
   --type-caption: 12px;
   --type-body: 14px;
   --type-ui: 15px;
@@ -46,10 +53,10 @@
   --stage-max: min(72ch, 100%);
   --cta-max: min(420px, 100%);
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --font-ui: "Outfit", "Noto Sans TC", "Segoe UI Variable", "Microsoft JhengHei UI", sans-serif;
+  --font-ui: "Segoe UI Variable Display", "Segoe UI", "Microsoft JhengHei UI", "Microsoft JhengHei", sans-serif;
   --font-display: var(--font-ui);
-  --font-body: "Noto Sans TC", "Segoe UI Variable", "Microsoft JhengHei UI", sans-serif;
-  --font-mono: "IBM Plex Mono", "Cascadia Code", Consolas, monospace;
+  --font-body: "Segoe UI Variable Text", "Segoe UI", "Microsoft JhengHei UI", "Microsoft JhengHei", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Microsoft JhengHei UI", monospace;
   font-family: var(--font-body);
   font-size: var(--type-ui);
   font-synthesis: none;
@@ -62,12 +69,14 @@
   --panel: #ffffff;
   --ink: #1c212b;
   --muted: #5a6472;
-  --faint: #7a8494;
+  --faint: #5f6978;
   --line: #d5dae3;
   --line-strong: #b8c0cc;
   --accent: #b06830;
   --accent-hover: #965824;
   --accent-soft: #f3ebe3;
+  --primary-bg: #94561f;
+  --primary-bg-hover: #874d1a;
   --ok: #3f6b4d;
   --ok-soft: #eef5f0;
   --danger: #a34b40;
@@ -118,7 +127,8 @@ input, select, textarea, .input-row, .path-block, .footer {
   pointer-events: auto;
 }
 a { color: inherit; }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
+/* 可見焦點（規格 §6）：所有可聚焦元素（含 tabindex 的紀錄區、分頁）用鍵盤聚焦時都有 2px 外框 */
+:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -169,8 +179,13 @@ code {
   inset: 0;
   pointer-events: none !important;
   opacity: 0.22;
-  background: url("assets/atmosphere-banner.png") center / cover no-repeat;
+  /* 背景圖跟著主題換（規格 §1.3）；CSS 的相對路徑以 styles/ 為基準 */
+  background: url("../assets/art/workspace-background-dark.png") center / cover no-repeat;
   mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 70%);
+}
+
+[data-theme="light"] .app-atmosphere::after {
+  background-image: url("../assets/art/workspace-background-light.png");
 }
 
 .app {
@@ -227,7 +242,7 @@ code {
 }
 .winbar-title {
   justify-self: center;
-  font-family: var(--font-display, Outfit, "Noto Sans TC", sans-serif);
+  font-family: var(--font-display);
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -396,10 +411,10 @@ code {
   width: 26px;
   height: 26px;
   border-radius: 7px;
-  background: color-mix(in srgb, var(--accent) 88%, #1a120c);
-  color: #fff8f2;
+  background: var(--primary-bg);
+  color: var(--primary-ink);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: -0.04em;
   align-self: center;
@@ -500,9 +515,9 @@ code {
   border-radius: 6px;
   background: var(--canvas);
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
 }
-.overflow-meta-note { color: var(--faint); font-size: 11px; }
+.overflow-meta-note { color: var(--faint); font-size: 12px; }
 .overflow-item {
   display: flex;
   align-items: center;
@@ -559,7 +574,6 @@ code {
   font-family: var(--font-mono);
   font-size: 12px;
 }
-.update-status { font-size: 11px !important; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 h1, h2, h3, p { margin-top: 0; }
 h1 {

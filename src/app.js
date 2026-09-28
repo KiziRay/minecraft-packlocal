@@ -14,14 +14,11 @@ import {
   isApplyPending,
   isBrokenRecordError,
   isForkableError,
-  keepOptionDetail,
   offerForkInstance,
   offerRecordReset,
-  skipOptionDetail,
 } from "./ui/apply-pending.js";
 import {
   BACKUP_STORAGE_KEY,
-  CACHE_REMIND_KEY,
   CONSENT_STORAGE_KEY,
   CONSENT_STORAGE_KEY_LEGACY,
   FONT_PREFS_STORAGE_KEY,
@@ -38,6 +35,7 @@ import { isSupportedMinecraftVersion, unsupportedVersionMessage } from "./core/v
 import { GPT_COPY } from "./ai/copy.js";
 import {
   ensureLocalLlmReady,
+  forgetLocalLlmAfterExternalDelete,
   localLlmStatus,
   syncSetupButtonLabel,
   wireLocalLlm,
@@ -54,12 +52,19 @@ import {
   routeSettingsUpdate,
 } from "./core/settings-sync.js";
 import { wireHelpTips } from "./ui/help-tip.js";
+import { wireTabKeys } from "./ui/tab-keys.js";
 import { choiceDialog, confirmDialog, isConfirmOpen } from "./ui/confirm.js";
 import { settingsHealthBanner } from "./ui/banner.js";
 import { DISPLAY_CATEGORY, buildIssuePayload, describeIssueResult } from "./ui/issue-report.js";
 import { isAriaDisabled } from "./flow/status-card.js";
 import { createPackActions, describeImportReport } from "./flow/pack-actions.js";
 import { createDisclosure } from "./flow/disclosure.js";
+import {
+  announceMainState,
+  deleteResultsAfterApplyEnabled as readDeleteResultsSetting,
+  isDataMigrating,
+  wireSettingsNotices,
+} from "./flow/settings-bridge.js";
 import { CONSENT_CONTENT_VERSION, TOUR_SKIPPED_TOAST, afterConsent, isConsentAccepted } from "./flow/first-run.js";
 import { createRemovalFlow } from "./flow/removal-flow.js";
 import { runExclusive } from "./ui/once.js";
@@ -145,6 +150,8 @@ let sfxLastErrorAt = 0;
 let sfxLastSuccessAt = 0;
 let apiKeyDraft = "";
 let apiKeySavedMask = "";
+/** 分頁的 roving tabindex 同步（wireTabKeys 接上後才有作用）。 */
+let syncWorkbenchTabKeys = () => {};
 let apiKeyEditing = false;
 let gptLoginInFlight = false;
 let hasApplyBackups = false;
@@ -720,6 +727,7 @@ const removalFlow = createRemovalFlow({
   confirmDialog,
   ensureGameClosed: (path, label) => ensureGameClosed(path, label),
   formatError: (e) => formatInvokeError(e),
+  onBusy: (on) => setBusy(on, "apply"),
 });
 
 /**
@@ -742,6 +750,7 @@ const packActions = createPackActions({
     progressBusy,
     shareUploadInFlight,
     busyJobKind: window.__busyJobKind || "",
+    dataMigrating: isDataMigrating(),
     localCacheProbe,
     translationState,
     hasApplyBackups,
@@ -836,8 +845,8 @@ function setAutoOutputDir(path) {
   if (!customOutputEnabled()) input.value = value;
   const status = $("output-status");
   if (status) status.textContent = value
-    ? "翻譯會在這個位置建立「翻譯結果」；完成後直接套用到整合包資料夾。"
-    : "請先選擇整合包資料夾。";
+    ? "翻譯會在這個位置建立「翻譯結果」；完成後套用到遊戲資料夾。"
+    : "請先選擇遊戲資料夾。";
   syncOutputField();
   scheduleBackupStateRefresh();
   refreshShareableState();
@@ -882,16 +891,6 @@ function readOutputCustomRoot() {
   }
 }
 
-function readCacheRemindEnabled() {
-  try {
-    const raw = localStorage.getItem(CACHE_REMIND_KEY);
-    if (raw == null) return true;
-    return raw !== "0" && raw !== "false";
-  } catch (_) {
-    return true;
-  }
-}
-
 function readLastInstancePath() {
   try {
     return String(localStorage.getItem(LAST_INSTANCE_PATH_KEY) || "").trim();
@@ -911,9 +910,9 @@ function writeLastInstancePath(path) {
 }
 
 function outputStorageHint(mode) {
-  if (mode === "beside") return "翻譯結果會放在整合包旁的「繁中翻譯輸出」資料夾。";
-  if (mode === "custom") return "翻譯結果會放在你指定的根目錄下，依整合包分開存放。";
-  return "工具會在 AppData 下為每個整合包建立獨立資料夾。";
+  if (mode === "beside") return "翻譯結果會放在模組整合包旁邊的翻譯輸出資料夾。";
+  if (mode === "custom") return "翻譯結果會放在你指定的資料夾，每個模組整合包分開存放。";
+  return "工具會在這台電腦的使用者資料夾裡，替每個模組整合包建立獨立資料夾。";
 }
 
 /** 依設定解析此整合包的預設結果根（本包「另指定」優先）。 */
@@ -974,7 +973,6 @@ function showLocalCacheCard(probe) {
   // 剛移除翻譯（狀態卡 S19）時也不顯示：「套用到遊戲」只在狀態卡一處。
   if (
     !localCacheProbe ||
-    !readCacheRemindEnabled() ||
     translationState === "running" ||
     packActions.isRemovalShownFor(($("instance")?.value || "").trim())
   ) {
@@ -1061,7 +1059,7 @@ async function probeLocalPackCache(instancePath, { silent } = {}) {
       } else {
         await refreshShareableState();
       }
-      if (!silent && readCacheRemindEnabled()) {
+      if (!silent) {
         appendLog(probe.message || "已找到本機翻譯結果。", "info");
       }
     } else {
@@ -2844,6 +2842,7 @@ function showAppPage(page, opts = {}) {
     tabFont.classList.toggle("active", name === "font");
     tabFont.setAttribute("aria-selected", name === "font" ? "true" : "false");
   }
+  syncWorkbenchTabKeys();
   lastWorkbenchPage = name;
   document.body.dataset.appPage = name;
   document.body.dataset.appSection = "workbench";
@@ -3043,6 +3042,8 @@ function wireShellChrome() {
 }
 
 function syncUiState() {
+  // 設定視窗靠這個知道「翻譯中」與目前遊戲資料夾（刪備份、搬移、刪模型要停用）；狀態沒變不重送
+  announceMainState();
   const hasInstance = !!($("instance")?.value || "").trim();
   const hasOutput = !!selectedOutputDir();
   const complete = translationState === "complete";
@@ -3059,7 +3060,7 @@ function syncUiState() {
   // 本包選項現在是設定視窗的一個分頁：沒選資料夾時只要把那一區換成提示文字，
   // 不要把整個設定視窗關掉——使用者可能正在看別的分頁。
   syncPackOptionsAvailability();
-  ["field-output", "pack-version-group", "translation-method-group", "reference-details"]
+  ["field-output", "pack-version-group", "reference-details"]
     .forEach((id) => toggleHidden(id, !(hasInstance && !!instanceValidation.ok)));
   // 狀態卡（規格 §2）：一句現況＋唯一主要按鈕；AI 列只在狀態要求時出現
   const packState = packActions.renderStatusCard();
@@ -3478,7 +3479,7 @@ function syncAiModeUi(mode) {
 
 function aiModeLabel(mode) {
   if (mode === "custom") return "自訂 API";
-  if (mode === "gpt") return "GPT";
+  if (mode === "gpt") return "ChatGPT";
   if (mode === "local") return "本地模型";
   return "自訂 API";
 }
@@ -3553,12 +3554,12 @@ async function refreshAiStatus() {
           const gptReady = ready && gptStatusIsUsable(gptStatus);
           const gptState = String(gptStatus?.state || "").toLowerCase();
           statusEl.textContent = gptReady
-            ? "AI：GPT 已登入，開始時會測試翻譯"
+            ? "AI：ChatGPT 已登入，開始時會測試翻譯"
             : !discordReady
               ? "AI：請先完成 Discord 驗證"
               : gptState === "reauth_required"
-                ? "AI：請重新登入 GPT"
-                : "AI：正在等待 GPT 可用";
+                ? "AI：請重新登入 ChatGPT"
+                : "AI：正在等待 ChatGPT 可用";
           if (statusRow) statusRow.dataset.state = gptReady ? "gpt" : "error";
           if (noteEl) noteEl.textContent = String(gptStatus?.message || GPT_COPY.noteGpt);
           return s;
@@ -3589,12 +3590,10 @@ async function refreshAiStatus() {
           if ($("local-llm-note")) {
             $("local-llm-note").textContent = GPT_COPY.noteLocal;
           }
-          // 就緒後才給「停用」與「刪除」出口：llama-server 會一直佔著記憶體／VRAM，
-          // 刪除則是「這台電腦裝過」才有意義的動作。
+          // 就緒後才給「停用」出口：llama-server 會一直佔著記憶體／VRAM。
+          // 刪除本地模型檔案只在設定→資料與備份（B5a-2）。
           const stopBtn = $("btn-local-llm-stop");
           if (stopBtn) stopBtn.hidden = !localReady;
-          const deleteBtn = $("btn-local-llm-delete");
-          if (deleteBtn) deleteBtn.hidden = !(localStatus && localStatus.installed);
           syncSetupButtonLabel(localReady);
           return s;
         }
@@ -3734,14 +3733,14 @@ function syncCustomProviderUi(provider) {
     if (isOther) {
       note.textContent = "請再填寫服務網址與模型名稱；一般使用者不需要改這些設定。";
     } else if (normalized === "glm") {
-      note.textContent = "只要填 API Key，工具會自動使用智譜 GLM 的官方設定。";
+      note.textContent = "只要填 API 金鑰，工具會自動使用智譜 GLM 的官方設定。";
     } else if (normalized === "openai") {
-      note.textContent = "只要填 API Key，工具會自動使用 OpenAI 的官方設定。";
+      note.textContent = "只要填 API 金鑰，工具會自動使用 OpenAI 的官方設定。";
     } else if (normalized === "qwen") {
-      note.textContent = "只要填 API Key，工具會自動使用通義千問的官方設定。";
+      note.textContent = "只要填 API 金鑰，工具會自動使用通義千問的官方設定。";
     } else {
       note.innerHTML =
-        '推薦：便宜划算（官方 deepseek-v4-flash、非思考模式）。只要填 API Key；金鑰申請 <a href="https://platform.deepseek.com" class="inline-ext-link" data-url="https://platform.deepseek.com">platform.deepseek.com</a>';
+        '推薦：便宜划算（官方 deepseek-v4-flash、非思考模式）。只要填 API 金鑰；金鑰申請 <a href="https://platform.deepseek.com" class="inline-ext-link" data-url="https://platform.deepseek.com">platform.deepseek.com</a>';
       note.querySelector("a.inline-ext-link")?.addEventListener("click", (e) => {
         e.preventDefault();
         const url = e.currentTarget.getAttribute("data-url");
@@ -4117,11 +4116,11 @@ function renderGptStatus(status) {
   const statusName = gptDisplayName(status);
   if (title) {
     title.textContent = usable
-      ? `GPT 已登入：${statusName || "GPT 帳號"}（開始翻譯時會測試）`
+      ? `ChatGPT 已登入：${statusName || "ChatGPT 帳號"}（開始翻譯時會測試）`
       : loggedIn
         ? state === "reauth_required"
-          ? `需重新登入：${statusName || "GPT 帳號"}`
-          : `已保存：${statusName || "GPT 帳號"}`
+          ? `需重新登入：${statusName || "ChatGPT 帳號"}`
+          : `已保存：${statusName || "ChatGPT 帳號"}`
         : GPT_COPY.statusLoggedOut;
   }
   if (note) {
@@ -4183,21 +4182,21 @@ async function beginGptLogin() {
   try {
     const result = await invokeFirstAvailable(["gpt_login"], undefined);
     if (result && result.ok) {
-      appendLog("GPT 登入完成。", "info");
-      showAppToast("GPT 已登入");
+      appendLog("ChatGPT 登入完成。", "info");
+      showAppToast("ChatGPT 已登入");
       markGptLoginOverlayDone();
     } else {
       const reason = String((result && result.error) || "登入未完成");
       if (reason === "cancelled") {
-        appendLog("已取消 GPT 登入。", "warn");
+        appendLog("已取消 ChatGPT 登入。", "warn");
       } else if (reason === "timeout") {
-        appendLog("GPT 登入逾時，請重新登入。", "warn");
+        appendLog("ChatGPT 登入逾時，請重新登入。", "warn");
       } else {
         appendLog(GPT_COPY.loginFailed + " " + reason, "warn");
       }
     }
   } catch (error) {
-    appendError("GPT 登入失敗：" + formatInvokeError(error));
+    appendError("ChatGPT 登入失敗：" + formatInvokeError(error));
   } finally {
     gptLoginInFlight = false;
     if (loginBtn) loginBtn.disabled = false;
@@ -4209,25 +4208,25 @@ async function beginGptLogin() {
 async function cancelGptLoginFlow() {
   try {
     await invokeFirstAvailable(["cancel_gpt_login_cmd", "cancel_gpt_login"], undefined);
-    appendLog("已要求取消 GPT 登入。", "warn");
+    appendLog("已要求取消 ChatGPT 登入。", "warn");
   } catch (error) {
-    appendError("無法取消 GPT 登入：" + formatInvokeError(error));
+    appendError("無法取消 ChatGPT 登入：" + formatInvokeError(error));
   }
 }
 
 async function logoutGpt() {
   const ok = await confirmDialog({
-    title: "登出 GPT？",
-    body: "登出後要再用 GPT 翻譯，得重新在瀏覽器完成一次登入。本機的翻譯結果不受影響。",
+    title: "登出 ChatGPT？",
+    body: "登出後要再用 ChatGPT 翻譯，得重新在瀏覽器完成一次登入。本機的翻譯結果不受影響。",
     confirmLabel: "登出",
     cancelLabel: "先不要",
   });
   if (!ok) return;
   try {
     await invokeFirstAvailable(["gpt_logout_cmd", "gpt_logout"], undefined);
-    appendLog("已登出 GPT。", "info");
+    appendLog("已登出 ChatGPT。", "info");
   } catch (error) {
-    appendError("GPT 登出失敗：" + formatInvokeError(error));
+    appendError("ChatGPT 登出失敗：" + formatInvokeError(error));
   } finally {
     gptStatusCache = null;
     await refreshAiStatus();
@@ -4262,7 +4261,7 @@ function closeGptLoginOverlay() {
 function markGptLoginOverlayDone() {
   if ($("gpt-login-overlay-title")) $("gpt-login-overlay-title").textContent = "已登入";
   if ($("gpt-login-overlay-note")) {
-    $("gpt-login-overlay-note").textContent = "GPT 登入完成。可按關閉。";
+    $("gpt-login-overlay-note").textContent = "ChatGPT 登入完成。可按關閉。";
   }
   if ($("gpt-login-overlay-status")) $("gpt-login-overlay-status").textContent = "登入成功";
   const overlay = $("gpt-login-overlay");
@@ -4573,9 +4572,9 @@ async function adoptInstancePath(p, { silentProbe = false } = {}) {
       if (base) {
         setAutoOutputDir(base);
         appendLog(
-          "此整合包專用結果位置：\n" +
+          "這個模組整合包的結果位置：\n" +
             base +
-            "\n翻譯完成會直接套用到整合包資料夾。多包請勿共用同一結果資料夾。"
+            "\n翻譯完成會套用到遊戲資料夾。不同模組整合包請勿共用同一個結果資料夾。"
         );
       }
     } catch (_) {
@@ -4600,7 +4599,7 @@ async function onPickInstance() {
     return;
   }
   try {
-    const p = await pickDir("選擇遊戲／整合包資料夾", readLastInstancePath());
+    const p = await pickDir("選擇遊戲資料夾", readLastInstancePath());
     if (p) {
       hideResumeCard();
       await adoptInstancePath(p);
@@ -4817,7 +4816,7 @@ async function validateSelectedInstance(path) {
   try {
     const result = await invoke("validate_instance_cmd", { instancePath });
     const ok = !!(result && result.ok);
-    const reason = String((result && result.reason) || "").trim() || (ok ? "實例可用。" : "實例檢查未通過。");
+    const reason = String((result && result.reason) || "").trim() || (ok ? "遊戲資料夾可用。" : "遊戲資料夾檢查沒過。");
     const hints = Array.isArray(result?.hints) ? result.hints.filter(Boolean) : [];
     instanceValidation = { ok, reason, hints };
     const detail = hints.length ? `${reason} ${hints[0]}` : reason;
@@ -4876,7 +4875,7 @@ async function refreshPackTranslationName(instancePath) {
   } catch (_) {
     if ($("pack-version-status")) {
       $("pack-version-status").textContent =
-        "整合包版本尚未偵測，完成翻譯時會使用 R1。可翻譯前自訂名稱；留空則系統產生。";
+        "模組整合包版本尚未偵測，完成翻譯時會使用 R1。可翻譯前自訂名稱；留空則系統產生。";
     }
   }
 }
@@ -4901,7 +4900,7 @@ async function refreshReferencePack() {
     return input.value;
   }
   if (status) {
-    status.textContent = "尚未指定參考翻譯；可手動選本機繁中／社群漢化資料夾或 zip，或略過。";
+    status.textContent = "尚未指定參考翻譯；可手動選本機的繁體中文翻譯或社群漢化資料夾、zip，或略過。";
   }
   return "";
 }
@@ -5032,7 +5031,7 @@ async function onRunInner() {
     outputDir = (await resolveOutputDirForInstance(instancePath)) || "";
     if (outputDir) {
       setAutoOutputDir(outputDir);
-      appendLog("此整合包專用結果位置：\n" + outputDir);
+      appendLog("這個模組整合包的結果位置：\n" + outputDir);
     }
   }
   if (!outputDir) return log("翻譯結果位置還沒準備好，請重新選擇遊戲資料夾。");
@@ -5140,35 +5139,9 @@ async function onRunInner() {
     return log(unsupportedVersionMessage(targetVersion));
   }
 
-  // 開始翻譯前讓使用者決定要不要留下「翻譯結果」。
-  //
-  // 這裡刻意用三選一而不是是非題：舊版用 confirmDialog，點空白處會回 false，
-  // 而 false 的意思是「保留並開始翻譯」——使用者根本沒表達意見，翻譯就開始了
-  // （使用者實測回報：不小心點到空白處就開始跑，還不知道它在做什麼）。
-  // 改成 choiceDialog 之後，點空白處／Esc 回 null，代表「什麼都不做」。
-  const keepChoice = await choiceDialog({
-    title: "這次的翻譯結果要保留嗎？",
-    body:
-      "建議先啟動一次遊戲再翻譯：有些模組要等第一次啟動才會產生語言檔，沒跑過就翻容易漏掉那些內容。\n\n" +
-      "翻譯結果是一份可以重複使用的檔案，決定要不要留著之後再開始。",
-    options: [
-      {
-        value: "keep",
-        label: "保留（建議）",
-        detail: keepOptionDetail(currentBackupChoice()),
-      },
-      {
-        value: "skip",
-        label: "不保留翻譯結果",
-        detail: skipOptionDetail(currentBackupChoice()),
-      },
-    ],
-    cancelLabel: "取消，先不要翻譯",
-  });
-  if (!keepChoice) {
-    return appendLog("已取消，這次沒有開始翻譯。");
-  }
-  const skipResultFolder = keepChoice === "skip";
+  // 要不要留下「翻譯結果」改由設定「翻完刪除翻譯結果」決定（唯一位置在設定→資料與備份，
+  // 第一次勾要同列確認；B5a-2）。開始前不再跳三選一。只管結果資料夾，備份照 backupChoice（G1.8）。
+  const skipResultFolder = deleteResultsAfterApplyEnabled();
 
   setBusy(true, "translate");
   lastStepIdx = -1;
@@ -5182,13 +5155,13 @@ async function onRunInner() {
   if ($("btn-package")) $("btn-package").disabled = true;
   // 「不保留」只管翻譯結果資料夾；備份一律照設定（後端讀 translate.backupChoice）
   const backupNote = {
-    always: "裝進遊戲前會先備份遊戲原本的檔案。",
+    always: "套用到遊戲前會先備份遊戲原本的檔案。",
     never: "依你的設定不備份；覆蓋遊戲原本的檔案前會再問你。",
-  }[currentBackupChoice()] || "第一次裝進遊戲前會問你要不要備份。";
+  }[currentBackupChoice()] || "第一次套用到遊戲前會問你要不要備份。";
   appendLog(
     (skipResultFolder
-      ? "翻譯完成後會直接裝進遊戲，裝好後不保留這次的翻譯結果。"
-      : "翻譯完成後會直接裝進遊戲，翻譯結果也會留著。") + backupNote
+      ? "翻譯完成後會套用到遊戲，套用後不保留這次的翻譯結果。"
+      : "翻譯完成後會套用到遊戲，翻譯結果也會留著。") + backupNote
   );
   setProgress(1, "準備中…");
   void hideUiForTranslateRun();
@@ -5758,47 +5731,12 @@ async function updateFontPreview(path) {
   }
 }
 
-/**
- * 刪除全部備份。入口在設定視窗「資料與備份」（透過 mcpl:settings-action），
- * 診斷頁的舊按鈕暫時保留（B8 移除）；兩者走同一條流程、同一個確認對話框。
- */
-async function deleteAllBackupsFlow() {
-  const instancePath = ($("instance").value || "").trim();
-  if (!instancePath) return log("請先在主畫面選好遊戲資料夾，才能刪除它的備份。");
-  const backupRoot = resultWorkDir(selectedOutputDir()) || selectedOutputDir() || "";
-  const ok = await confirmDialog({
-    title: "刪除全部備份？",
-    body:
-      "會刪掉工具建立的所有備份。之後「移除翻譯」仍能拿掉工具加的檔案、改回設定，\n" +
-      "但被翻譯覆蓋的原檔就無法還原了。\n" +
-      "也會刪掉清單確認屬於這個整合包的舊版工具備份：刪除後將無法還原舊版工具改過的檔案。無法確認屬於這個整合包的備份不會刪，會列出來。翻譯結果本身不會被刪除。",
-    affected: backupRoot ? [backupRoot] : [],
-    danger: true,
-    confirmLabel: "刪除備份",
-    cancelLabel: "取消",
-    ackLabel: "我知道刪除後就無法還原套用",
-  });
-  if (!ok) return;
-  try {
-    const result = await invoke("delete_apply_backups_cmd", {
-      instancePath,
-      outputDir: selectedOutputDir() || null,
-    });
-    appendLog(
-      result.playerSummary || result.player_summary || "備份刪除完成。",
-      result.failed?.length ? "warn" : "info"
-    );
-    await refreshBackupState();
-  } catch (e) {
-    appendError("刪除備份失敗");
-    appendError(formatInvokeError(e));
-  }
-}
-
 window.addEventListener("DOMContentLoaded", async () => {
   // 0.2.4：先露出 UI、再綁全部按鈕；任何 await／錯誤都不可擋住接線
   revealInitialContent();
   wireHelpTips();
+  // 分頁方向鍵（規格 §6）：左右切換「翻譯」「字體工具」，只有目前分頁在 Tab 順序裡
+  syncWorkbenchTabKeys = wireTabKeys($("workbench-tabs"));
   // 設定改存實體檔案（跟著工具走），不再只依賴 WebView2 的 localStorage 快取。
   // 必須在 initTheme／loadBackupPreference 之前完成，否則那些函式會讀到還沒
   // 從檔案同步回來的舊值。失敗會靜默降級成純 localStorage，不擋啟動。
@@ -6152,7 +6090,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       if ($("version-status")) {
         $("version-status").textContent = value
           ? "已手動指定：Minecraft " + value
-          : "將從遊戲實例自動偵測（須為 1.13 以上）";
+          : "將從遊戲資料夾自動偵測（須為 1.13 以上）";
       }
       syncUiState();
     };
@@ -6389,7 +6327,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       } catch (e) {
         appendLog("CFPA 下載略過：" + formatInvokeError(e), "warn");
         if ($("reference-status")) {
-          $("reference-status").textContent = "CFPA 下載失敗，可改選本機 zip／資料夾。";
+          $("reference-status").textContent = "社群簡中翻譯下載失敗，可改選本機 zip／資料夾。";
         }
       } finally {
         if (btn) btn.disabled = false;
@@ -6638,98 +6576,15 @@ window.addEventListener("DOMContentLoaded", async () => {
 // 第一版把設定視窗的初始化排在那條鏈的最後，結果開機一出錯就整片白畫面。
 // 分成獨立的監聽器之後，兩邊互不影響——一邊炸了另一邊照樣跑完。
 window.addEventListener("DOMContentLoaded", () => {
-  wirePackOptionsBridge().catch((e) => {
-    console.warn("[boot] pack-options-bridge", e);
+  wireSettingsBridge().catch((e) => {
+    console.warn("[boot] settings-bridge", e);
   });
 });
 
-// ══ 主視窗 ↔ 設定視窗：本包選項同步 ═════════════════════════════════════
-//
-// # 為什麼需要這一段
-//
-// 本包選項（結果位置、資源包名稱、目標版本、備份、參考翻譯）是**開始翻譯的
-// 當下直接從 DOM 讀的**。設定搬進第二個視窗之後，兩個視窗各有各的 DOM——
-// 在設定視窗改了資源包名稱，主視窗按下開始翻譯時讀到的還是它自己那份舊值。
-//
-// 解法是把這幾個欄位在兩個視窗之間同步：設定視窗一改就送出去，主視窗收到就
-// 寫回自己的 DOM。這樣「開始翻譯讀 DOM」這件事完全不用改，也就不會弄壞
-// 既有的每一條翻譯流程。
-
-/** 需要跨視窗同步的本包選項欄位。value 是讀寫方式。 */
-const PACK_OPTION_FIELDS = [
-  { id: "output", kind: "text" },
-  { id: "pack-name", kind: "text" },
-  { id: "target-version", kind: "text" },
-  { id: "reference-pack", kind: "text" },
-  { id: "choose-output-dir", kind: "check" },
-  { id: "backup-before-apply", kind: "check" },
-];
-
-function readPackOptions() {
-  const out = {};
-  for (const field of PACK_OPTION_FIELDS) {
-    const el = $(field.id);
-    if (!el) continue;
-    out[field.id] = field.kind === "check" ? !!el.checked : String(el.value ?? "");
-  }
-  return out;
-}
-
-/**
- * 把收到的本包選項寫回這個視窗的 DOM。
- *
- * 寫入時派發 `change`，讓既有的 onchange 處理器（狀態列文字、顯示／隱藏）
- * 照常跑——這樣同步進來的值和使用者自己點的值走同一條路，不會有第二套行為。
- */
-function applyPackOptions(values) {
-  if (!values || typeof values !== "object") return;
-  for (const field of PACK_OPTION_FIELDS) {
-    if (!(field.id in values)) continue;
-    const el = $(field.id);
-    if (!el) continue;
-    if (field.kind === "check") {
-      const next = !!values[field.id];
-      if (el.checked === next) continue;
-      el.checked = next;
-    } else {
-      const next = String(values[field.id] ?? "");
-      if (el.value === next) continue;
-      el.value = next;
-    }
-    try {
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } catch (_) {
-      /* 派發失敗不影響值本身 */
-    }
-  }
-}
-
-async function wirePackOptionsBridge() {
-  // 收到對面視窗的值就套用。加旗標避免「套用 → 觸發 change → 又送回去」的迴圈。
-  let applying = false;
-  await listen("mcpl:pack-options", (ev) => {
-    applying = true;
-    try {
-      applyPackOptions(ev?.payload);
-    } finally {
-      applying = false;
-    }
-  });
-
-  await listen("mcpl:pack-options-request", () => {
-    void emit("mcpl:pack-options", readPackOptions());
-  });
-
-  // 自己這邊有人動了選項就廣播出去
-  for (const field of PACK_OPTION_FIELDS) {
-    const el = $(field.id);
-    if (!el) continue;
-    el.addEventListener("change", () => {
-      if (applying) return;
-      void emit("mcpl:pack-options", readPackOptions());
-    });
-  }
-
+// ══ 主視窗 ↔ 設定視窗：設定同步與設定視窗請主視窗做的事 ═════════════════
+// 設定視窗（settings.html）不載入 app.js：它自己寫設定檔，再用事件通知主視窗立刻套用。
+// （本包選項早已不在設定視窗，舊的本包選項跨視窗同步已刪，B5a-2。）
+async function wireSettingsBridge() {
   // settings.html 是獨立、輕量的頁面：它自己寫設定檔，再通知主工具立刻套用。
   await listen(SETTINGS_UPDATED_EVENT, (ev) => {
     // 自己送出去的（主視窗縮放同步給設定視窗）不再處理一次
@@ -6738,42 +6593,56 @@ async function wirePackOptionsBridge() {
       store: (path, value) => applyExternalSetting(path, value),
       theme: (value) => applyTheme(value),
       uiScale: (value) => void setWebviewScalePercent(value, { persist: true, fromAuto: false }),
-      uiAutoScale: (on) => void setWebviewAutoScale(on, { persist: true, flash: false }),
+      uiAutoScale: (on) => void setWebviewAutoScale(on, { persist: true }),
       sfx: (prefs) => applySfxPrefs(prefs),
       outputStorage: () => void onOutputStorageChangedExternally(),
-      cacheRemind: () => {
-        const instancePath = ($("instance")?.value || "").trim();
-        if (instancePath) void probeLocalPackCache(instancePath, { silent: true });
-        else hideLocalCacheCard();
-      },
       rememberApiKey: (on) => void invoke("set_remember_api_key_cmd", { remember: on }).catch(() => {}),
     });
   });
   await listen(SETTINGS_ACTION_EVENT, (ev) => {
     routeSettingsAction(ev?.payload || {}, {
+      // 重看引導與說明：重播引導，並把所有說明重設為第一次（規格 §1.3、§4.1）
       "replay-onboarding": () => {
+        disclosure.resetAll();
         showAppPage("translate");
+        syncUiState();
         startOnboarding({ force: true });
-      },
-      "delete-backups": () => {
-        if (progressBusy) {
-          appendLog("翻譯進行中，請等完成後再刪除備份。", "warn");
-          return;
-        }
-        void deleteAllBackupsFlow();
       },
       "show-update": () => {
         if (typeof window.zfCheckUpdate === "function") void window.zfCheckUpdate();
       },
     });
   });
-  await listen("mcpl:open-main-section", (ev) => {
-    const section = String(ev?.payload?.section || "translate");
-    showAppPage("translate");
-    const target = section === "ai" ? $("ai-options-group") || $("use-ai") : $("btn-run") || $("instance");
-    window.requestAnimationFrame(() => target?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  // 設定視窗做完事（清除金鑰、刪除本地模型、刪除備份）→ 主畫面立即更新；設定視窗要主視窗狀態 → 回報
+  await wireSettingsNotices({
+    listen,
+    emit,
+    readMainState: () => ({
+      busy: progressBusy,
+      instancePath: ($("instance")?.value || "").trim(),
+      outputDir: selectedOutputDir() || "",
+      packName: packNameForTranslate() || "",
+    }),
+    onApiKeyCleared: async () => {
+      await refreshApiSettings();
+      await refreshAiStatus();
+    },
+    onLocalModelDeleted: async () => {
+      forgetLocalLlmAfterExternalDelete();
+      await refreshAiStatus();
+    },
+    onBackupsDeleted: async (summary) => {
+      if (summary) appendLog(summary, "info");
+      await refreshBackupState();
+    },
+    // 搬移工具資料期間「開始翻譯」停用並就地說明（審查 F10）
+    onDataMigratingChanged: () => syncUiState(),
   });
-  await listen("mcpl:show-issue-report", () => showIssueOverlay());
+}
+
+/** 設定「翻完刪除翻譯結果」（唯一位置在設定→資料與備份；第一次勾要同列確認）。 */
+function deleteResultsAfterApplyEnabled() {
+  return readDeleteResultsSetting(getSetting);
 }
 
 /**

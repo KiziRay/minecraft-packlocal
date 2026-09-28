@@ -16,7 +16,7 @@ export const GPT_COPY = Object.freeze({
   // 安裝步驟的細節留給面板內的 noteLocal 講。
   noteLocalShort:
     "使用這台電腦執行的本地模型，不佔用外部額度。免費，但速度隨電腦而異。",
-  statusLoggedOut: "尚未登入 GPT",
+  statusLoggedOut: "尚未登入 ChatGPT",
   statusPending: "請在瀏覽器完成登入…（可按取消）",
-  loginFailed: "無法完成 GPT 登入。請重試，或改用自訂 API。",
+  loginFailed: "無法完成 ChatGPT 登入。請重試，或改用自訂 API。",
 });

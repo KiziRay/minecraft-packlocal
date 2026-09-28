@@ -133,14 +133,16 @@ test("設定視窗分四類，並補齊從舊設定頁搬過來的每一項", ()
   for (const label of ["外觀與操作", "翻譯與 AI", "資料與備份", "關於"]) {
     assert.ok(settingsHtml.includes(`>${label}</button>`), `分類名稱要叫「${label}」`);
   }
+  // B5a-2：刪「發現已翻過時提醒我」（cache-remind）；「改回每次詢問」併入備份三選一（backup-choice）
   const required = [
-    "output-storage-mode", "pick-output-custom-root", "clear-output-custom-root", "cache-remind",
+    "output-storage-mode", "pick-output-custom-root", "clear-output-custom-root",
     "remember-api-key", "clear-api-key", "local-cloud-topup", "ui-autoscale", "ui-scale-reset",
-    "check-update", "replay-onboarding", "delete-backups", "reset-backup-choice",
+    "check-update", "replay-onboarding", "delete-backups", "backup-choice",
   ];
+  const wiring = settingsScript + read("settings/data-pane.js");
   for (const id of required) {
     assert.ok(settingsHtml.includes(`id="${id}"`), `設定視窗缺少 ${id}`);
-    assert.ok(settingsScript.includes(`$("${id}")`), `設定視窗沒有接上 ${id}`);
+    assert.ok(wiring.includes(`$("${id}")`), `設定視窗沒有接上 ${id}`);
   }
   assert.ok(!settingsHtml.includes("keep-local-model"), "本地模型常駐設定已移除");
 });
@@ -157,15 +159,16 @@ test("設定視窗文案不出現開發者術語", () => {
   }
 });
 
-test("刪除全部備份、重看引導、檢查更新都交給主視窗執行", () => {
+test("重看引導、顯示更新交給主視窗；刪除全部備份（D-07）在設定視窗內做（B5a-2）", () => {
   const actions = read("settings-window-actions.js");
-  assert.ok(actions.includes('askMain("delete-backups")'));
   assert.ok(actions.includes('askMain("replay-onboarding")'));
   assert.ok(actions.includes("describeUpdateCheck("));
-  assert.ok(app.includes("async function deleteAllBackupsFlow()"));
+  assert.ok(!actions.includes('askMain("delete-backups")'));
+  const pane = read("settings/data-pane.js");
+  assert.ok(pane.includes('invoke("delete_apply_backups_cmd"'), "設定視窗自己呼叫後端刪除");
+  assert.ok(pane.includes("confirmDialog(deleteBackupsDialog("), "D-07 在設定視窗內確認");
   // B5a-1：診斷分頁刪除，刪除全部備份只剩設定視窗一個入口（規格 §1.2）
   assert.ok(!html.includes('id="btn-delete-backups"'), "主視窗不再有刪除全部備份的舊按鈕");
-  assert.ok(app.includes('"delete-backups": () => deleteAllBackupsFlow()') || app.includes("deleteAllBackupsFlow()"));
 });
 
 test("B5a-1：主視窗不再有診斷分頁（DOM 與分頁按鈕），翻譯頁的主要按鈕只在狀態卡", () => {

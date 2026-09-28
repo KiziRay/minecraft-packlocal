@@ -14,7 +14,6 @@ export const OUTPUT_STORAGE_MODE_KEY = "modpack-i18n-output-storage-mode-v1";
 /** custom 模式的根目錄 */
 export const OUTPUT_CUSTOM_ROOT_KEY = "modpack-i18n-output-custom-root-v1";
 /** 發現本機已有翻譯時是否提醒 */
-export const CACHE_REMIND_KEY = "modpack-i18n-cache-remind-v1";
 /** 上次成功選取的實例路徑（重開可直接分享） */
 export const LAST_INSTANCE_PATH_KEY = "modpack-i18n-last-instance-path-v1";
 export const LOCAL_LLM_CONSENT_KEY = "modpack-i18n-local-llm-consent-v1";
