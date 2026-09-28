@@ -1,9 +1,13 @@
 mod download;
 mod hardware;
 mod install;
+mod gguf_meta;
 mod manifest;
+pub mod release;
+pub mod timeouts;
 mod select;
 mod server;
+pub mod sizing;
 
 pub use install::{
     delete_local_model, ensure_ready_for_translate, install_and_start, probe_install, ProbeView,
@@ -12,10 +16,13 @@ pub use server::{
     chat_base_url, files_ready, health_ok, load_state, stop_own_server, LOCAL_LLM_API_KEY,
     PORT_BASE,
 };
+/// 本地伺服器狀態（啟動時的顯示卡層數、上下文、同時處理數）。
+pub use server::ServerState as ServerStateView;
 /// 只有 deepseek.rs 的測試會引用：釘住「輸出上限 ≤ 上下文 1/4」這條不變式。
 #[allow(unused_imports)]
 pub use server::context_size_for;
 pub use server::recommended_parallel_slots;
+pub use server::{own_server_liveness, take_start_note, OwnServerLiveness};
 
 use crate::engine::security::validate_local_llm_base_url;
 use install::default_install_dir;

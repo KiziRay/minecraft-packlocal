@@ -14,6 +14,8 @@ const CODEX_ORIGINATOR: &str = "codex-tui";
 pub struct CodexChatError {
     pub status_code: Option<u16>,
     pub message: String,
+    /// B4：伺服器要求等多久再試（`Retry-After`）；沒給就是 `None`
+    pub retry_after: Option<Duration>,
 }
 
 pub fn complete_chat(
@@ -37,6 +39,7 @@ fn auth_error(message: String) -> CodexChatError {
     CodexChatError {
         status_code: Some(401),
         message,
+        retry_after: None,
     }
 }
 
@@ -128,22 +131,27 @@ fn send_once(
             } else {
                 format!("無法連線到 GPT：{error}")
             },
+            retry_after: None,
         })?;
     let status = response.status();
+    let retry_after = super::retry_policy::parse_retry_after(
+        response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        std::time::SystemTime::now(),
+    );
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(status_error(status.as_u16(), &body));
+        let mut error = status_error(status.as_u16(), &body);
+        error.retry_after = retry_after;
+        return Err(error);
     }
-    parse_codex_response(&body).map_err(|message| CodexChatError {
-        status_code: Some(200),
-        message,
-    })
+    parse_codex_response(&body)
 }
 
 fn status_error(status: u16, body: &str) -> CodexChatError {
     let message = parse_error_message(body);
     CodexChatError {
         status_code: Some(status),
+        retry_after: None,
         message: match status {
             401 | 403 => format!("GPT 驗證失敗：{message}"),
             // 429 只證明這個 Codex Responses 端點拒絕了本次請求；它不能證明
@@ -193,23 +201,105 @@ fn parse_error_message(body: &str) -> String {
     }
 }
 
-fn parse_codex_response(body: &str) -> Result<Value, String> {
+fn stream_error(message: impl Into<String>) -> CodexChatError {
+    CodexChatError {
+        status_code: Some(200),
+        message: message.into(),
+        retry_after: None,
+    }
+}
+
+fn parse_codex_response(body: &str) -> Result<Value, CodexChatError> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return Err("GPT 沒有回傳任何內容。".into());
+        return Err(stream_error("GPT 沒有回傳任何內容。"));
     }
     if trimmed.starts_with('{') {
         let value: Value = serde_json::from_str(trimmed)
-            .map_err(|error| format!("GPT 回應無法解析：{error}"))?;
+            .map_err(|error| stream_error(format!("GPT 回應無法解析：{error}")))?;
         if value.get("response").is_some() {
-            return normalize_completed_event(&value, &BTreeMap::new(), &[]);
+            return normalize_completed_event(&value, &BTreeMap::new(), &[]).map_err(stream_error);
         }
-        return normalize_nonstream_response(&value);
+        return normalize_nonstream_response(&value).map_err(stream_error);
     }
     parse_codex_sse(trimmed)
 }
 
-fn parse_codex_sse(body: &str) -> Result<Value, String> {
+/// B4：`response.incomplete`（輸出被截斷）與可拆小的 `response.failed` 改成「截斷」回應
+/// （`finish_reason = length`，內容可能是一半），讓翻譯端走既有的拆半重送；
+/// 舊版把它們都當成「串流在完成前中斷」原樣重送同一批，結果一樣截斷。
+fn truncated_response(
+    event: &Value,
+    indexed_items: &BTreeMap<i64, Value>,
+    fallback_items: &[Value],
+    why: &str,
+) -> Value {
+    let mut output = event
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if output.is_empty() {
+        output.extend(indexed_items.values().cloned());
+        output.extend(fallback_items.iter().cloned());
+    }
+    json!({
+        "choices": [
+            {
+                "message": { "content": extract_output_text(&output) },
+                "finish_reason": "length",
+                "codex_event": why,
+            }
+        ],
+        "usage": event
+            .get("response")
+            .and_then(|response| response.get("usage"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    })
+}
+
+/// `response.failed`／`error` 事件：額度與限流照實回錯（不拆、不空轉）；
+/// 內容太長與其他失敗改走拆半。
+fn failed_event(
+    event: &Value,
+    indexed_items: &BTreeMap<i64, Value>,
+    fallback_items: &[Value],
+) -> Result<Value, CodexChatError> {
+    let error = event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event.get("error"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let code = error.get("code").and_then(Value::as_str).unwrap_or("").to_string();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(220)
+        .collect::<String>();
+    let lower = format!("{code} {message}").to_lowercase();
+    if lower.contains("insufficient_quota") || lower.contains("usage_limit") || lower.contains("usage limit") {
+        return Err(CodexChatError {
+            status_code: Some(429),
+            message: format!("ChatGPT 暫時不接受翻譯請求（用量上限）：{code} {message}").trim().to_string(),
+            retry_after: None,
+        });
+    }
+    if lower.contains("rate_limit") || lower.contains("rate limit") {
+        return Err(CodexChatError {
+            status_code: Some(429),
+            message: format!("GPT 請求太頻繁：{message}"),
+            retry_after: None,
+        });
+    }
+    Ok(truncated_response(event, indexed_items, fallback_items, "failed"))
+}
+
+fn parse_codex_sse(body: &str) -> Result<Value, CodexChatError> {
     let mut indexed_items = BTreeMap::new();
     let mut fallback_items = Vec::new();
     for line in body.lines() {
@@ -222,7 +312,7 @@ fn parse_codex_sse(body: &str) -> Result<Value, String> {
             continue;
         }
         let value: Value = serde_json::from_str(payload)
-            .map_err(|error| format!("GPT 串流事件無法解析：{error}"))?;
+            .map_err(|error| stream_error(format!("GPT 串流事件無法解析：{error}")))?;
         match value.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.output_item.done" => {
                 if let Some(item) = value.get("item").cloned() {
@@ -234,12 +324,19 @@ fn parse_codex_sse(body: &str) -> Result<Value, String> {
                 }
             }
             "response.completed" => {
-                return normalize_completed_event(&value, &indexed_items, &fallback_items);
+                return normalize_completed_event(&value, &indexed_items, &fallback_items)
+                    .map_err(stream_error);
+            }
+            "response.incomplete" => {
+                return Ok(truncated_response(&value, &indexed_items, &fallback_items, "incomplete"));
+            }
+            "response.failed" | "error" => {
+                return failed_event(&value, &indexed_items, &fallback_items);
             }
             _ => {}
         }
     }
-    Err("GPT 串流在完成前中斷。".into())
+    Err(stream_error("GPT 串流在完成前中斷。"))
 }
 
 fn normalize_completed_event(
@@ -413,3 +510,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "codex_chat_b4_tests.rs"]
+mod b4_tests;

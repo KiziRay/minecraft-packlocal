@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_with_scope;
+use super::deepseek::translate_plain_strings_partial;
 use super::mech_tokens::{is_identifier_token, is_poisoned_mech_translation, is_resource_path_token};
 use super::placeholder::{self, GuardStats};
 use super::translation_scope::TranslationScope;
@@ -72,6 +72,8 @@ where
     // 審查 F1：本輪產出清單（先清掉任務上一輪的條目）
     super::text_sources::begin(output_dir, "ftbquests");
     // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    // B4：AI 中途停下（額度、斷線、停止）時寫出已命中的部分，但不 commit（改 confirm_partial）
+    let mut incomplete: Option<String> = None;
     let round: Result<_, String> = (|| {
     let mc_src = minecraft_dir.join("config").join("ftbquests");
     if !mc_src.is_dir() {
@@ -206,10 +208,14 @@ where
                 ),
             );
             let app_prog = &mut on_progress;
-            let translated = translate_plain_strings_with_scope(&need_ai, scope, |pct, msg| {
+            let outcome = translate_plain_strings_partial(&need_ai, scope, &[], |pct, msg| {
                 let mapped = 30 + (pct as u16 * 50 / 100) as u8;
                 app_prog(mapped.min(80), msg);
             })?;
+            if let Some(reason) = outcome.incomplete {
+                incomplete = Some(reason);
+            }
+            let translated = outcome.out;
             for (i, en) in need_ai.iter().enumerate() {
                 if let Some(zh) = translated.get(i) {
                     let t = zh.trim();
@@ -303,16 +309,32 @@ where
         files_written: written,
         output_dir: dest_root.display().to_string(),
         note: format!(
-            "任務／劇情已處理：變更 {} 條 → 寫出 {} 個 snbt（結構欄 type／shape 等未送翻）{gap_note}。",
+            "任務／劇情已處理：變更 {} 條 → 寫出 {} 個 snbt（結構欄 type／shape 等未送翻）{gap_note}。{}",
             map.len(),
-            written
+            written,
+            partial_note(incomplete.as_deref())
         ),
     })
     })();
     if round.is_ok() {
-        super::text_sources::commit(output_dir, "ftbquests", minecraft_dir);
+        if incomplete.is_some() {
+            super::text_sources::confirm_partial(output_dir, "ftbquests", minecraft_dir);
+        } else {
+            super::text_sources::commit(output_dir, "ftbquests", minecraft_dir);
+        }
     }
     round
+}
+
+/// B4：部分完成時附在結果說明後面的一句話。
+pub(crate) fn partial_note(incomplete: Option<&str>) -> String {
+    match incomplete {
+        Some(reason) => format!(
+            "（AI 中途停下，只完成部分：{}；已翻好的先寫出，接續補完會補上其餘）",
+            reason.lines().next().unwrap_or("AI 不可用")
+        ),
+        None => String::new(),
+    }
 }
 
 /// 仍需送 AI 的顯示字串：未在 map、且非「純繁中」。

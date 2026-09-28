@@ -32,6 +32,10 @@ mod failed_items;
 /// 回歸語料守衛，僅測試期編譯。
 #[cfg(test)]
 mod fixtures_guard;
+#[cfg(test)]
+mod ai_fake_server;
+#[cfg(test)]
+mod extra_source_partial_tests;
 mod font_pack;
 pub mod font_restore;
 mod native_lang;
@@ -83,6 +87,8 @@ mod text_component;
 pub mod source_catalog;
 pub mod provenance;
 mod quests_books;
+pub mod retry_policy;
+pub mod run_interrupt;
 pub mod release_manifest;
 mod resource_pack_guard;
 pub mod pack_repair;

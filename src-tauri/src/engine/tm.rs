@@ -185,15 +185,21 @@ impl Tm {
 
     /// 存回磁碟。失敗只回報，不中斷翻譯（記憶庫是最佳化，不是真相來源）。
     pub fn save(&self) -> Result<(), String> {
+        self.save_to(&tm_path())
+    }
+
+    /// 存到指定檔案（`save` 用預設位置；測試用暫存位置）。
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
         if self.added == 0 {
             return Ok(());
         }
         static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // B4：別的執行緒寫到一半當掉（鎖中毒）時照樣寫，不讓這一輪的譯文存不進去
         let _lock = SAVE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .map_err(|_| "翻譯記憶寫入鎖定失敗。".to_string())?;
-        let path = tm_path();
+            .unwrap_or_else(|e| e.into_inner());
+        let path = path.to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -236,14 +242,66 @@ impl Tm {
     }
 }
 
-/// 提前 return／panic 時仍盡力把本輪新增寫回磁碟。
+/// B4：逐批落盤的門檻——累積這麼多新條目、或距上次落盤超過這麼久，就先寫一次磁碟。
+/// 每次寫都是整份重寫（含合併），所以不每批都寫（待使用者實測）。
+const FLUSH_EVERY_ADDED: usize = 50;
+const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 提前 return／panic 時仍盡力把本輪新增寫回磁碟；B4 起翻譯中也逐批落盤（`flush_if_due`）。
 pub struct TmSaveGuard {
     tm: Tm,
+    /// 上次落盤時的新增數
+    flushed_added: usize,
+    last_flush: std::time::Instant,
+    /// 測試用的存放位置（`None`＝預設位置）
+    path: Option<PathBuf>,
 }
 
 impl TmSaveGuard {
     pub fn new(tm: Tm) -> Self {
-        Self { tm }
+        Self {
+            tm,
+            flushed_added: 0,
+            last_flush: std::time::Instant::now(),
+            path: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_path(tm: Tm, path: PathBuf) -> Self {
+        Self {
+            tm,
+            flushed_added: 0,
+            last_flush: std::time::Instant::now(),
+            path: Some(path),
+        }
+    }
+
+    fn save_now(&self) -> Result<(), String> {
+        match &self.path {
+            Some(path) => self.tm.save_to(path),
+            None => self.tm.save(),
+        }
+    }
+
+    /// 有新條目就寫磁碟。回傳這次有沒有寫。
+    pub fn flush(&mut self) -> Result<bool, String> {
+        if self.tm.added == self.flushed_added {
+            return Ok(false);
+        }
+        self.save_now()?;
+        self.flushed_added = self.tm.added;
+        self.last_flush = std::time::Instant::now();
+        Ok(true)
+    }
+
+    /// 逐批落盤：新條目夠多或時間夠久才寫（程式中途被關掉，已翻好的也留得住）。
+    pub fn flush_if_due(&mut self) -> Result<bool, String> {
+        let fresh = self.tm.added.saturating_sub(self.flushed_added);
+        if fresh == 0 || (fresh < FLUSH_EVERY_ADDED && self.last_flush.elapsed() < FLUSH_EVERY) {
+            return Ok(false);
+        }
+        self.flush()
     }
 }
 
@@ -262,7 +320,7 @@ impl std::ops::DerefMut for TmSaveGuard {
 
 impl Drop for TmSaveGuard {
     fn drop(&mut self) {
-        let _ = self.tm.save();
+        let _ = self.save_now();
     }
 }
 
@@ -286,6 +344,44 @@ struct TmFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_tm(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mcpl-b4-tm-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("tm.json")
+    }
+
+    #[test]
+    fn b4_translations_are_flushed_to_disk_batch_by_batch() {
+        // 翻到一半被工作管理員結束：已經翻好的要已經在磁碟上，重開後接續補完才用得到
+        let path = scratch_tm("flush");
+        let mut guard = TmSaveGuard::with_path(Tm::default(), path.clone());
+        for i in 0..FLUSH_EVERY_ADDED {
+            guard.insert(&format!("Zq Flush Item {i}"), &format!("測試條目{}", "甲".repeat(i % 3 + 1)));
+        }
+        assert!(guard.flush_if_due().unwrap(), "累積夠多新條目就要落盤");
+        let on_disk = Tm::load_from(&path);
+        assert!(on_disk.entries.contains_key(&storage_key("Zq Flush Item 0", None)));
+        // 才一條新的、時間也還沒到：先不寫（避免每批都整份重寫）
+        guard.insert("Zq Flush Late", "晚到的條目");
+        assert!(!guard.flush_if_due().unwrap());
+        // 強制落盤
+        assert!(guard.flush().unwrap());
+        assert!(Tm::load_from(&path).entries.contains_key(&storage_key("Zq Flush Late", None)));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn b4_guard_still_saves_on_drop() {
+        let path = scratch_tm("drop");
+        {
+            let mut guard = TmSaveGuard::with_path(Tm::default(), path.clone());
+            guard.insert("Zq Drop Item", "丟棄前保存");
+        }
+        assert!(Tm::load_from(&path).entries.contains_key(&storage_key("Zq Drop Item", None)));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 
     fn blank() -> Tm {
         Tm::default()

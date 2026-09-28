@@ -56,6 +56,8 @@ import {
 import { wireHelpTips } from "./ui/help-tip.js";
 import { choiceDialog, confirmDialog, isConfirmOpen } from "./ui/confirm.js";
 import { runExclusive } from "./ui/once.js";
+import { createLocalModelRounds } from "./core/local-model-round.js";
+import { STOP_LABELS, resetStopButton } from "./ui/stop-button.js";
 import {
   configureRefreshBus,
   registerRegion,
@@ -2674,8 +2676,7 @@ function setBusy(busy, jobKind) {
   const diagnoseStop = $("btn-diagnose-stop");
   if (stop) {
     stop.hidden = !busy || kind !== "translate";
-    stop.disabled = false;
-    stop.textContent = "停止翻譯";
+    resetStopButton(stop);
   }
   if (fontStop) fontStop.hidden = !busy || kind !== "font";
   if (diagnoseStop) diagnoseStop.hidden = !busy || kind !== "diagnose";
@@ -3915,18 +3916,20 @@ async function wirePrivacySettings() {
  *
  * llama-server 會一直佔著記憶體與顯示卡，翻完不關等於整台電腦被綁住。
  * 「翻譯後保持常駐」設定已移除：本地模型一律翻完就關。
+ *
+ * B4：以輪次編號避免關閉競態——翻完立刻按「接續補完」時，上一輪遲到的關閉
+ * 不得關掉新一輪要用的模型（見 core/local-model-round.js，後端也會再檢查一次）。
  */
-async function releaseLocalModelAfterRun() {
-  if (aiModeFromUi() !== "local") return;
-  try {
-    const status = await invoke("local_llm_status_cmd", { installDir: null });
-    if (!status || !status.ready) return;
-    await invoke("local_llm_stop_cmd");
-    appendLog("已關閉本地模型，釋放記憶體與顯示卡資源。");
-    void refreshAiStatus();
-  } catch (_) {
-    /* 關不掉不影響翻譯結果，也不值得打擾使用者 */
-  }
+const localModelRounds = createLocalModelRounds({
+  invoke,
+  isLocalMode: () => aiModeFromUi() === "local",
+  log: (msg) => appendLog(msg),
+  onStopped: () => void refreshAiStatus(),
+  markIdle: () => invoke("set_translation_active_cmd", { active: false }).catch(() => {}),
+});
+
+async function releaseLocalModelAfterRun(round) {
+  await localModelRounds.release(round);
 }
 
 /**
@@ -5240,6 +5243,7 @@ async function onRunInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  const modelRound = await localModelRounds.begin();
   try {
     const result = await invoke("one_click_translate", {
       instancePath,
@@ -5344,7 +5348,7 @@ async function onRunInner() {
   } finally {
     setBusy(false);
     refreshBackupState();
-    void releaseLocalModelAfterRun();
+    void releaseLocalModelAfterRun(modelRound);
   }
   if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
@@ -5419,6 +5423,7 @@ async function onRepairInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  const modelRound = await localModelRounds.begin();
   try {
     const result = await invoke("repair_translation_pack", {
       outputDir,
@@ -5453,7 +5458,7 @@ async function onRepairInner() {
   } finally {
     setBusy(false);
     refreshBackupState();
-    void releaseLocalModelAfterRun();
+    void releaseLocalModelAfterRun(modelRound);
   }
   if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
@@ -5510,6 +5515,7 @@ async function onSupplementInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  const modelRound = await localModelRounds.begin();
   try {
     const result = await invoke("supplement_translate", {
       outputDir,
@@ -5561,7 +5567,7 @@ async function onSupplementInner() {
   } finally {
     setBusy(false);
     refreshBackupState();
-    void releaseLocalModelAfterRun();
+    void releaseLocalModelAfterRun(modelRound);
   }
   if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
 }
@@ -5576,7 +5582,7 @@ async function onStop() {
   const btn = $("btn-stop");
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "停止中…";
+    btn.textContent = STOP_LABELS.sending;
   }
   setProgressStateBadge("cancelling");
   appendLog(
@@ -5586,19 +5592,18 @@ async function onStop() {
   try {
     await invoke("cancel_task");
     if (btn) {
-      btn.textContent = "停止已送出";
+      btn.textContent = STOP_LABELS.sent;
       window.setTimeout(() => {
         if (!progressBusy || !$("btn-stop")) return;
         $("btn-stop").disabled = false;
-        $("btn-stop").textContent = "再次停止";
+        // 審查 2：第一次停止後後端正在寫出並套用已翻部分；再按會放棄寫出與套用
+        $("btn-stop").textContent = STOP_LABELS.afterFirstStop;
+        $("btn-stop").title = STOP_LABELS.afterFirstStopTitle;
       }, 900);
     }
   } catch (e) {
     appendError("無法送出停止要求：" + formatInvokeError(e));
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = "停止翻譯";
-    }
+    resetStopButton(btn);
   } finally {
     stopRequestInFlight = false;
   }

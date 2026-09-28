@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 
 use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_mapped;
+use super::deepseek::translate_plain_strings_mapped_partial;
 use super::mech_tokens::{
     is_ascii_enum_token, is_bracket_meta_token, is_fancymenu_display_key,
     is_fancymenu_translatable_source, is_mechanism_path_segment, is_origins_powers_path,
@@ -116,6 +116,8 @@ where
     // 審查 F1：本輪產出清單（先清掉覆寫文字上一輪的條目）
     super::text_sources::begin(output_dir, "overlay");
     // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    // B4：AI 中途停下時寫出已命中的部分，但不 commit（改 confirm_partial）
+    let mut incomplete: Option<String> = None;
     let round: Result<_, String> = (|| {
     // 審查 F2：來源必須是原檔
     let index = super::tool_products::ToolIndex::for_game(minecraft_dir);
@@ -270,13 +272,42 @@ where
             );
             let total_batches = need_ai.len().div_ceil(AI_BATCH_SIZE);
             for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
-                super::cancel::check()?;
+                // B4：停止＝不再送新批，已翻好的照樣寫出
+                if super::cancel::is_cancelled() {
+                    incomplete.get_or_insert_with(|| super::cancel::CANCEL_MESSAGE.to_string());
+                    break;
+                }
                 let batch_start = batch_index * AI_BATCH_SIZE;
-                let translated = translate_plain_strings_mapped(batch, scope, &ns_by_src, |pct, msg| {
+                // B4：一批失敗只跳過那一批；AI 停下後後面的批只用免費資料層（不空轉）
+                let translated = match translate_plain_strings_mapped_partial(batch, scope, &ns_by_src, |pct, msg| {
                     let completed = batch_start + batch.len() * pct as usize / 100;
                     let mapped = 40 + ((completed * 38) / need_ai.len().max(1)) as u8;
                     on_progress(mapped.min(78), msg);
-                })?;
+                }) {
+                    Ok(outcome) => {
+                        if let Some(reason) = outcome.incomplete {
+                            incomplete.get_or_insert(reason);
+                        }
+                        if outcome.stopped_by_user {
+                            // 使用者按了停止：這批已翻的照收，後面的批不再送
+                            let out = outcome.out;
+                            for (i, en) in batch.iter().enumerate() {
+                                if let Some(zh) = out.get(i) {
+                                    let t = zh.trim();
+                                    if !t.is_empty() && t != en {
+                                        map.insert(en.clone(), t.to_string());
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        outcome.out
+                    }
+                    Err(e) => {
+                        incomplete.get_or_insert(e);
+                        continue;
+                    }
+                };
                 for (i, en) in batch.iter().enumerate() {
                     if let Some(zh) = translated.get(i) {
                         let t = zh.trim();
@@ -420,11 +451,15 @@ where
     Ok(OverlayTranslateResult {
         files_written: written,
         strings_translated: map.len(),
-        note,
+        note: format!("{note}{}", super::ftbquests::partial_note(incomplete.as_deref())),
     })
     })();
     if round.is_ok() {
-        super::text_sources::commit(output_dir, "overlay", minecraft_dir);
+        if incomplete.is_some() {
+            super::text_sources::confirm_partial(output_dir, "overlay", minecraft_dir);
+        } else {
+            super::text_sources::commit(output_dir, "overlay", minecraft_dir);
+        }
     }
     round
 }

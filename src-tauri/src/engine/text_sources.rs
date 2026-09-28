@@ -233,6 +233,27 @@ pub fn commit(work: &Path, producer: &str, mc: &Path) {
     log_err("產出清單", result);
 }
 
+/// B4：產出者**沒跑完**（AI 中途停下、使用者按停止），但已經寫出的檔要能裝進遊戲。
+///
+/// 暫存的條目加進確認清單（同一個檔以這次為準）；**不動**它上一輪的其他條目、
+/// **不產生退休候選**、不更新「最近一次完整跑完」時間——退休只能在完整跑完（`commit`）時判斷。
+/// 前置條件同 `commit`：遊戲根目錄讀得到，否則這輪不確認。
+pub fn confirm_partial(work: &Path, producer: &str, mc: &Path) {
+    if fs::read_dir(long_path(mc)).is_err() {
+        crate::dev_log!("translate", "{producer}：讀不到遊戲資料夾，部分產出不確認（上一輪清單保持有效）");
+        return;
+    }
+    let result = with_manifest(work, |m| {
+        let Some(new) = m.pending.remove(producer) else { return };
+        for key in new.keys() {
+            m.retiring.remove(key);
+        }
+        m.entries.extend(new);
+        m.game_root = mc.display().to_string();
+    });
+    log_err("產出清單", result);
+}
+
 /// 記下 `output` 是 `producer` 從遊戲裡的 `game_source` 做出來的；`read_source` 是實際讀的原檔
 /// （遊戲裡的原檔，或工具版本對應的原檔備份）。產出者已 `begin` 就記進暫存，否則直接記進清單。
 pub fn record(work: &Path, output: &Path, mc: &Path, game_source: &Path, read_source: &Path, producer: &str) {

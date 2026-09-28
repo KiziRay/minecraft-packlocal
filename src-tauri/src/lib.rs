@@ -451,7 +451,11 @@ fn infer_progress_hint(message: &str) -> ProgressHint {
         hint.state = Some(STATE_THROTTLED);
     } else if message.contains("相容降級") || message.contains("已降級") {
         hint.state = Some(STATE_DEGRADED);
-    } else if message.contains("只重送仍未解決") || message.contains("嚴格重試") {
+    } else if message.contains("只重送仍未解決")
+        || message.contains("嚴格重試")
+        || message.contains("自動重試")
+        || message.contains("縮小批次重送")
+    {
         hint.state = Some(STATE_RETRYING);
     } else if message.contains("已停止")
         || message.contains("已依你的要求停止")
@@ -795,6 +799,8 @@ struct OneClickResult {
     pending_overwrites: Vec<String>,
     /// B2：顯示安全——退回英文清單與「字體可能不支援中文」（B8 顯示）
     display_safety: engine::DisplaySafety,
+    /// B4：這一輪有沒有中途停下（使用者停止／AI 不可用）、沒回應與品質沒過各幾條（B8 顯示）
+    interruption: engine::run_interrupt::InterruptionView,
 }
 
 /// 把套用狀態接到翻譯結果上；還沒裝進遊戲時，結論的第一句就要講這件事。
@@ -808,6 +814,10 @@ fn with_apply_notice(mut result: OneClickResult, applied: &ApplyResult) -> OneCl
             "【翻譯已完成，還沒裝進遊戲】\n{}\n\n{}",
             applied.player_summary, result.player_summary
         );
+    }
+    // B4：AI 中途停下時，結論第一句先講這件事（已翻好的保留、下一步按接續補完）
+    if let Some(note) = &result.interruption.ai_stopped {
+        result.player_summary = format!("【這一輪中途停下】\n{note}\n\n{}", result.player_summary);
     }
     result
 }
@@ -1774,6 +1784,21 @@ fn existing_pack_matches_current_mods(mc: &Path, pack_path: &Path, instance: &Pa
     live != 0 && live == recorded
 }
 
+/// B4：使用者按了停止——**不丟已翻部分**：把取消旗標收下（之後的寫檔、套用不會被它打斷），
+/// 標成「使用者停止」（後面的翻譯步驟不再做），接著照常寫出資源包、存工作階段、裝進遊戲。
+/// 再按一次停止才會真的中斷。
+fn begin_user_stop_finalize(app: &AppHandle, user_stopped: &mut bool) {
+    if !*user_stopped {
+        emit_warn(
+            app,
+            "已停止翻譯：正在寫出已翻好的部分並裝進遊戲（不會再翻新的內容；之後按「接續補完」會從這裡繼續）…",
+        );
+    }
+    *user_stopped = true;
+    reset_cancel();
+    engine::run_interrupt::stop_by_user(CANCEL_MESSAGE);
+}
+
 fn run_one_click(
     app: &AppHandle,
     instance: PathBuf,
@@ -1790,6 +1815,8 @@ fn run_one_click(
 ) -> Result<OneClickResult, String> {
     // B2：每輪開始先清空上一輪的退回紀錄
     engine::begin_guard_run();
+    // B4：清掉上一輪的「AI 已停」狀態
+    engine::run_interrupt::reset();
     preflight_selected_ai(app, use_ai, "開始掃描整合包")?;
     // 上次沒送成功的社群共享庫貢獻，開工前先補送一次。
     // 這件事本來就會做，但過去完全不出聲，使用者看到「859 條暫存稍後再送」之後
@@ -2317,6 +2344,10 @@ fn run_one_click(
     let mut shared_hits = 0usize;
     let mut shared_glossary_hits = 0usize;
     let mut quality_deferred: LangMap = HashMap::new();
+    // B4：AI 沒回應的（跟品質沒過分開；接續補完一定會再送）
+    let mut no_answer: LangMap = HashMap::new();
+    // B4：使用者按了停止——寫出已翻好的部分並裝進遊戲，後面的翻譯步驟不做
+    let mut user_stopped = false;
     let mut ai_note = String::new();
     let mut ai_usage_note = String::new();
     let mut langmap_stage: Option<engine::StageEntry> = None;
@@ -2353,6 +2384,18 @@ fn run_one_click(
                     }
                     langmap_stage = Some(entry);
                     merge_pending(&mut quality_deferred, &r.quality_deferred);
+                    merge_pending(&mut no_answer, &r.no_answer);
+                    if r.stopped_by_user {
+                        user_stopped = true;
+                    } else if let Some(reason) = &r.ai_unavailable {
+                        emit_warn(
+                            app,
+                            &format!(
+                                "AI 中途停下：{}。已翻好的都保留，這一輪後面的步驟只用免費資料（不再空轉重試）。",
+                                reason.lines().next().unwrap_or("AI 不可用")
+                            ),
+                        );
+                    }
                     ai_filled = r.filled;
                     glossary_hits = r.glossary_hits;
                     tm_hits = r.tm_hits;
@@ -2408,22 +2451,21 @@ fn run_one_click(
                         error_lines.push(line);
                     }
                 }
+                // B4：失敗、停止都不再 `return Err` 丟掉整輪——資料層與已翻好的都在 zh 裡，
+                // 照樣往下寫出、裝進遊戲，並存工作階段讓「接續補完」從這裡繼續。
                 Err(e) => {
-                    if looks_like_cancel_message(&e) {
-                        let line = format!("AI 翻譯失敗：{e}");
-                        error_lines.push(line.clone());
-                        append_error_file(&work, &error_lines);
-                        dev_progress::leave("ai_fill");
-                        dev_progress::finish("cancel:ai_fill");
-                        return Err(line);
-                    }
-                    let line = format!("AI 翻譯失敗：{e}");
-                    emit_error(app, &line);
+                    let line = format!("AI 翻譯中斷：{e}");
                     error_lines.push(line.clone());
-                    append_error_file(&work, &error_lines);
-                    dev_progress::leave("ai_fill");
-                    dev_progress::finish("error:ai_fill");
-                    return Err(line);
+                    langmap_stage = Some(engine::StageEntry::failed_unknown_count(
+                        "語言表",
+                        e.lines().next().unwrap_or("AI 翻譯中斷").to_string(),
+                    ));
+                    if looks_like_cancel_message(&e) {
+                        user_stopped = true;
+                    } else {
+                        emit_error(app, &line);
+                        engine::run_interrupt::halt_ai(&e);
+                    }
                 }
             }
             postprocess_lang_values(&mut zh, &dict);
@@ -2443,6 +2485,9 @@ fn run_one_click(
             dev_progress::mark(&format!(
                 "ai_filled={ai_filled} glossary={glossary_hits} tm={tm_hits} shared={shared_hits}"
             ));
+            if user_stopped || is_cancelled() {
+                begin_user_stop_finalize(app, &mut user_stopped);
+            }
         } else {
             emit_progress_stage(
                 app,
@@ -2461,7 +2506,7 @@ fn run_one_click(
     }
 
     // JAR 文件複查（耗時）：延後到 AI 主翻譯之後，不擋 8176 句牆鐘
-    if sources.jar_documentation {
+    if sources.jar_documentation && !user_stopped {
         check_cancelled()?;
         emit_progress_stage(
             app,
@@ -2504,7 +2549,9 @@ fn run_one_click(
     );
     dev_progress::enter("pack_out");
     let jar_translation = rewrite_jars_and_log(&app, &instance, &work, &zh, &en_only)?;
-    let jar_patchouli_note = if sources.jar_patchouli {
+    let jar_patchouli_note = if user_stopped {
+        "已停止：JAR 內 Patchouli 這一輪不處理（接續補完時再做）".to_string()
+    } else if sources.jar_patchouli {
         match translate_jar_patchouli(&instance, &work, use_ai, Some(&translation_scope), |pct, msg| {
             emit_progress_stage(
                 app,
@@ -2526,7 +2573,9 @@ fn run_one_click(
         emit_log(app, "info", &note);
         note
     };
-    if sources.jar_display {
+    if user_stopped {
+        emit_log(app, "info", "已停止：JAR 顯示文字這一輪不處理（接續補完時再做）");
+    } else if sources.jar_display {
         match translate_jar_display_texts(&instance, &work, use_ai, Some(&translation_scope), |pct, msg| {
             emit_progress_stage(
                 app,
@@ -2595,20 +2644,25 @@ fn run_one_click(
     // ═══ 階段 D–E4：獨立額外來源（進度 82–97）═══
     // use_ai=true 時維持序列，避免多個來源同時打 AI；use_ai=false 時最多 3 路並行。
     let mc_for_extra = resolve_minecraft_dir(&instance).unwrap_or_else(|_| instance.clone());
-    let extra_summary = run_extra_sources(
-        app,
-        &mc_for_extra,
-        &work,
-        use_ai,
-        Some(&translation_scope),
-        sources,
-        82,
-        15,
-    );
-    if extra_summary.cancelled {
-        error_lines.extend(extra_summary.errors);
-        append_error_file(&work, &error_lines);
-        return Err(format!("AI 翻譯失敗：{CANCEL_MESSAGE}"));
+    let extra_summary = if user_stopped {
+        // 已停止：額外來源這一輪不處理（它們上一輪確認過的產出照樣有效）
+        emit_log(app, "info", "已停止：任務書、覆寫文字等額外來源這一輪不處理（接續補完時再做）");
+        ExtraSourceSummary::default()
+    } else {
+        run_extra_sources(
+            app,
+            &mc_for_extra,
+            &work,
+            use_ai,
+            Some(&translation_scope),
+            sources,
+            82,
+            15,
+        )
+    };
+    if extra_summary.cancelled || is_cancelled() {
+        // B4：額外來源途中按停止：已寫出的保留，接著寫出主資源包並裝進遊戲
+        begin_user_stop_finalize(app, &mut user_stopped);
     }
     for note in &extra_summary.skipped {
         skipped_by_tier.push(note.clone());
@@ -2665,7 +2719,7 @@ fn run_one_click(
             ),
         );
     }
-    let rem_n = count_map(&remaining);
+    let rem_n = if user_stopped { 0 } else { count_map(&remaining) };
     let mut supplement_filled = 0usize;
     if rem_n > 0 {
         emit_progress_ex(
@@ -2712,6 +2766,10 @@ fn run_one_click(
         ) {
             Ok(r) => {
                 merge_pending(&mut quality_deferred, &r.quality_deferred);
+                merge_pending(&mut no_answer, &r.no_answer);
+                if r.stopped_by_user {
+                    begin_user_stop_finalize(app, &mut user_stopped);
+                }
                 supplement_filled = r.filled;
                 ai_filled = ai_filled.saturating_add(r.filled);
                 glossary_hits = glossary_hits.saturating_add(r.glossary_hits);
@@ -2763,12 +2821,13 @@ fn run_one_click(
             Err(e) => {
                 let line = format!("補充：語言表補譯失敗：{e}");
                 if looks_like_cancel_message(&e) {
-                    error_lines.push(line.clone());
-                    append_error_file(&work, &error_lines);
-                    return Err(line);
+                    // B4：停止不丟已翻部分，照樣寫出並裝進遊戲
+                    error_lines.push(line);
+                    begin_user_stop_finalize(app, &mut user_stopped);
+                } else {
+                    emit_error(app, &line);
+                    error_lines.push(line);
                 }
-                emit_error(app, &line);
-                error_lines.push(line);
             }
         }
     } else {
@@ -2792,10 +2851,18 @@ fn run_one_click(
     // 但暫緩多半是當下 AI 狀態不好造成的，隔一批通常就過了——要求使用者去勾一個
     // 他不知道意義的選項，只會讓人以為工具沒做完。這裡在同一輪內自動再試一次，
     // 失敗的仍然留在暫緩（不會無限重試），並設上限避免大整合包爆量。
-    const AUTO_RETRY_CAP: usize = 400;
+    //
+    // B4：上限改成按比例（這一輪送 AI 的量的 25%，至少 50、最多 2000），取代寫死的 400：
+    // 小包 400 等於全部重試，大包 400 卻只試到一角。AI 已停（額度、停止）就不重試——那只會空轉。
+    let auto_retry_cap =
+        engine::retry_policy::proportional_cap(pending_before_n.max(count_map(&quality_deferred)), 25, 50, 2000);
     let deferred_total = count_map(&quality_deferred);
-    if use_ai && deferred_total > 0 {
-        let retry_set = take_capped_langmap(&quality_deferred, AUTO_RETRY_CAP);
+    let ai_halted = engine::run_interrupt::current().is_some();
+    if ai_halted && deferred_total > 0 {
+        emit_log(app, "info", &format!("補強：AI 這一輪已停下，品質暫緩的 {deferred_total} 條留待接續補完"));
+    }
+    if use_ai && deferred_total > 0 && !user_stopped && !ai_halted {
+        let retry_set = take_capped_langmap(&quality_deferred, auto_retry_cap);
         let retry_n = count_map(&retry_set);
         emit_progress_ex(
             app,
@@ -2882,10 +2949,9 @@ fn run_one_click(
             }
             Err(e) => {
                 if looks_like_cancel_message(&e) {
-                    let line = format!("補強：自動重試中止：{e}");
-                    error_lines.push(line.clone());
-                    append_error_file(&work, &error_lines);
-                    return Err(line);
+                    // B4：停止不丟已翻部分，照樣寫出並裝進遊戲
+                    error_lines.push(format!("補強：自動重試中止：{e}"));
+                    begin_user_stop_finalize(app, &mut user_stopped);
                 }
                 // 自動重試失敗不該讓整輪翻譯失敗——原本的成果都還在
                 emit_log(app, "warn", &format!("補強：自動重試未完成（{e}），不影響已完成的翻譯。"));
@@ -2934,6 +3000,7 @@ fn run_one_click(
     // 先算好「補得動的缺口」——下面 pending 會被移進工作階段
     let gaps = engine::count_gaps(&pending);
     prune_quality_deferred(&mut quality_deferred, &zh);
+    let quality_deferred_for_view = quality_deferred.clone();
     stop_share.disarm();
     emit_progress_stage(
         app,
@@ -3039,7 +3106,12 @@ fn run_one_click(
             },
             // 走到這裡代表整條流程真的跑完了，計數是新鮮的——
             // 只有這種狀態的數字可以拿來對使用者講「還缺幾條」。
-            last_run_outcome: engine::RunOutcome::Completed,
+            // B4：使用者按停止的記成 Aborted（接續補完從 pending_en 繼續）。
+            last_run_outcome: if user_stopped {
+                engine::RunOutcome::Aborted
+            } else {
+                engine::RunOutcome::Completed
+            },
         },
     );
 
@@ -3187,11 +3259,13 @@ fn run_one_click(
             / built.keys_total.saturating_add(pending_count))
             .min(100) as u8
     };
-    let completed_with_pending = pending_count > 0;
+    let completed_with_pending = pending_count > 0 || engine::run_interrupt::current().is_some();
     emit_progress_ex(
         app,
         Some(100),
-        if completed_with_pending {
+        if user_stopped {
+            "已停止：已翻好的部分已寫出，可按接續補完繼續"
+        } else if completed_with_pending {
             "本輪流程完成，仍有內容待補"
         } else {
             "翻譯流程完成"
@@ -3252,11 +3326,16 @@ fn run_one_click(
         emit_log(app, "warn", &format!("完整性檢查：{line}"));
     }
     let stage_failures = stage_ledger.player_summary();
-    let headline = match (stage_ledger.has_total_failure(), applied.is_applied()) {
+    // B4：AI 中途停下（停止、額度、斷線太久）不可以講成「完成」
+    let headline = match (engine::run_interrupt::current().is_some(), applied.is_applied()) {
+        (true, true) => "這一輪中途停下，沒有全部完成。已翻好的部分都已裝進遊戲；按「接續補完」會從停下的地方繼續。",
+        (true, false) => "這一輪中途停下，沒有全部完成，而且還沒裝進遊戲（原因見最上面）；已翻好的部分都有保留。",
+        _ => match (stage_ledger.has_total_failure(), applied.is_applied()) {
         (false, true) => "完成！整合包裡玩得到的文字已翻成台灣繁體中文（圖片上的字除外），並已裝進遊戲。",
         (false, false) => "翻好了，還沒裝進遊戲（原因與下一步見最上面）。",
         (true, true) => "這一輪沒有全部完成。已完成的部分都已裝進遊戲，但有內容完全沒翻到（見下方）。",
         (true, false) => "這一輪沒有全部完成，而且還沒裝進遊戲；有內容完全沒翻到（見下方）。",
+        },
     };
     let player_summary = format!(
         "{headline}\n\
@@ -3291,7 +3370,11 @@ fn run_one_click(
         RESULT_DIR_NAME,
     );
 
+    // 沒回應清單只留「現在仍缺」的（同一輪後面的補充可能已補上）
+    let no_answer_left = count_map(&remaining_pending(&no_answer, &zh));
+    let deferred_left = count_map(&remaining_pending(&quality_deferred_for_view, &zh));
     Ok(with_apply_notice(OneClickResult {
+        interruption: engine::run_interrupt::view(no_answer_left, deferred_left),
         display_safety: Default::default(),
         run_plan: plan.clone(),
         run_plan_has_overrides: plan.has_overrides(),
@@ -3550,6 +3633,7 @@ fn run_supplement(
 ) -> Result<OneClickResult, String> {
     // B2：每輪開始先清空上一輪的退回紀錄
     engine::begin_guard_run();
+    engine::run_interrupt::reset();
     reset_contribute_tracker();
     preflight_selected_ai(app, use_ai, "開始讀取上次的翻譯工作階段")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(5), "正在讀取上次的翻譯工作階段…");
@@ -3831,6 +3915,7 @@ fn run_supplement(
             emit_warn(app, w);
         }
         return Ok(with_apply_notice(OneClickResult {
+             interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
              display_safety: Default::default(),
              run_plan: supplement_plan.clone(),
              run_plan_has_overrides: supplement_plan.has_overrides(),
@@ -3937,6 +4022,19 @@ fn run_supplement(
         );
     })?;
     merge_pending(&mut session.quality_deferred, &ai_report.quality_deferred);
+    // B4：補翻途中按停止（或 AI 停下）：已補好的照樣寫出、裝進遊戲，後面不再翻
+    let mut user_stopped = false;
+    if ai_report.stopped_by_user || is_cancelled() {
+        begin_user_stop_finalize(app, &mut user_stopped);
+    } else if let Some(reason) = &ai_report.ai_unavailable {
+        emit_warn(
+            app,
+            &format!(
+                "AI 中途停下：{}。已補好的都保留並裝進遊戲；排除原因後再按一次會從停下的地方繼續。",
+                reason.lines().next().unwrap_or("AI 不可用")
+            ),
+        );
+    }
     let deferred_after_ai = count_map(&ai_report.quality_deferred);
     if deferred_after_ai > 0 {
         emit_log(
@@ -4023,7 +4121,9 @@ fn run_supplement(
     let mut source_errors: Vec<String> = Vec::new();
     let inst = PathBuf::from(&session.instance_path);
     let _ = seed_tm_from_langmaps(&session.pending_en, &zh);
-    let mut quest_note = if let Ok(mc) = resolve_minecraft_dir(&inst) {
+    let mut quest_note = if user_stopped {
+        "已停止：額外來源這一輪不處理".to_string()
+    } else if let Ok(mc) = resolve_minecraft_dir(&inst) {
         emit_progress_stage(app, dev_progress::STAGE_EXTRAS, Some(88), "補充：覆寫／任務仍缺…");
         let extra_summary = run_extra_sources(
             app,
@@ -4171,6 +4271,10 @@ fn run_supplement(
     };
 
     Ok(with_apply_notice(OneClickResult {
+        interruption: engine::run_interrupt::view(
+            count_map(&remaining_pending(&ai_report.no_answer, &zh)),
+            count_map(&session.quality_deferred),
+        ),
         display_safety: Default::default(),
         run_plan: supplement_plan.clone(),
         run_plan_has_overrides: supplement_plan.has_overrides(),
@@ -4267,6 +4371,7 @@ fn run_repair(
 ) -> Result<OneClickResult, String> {
     // B2：每輪開始先清空上一輪的退回紀錄
     engine::begin_guard_run();
+    engine::run_interrupt::reset();
     reset_contribute_tracker();
     preflight_selected_ai(app, use_ai, "開始修復翻譯結果")?;
     emit_progress_stage(app, dev_progress::STAGE_PREP, Some(3), "修復：尋找工作階段…");
@@ -4592,6 +4697,7 @@ fn run_repair(
     );
 
     Ok(with_apply_notice(OneClickResult {
+        interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
         display_safety: Default::default(),
         run_plan: repair_plan.clone(),
         run_plan_has_overrides: repair_plan.has_overrides(),
@@ -6337,6 +6443,24 @@ fn cloud_topup_choice_cmd() -> CloudTopUpView {
     }
 }
 
+/// B4 #8：本地模型「翻完自動關閉」的輪次編號：每一輪翻譯開始時前端來拿。
+#[tauri::command]
+fn local_llm_begin_round_cmd() -> u64 {
+    engine::local_llm::release::begin_round()
+}
+
+/// B4 #8：這一輪結束時關閉本地模型——只有「還是最新一輪、而且沒有翻譯在跑」才關，
+/// 翻完立刻按「接續補完」時，舊的關閉不會關掉新一輪要用的模型。
+#[tauri::command]
+fn local_llm_release_after_run_cmd(round: u64) -> serde_json::Value {
+    let (stopped, message) = engine::local_llm::release::release_after_run(
+        round,
+        TRANSLATION_ACTIVE.load(Ordering::Relaxed),
+        engine::local_llm::stop_own_server,
+    );
+    serde_json::json!({ "stopped": stopped, "message": message })
+}
+
 #[tauri::command]
 fn local_llm_stop_cmd() {
     engine::local_llm::stop_own_server();
@@ -6777,6 +6901,8 @@ pub fn run() {
             local_llm_ensure_ready_cmd,
             cloud_topup_choice_cmd,
             local_llm_stop_cmd,
+            local_llm_begin_round_cmd,
+            local_llm_release_after_run_cmd,
             local_llm_delete_cmd,
             is_game_running_cmd,
             suggest_output_dir,
@@ -6824,3 +6950,7 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+#[path = "lib_b4_tests.rs"]
+mod lib_b4_tests;

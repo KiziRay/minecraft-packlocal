@@ -19,9 +19,56 @@ pub struct ServerState {
     pub install_dir: String,
     #[serde(default)]
     pub gguf_path: String,
+    /// B4：啟動時實際放進顯示卡的層數（0＝純 CPU）。用來估每批該等多久。
+    #[serde(default)]
+    pub ngl: u32,
+    /// B4：啟動時的上下文大小（`-c`），寫日誌與估算用。
+    #[serde(default)]
+    pub ctx: u32,
+    /// B4：啟動時的同時處理數（`--parallel`）；送出端的並行不超過它。0＝舊狀態檔／不知道。
+    #[serde(default)]
+    pub slots: u32,
+    /// B4 F7：模型總層數（gguf `block_count`）；0＝讀不到（速度假設改用保守的 CPU 值）。
+    #[serde(default)]
+    pub layers: u32,
 }
 
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
+/// B4：最近一次啟動的決策說明（上下文、同時處理數、顯示卡層數與理由），給翻譯日誌取用。
+static LAST_START_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// B4：我們自己啟動的本地模型程式現在的狀態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnServerLiveness {
+    /// 還在跑
+    Running,
+    /// 已經結束（附結束代碼）
+    Exited(String),
+    /// 不是這個工具這次啟動的（例如上一次開的），無從判斷
+    Unknown,
+}
+
+/// B4：程式消失要靠「看程序」偵測，不能只等逾時——逾時要等好幾分鐘，
+/// 而程式當掉（多半是記憶體不足）當下就能知道。
+pub fn own_server_liveness() -> OwnServerLiveness {
+    let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(child) = guard.as_mut() else {
+        return OwnServerLiveness::Unknown;
+    };
+    match child.try_wait() {
+        Ok(None) => OwnServerLiveness::Running,
+        Ok(Some(status)) => OwnServerLiveness::Exited(match status.code() {
+            Some(code) => format!("結束代碼 {code:#x}"),
+            None => "被系統結束".to_string(),
+        }),
+        Err(_) => OwnServerLiveness::Unknown,
+    }
+}
+
+/// B4：取走最近一次啟動的決策說明（取一次就清掉，避免每批重複寫日誌）。
+pub fn take_start_note() -> Option<String> {
+    LAST_START_NOTE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
 
 /// 狀態檔位置：三代預設值疊在一起——本地模型第一版用 `%LOCALAPPDATA%`，
 /// 第九輪統一改 `%APPDATA%`（跟其餘十個子系統一致），第十輪再統一改成可攜式根
@@ -263,6 +310,10 @@ pub fn stop_own_server() {
         port: 0,
         install_dir: state.install_dir,
         gguf_path: state.gguf_path,
+        ngl: 0,
+        ctx: 0,
+        slots: 0,
+        layers: 0,
     });
 }
 
@@ -372,19 +423,36 @@ fn memory_shortfall_message(what_happened: &str) -> String {
 /// 曾經寫死 4096，但翻譯請求的 `max_tokens` 最高會要到 8192——**輸出上限比整個上下文還大**，
 /// 長任務書／書本必定截斷或直接失敗，對使用者呈現為「已安裝但翻譯失敗」。
 /// 這裡依系統記憶體選一個安全值；輸出上限那一側另外在 deepseek.rs 夾住。
+/// B4：保底值改由 sizing.rs 統一計算（實際啟動用 `sizing::plan_context`）；這支留給不變式測試。
+#[allow(dead_code)]
 pub fn context_size_for(ram_bytes: u64) -> u32 {
-    let gb = ram_bytes / (1024 * 1024 * 1024);
-    if gb >= 32 {
-        16384
-    } else if gb >= 16 {
-        12288
-    } else {
-        8192
-    }
+    super::sizing::baseline_context_for(ram_bytes)
 }
 
 pub fn start_server(install_dir: &Path, ngl: u32) -> Result<u16, String> {
-    start_server_with_ctx(install_dir, ngl, context_size_for(total_ram_bytes()))
+    // B4：上下文依「每批需要多少 × 同時處理幾個」回推，再用記憶體封頂（見 sizing.rs）。
+    // 舊版只看記憶體分三級，開 3 個 slot 時每個請求可能分不到一批所需的量。
+    let ram = total_ram_bytes();
+    let model_bytes = find_gguf(install_dir)
+        .ok()
+        .and_then(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let slots = parallel_slots_for(ram, physical_cores());
+    let plan = super::sizing::plan_context(
+        ram,
+        model_bytes,
+        slots,
+        crate::engine::deepseek::LOCAL_MAX_BATCH_ITEMS as u32,
+        crate::engine::deepseek::LOCAL_LLM_MAX_COMPLETION_TOKENS as u32,
+    );
+    let note = plan.note(ngl);
+    crate::dev_log!("local", "{note}");
+    let result = start_server_with_slots(install_dir, ngl, plan.ctx, plan.slots);
+    if result.is_ok() {
+        *LAST_START_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(note);
+    }
+    result
 }
 
 fn total_ram_bytes() -> u64 {
@@ -442,12 +510,18 @@ pub fn recommended_parallel_slots() -> u32 {
 /// 明確傳入 `--api-key` 是 CLI 參數，會蓋過環境變數的預設值，徹底不受環境汙染影響。
 pub const LOCAL_LLM_API_KEY: &str = "mcpl-local-llm";
 
+#[allow(dead_code)] // 舊入口（依記憶體自算同時處理數）；B4 起啟動走 start_server → plan_context
 pub fn start_server_with_ctx(install_dir: &Path, ngl: u32, ctx: u32) -> Result<u16, String> {
+    start_server_with_slots(install_dir, ngl, ctx, parallel_slots_for(total_ram_bytes(), physical_cores()))
+}
+
+/// B4：同時處理數由呼叫端決定（記憶體不夠時 sizing 會降成 1），並記進狀態讓送出端照著用。
+fn start_server_with_slots(install_dir: &Path, ngl: u32, ctx: u32, slots: u32) -> Result<u16, String> {
     let exe = find_llama_exe(install_dir)?;
     let gguf = find_gguf(install_dir)?;
     let port = pick_port()?;
     let cores = physical_cores();
-    let slots = parallel_slots_for(total_ram_bytes(), cores);
+    let slots = slots.max(1);
     // 留一顆核心給工具本身與系統，避免翻譯期間整台電腦卡住
     let threads = cores.saturating_sub(1).max(1);
     stop_own_server();
@@ -493,6 +567,13 @@ pub fn start_server_with_ctx(install_dir: &Path, ngl: u32, ctx: u32) -> Result<u
     let mut next = load_state();
     next.pid = pid;
     next.port = port;
+    next.ngl = ngl;
+    next.ctx = ctx;
+    next.slots = slots;
+    next.layers = super::gguf_meta::read_block_count(&gguf).unwrap_or(0);
+    crate::dev_log!("local", "模型總層數：{}（0＝讀不到，速度改用 CPU 假設）", next.layers);
+    // 新的程式、新的速度：上一輪量到的速度不再準
+    super::sizing::reset_speed();
     next.install_dir = install_dir.display().to_string();
     if next.gguf_path.trim().is_empty() {
         if let Ok(found) = find_gguf(install_dir) {

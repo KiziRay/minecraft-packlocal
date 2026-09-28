@@ -25,7 +25,7 @@ use walkdir::WalkDir;
 
 use super::cjk::looks_chinese;
 use super::convert::convert_s2tw_batch;
-use super::deepseek::translate_plain_strings_mapped;
+use super::deepseek::translate_plain_strings_mapped_partial;
 use super::mech_tokens::is_resource_path_token;
 use super::translation_scope::TranslationScope;
 
@@ -73,6 +73,8 @@ where
     // 審查 F1：本輪產出清單（先清掉任務書／手冊上一輪的條目）
     super::text_sources::begin(output_dir, "quests_books");
     // 審查 F-a：本輪完整跑完才 commit；中途取消或出錯時上一輪的清單保持有效
+    // B4：AI 中途停下時寫出已命中的部分，但不 commit（改 confirm_partial）
+    let mut incomplete: Option<String> = None;
     let round: Result<_, String> = (|| {
     on_progress(2, "任務／書本：掃描 Better Questing／HQM／Heracles／Modonomicon…");
     let files = collect_files(minecraft_dir);
@@ -165,12 +167,41 @@ where
             let total_batches = need_ai.len().div_ceil(AI_BATCH_SIZE);
             on_progress(30, &format!("任務／書本：AI 分批翻譯 {} 條…", need_ai.len()));
             for (batch_index, batch) in need_ai.chunks(AI_BATCH_SIZE).enumerate() {
-                super::cancel::check()?;
+                // B4：停止＝不再送新批，已翻好的照樣寫出
+                if super::cancel::is_cancelled() {
+                    incomplete.get_or_insert_with(|| super::cancel::CANCEL_MESSAGE.to_string());
+                    break;
+                }
                 let start = batch_index * AI_BATCH_SIZE;
-                let translated = translate_plain_strings_mapped(batch, scope, &ns_by_src, |pct, msg| {
+                // B4：一批失敗只跳過那一批；AI 停下後後面的批只用免費資料層（不空轉）
+                let translated = match translate_plain_strings_mapped_partial(batch, scope, &ns_by_src, |pct, msg| {
                     let done = start + batch.len() * pct as usize / 100;
                     on_progress(30 + ((done * 50) / need_ai.len().max(1)) as u8, msg);
-                })?;
+                }) {
+                    Ok(outcome) => {
+                        if let Some(reason) = outcome.incomplete {
+                            incomplete.get_or_insert(reason);
+                        }
+                        if outcome.stopped_by_user {
+                            // 使用者按了停止：這批已翻的照收，後面的批不再送
+                            let out = outcome.out;
+                            for (i, en) in batch.iter().enumerate() {
+                                if let Some(zh) = out.get(i) {
+                                    let t = zh.trim();
+                                    if !t.is_empty() && t != en {
+                                        map.insert(en.clone(), t.to_string());
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        outcome.out
+                    }
+                    Err(e) => {
+                        incomplete.get_or_insert(e);
+                        continue;
+                    }
+                };
                 for (i, en) in batch.iter().enumerate() {
                     if let Some(zh) = translated.get(i) {
                         let t = zh.trim();
@@ -229,15 +260,20 @@ where
         files_written: written,
         strings_translated: map.len(),
         note: format!(
-            "任務／書本（Better Questing／HQM／Heracles／Modonomicon）：翻譯表 {} 條、寫出 {} 檔{}。流程完成時會直接套用到遊戲。",
+            "任務／書本（Better Questing／HQM／Heracles／Modonomicon）：翻譯表 {} 條、寫出 {} 檔{}。流程完成時會直接套用到遊戲。{}",
             map.len(),
             written,
-            ""
+            "",
+            super::ftbquests::partial_note(incomplete.as_deref())
         ),
     })
     })();
     if round.is_ok() {
-        super::text_sources::commit(output_dir, "quests_books", minecraft_dir);
+        if incomplete.is_some() {
+            super::text_sources::confirm_partial(output_dir, "quests_books", minecraft_dir);
+        } else {
+            super::text_sources::commit(output_dir, "quests_books", minecraft_dir);
+        }
     }
     round
 }

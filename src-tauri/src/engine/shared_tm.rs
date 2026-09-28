@@ -499,11 +499,50 @@ fn note_sent_entries(entries: &[SharedTmEntry]) {
     }
 }
 
+// B4 測試衛生：開了這個的測試執行緒，貢獻一律不上網、不碰佇列檔
+// （佇列檔在沒有可攜式資料夾時會落在真實的 %APPDATA%）。
+#[cfg(test)]
+thread_local! {
+    static OFFLINE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct OfflineForTest;
+
+#[cfg(test)]
+impl OfflineForTest {
+    pub(crate) fn enter() -> Self {
+        OFFLINE_FOR_TEST.with(|c| c.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OfflineForTest {
+    fn drop(&mut self) {
+        OFFLINE_FOR_TEST.with(|c| c.set(false));
+    }
+}
+
+fn offline_for_test() -> bool {
+    #[cfg(test)]
+    {
+        OFFLINE_FOR_TEST.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// 批次貢獻：回傳 accepted／conflicts；失敗不影響翻譯。
 /// 先 flush 本機佇列，再送本次條目；網路失敗時寫入佇列稍後重試。
 /// 自動略過本輪已送過的 keyhash。
 /// 有牆鐘與 chunk 上限：超時剩餘入隊，不阻塞一鍵翻譯。
 pub fn contribute(entries: &[SharedTmEntry]) -> ContributeResult {
+    if offline_for_test() {
+        return ContributeResult::default();
+    }
     contribute_budgeted(
         entries,
         Instant::now() + CONTRIBUTE_WALL_BUDGET,
