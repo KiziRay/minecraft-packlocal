@@ -328,7 +328,11 @@ usage limit reached
         let src = |rel: &str| std::fs::read_to_string(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(rel)).unwrap();
         let timeouts = src("engine/local_llm/timeouts.rs");
         assert!(timeouts.contains("run_interrupt::LOCAL_STUCK_MARK"));
-        let ds = src("engine/deepseek.rs");
+        // T1：deepseek.rs 拆成 deepseek/ 子模組，整個資料夾一起看
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/engine/deepseek");
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        let ds: String = files.iter().map(|p| std::fs::read_to_string(p).unwrap()).collect();
         for mark in ["LOCAL_GONE_MARK", "LOCAL_UNREACHABLE_MARK", "NO_PROGRESS_MARK", "RELOGIN_MARK", "CHATGPT_BUSY_TITLE"] {
             assert!(ds.contains(&format!("run_interrupt::{mark}")), "{mark}");
         }

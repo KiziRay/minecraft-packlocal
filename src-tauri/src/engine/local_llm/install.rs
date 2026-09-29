@@ -815,13 +815,12 @@ mod tests {
 
     #[test]
     fn space_shortage_is_hard_block_before_download() {
+        // T1：不再先量一次可用空間再要求「多 1 byte」——兩次量測之間其他平行測試刪檔，
+        // 可用空間變大就會偶發放行。改要求不可能有的空間，結果不受即時磁碟空間影響。
         let dir = std::env::temp_dir();
-        if let Some(free) = crate::engine::disk::free_space(&dir) {
-            let need = free.saturating_add(1);
-            if need > free {
-                let err = crate::engine::disk::ensure_space(&dir, need).unwrap_err();
-                assert!(err.contains("空間不足"));
-            }
+        if crate::engine::disk::free_space(&dir).is_some() {
+            let err = crate::engine::disk::ensure_space(&dir, u64::MAX).unwrap_err();
+            assert!(err.contains("空間不足"));
         }
     }
 }

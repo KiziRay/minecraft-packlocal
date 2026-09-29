@@ -24,6 +24,16 @@ const PORTABLE_FOLDER: &str = "modpack-i18n-data";
 /// 執行檔自己的路徑才是使用者實際「這個工具在哪」的認知。取不到執行檔路徑
 /// （理論上不會發生，保險起見）才退回目前工作目錄。
 pub fn portable_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        return test_data_base().join("portable").join(PORTABLE_FOLDER);
+    }
+    #[allow(unreachable_code)]
+    exe_portable_root()
+}
+
+/// 正式版的可攜式根（執行檔旁）。測試版的 `portable_root()` 不用它，見 `test_data_base`。
+fn exe_portable_root() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -34,6 +44,11 @@ pub fn portable_root() -> PathBuf {
 /// 舊版根（`%APPDATA%`，Roaming）——第九輪以前，除本地模型／CFPA 快取外的
 /// 全部子系統都用這個。
 pub fn legacy_roaming_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        return test_data_base().join("roaming").join(APP_FOLDER);
+    }
+    #[allow(unreachable_code)]
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_FOLDER)
@@ -41,9 +56,33 @@ pub fn legacy_roaming_root() -> PathBuf {
 
 /// 舊版根（`%LOCALAPPDATA%`，Local）——本地模型／CFPA 快取在第九輪以前用這個。
 pub fn legacy_local_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        return test_data_base().join("local").join(APP_FOLDER);
+    }
+    #[allow(unreachable_code)]
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_FOLDER)
+}
+
+/// T1 測試衛生：測試執行檔的三個資料根（可攜式／Roaming／Local）一律改到這個暫存資料夾底下，
+/// 測試永遠不讀寫玩家真實的 `%APPDATA%`、`%LOCALAPPDATA%` 與建置資料夾旁的 `modpack-i18n-data`。
+///
+/// 為什麼不用環境變數：`dirs::data_dir()` 在 Windows 走系統 API（Known Folder），不看 `APPDATA`，
+/// 測試改 `APPDATA` 擋不住（codex_auth 測試因此寫進過真實資料夾）。
+/// 資料夾名含行程編號＋啟動時間：Windows 會重用行程編號，只用行程編號會撞到上一輪留下的檔。
+#[cfg(test)]
+pub(crate) fn test_data_base() -> PathBuf {
+    static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mcpl-test-data-{}-{nanos}", std::process::id()))
+    })
+    .clone()
 }
 
 /// 純函式核心：給定新／舊兩個根目錄，回傳實際要用的路徑。抽出來是因為
@@ -313,6 +352,31 @@ mod tests {
     #[test]
     fn portable_root_is_under_the_executable_directory() {
         let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        assert_eq!(portable_root(), exe_dir.join(PORTABLE_FOLDER));
+        assert_eq!(exe_portable_root(), exe_dir.join(PORTABLE_FOLDER));
+    }
+
+    /// T1 守門：測試期間三個資料根都在這一輪專用的暫存資料夾底下，不指向真實使用者資料夾。
+    #[test]
+    fn t1_test_data_roots_never_point_at_real_user_folders() {
+        let base = test_data_base();
+        let temp = std::env::temp_dir();
+        assert!(base.starts_with(&temp), "{}", base.display());
+        let name = base.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with(&format!("mcpl-test-data-{}-", std::process::id())), "{name}");
+        let real: Vec<PathBuf> = [dirs::data_dir(), dirs::data_local_dir()]
+            .into_iter()
+            .flatten()
+            .map(|d| d.join(APP_FOLDER))
+            .chain([exe_portable_root()])
+            .collect();
+        for root in [portable_root(), legacy_roaming_root(), legacy_local_root(), active_root()] {
+            assert!(root.starts_with(&base), "測試資料根跑出暫存資料夾：{}", root.display());
+            for bad in &real {
+                assert!(!root.starts_with(bad), "測試資料根指向真實資料夾：{}", root.display());
+            }
+        }
+        for rel in ["tm.json", "shared_contribute_queue.json", "codex_auth.json", "secrets.json", "work"] {
+            assert!(resolve_file(Path::new(rel)).starts_with(&base), "{rel}");
+        }
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::discord_auth::managed_ai_session_cookie;
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 use super::share_pack::{package_translation_sfx, SHARE_MAX_UPLOAD_BYTES, SHARE_MPU_PART_BYTES};
 use super::turnstile::MANAGED_AI_PROTOCOL;
 
@@ -65,7 +65,7 @@ pub fn upload_share_package(work_root: &Path, name: &str) -> Result<ShareUploadR
             ));
         }
 
-        let base = MANAGED_BASE_URL.trim_end_matches('/');
+        let base = managed_base_url().trim_end_matches('/');
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(600))

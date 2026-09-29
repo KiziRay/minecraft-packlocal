@@ -261,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "T1：讀玩家真實 %APPDATA% 的翻譯結果，只在手動驗證時執行（cargo test -- --ignored）"]
     fn cte2_work_layout_smoke_if_present() {
         let Some(appdata) = std::env::var_os("APPDATA") else {
             return;

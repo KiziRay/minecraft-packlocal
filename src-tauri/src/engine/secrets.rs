@@ -374,6 +374,23 @@ pub fn api_chat_completions_url(base_url: &str) -> String {
 /// Cloudflare Worker 公開 URL（更新、共享 TM、診斷回報）。不是 AI 金鑰。
 pub const MANAGED_BASE_URL: &str = "https://modpack-i18n.jolin34563.workers.dev";
 
+/// 真的發出網路請求時用的 Worker 位址。正式版就是 `MANAGED_BASE_URL`。
+///
+/// T1 測試衛生：測試版改成不存在的網址格式，reqwest 在送出前就回錯（不查 DNS、不連線），
+/// 測試因此不會連線 Worker、也不會把測試資料上傳到共享庫。比對網址字串（例如下載網址驗證）仍用常數。
+pub fn managed_base_url() -> &'static str {
+    #[cfg(test)]
+    {
+        return TEST_OFFLINE_BASE_URL;
+    }
+    #[allow(unreachable_code)]
+    MANAGED_BASE_URL
+}
+
+/// 測試版的 Worker 位址：自訂 scheme，reqwest 一律拒絕送出。
+#[cfg(test)]
+pub(crate) const TEST_OFFLINE_BASE_URL: &str = "mcpl-offline-test://worker";
+
 /// AI 連線設定（金鑰 + 端點 + 模型）。
 #[derive(Debug, Clone)]
 pub struct ApiConfig {

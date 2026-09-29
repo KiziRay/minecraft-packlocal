@@ -21,7 +21,7 @@ use super::provenance;
 use super::release_manifest::{
     validate as validate_manifest, ClientContext, ManifestReject, ReleaseManifest,
 };
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::{managed_base_url, MANAGED_BASE_URL};
 use super::trust_keys::PINNED_KEYS;
 
 /// 程式內版本。**由 `Cargo.toml` 取得，不得寫死字串**——1.0.9 之前這裡是硬編的
@@ -199,7 +199,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 fn endpoint(build_id: Option<&str>) -> String {
-    let base = format!("{}/api/desktop/latest", MANAGED_BASE_URL.trim_end_matches('/'));
+    let base = format!("{}/api/desktop/latest", managed_base_url().trim_end_matches('/'));
     // build id 直接串進 query string，含 `+`／空白等字元會在傳輸中被改寫成別的值，
     // Worker 拿到的就不是我們送的東西。不安全就整個不帶，退回無參數查詢
     // ——寧可少一個提示參數，也不要送一個會被靜默竄改的識別碼。

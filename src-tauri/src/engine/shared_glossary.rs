@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use super::discord_auth::managed_ai_session_cookie;
 use super::hashutil::sha256_hex;
 use super::placeholder;
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 use super::translation_quality::is_usable_zh;
 use super::translation_scope::TranslationScope;
 use super::turnstile::MANAGED_AI_PROTOCOL;
@@ -131,7 +131,7 @@ fn client() -> Option<reqwest::blocking::Client> {
 }
 
 fn base() -> String {
-    MANAGED_BASE_URL.trim_end_matches('/').to_string()
+    managed_base_url().trim_end_matches('/').to_string()
 }
 
 fn apply_contribute_headers(

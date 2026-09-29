@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 
 const FEEDBACK_NOTE_MAX_CHARS: usize = 800;
 const FEEDBACK_CLIENT_ID_RE: &str = r"^[A-Za-z0-9_-]{8,64}$";
@@ -41,7 +41,7 @@ struct WorkerSubmitFeedbackResponse {
 }
 
 fn worker_url(path: &str) -> String {
-    let base = MANAGED_BASE_URL.trim_end_matches('/');
+    let base = managed_base_url().trim_end_matches('/');
     format!("{base}{path}")
 }
 

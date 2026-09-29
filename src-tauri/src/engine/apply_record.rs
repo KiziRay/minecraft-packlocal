@@ -255,12 +255,14 @@ pub fn policy_from_choice(choice: BackupChoice, overwrite_confirmed: bool) -> Ba
 // ─── 位置 ───────────────────────────────────────────────
 
 pub(super) fn store_root() -> PathBuf {
-    if cfg!(test) {
-        // 測試不寫進執行檔旁的真實資料夾
-        std::env::temp_dir().join(format!("mcpl-apply-store-test-{}", std::process::id()))
-    } else {
-        super::paths::active_root()
+    #[cfg(test)]
+    {
+        // 測試不寫進執行檔旁的真實資料夾。T1：放在這一輪專用的測試資料夾（行程編號＋啟動時間），
+        // 只用行程編號時 Windows 重用編號會讀到上一輪留下的紀錄，認回判斷變成「兩份對得上」而偶發失敗。
+        return super::paths::test_data_base().join("apply-store");
     }
+    #[allow(unreachable_code)]
+    super::paths::active_root()
 }
 
 /// 遊戲資料夾正規化後的字串（大小寫、斜線、長路徑前綴都不影響）。

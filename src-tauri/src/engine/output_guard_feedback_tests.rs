@@ -57,8 +57,11 @@ fn b2_every_upload_and_memory_path_filters_with_guard() {
     let contribute = &contribute[..contribute.find("\n}\n").unwrap()];
     assert!(contribute.contains("guard_share_entries("), "contribute 沒過濾");
 
-    let deepseek = include_str!("deepseek.rs");
-    for anchor in ["to_share.push(shared_tm::SharedTmEntry {", "fn contribute_plain_job_outputs("] {
+    // T1：deepseek.rs 拆成 deepseek/ 子模組，兩個蒐集點分在 fill.rs 與 plain.rs
+    for (deepseek, anchor) in [
+        (include_str!("deepseek/fill.rs"), "to_share.push(shared_tm::SharedTmEntry {"),
+        (include_str!("deepseek/plain.rs"), "fn contribute_plain_job_outputs("),
+    ] {
         let at = deepseek.find(anchor).unwrap_or_else(|| panic!("找不到 {anchor}"));
         let window = &deepseek[at.saturating_sub(600)..(at + 900).min(deepseek.len())];
         assert!(window.contains("output_guard::passes("), "{anchor} 附近沒有過 guard");

@@ -34,7 +34,7 @@ use super::jar_scan::LangMap;
 use super::lang_provenance::{get_source, LangSource, ProvenanceMap};
 use super::mech_tokens::is_poisoned_mech_translation;
 use super::placeholder;
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 use super::shared_contribute_queue;
 use super::shared_identity;
 use super::translation_quality::is_usable_zh;
@@ -263,7 +263,7 @@ fn client_with_timeout(timeout: Duration) -> Option<reqwest::blocking::Client> {
 }
 
 fn base() -> String {
-    MANAGED_BASE_URL.trim_end_matches('/').to_string()
+    managed_base_url().trim_end_matches('/').to_string()
 }
 
 /// 批次查詢（相容舊呼叫）：只回命中表。

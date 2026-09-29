@@ -62,7 +62,7 @@ fn snapshot(root: &Path) -> Vec<String> {
 }
 
 fn store_root() -> PathBuf {
-    std::env::temp_dir().join(format!("mcpl-apply-store-test-{}", std::process::id()))
+    crate::engine::apply_record::store_root()
 }
 
 // ─── 分類 ───────────────────────────────────────────────

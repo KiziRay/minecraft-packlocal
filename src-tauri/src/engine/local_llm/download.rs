@@ -1,6 +1,6 @@
 use super::select::FileSpec;
 use crate::engine::hashutil::Sha256Hasher;
-use crate::engine::secrets::MANAGED_BASE_URL;
+use crate::engine::secrets::managed_base_url;
 use crate::engine::turnstile::MANAGED_AI_PROTOCOL;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -91,7 +91,7 @@ fn encode_object_name(name: &str) -> String {
 pub fn object_url(name: &str) -> String {
     format!(
         "{}/api/local-llm/file/{}",
-        MANAGED_BASE_URL.trim_end_matches('/'),
+        managed_base_url().trim_end_matches('/'),
         encode_object_name(name)
     )
 }
@@ -99,7 +99,7 @@ pub fn object_url(name: &str) -> String {
 pub fn manifest_url() -> String {
     format!(
         "{}/api/local-llm/manifest",
-        MANAGED_BASE_URL.trim_end_matches('/')
+        managed_base_url().trim_end_matches('/')
     )
 }
 

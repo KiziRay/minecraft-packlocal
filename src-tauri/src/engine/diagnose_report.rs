@@ -13,7 +13,7 @@ use zip::{CompressionMethod, ZipWriter};
 use super::discord_auth::managed_ai_session_cookie;
 use super::jar_scan::resolve_minecraft_dir;
 use super::out_layout::RESULT_DIR_NAME;
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 use super::session::SESSION_FILE;
 use super::turnstile::MANAGED_AI_PROTOCOL;
 
@@ -335,7 +335,7 @@ fn build_report_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
 
 fn upload_report_zip(req: &DiagnoseReportRequest, bytes: &[u8]) -> Result<DiagnoseReportResult, String> {
     let session = managed_ai_session_cookie()?;
-    let base = MANAGED_BASE_URL.trim_end_matches('/');
+    let base = managed_base_url().trim_end_matches('/');
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(180))

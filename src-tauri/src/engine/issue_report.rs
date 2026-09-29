@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::secrets::MANAGED_BASE_URL;
+use super::secrets::managed_base_url;
 use super::turnstile::MANAGED_AI_PROTOCOL;
 
 pub const ISSUE_SUMMARIES: &[&str] = &[
@@ -178,7 +178,7 @@ pub fn submit_issue_report(
     };
     let url = format!(
         "{}/api/issue-thread",
-        MANAGED_BASE_URL.trim_end_matches('/')
+        managed_base_url().trim_end_matches('/')
     );
     let idempotency_key = issue_idempotency_key(idempotency_key.as_deref());
     let client = match reqwest::blocking::Client::builder()
