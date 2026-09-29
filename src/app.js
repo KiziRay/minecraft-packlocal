@@ -1115,6 +1115,8 @@ async function probeLocalPackCache(instancePath, { silent } = {}) {
     if (packChangeProbe) {
       hideLocalCacheCard();
       hasShareableFiles = false;
+      // B6a-1：「翻譯更新的部分」走接續補完，要用上次的結果位置（同可用結果的做法）
+      if (probe.outputDir && !customOutputEnabled()) setAutoOutputDir(probe.outputDir);
       if (!silent) appendLog(probe.message || "上次翻譯後模組整合包有變動，要重新翻譯。", "warn");
       syncUiState();
       return probe;
@@ -5056,7 +5058,8 @@ async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } 
   lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
-  clearLog("開始接續補完");
+  // B6a-1：模組整合包已更新時，同一顆接續補完是「翻譯更新的部分」（後端先重掃）
+  clearLog(packChangeProbe ? "開始翻譯更新的部分" : "開始接續補完");
   // 補充漏翻是接續同一個整合包的翻譯效果，不是另開一輪新翻譯——進階統計要接著累加，
   // 不能讓「翻譯」階段辛苦累出來的數字被「補充」階段的新引擎歸零蓋掉。
   resetCoverageMetrics("補翻統計蒐集中", { carryForward: true });

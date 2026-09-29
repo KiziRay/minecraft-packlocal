@@ -97,7 +97,7 @@ where
 
     // ─── 1) mods jar / zip（平行掃描；含 Essential 等雙 jar，只讀 lang 不拆包）───
     on_progress(6, "本地整理：列出模組檔…");
-    let jar_paths = list_archive_files(&mc.join("mods"), 2);
+    let jar_paths = list_archive_files(&mc.join("mods"), 2, &mut errors);
     let total_j = jar_paths.len().max(1);
     on_progress(
         8,
@@ -474,16 +474,22 @@ fn worker_count(jar_count: usize, available: usize, configured: Option<usize>) -
     requested.clamp(1, 16).min(jar_count.max(1))
 }
 
-fn list_archive_files(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+/// B6a-1 第二輪：mods/ 不是資料夾、讀不到、走訪出錯都記進錯誤清單（不靜默當成沒有模組：
+/// 更新偵測靠「掃描沒有錯誤」才敢判定模組被拿掉）。
+fn list_archive_files(root: &Path, max_depth: usize, errors: &mut Vec<String>) -> Vec<PathBuf> {
     if !root.is_dir() {
+        errors.push(format!("讀不到模組資料夾：{}", root.display()));
         return vec![];
     }
     let mut out = Vec::new();
-    for entry in WalkDir::new(root)
-        .max_depth(max_depth)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in WalkDir::new(root).max_depth(max_depth).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(format!("讀不到模組資料夾裡的項目（{e}）：{}", root.display()));
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1206,4 +1212,29 @@ fn parse_properties_lang(text: &str) -> HashMap<String, String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod b6a1_listing_tests {
+    use super::*;
+
+    /// B6a-1 第二輪 1：mods/ 讀不到（不是資料夾、走訪出錯）要記進錯誤清單，不能靜默當成沒有模組。
+    #[test]
+    fn b6a1_fix2_mods_listing_failure_is_recorded() {
+        let root = crate::engine::paths::test_data_base().join("b6a1-fix2-listing");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("mods"), b"not a folder").unwrap();
+        let mut errors = Vec::new();
+        assert!(list_archive_files(&root.join("mods"), 2, &mut errors).is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("讀不到模組資料夾"), "{errors:?}");
+        let mut errors = Vec::new();
+        list_archive_files(&root.join("missing"), 2, &mut errors);
+        assert_eq!(errors.len(), 1, "不存在也要記");
+        std::fs::create_dir_all(root.join("ok")).unwrap();
+        let mut errors = Vec::new();
+        list_archive_files(&root.join("ok"), 2, &mut errors);
+        assert!(errors.is_empty(), "空的資料夾讀得到，不是錯誤");
+    }
 }

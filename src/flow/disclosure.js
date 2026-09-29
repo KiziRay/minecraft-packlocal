@@ -34,6 +34,12 @@ export const DISCLOSURES = Object.freeze({
     settingPath: "ui.disclosure.packChanged",
     topic: "重新翻譯會不會很久",
   }),
+  // B6a-1：S16 Minecraft 版本變了
+  mcChanged: Object.freeze({
+    storageKey: "mcpl-disclosure-mc-changed",
+    settingPath: "ui.disclosure.mcChanged",
+    topic: "版本變了為什麼要重新翻譯",
+  }),
   // B5b：開始前確認（第一次多一句）、E1 AI 列「適合誰」、翻譯中附加行、本地模型第一次較久
   prestart: Object.freeze({
     storageKey: "mcpl-disclosure-prestart",

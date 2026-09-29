@@ -71,6 +71,10 @@ pub struct TranslateSession {
     /// 其餘狀態一律交給「上次的翻譯沒有做完」接續卡處理。
     #[serde(default)]
     pub last_run_outcome: RunOutcome,
+    /// B6a-1：判斷整合包有沒有更新的依據（英文雜湊 sourceHashes、MC 版本 mcVersion、模組清單 modFiles）。
+    /// 舊工作階段沒有這些欄位＝無法確認，不判「已更新」「版本變了」；補翻時重掃一次補上。
+    #[serde(flatten)]
+    pub update_basis: super::pack_update::UpdateBasis,
 }
 
 /// 上一次執行的收尾狀態。舊工作階段沒有這個欄位 → `Unknown`。
@@ -850,6 +854,7 @@ mod tests {
             mods_fingerprint: 0,
             run_preferences: RunPreferences::default(),
             last_run_outcome: RunOutcome::Completed,
+            update_basis: Default::default(),
         };
         save_session(&dir, &session).unwrap();
         // 寫完不該留下暫存檔

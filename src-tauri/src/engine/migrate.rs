@@ -267,7 +267,8 @@ mod tests {
         assert!(needs_rescan, "沒有原文雜湊的舊工作階段必須標記需重掃");
 
         let mut with_hash: Value = serde_json::from_str(LEGACY_SESSION).unwrap();
-        with_hash[SESSION_SOURCE_HASH_FIELD] = json!({ "create": "abc123" });
+        // B6a-1：實際格式是 命名空間 → 鍵 → 英文雜湊（pack_update::SourceHashes）
+        with_hash[SESSION_SOURCE_HASH_FIELD] = json!({ "create": { "block.create.gear": "abc123" } });
         let (_, rescan) = read_session_text(&with_hash.to_string()).unwrap();
         assert!(!rescan);
     }

@@ -147,7 +147,7 @@ impl ToolIndex {
 
     /// 工具版本對應的原檔：備份區（備份標記的原檔指紋要相符；`.mcpl` 被刪時用認回的識別碼找）
     /// 或 1.0.x 舊版備份。
-    fn original_backup(&self, path: &Path) -> Option<PathBuf> {
+    pub(crate) fn original_backup(&self, path: &Path) -> Option<PathBuf> {
         let rel = apply_record::rel_key(&self.mc, path);
         let current_id = mcpl_marker::read_instance(&self.mc).ok().flatten().map(|i| i.id);
         let current = (apply_guard::backup_paths_at(&apply_record::instance_backup_dir(&self.mc), &rel), current_id);

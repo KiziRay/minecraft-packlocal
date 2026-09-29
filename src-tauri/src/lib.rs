@@ -804,6 +804,8 @@ struct OneClickResult {
     /// B5c：套用到遊戲的完整結果（備份位置、語言、隔離、模組已更新、舊產物、退休、讀不到…），
     /// 完成卡「已幫你做的事」「還是英文的部分」照這份寫，不再從中文句子猜。由 with_apply_notice 填入。
     apply_result: Option<ApplyResult>,
+    /// B6a-1：這一輪因為模組整合包更新做了什麼（重掃、新增／改過幾句、拿掉的模組舊翻譯已清掉）
+    pack_update: Option<engine::pack_update::UpdateSummary>,
 }
 
 /// 把套用狀態接到翻譯結果上；還沒裝進遊戲時，結論的第一句就要講這件事。
@@ -1548,6 +1550,67 @@ fn rewrite_jars_and_log(
     Ok(report)
 }
 
+/// B6a-1：補翻前，模組整合包更新了（mods 指紋不同）或舊工作階段沒有英文雜湊 → 重掃遊戲資料夾（只讀），
+/// 刷新英文原文表（G2.15／G2.20），只把新增、英文改過的句子與上次的缺口列入待補；英文改過的舊譯文不沿用、
+/// 拿掉的模組舊翻譯從資源包清掉。判斷與計算在 engine::pack_update，這裡只接線。
+fn refresh_after_pack_update(
+    app: &AppHandle,
+    work: &Path,
+    session: &mut TranslateSession,
+    zh: &mut LangMap,
+    dict: &HashMap<String, String>,
+) -> Result<Option<engine::pack_update::UpdateSummary>, String> {
+    let instance = PathBuf::from(session.instance_path.trim());
+    if !instance.exists() {
+        return Ok(None);
+    }
+    let Some(reason) = engine::pack_update::refresh_reason(session, &instance, Some(work)) else {
+        return Ok(None);
+    };
+    emit_progress_stage(app, dev_progress::STAGE_SCAN, Some(16), "模組整合包有更新，重新讀取遊戲裡的文字…");
+    let app_scan = app.clone();
+    let (zh_scan, en_only, _prov, report) = scan_instance(&instance, dict, true, true, move |pct, msg| {
+        let mapped = 16 + (pct as u16 * 8 / 100) as u8;
+        emit_progress_stage(&app_scan, dev_progress::STAGE_SCAN, Some(mapped.min(24)), msg);
+    })?;
+    let en_full = engine::snapshot_sources();
+    if let Err(e) = engine::source_catalog_save(work, &en_full) {
+        emit_warn(app, &format!("英文原文表存檔失敗（之後補翻時會重新讀取遊戲原文）：{e}"));
+    }
+    let mut refresh = engine::pack_update::plan_refresh(engine::pack_update::RefreshInput {
+        old_hashes: &session.update_basis.source_hashes,
+        old_pending: &session.pending_en,
+        en_full: &en_full,
+        en_only: &en_only,
+        zh_scan: &zh_scan,
+        old_zh: zh,
+        // 審查 F1：掃描有錯誤、模組檔還在或暫時停用（.jar.disabled）都不算被拿掉
+        removal: engine::pack_update::RemovalCheck {
+            scan_clean: engine::pack_update::scan_is_clean(&report.errors),
+            old_ns_jars: &session.update_basis.ns_jars,
+            mods_now: &engine::pack_update::mods_now(&instance),
+        },
+    });
+    postprocess_lang_values(&mut refresh.scan_fill, dict);
+    let mut new_zh = std::mem::take(&mut refresh.zh);
+    merge_fill_missing(&mut new_zh, &refresh.scan_fill);
+    *zh = new_zh;
+    engine::pack_update::forget_keys(&mut session.quality_deferred, &refresh.stale);
+    session.pending_count = count_map(&refresh.pending);
+    session.pending_en = std::mem::take(&mut refresh.pending);
+    session.mods_fingerprint = engine::mods_fingerprint(&instance);
+    session.update_basis = engine::pack_update::UpdateBasis {
+        source_hashes: std::mem::take(&mut refresh.hashes),
+        mc_version: engine::pack_update::current_mc_version(&instance),
+        // 審查 F3：以原檔為準（工具放進 mods/ 的翻譯版記原檔大小）
+        mod_files: engine::pack_update::effective_mod_files(&instance, Some(work), &Default::default()),
+        ns_jars: engine::pack_update::ns_jars(&instance),
+    };
+    let summary = engine::pack_update::UpdateSummary::from_refresh(reason, &refresh);
+    emit_log(app, "info", &summary.log_line());
+    Ok(Some(summary))
+}
+
 /// 中止進行中的長任務（掃描／補譯／覆寫）。已完成的部分留在結果資料夾。
 #[tauri::command]
 fn cancel_task() -> String {
@@ -2013,6 +2076,14 @@ fn run_one_click(
     if let Err(e) = engine::source_catalog_save(&work, &engine::snapshot_sources()) {
         emit_warn(app, &format!("英文原文表存檔失敗（之後補翻時會重新讀取遊戲原文）：{e}"));
     }
+    // B6a-1：判斷整合包有沒有更新的依據（英文雜湊、MC 版本、模組清單），存進工作階段
+    let update_basis = engine::pack_update::basis_for(&instance, Some(&work), &engine::snapshot_sources());
+    // 審查 F4：上一輪的依據（這個結果自己的；另存新結果時找同一個遊戲資料夾最近一次套用的，只讀）
+    let prior_basis = engine::pack_update::prior_session(&instance, &work).map(|s| s.update_basis).unwrap_or_default();
+    // 審查 F2：本地整理完的中途快照沿用上一份工作階段的依據，新依據只在結尾寫
+    let (interim_fingerprint, interim_basis) =
+        engine::pack_update::interim_basis(load_session(&work).ok().map(|(s, _)| s).as_ref());
+    let scan_clean = engine::pack_update::scan_is_clean(&report.errors);
     // 停止時把當下有效譯文掃尾進共享庫（成功路徑會 disarm）
     let mut stop_share = OnCancelShare {
         active: true,
@@ -2142,12 +2213,24 @@ fn run_one_click(
 
     // 接續先前譯文（同機）：精確名／同 version 工具產物／session／遊戲內已套用
     let mut prior_merged = 0usize;
+    let mut one_click_update: Option<engine::pack_update::UpdateSummary> = None;
     {
         let pack_version = detect_pack_version(&instance).version;
+        // B6a-1：上次翻譯當時的英文雜湊；英文改過的句子、被拿掉的模組不沿用舊譯文
+        let old_hashes = &prior_basis.source_hashes;
+        let mods_now = engine::pack_update::mods_now(&instance);
+        let removal = engine::pack_update::RemovalCheck { scan_clean, old_ns_jars: &prior_basis.ns_jars, mods_now: &mods_now };
         let sources = discover_prior_zh_sources(&work, &pack_name, &pack_version, &instance);
         for prior_pack in sources {
             match load_pack_zh(&prior_pack) {
-                Ok(prior) => {
+                Ok(mut prior) => {
+                    let (stale, removed) =
+                        engine::pack_update::drop_stale(&mut prior, old_hashes, &update_basis.source_hashes, &zh, &removal);
+                    if stale > 0 || removed > 0 {
+                        let s = one_click_update.get_or_insert_with(Default::default);
+                        s.changed_sentences = s.changed_sentences.max(stale);
+                        s.removed_mods = s.removed_mods.max(removed);
+                    }
                     let n = merge_fill_missing(&mut zh, &prior);
                     if n == 0 {
                         continue;
@@ -2176,6 +2259,9 @@ fn run_one_click(
                     );
                 }
             }
+        }
+        if let Some(s) = &one_click_update {
+            emit_log(app, "info", &s.log_line());
         }
         if prior_merged > 0 {
             emit_progress_ex(
@@ -2291,7 +2377,8 @@ fn run_one_click(
             translation_mode: mode.value().into(),
             translation_quality: quality.value().into(),
             coverage_tier: tier.value().into(),
-            mods_fingerprint: engine::mods_fingerprint(&instance),
+            // 審查 F2：中途快照沿用上一份的 mods 指紋（崩潰後接續補完才會發現有更新、重掃）
+            mods_fingerprint: interim_fingerprint,
             // 把「這一輪怎麼跑」存進工作階段：中斷續翻時要沿用同樣的選擇。
             // skip_result_folder＝開始時選了「不保留翻譯結果」，只管結果資料夾；
             // 備份不在這裡決定，一律照設定（translate.backupChoice）。
@@ -2306,6 +2393,7 @@ fn run_one_click(
             // 標成 Crashed：真的跑完會在結尾覆寫成 Completed；
             // 中途崩潰或被關掉就停在這裡，計數不可信也不會被拿去講缺漏。
             last_run_outcome: engine::RunOutcome::Crashed,
+            update_basis: interim_basis,
         },
     );
 
@@ -3129,6 +3217,7 @@ fn run_one_click(
             } else {
                 engine::RunOutcome::Completed
             },
+            update_basis: update_basis.clone(),
         },
     );
 
@@ -3390,6 +3479,7 @@ fn run_one_click(
     let deferred_left = count_map(&remaining_pending(&quality_deferred_for_view, &zh));
     Ok(with_apply_notice(OneClickResult {
         apply_result: None,
+        pack_update: one_click_update,
         interruption: engine::run_interrupt::view(no_answer_left, deferred_left),
         display_safety: Default::default(),
         run_plan: plan.clone(),
@@ -3756,6 +3846,8 @@ fn run_supplement(
         }
     };
     postprocess_lang_values(&mut zh, &dict);
+    // B6a-1：整合包更新了 → 重掃，只翻新增／改過的句子（順便補完舊缺口）；要在載入英文原文表之前
+    let pack_update = refresh_after_pack_update(app, &work, &mut session, &mut zh, &dict)?;
 
     let mut pending = remaining_pending(&session.pending_en, &zh);
     let rework = rework_unusable_zh(&zh);
@@ -3932,6 +4024,7 @@ fn run_supplement(
         }
         return Ok(with_apply_notice(OneClickResult {
         apply_result: None,
+        pack_update: pack_update.clone(),
              interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
              display_safety: Default::default(),
              run_plan: supplement_plan.clone(),
@@ -4289,6 +4382,7 @@ fn run_supplement(
 
     Ok(with_apply_notice(OneClickResult {
         apply_result: None,
+        pack_update: pack_update.clone(),
         interruption: engine::run_interrupt::view(
             count_map(&remaining_pending(&ai_report.no_answer, &zh)),
             count_map(&session.quality_deferred),
@@ -4716,6 +4810,7 @@ fn run_repair(
 
     Ok(with_apply_notice(OneClickResult {
         apply_result: None,
+        pack_update: None,
         interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
         display_safety: Default::default(),
         run_plan: repair_plan.clone(),
@@ -5126,6 +5221,7 @@ mod local_cache_probe_tests {
             mods_fingerprint: 0,
             run_preferences: engine::RunPreferences::default(),
             last_run_outcome: engine::RunOutcome::Completed,
+            update_basis: Default::default(),
         }
     }
 
@@ -5771,6 +5867,8 @@ struct LocalPackCacheProbe {
     counts_trusted: bool,
     /// B5c 審查 3a：最新一輪結果有沒有套用到這個遊戲資料夾（唯讀比對；不知道＝None）
     last_applied: Option<bool>,
+    /// B6a-1：上次翻譯之後的更新差異（新增模組、約幾句要翻、任務文字改了幾處、MC 版本；唯讀）
+    pack_update: Option<engine::pack_update::UpdateView>,
 }
 
 fn file_mtime_ms(path: &Path) -> Option<u64> {
@@ -5810,6 +5908,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
     // 上一次到底有沒有跑完？沒跑完的計數一律不可信（見 gap_model 的說明）。
     let mut counts_fresh = false;
     let mut mods_changed_here = false;
+    let mut update_view: Option<engine::pack_update::UpdateView> = None;
     let (matched, pending_count, session_path_str, updated_at_ms, keys_zh) =
         if let Some(ref sp) = session_path {
             match load_session(sp.parent().unwrap_or(&work)) {
@@ -5821,12 +5920,14 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
                     // 路徑相同不代表還是同一包：啟動器常見操作是沿用同一個 instance
                     // 資料夾、換掉整個 mods/。只在兩邊都「有記錄」時才拿來否決——
                     // 0 代表舊工作階段（遷移前）或當下讀不到 mods/，一律不擋。
-                    let live_fingerprint = engine::mods_fingerprint(instance);
-                    let mods_changed = session.mods_fingerprint != 0
-                        && live_fingerprint != 0
-                        && session.mods_fingerprint != live_fingerprint;
+                    // B6a-1：mods 指紋、任務等文字來源指紋、MC 版本（都只讀；舊工作階段沒記＝不判）
+                    let view = engine::pack_update::inspect(&session, instance, sp.parent().unwrap_or(&work));
+                    let mods_changed = view.updated();
                     let matched = path_matched && !mods_changed;
                     mods_changed_here = path_matched && mods_changed;
+                    if mods_changed_here {
+                        update_view = Some(view);
+                    }
                     counts_fresh = session.last_run_outcome.counts_are_trustworthy();
                     // 只算「補得動」的缺口：羅馬數字、圖示、單位、品牌名本來就
                     // 不該翻，算進去的話使用者永遠看到一個補不完的數字。
@@ -5855,10 +5956,11 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
     // B5d：同一個遊戲資料夾、mods 變了 → 照實回「有變動」（舊版回 None，畫面看起來像沒翻過）。
     // 這不是可用的結果：不可分享、不可直接套用，兩個消費端（開始翻譯的三選一、本機已有翻譯卡）都不當成已有結果。
     if mods_changed_here {
+        let view = update_view.unwrap_or_default();
         return Some(LocalPackCacheProbe {
             status: "changed".into(),
             matched: false,
-            mods_changed: true,
+            mods_changed: view.mods_changed,
             output_dir: output_dir.display().to_string(),
             work_root: work.display().to_string(),
             session_path: session_path_str,
@@ -5867,11 +5969,16 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
             shareable: false,
             applyable: false,
             updated_at_ms,
-            message: "上次翻譯後模組整合包有變動，要重新翻譯。".into(),
+            message: if view.mc_changed {
+                "Minecraft 版本變了，要重新翻譯。".into()
+            } else {
+                "上次翻譯後模組整合包有變動，按「翻譯更新的部分」只翻有變的內容。".into()
+            },
             pack_name,
             canonical_zip,
             counts_trusted: false,
             last_applied: None,
+            pack_update: Some(view),
         });
     }
     if !matched && !shareable {
@@ -5939,6 +6046,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
         canonical_zip,
         counts_trusted: trust_counts,
         last_applied: engine::result_owner::latest_applied(instance, &work),
+        pack_update: None,
     })
 }
 
@@ -6026,6 +6134,7 @@ fn probe_local_pack_cache_cmd(
         canonical_zip: None,
         counts_trusted: false,
         last_applied: None,
+        pack_update: None,
     }))
 }
 
@@ -7102,3 +7211,7 @@ mod lib_b5d_tests;
 #[cfg(test)]
 #[path = "lib_b5c_tests.rs"]
 mod lib_b5c_tests;
+
+#[cfg(test)]
+#[path = "lib_b6a1_tests.rs"]
+mod lib_b6a1_tests;

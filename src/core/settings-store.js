@@ -55,6 +55,7 @@ const KEY_MAP = {
   "mcpl-disclosure-broken-record": "ui.disclosure.brokenRecord",
   "mcpl-disclosure-copied": "ui.disclosure.copied",
   "mcpl-disclosure-pack-changed": "ui.disclosure.packChanged",
+  "mcpl-disclosure-mc-changed": "ui.disclosure.mcChanged",
   "mcpl-banner-update-dismissed": "ui.banner.updateDismissedVersion",
   "mcpl-delete-results-after-apply": "translate.deleteResultsAfterApply",
   "mcpl-delete-results-ack": "translate.deleteResultsAck",

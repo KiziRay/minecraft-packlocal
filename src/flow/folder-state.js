@@ -7,6 +7,7 @@
  */
 
 import { shortPackName, packNameFromPath } from "./pack-state.js";
+import { packUpdateState } from "./pack-update.js";
 
 export const FOLDER_STATE = Object.freeze({
   checking: "CHECKING",
@@ -239,6 +240,11 @@ export function resultState(input) {
   const src = input && typeof input === "object" ? input : {};
   const name = src.packName || "這個模組整合包";
   const shown = typeof src.extraShown === "function" ? src.extraShown : () => true;
+  // B6a-1：探測帶更新差異 → S16（MC 版本變了）或 S15「翻譯更新的部分」；沒有差異資料時退回 S15 暫行
+  const updated = src.packChanged && !src.translationComplete
+    ? packUpdateState({ packName: name, packUpdate: src.packUpdate, extraShown: shown })
+    : null;
+  if (updated) return updated;
   // 剛重新翻完（這次工作階段已記下新的 mods 指紋）時不再說有變動
   if (src.packChanged && !src.translationComplete) {
     return st(FOLDER_STATE.packChanged, {
@@ -279,8 +285,8 @@ export function readyDetailLines({ translationComplete = false, hasOptions = nul
   return ["建議先啟動一次遊戲再翻譯：有些模組第一次啟動才產生語言檔。"];
 }
 
-/** N-03、N-04 只在這些狀態出現（規格 §3.4：只在 S13–S16；B5d 的「可開始」即 S13 暫行）。 */
-export const BANNER_STATES = Object.freeze(["READY", "S15"]);
+/** N-03、N-04 只在這些狀態出現（規格 §3.4：只在 S13–S16；B5d 的「可開始」即 S13 暫行；S16 由 B6a-1 加）。 */
+export const BANNER_STATES = Object.freeze(["READY", "S15", "S16"]);
 
 /**
  * 橫幅決定：N-03 遊戲正在執行（每次選資料夾最多一次）、N-04 還沒啟動過（沒 options.txt）。

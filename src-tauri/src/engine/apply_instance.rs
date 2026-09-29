@@ -1277,3 +1277,7 @@ mod b5c_tests;
 #[cfg(test)]
 #[path = "apply_instance_b3_tests.rs"]
 mod b3_tests;
+
+#[cfg(test)]
+#[path = "apply_instance_b6a1_tests.rs"]
+mod b6a1_tests;

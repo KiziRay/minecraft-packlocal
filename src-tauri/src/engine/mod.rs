@@ -116,6 +116,8 @@ mod security;
 mod scan_cache;
 mod search_system;
 mod session;
+pub mod pack_update;
+mod pack_update_mods;
 pub mod result_owner;
 mod shared_identity;
 mod shared_tm;

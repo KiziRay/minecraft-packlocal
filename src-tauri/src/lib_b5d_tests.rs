@@ -44,6 +44,7 @@ fn b5d_probe_says_pack_changed_instead_of_looking_untranslated() {
         mods_fingerprint: engine::mods_fingerprint(&instance),
         run_preferences: engine::RunPreferences::default(),
         last_run_outcome: engine::RunOutcome::Completed,
+        update_basis: Default::default(),
     };
     save_session(&work, &session).unwrap();
     assert_eq!(probe_cache_at(&instance, &work).unwrap().status, "ready", "沒變動時照舊");
@@ -186,6 +187,7 @@ fn b5d_fix4_partial_result_replaces_an_earlier_changed_one() {
             mods_fingerprint: fingerprint,
             run_preferences: engine::RunPreferences::default(),
             last_run_outcome: engine::RunOutcome::Completed,
+            update_basis: Default::default(),
         }
     };
     let live = engine::mods_fingerprint(&instance);

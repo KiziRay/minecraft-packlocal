@@ -72,6 +72,7 @@ export function createPackActions(deps) {
       // B5d：選資料夾就判定
       folder: folders() ? folders().gateInput(path) : null,
       packChanged: !!s.packChangeProbe,
+      packUpdate: s.packChangeProbe ? s.packChangeProbe.packUpdate || null : null,
       hasTranslationRecord: !!s.hasApplyBackups,
       versionUnknown: !!s.versionUnknown,
       hasOptions: folders() ? folders().hasOptions(path) : null,

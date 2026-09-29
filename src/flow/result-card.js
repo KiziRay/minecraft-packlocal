@@ -8,6 +8,8 @@
  * 純函式、不碰 DOM；畫面由 status-card.js 依回傳的狀態畫。
  */
 
+import { updateDoneLines } from "./pack-update.js";
+
 export const RESULT_STATE = Object.freeze({ applyPending: "S11", partial: "S14", done: "S17" });
 
 export const RESULT_ACTION = Object.freeze({
@@ -83,6 +85,8 @@ export function summarizeRun(result, { origin = "run", finishedNow = true, local
     localModelClosed: !!localModelClosed,
     backupChoice: String(backupChoice || ""),
     resourcePackRepaired: false,
+    // B6a-1：這一輪因為模組整合包更新做了什麼（拿掉的模組舊翻譯已清掉）
+    packUpdate: pick(r, "packUpdate", "pack_update") || null,
   };
 }
 
@@ -231,6 +235,7 @@ export function doneLines(summary) {
     if (a.skippedChanged.length) out.push(`${a.skippedChanged.length} 個檔被模組整合包更新改過，工具不碰`);
   }
   if (s.resourcePackRepaired) out.push("已修好資源包清單");
+  out.push(...updateDoneLines(s.packUpdate));
   if (s.localModelClosed) out.push("已關閉本地模型");
   return out;
 }

@@ -42,6 +42,7 @@ export const SETTING_PATHS = [
   "ui.disclosure.brokenRecord",
   "ui.disclosure.copied",
   "ui.disclosure.packChanged",
+  "ui.disclosure.mcChanged",
   "ui.disclosure.prestart",
   "ui.disclosure.aiChoice",
   "ui.disclosure.runTips",

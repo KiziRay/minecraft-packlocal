@@ -59,6 +59,10 @@ struct Manifest {
     /// 產出者最近一次完整跑完的時間（秒）
     #[serde(default)]
     rounds: BTreeMap<String, u64>,
+    /// B6a-1：產出者最近一次完整跑完時，它每個來源檔當下的指紋（產出者 → 來源 → 指紋）。
+    /// 來源改了、但這一版已經處理過（沒有可翻的字所以沒有新產出）→ 不再算「要翻」。舊資料沒有這欄＝照舊行為。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    processed: BTreeMap<String, BTreeMap<String, String>>,
     /// 產出清單屬於哪個遊戲資料夾（路徑鍵）；套到別的遊戲資料夾時不做任何退休
     #[serde(default, skip_serializing_if = "String::is_empty")]
     game_key: String,
@@ -227,6 +231,13 @@ pub fn commit(work: &Path, producer: &str, mc: &Path) {
         }
         m.entries.extend(new);
         m.rounds.insert(producer.to_string(), super::mcpl_marker::now_secs());
+        let done: BTreeMap<String, String> = m
+            .entries
+            .values()
+            .filter(|s| s.producer == producer && !s.source.is_empty())
+            .filter_map(|s| apply_record::file_sha256(&mc.join(&s.source)).map(|sha| (s.source.clone(), sha)))
+            .collect();
+        m.processed.insert(producer.to_string(), done);
         m.game_key = game_key(mc);
         m.game_root = mc.display().to_string();
     });
@@ -399,6 +410,32 @@ pub fn drop_unconfirmed(work: &Path, mc: &Path, plan: &mut ApplyPlan, record: &A
         true
     });
     dropped
+}
+
+/// B6a-1（唯讀）：翻譯之後來源檔確定被改過的有幾個（任務、腳本等；不在、讀不到的不算）。
+/// 清單屬於別的遊戲資料夾、讀不到清單都回 0（無法確認＝不判已更新）。
+pub fn count_changed_sources(work: &Path, mc: &Path) -> usize {
+    let Ok(manifest) = read(work) else { return 0 };
+    if manifest.entries.is_empty() || (!manifest.game_key.is_empty() && manifest.game_key != game_key(mc)) {
+        return 0;
+    }
+    let index = super::tool_products::ToolIndex::for_game(mc);
+    let empty = ApplyRecord::default();
+    let mut seen = HashSet::new();
+    // 審查第二輪 3：來源改了之後，產出者已經完整跑過一輪處理「這一版」（已處理指紋＝現在的指紋）——
+    // 沒有新產出是因為沒有可翻的字，不再算「要翻」，S15 才會消失。以指紋比對（不看修改時間）；舊資料沒有已處理指紋＝照舊。
+    let processed_after_change = |s: &TextSource| {
+        let Some(done) = manifest.processed.get(&s.producer) else { return false };
+        let Some(sha) = done.get(&s.source) else { return false };
+        apply_record::file_sha256(&mc.join(&s.source)).as_deref() == Some(sha.as_str())
+    };
+    manifest
+        .entries
+        .values()
+        .filter(|s| seen.insert(s.source.clone()))
+        .filter(|s| source_state(mc, &s.source) == SourceState::Present && !source_unchanged(mc, s, &empty, &index))
+        .filter(|s| !processed_after_change(s))
+        .count()
 }
 
 /// 來源還是翻譯當時那份原檔（審查 F-c：與 ToolIndex 同一套判斷）：

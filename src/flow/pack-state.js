@@ -108,6 +108,8 @@ function normalize(input) {
     // B5d：選資料夾就判定（folder-state.js）
     folder: src.folder && typeof src.folder === "object" ? src.folder : null,
     packChanged: !!src.packChanged,
+    // B6a-1：探測的更新差異（S15 句數、S16 版本）
+    packUpdate: src.packUpdate && typeof src.packUpdate === "object" ? src.packUpdate : null,
     hasTranslationRecord: !!src.hasTranslationRecord,
     versionUnknown: !!src.versionUnknown,
     hasOptions: typeof src.hasOptions === "boolean" ? src.hasOptions : null,
@@ -311,12 +313,14 @@ function computeState(i) {
   const after = resultState({
     packName: name,
     packChanged: i.packChanged,
+    packUpdate: i.packUpdate,
     hasTranslationRecord: i.hasTranslationRecord,
     hasResult: i.hasResult,
     translationComplete: i.translationComplete,
     extraShown: i.extraShown,
   });
-  if (after) return { ...after, reTranslate: true };
+  // B6a-1：S15「翻譯更新的部分」直接開跑（R-8），不走重新翻譯的開始前確認
+  if (after) return { ...after, reTranslate: after.reTranslate ?? true };
 
   // B5c：S14／S17（這一輪的結果；沒有時用本機結果探測，取代「本機已有翻譯」卡）
   if (i.result) return resultCardState(i.result, { ...i.resultCtx, packName: name });

@@ -679,6 +679,7 @@ mod tests {
             mods_fingerprint: 0,
             run_preferences: Default::default(),
             last_run_outcome: Default::default(),
+            update_basis: Default::default(),
         };
         save_session(&work, &session).unwrap();
         assert!(work.join(SESSION_FILE).is_file());
