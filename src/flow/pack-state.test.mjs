@@ -98,10 +98,11 @@ test("S01：沒選資料夾時一句話＋「選擇遊戲資料夾」；附加�
   assert.equal(plan.extra.canRecall, true, "退場後原位置留「？」");
 });
 
-test("暫行「可開始」：選好資料夾後一句現況＋「開始翻譯」（呼叫舊 onRun 的 #btn-run）", () => {
+test("可開始（B5b 起＝S13 還沒翻過）：一句現況＋「開始翻譯」（#btn-run）；有舊結果時仍是暫行句", () => {
   const s = computePackState(base);
   assert.equal(s.id, STATE.ready);
-  assert.match(s.sentence, /已選好「ATM10」/);
+  assert.equal(s.sentence, "還沒翻過，確認下面幾項就能開始");
+  assert.match(computePackState({ ...base, hasResult: true }).sentence, /已選好「ATM10」/);
   assert.equal(s.primary.action, ACTION.run);
   assert.equal(s.primary.label, "開始翻譯");
   assert.equal(PRIMARY_BUTTON_IDS[s.primary.action], "btn-run");

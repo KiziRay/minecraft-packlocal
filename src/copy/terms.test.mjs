@@ -90,6 +90,12 @@ const COPY_MODULES = [
   "../onboarding/onboarding.js",
   "../flow/first-run.js",
   "../core/cloud-topup-consent.js",
+  // B5b：開始前確認、E1 AI 列、翻譯中、S12 的文案
+  "../flow/ai-readiness.js",
+  "../flow/prestart.js",
+  "../flow/run-progress.js",
+  "../flow/run-failure.js",
+  "../flow/run-flow.js",
 ];
 
 function report(hits) {

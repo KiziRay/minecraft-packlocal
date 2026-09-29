@@ -44,6 +44,12 @@ pub fn is_installed() -> bool {
     files_ready(&default_install_dir())
 }
 
+/// 狀態檔記過的安裝資料夾本身不存在（搬走、外接硬碟沒接）。沒記過、或資料夾還在（不管有沒有模型）都是 false。
+pub(crate) fn install_dir_missing(recorded: &str) -> bool {
+    let path = recorded.trim();
+    !path.is_empty() && !Path::new(path).exists()
+}
+
 pub fn status_view() -> serde_json::Value {
     let state = load_state();
     let dir = if state.install_dir.trim().is_empty() {
@@ -69,6 +75,9 @@ pub fn status_view() -> serde_json::Value {
     };
     serde_json::json!({
         "installed": installed,
+        // B5b 審查 3b：裝過（狀態檔記了安裝位置）但那個資料夾本身不在了——畫面照實說「找不到安裝位置」；
+        // 資料夾在但沒有模型照「還沒下載」（第二輪審查）
+        "installDirMissing": !installed && install_dir_missing(&state.install_dir),
         "sizeBytes": size_bytes,
         "ready": ready,
         "port": state.port,
@@ -105,5 +114,31 @@ fn log_install_dir_mismatch(dir: &std::path::Path) {
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod b5b_install_dir_tests {
+    use super::install_dir_missing;
+
+    /// B5b 第二輪審查 3b：只有「記住的安裝資料夾本身不存在」才算找不到位置；
+    /// 資料夾在但沒有模型（偵測後還沒下載、或模型檔被刪）照「還沒下載」。
+    #[test]
+    fn b5b_install_dir_missing_only_when_the_recorded_folder_is_gone() {
+        let root = std::env::temp_dir().join(format!("mcpl-b5b-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let recorded = root.display().to_string();
+        // 偵測後還沒下載：資料夾在、沒有模型
+        assert!(!install_dir_missing(&recorded));
+        // 刪除模型檔後：資料夾還在
+        std::fs::remove_dir_all(root.join("models")).unwrap();
+        assert!(!install_dir_missing(&recorded));
+        // 整個資料夾不見（搬走、外接硬碟沒接）
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(install_dir_missing(&recorded));
+        // 從沒記過位置
+        assert!(!install_dir_missing(""));
+        assert!(!install_dir_missing("   "));
     }
 }

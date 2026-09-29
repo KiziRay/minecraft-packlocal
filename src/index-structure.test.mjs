@@ -120,7 +120,8 @@ test("舊的內嵌設定頁已刪除，本包選項容器改放在本包選項�
   const slotAt = html.indexOf('id="pack-options-modal-slot"');
   const hostAt = html.indexOf('id="pack-options-host"');
   assert.ok(slotAt > 0 && hostAt > slotAt, "#pack-options-host 必須在本包選項視窗裡");
-  for (const id of ["output", "pack-name", "target-version", "reference-pack", "backup-before-apply"]) {
+  // B5b：#backup-before-apply 由開始前確認的備份列取代（grep 0 引用後刪除）
+  for (const id of ["output", "pack-name", "target-version", "reference-pack"]) {
     assert.ok(html.includes(`id="${id}"`), `本包選項欄位 ${id} 不可跟著舊設定頁一起消失`);
   }
 });

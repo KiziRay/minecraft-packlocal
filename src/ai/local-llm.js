@@ -122,7 +122,7 @@ function readCachedProbe() {
  * 「這個資料夾裡有什麼」的狀態。
  *
  * 使用者實測回報：把存放資料夾改成一個沒有模型的位置，畫面還是顯示
- * 「已就緒」並給出「關閉並開始翻譯」按鈕。原因是舊版的 ready／installed 是
+ * 「已就緒」並給出「完成，回到翻譯」按鈕。原因是舊版的 ready／installed 是
  * **全域**狀態（llama-server 正在跑就算 ready），跟輸入框裡指的資料夾無關；
  * 探測摘要又從快取重畫，於是「檔案放哪」顯示的還是上一個資料夾。
  *
@@ -247,7 +247,7 @@ export function closeLocalLlmOverlay() {
  * 舊版只認 `ready`（服務這一刻正在跑）——工具剛重開時服務還沒被叫起來，
  * 明明檔案早就裝好，也會被判定成「尚未就緒」，逼使用者重新走一次同意／下載
  * 流程。這裡改成也認 `installed`（檔案在，不管服務現在有沒有在跑）：
- * 真正把服務叫起來的動作交給 `ensureLocalLlmReady()`（按「關閉並開始翻譯」
+ * 真正把服務叫起來的動作交給 `ensureLocalLlmReady()`（按「完成，回到翻譯」
  * 或直接按「開始翻譯」時才觸發），這裡只負責「不要嚇使用者以為要重裝」。
  */
 function isReadyView(view) {
@@ -331,7 +331,7 @@ async function pickDir() {
 }
 
 /**
- * 依「目前資料夾的探測結果」決定要不要顯示「關閉並開始翻譯」。
+ * 依「目前資料夾的探測結果」決定要不要顯示「完成，回到翻譯」。
  *
  * 這顆按鈕代表「模型就在這個資料夾、可以直接用」，所以只有在探測過、
  * 而且探測的就是輸入框現在指的那個資料夾時才該出現。
@@ -502,6 +502,13 @@ export async function localLlmStatus() {
   }
 }
 
+/** 下載前偵測過的需要空間（位元組）；沒偵測過或清單未知回 0（畫面不得捏造大小）。 */
+export function localLlmNeedBytes() {
+  const cached = readCachedProbe();
+  if (!cached || cached.planKnown === false || cached.plan_known === false) return 0;
+  return Number(cached.needBytes ?? cached.need_bytes ?? 0) || 0;
+}
+
 export function localLlmReady(status) {
   return !!(status && (status.ready || status.localReady || status.local_ready));
 }
@@ -611,7 +618,11 @@ export function forgetLocalLlmAfterExternalDelete() {
   setHidden($("local-llm-probe-summary"), true);
 }
 
-export async function ensureLocalLlmReady({ refreshAiStatus, appendLog, silent } = {}) {
+/**
+ * `openOverlay: false`（B5b 開始前的 AI 閘門）：檔案不在時不自動開安裝浮層，回 false，
+ * 由狀態卡 AI 列說「本地模型還沒下載」並給「下載本地模型」按鈕（不疊視窗）。
+ */
+export async function ensureLocalLlmReady({ refreshAiStatus, appendLog, silent, openOverlay = true } = {}) {
   const status = await localLlmStatus();
   if (localLlmReady(status)) return true;
   const log = typeof appendLog === "function" ? appendLog : () => {};
@@ -643,6 +654,7 @@ export async function ensureLocalLlmReady({ refreshAiStatus, appendLog, silent }
   if (!silent) {
     log(lastInstallError || String(status.message || "尚未安裝本地模型。請先同意並完成下載。"), "warn");
   }
+  if (!openOverlay) return false;
   await openLocalLlmOverlay();
   if (typeof refreshAiStatus === "function") await refreshAiStatus();
   return false;

@@ -6416,6 +6416,7 @@ async fn ai_status() -> serde_json::Value {
             "providerReady": local_ready,
             "localInstalled": installed,
             "localReady": local_ready,
+            "localDirMissing": local.get("installDirMissing").and_then(|v| v.as_bool()).unwrap_or(false),
             "installDir": local.get("installDir").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "message": local.get("message").and_then(|v| v.as_str()).unwrap_or("尚未安裝本地模型。"),
         })

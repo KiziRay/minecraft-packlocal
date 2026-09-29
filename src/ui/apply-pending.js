@@ -170,8 +170,11 @@ export function createApplyPendingFlow(deps) {
     return handle(result, context, depth + 1);
   }
 
-  /** 翻譯／補翻／修復／單獨套用結束後呼叫。回傳 true＝已經裝進遊戲。 */
-  async function handle(result, context, depth = 0) {
+  /**
+   * 翻譯／補翻／修復／單獨套用結束後呼叫。回傳 true＝已經裝進遊戲。
+   * `overwriteConfirmed`（B5b 審查 4a）：這一輪已在開始前確認（§3.1 選不備份並勾「我了解」），套用不再跳 D-03。
+   */
+  async function handle(result, context, depth = 0, { overwriteConfirmed = false } = {}) {
     if (context) lastContext = context;
     const status = applyStatusOf(result);
     if (status === APPLY_STATUS.applied) {
@@ -197,6 +200,7 @@ export function createApplyPendingFlow(deps) {
       return applyNow(lastContext, { overwriteConfirmed: choice === "never" }, depth);
     }
     if (status === APPLY_STATUS.needsOverwriteConfirm) {
+      if (overwriteConfirmed && depth === 0) return applyNow(lastContext, { overwriteConfirmed: true }, depth);
       if (!(await confirmOverwrite(result))) {
         showCard(result);
         return false;

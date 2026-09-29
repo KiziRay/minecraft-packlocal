@@ -15,6 +15,7 @@ export const SETTING_PATHS = [
   "appearance.uiScale",
   "appearance.uiAutoScale",
   "consent.hideVersion",
+  // 已停用（B5b：#backup-before-apply 由開始前確認的備份列取代）：留在清單讓舊設定檔照常讀寫，值一律忽略
   "translate.backupBeforeApply",
   "translate.backupChoice",
   "translate.outputStorageMode",
@@ -26,6 +27,8 @@ export const SETTING_PATHS = [
   "translate.coverageAck",
   "translate.deleteResultsAfterApply",
   "translate.deleteResultsAck",
+  // B5b：記住「不使用 AI」（"0"＝不使用 AI；其他來源存在後端 ai_mode）
+  "translate.useAi",
   "localModel.consented",
   "localModel.installDir",
   "onboarding.seenVersion",
@@ -39,6 +42,10 @@ export const SETTING_PATHS = [
   "ui.disclosure.brokenRecord",
   "ui.disclosure.copied",
   "ui.disclosure.packChanged",
+  "ui.disclosure.prestart",
+  "ui.disclosure.aiChoice",
+  "ui.disclosure.runTips",
+  "ui.disclosure.localStart",
   "ui.banner.updateDismissedVersion",
 ];
 

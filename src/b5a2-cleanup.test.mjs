@@ -40,9 +40,9 @@ test("審查 F5：.update-button 死 CSS 刪除（HTML／JS 0 引用）", () => 
   assert.ok(!read("styles/options.css").includes(".update-button"));
 });
 
-test("本包選項沒有空標題「翻譯方式」；隱藏的 #backup-before-apply 與 #use-ai 仍保留", () => {
+test("本包選項沒有空標題「翻譯方式」；#use-ai 仍保留（#backup-before-apply 在 B5b 由開始前確認的備份列取代後刪除）", () => {
   assert.ok(!html.includes('id="translation-method-group"'));
   assert.ok(!html.includes(">翻譯方式<"));
-  assert.ok(html.includes('id="backup-before-apply"'), "#backup-before-apply 仍被 app.js 與 KEY_MAP 引用，B5b 才刪");
+  assert.ok(!html.includes('id="backup-before-apply"'), "B5b：備份改在開始前確認的備份列問");
   assert.ok(html.includes('id="use-ai"'), "#use-ai 是 AI 來源的現行狀態欄位");
 });

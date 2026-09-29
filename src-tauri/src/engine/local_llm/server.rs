@@ -558,6 +558,9 @@ fn start_server_with_slots(install_dir: &Path, ngl: u32, ctx: u32, slots: u32) -
         .spawn()
         .map_err(|e| format!("無法啟動本地模型：{e}"))?;
     let pid = child.id();
+    // B5b 第二輪審查（啟動中選「仍要關閉」會不會留下孤兒）：quit_app 的 stop_own_server 若跑在 spawn 之前、
+    // 這裡的 CHILD 還沒存進去，接著的 app.exit 結束本程式 → 下一行綁上的 Job Object（KILL_ON_JOB_CLOSE）
+    // 控制代碼被 OS 收回，llama-server 跟著結束。唯一沒保護的是 spawn() 與綁 Job 之間的極短空檔（推測，未實測）。
     // 工具被工作管理員強制結束、當機等優雅關閉路徑跑不到的情況，讓 OS 自己收掉
     // 這個子程序，不要留下孤兒佔用記憶體與顯示卡（見 kill_child_when_this_process_dies）。
     crate::engine::win_process::kill_child_when_this_process_dies(&child);

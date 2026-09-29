@@ -66,7 +66,10 @@ test("本地翻不好改用線上補完：預設不勾，未選擇要說明，�
   assert.ok(!/id="local-cloud-topup"[^>]*checked/.test(html), "預設不得勾選");
   assert.ok(script.includes("尚未選擇（第一次需要時會問你）"));
   assert.ok(script.includes("CLOUD_TOPUP_CONSENT"), "設定視窗要用和主視窗相同的同意說明");
-  assert.ok(read("../app.js").includes("CLOUD_TOPUP_CONSENT"), "主視窗也要用同一份同意說明");
+  // B5b：主視窗不再跳同意框，改成開始前確認的一列（預設只用本地；選「改用線上」＝同意，且寫明會用額度）
+  assert.ok(!read("../app.js").includes("CLOUD_TOPUP_CONSENT"), "主視窗不再跳線上補完同意框");
+  const prestart = read("../flow/prestart.js");
+  assert.ok(prestart.includes("改用線上 AI 補完（會用額度）") && prestart.includes('src.cloudDraft === "1" ? "1" : "0"'), "預設只用本地，要明確選才算同意");
   assert.ok(read("./cloud-topup-consent.js").includes("額度"), "同意說明要講明會用到線上 AI 額度");
 });
 

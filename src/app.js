@@ -18,7 +18,6 @@ import {
   offerRecordReset,
 } from "./ui/apply-pending.js";
 import {
-  BACKUP_STORAGE_KEY,
   CONSENT_STORAGE_KEY,
   CONSENT_STORAGE_KEY_LEGACY,
   FONT_PREFS_STORAGE_KEY,
@@ -36,7 +35,9 @@ import { GPT_COPY } from "./ai/copy.js";
 import {
   ensureLocalLlmReady,
   forgetLocalLlmAfterExternalDelete,
+  localLlmNeedBytes,
   localLlmStatus,
+  openLocalLlmOverlay,
   syncSetupButtonLabel,
   wireLocalLlm,
 } from "./ai/local-llm.js";
@@ -44,7 +45,9 @@ import { createOnboarding } from "./onboarding/onboarding.js";
 import { createSfxControls } from "./settings/sfx.js";
 import { wireUpdateChecker } from "./core/update.js";
 import { initWebviewScale, onScalePersisted, setWebviewAutoScale, setWebviewScalePercent } from "./ui-scale.js";
-import { CLOUD_TOPUP_CONSENT } from "./core/cloud-topup-consent.js";
+import { createRunFlow } from "./flow/run-flow.js";
+import { createAiGate, startLocalForRound } from "./flow/run-start.js";
+import { AI_FIX } from "./flow/ai-readiness.js";
 import {
   SETTINGS_ACTION_EVENT,
   SETTINGS_UPDATED_EVENT,
@@ -197,7 +200,7 @@ let coverageSettlementLocked = false;
 /**
  * 進階統計的「先前已結束階段」累計基準。
  *
- * 「翻譯」「補充漏翻」「修復工作階段」各自呼叫後端的 `Engine::connect()`，各自建立
+ * 「翻譯」「接續補完」「修復工作階段」各自呼叫後端的 `Engine::connect()`，各自建立
  * 一個全新的用量計數器——這是合理的連線生命週期設計，不是 bug。bug 在前端：
  * 新階段回報的（較小的）數字直接蓋掉畫面上（較大的）舊數字，看起來像統計被清空重來。
  * 這裡把「結束的階段」的最終值先併進基準，畫面顯示永遠是「基準＋目前階段」，
@@ -698,15 +701,6 @@ function initWinbarChrome() {
   syncMaxIcon();
 }
 
-/**
- * 要不要備份改由設定檔的 translate.backupChoice 決定（第一次套用時後端回「需要詢問」，
- * 由 applyPending 問一次並寫回設定）。這裡固定回 true＝「照設定」；
- * 只有開始翻譯時選「不保留、直接覆蓋」會傳 false。
- */
-function shouldBackupBeforeApply() {
-  return true;
-}
-
 /** 翻譯完成但還沒裝進遊戲時的後續處理（備份選擇、覆蓋確認、遊戲開著、還沒啟動過遊戲）。 */
 const applyPending = createApplyPendingFlow({
   $,
@@ -715,12 +709,7 @@ const applyPending = createApplyPendingFlow({
   choiceDialog,
   appendLog: (text, level) => appendLog(text, level),
   setBusy: (busy, kind) => setBusy(busy, kind),
-  saveBackupChoice: async (value) => {
-    await setSettingPath(BACKUP_CHOICE_PATH, value);
-    void Promise.resolve(
-      emit(SETTINGS_UPDATED_EVENT, { path: BACKUP_CHOICE_PATH, value, source: "main" })
-    ).catch(() => {});
-  },
+  saveBackupChoice: (value) => saveBackupChoiceSetting(value),
   onApplied: async () => {
     setTranslationState("complete");
     await refreshBackupState();
@@ -751,6 +740,92 @@ const folderChecks = createFolderChecks({
 });
 
 /**
+ * B5b 開始前與翻譯中（§3.1 開始前確認、E1 AI 列、AI 閘門、S12、進度）在 src/flow/run-flow.js。
+ * 閘門不開任何對話框或浮層：AI 還沒就緒就由狀態卡 AI 列說出真正原因並給對應按鈕。
+ */
+/** 本地模型已安裝時把服務叫起來（不開安裝浮層）；只在 localModelRounds.begin() 之後呼叫。 */
+function startLocalModel() {
+  // silent:false：啟動失敗的原因寫進紀錄（第二輪審查 1c-3）
+  return ensureLocalLlmReady({ refreshAiStatus, appendLog, silent: false, openOverlay: false });
+}
+
+/** 三個入口共用：輪次開始後啟動本地模型；啟動中狀態卡先說「正在啟動本地模型」，等待期間按停止照停止收尾。 */
+function localRoundOptions(useAi) {
+  return {
+    useAi,
+    localMode: aiModeFromUi() === "local",
+    start: startLocalModel,
+    isStopping: () => runFlow.isStopping(),
+    onStarting: (message) => {
+      runFlow.noteMessage(message);
+      packActions.renderStatusCard();
+    },
+    log: (message) => appendLog(message, "warn"),
+  };
+}
+const aiGate = createAiGate({
+  useAi: () => !!$("use-ai")?.checked,
+  waitModeChange: () => aiModeChangePromise,
+  refreshAiStatus: () => refreshAiStatus(),
+  provider: () => $("api-provider")?.value || "",
+  localNeedBytes: () => localLlmNeedBytes(),
+  gptUsable: async () => gptStatusIsUsable(await refreshGptStatus()),
+});
+let cloudTopUpInfo = null;
+let aiRowExpanded = false;
+/** 目前這一輪是哪個動作（S12「再試一次」重跑同一個）。 */
+let currentRunOrigin = "run";
+const runFlow = createRunFlow({
+  instancePath: () => ($("instance")?.value || "").trim(),
+  aiStatus: () => latestAiStatus,
+  useAi: () => !!$("use-ai")?.checked,
+  provider: () => $("api-provider")?.value || "",
+  localNeedBytes: () => localLlmNeedBytes(),
+  backupChoice: () => currentBackupChoice(),
+  cloudInfo: () => cloudTopUpInfo,
+  gate: aiGate,
+  saveBackupChoice: (value) => saveBackupChoiceSetting(value),
+  saveCloudChoice: async (value) => {
+    setSetting(LOCAL_CLOUD_TOPUP_KEY, value);
+    cloudTopUpInfo = { needsConsent: false, configured: false };
+  },
+  toast: (text) => showAppToast(text, 3000),
+  log: (text, level) => appendLog(text, level),
+  sync: () => syncUiState(),
+  aiFix: (action) => onAiFix(action),
+  expandAi: () => {
+    aiRowExpanded = true;
+    syncUiState();
+  },
+  disclosure,
+  showBanner: (banner) => packActions.bannerArea().show(banner),
+  hideBanner: (id) => packActions.bannerArea().hide(id),
+});
+
+/** 狀態卡 AI 列的修正按鈕：直達缺的那一項（不疊對話框）。 */
+function onAiFix(action) {
+  if (action === AI_FIX.discordLogin) return void $("btn-discord-login")?.click();
+  if (action === AI_FIX.discordJoin) return void $("btn-discord-join")?.click();
+  if (action === AI_FIX.localDownload || action === AI_FIX.localSetDir) return void openLocalLlmOverlay();
+  if (action === AI_FIX.gptLogin) return void beginGptLogin();
+  if (action === AI_FIX.customKey) {
+    aiRowExpanded = true;
+    syncUiState();
+    return void $("api-key")?.focus();
+  }
+  // 重新檢查、本地模型再試一次
+  void refreshAiStatus();
+}
+
+/** 記住「不使用 AI」（translate.useAi；其他來源存在後端 ai_mode）。 */
+const USE_AI_KEY = "mcpl-use-ai";
+function restoreUseAiChoice() {
+  if (getSetting(USE_AI_KEY, "") !== "0") return;
+  if ($("ai-source-none")) $("ai-source-none").checked = true;
+  syncUseAiFromSource();
+}
+
+/**
  * B5a-1 流程接線（狀態卡、D 區、S19、刪除結果並重翻、橫幅、浮層焦點）在 src/flow/pack-actions.js；
  * 這裡只把 app.js 的狀態與既有函式交給它。
  */
@@ -759,10 +834,14 @@ const packActions = createPackActions({
   doc: document,
   invoke,
   folderChecks,
+  runFlow,
   getSetting,
   setSetting,
   disclosure,
   removalFlow,
+  onSupplement: () => onSupplement(),
+  onRepair: () => onRepair(),
+  openIssueReport: () => showIssueOverlay(),
   getState: () => ({
     consentAccepted: hasHiddenConsentOverlay(),
     validation: instanceValidation,
@@ -819,25 +898,6 @@ function applyContextFromUi(outputDir) {
 /** 套用後若後端偵測到同模組內容的其他資料夾，這裡統一抽出提醒文字。 */
 function siblingInstanceWarning(result) {
   return (result && (result.siblingInstanceWarning || result.sibling_instance_warning)) || "";
-}
-
-function loadBackupPreference() {
-  const input = $("backup-before-apply");
-  if (!input) return;
-  try {
-    const saved = localStorage.getItem(BACKUP_STORAGE_KEY);
-    if (saved === "0" || saved === "1") input.checked = saved === "1";
-  } catch (_) {
-    /* 使用預設的安全選項 */
-  }
-}
-
-function saveBackupPreference() {
-  try {
-    localStorage.setItem(BACKUP_STORAGE_KEY, shouldBackupBeforeApply() ? "1" : "0");
-  } catch (_) {
-    /* 儲存失敗不影響本次套用 */
-  }
 }
 
 function customOutputEnabled() {
@@ -1601,6 +1661,12 @@ function isCancellation(e) {
 }
 
 /** 統一處理各流程的失敗／取消收尾 */
+/** 記住備份選擇（D-04 與 §3.1 備份列共用）：合併寫入設定檔後通知設定視窗（G0.1）。 */
+async function saveBackupChoiceSetting(value) {
+  await setSettingPath(BACKUP_CHOICE_PATH, value);
+  void Promise.resolve(emit(SETTINGS_UPDATED_EVENT, { path: BACKUP_CHOICE_PATH, value, source: "main" })).catch(() => {});
+}
+
 function currentBackupChoice() {
   const value = getSettingPath(BACKUP_CHOICE_PATH, "");
   return value === "always" || value === "never" ? value : "";
@@ -1624,8 +1690,10 @@ function offerRecordResetIfBroken(e, instancePath) {
   });
 }
 
-function handleRunFailure(e, whatFailed) {
+function handleRunFailure(e, whatFailed, origin = "run") {
   offerRecordResetIfBroken(e);
+  // B5b S12：依原因給主要按鈕（本批暫用錯誤字串判斷，分類碼在後續批次）；停止不是錯誤
+  if (!isCancellation(e)) runFlow.recordFailure(origin, formatInvokeError(e));
   if (isCancellation(e)) {
     // 這裡是「已經停下來了」的收尾，不是「正在停」。舊版把訊息寫「已停止」
     // 卻同時掛上 cancelling 徽章（顯示「取消中」），畫面上兩個互相矛盾的狀態
@@ -2236,11 +2304,11 @@ function stateBadgeLabel(state) {
     case "waiting":
       return "等待回應";
     case "retrying":
-      return "重試中";
+      return "連線中斷，自動重試中";
     case "throttled":
-      return "已降速（限流）";
+      return "服務商要求放慢，已自動放慢";
     case "degraded":
-      return "已降級";
+      return "較慢，已自動放寬等待時間";
     case "cancelling":
       return "取消中";
     case "completed_with_pending":
@@ -2563,6 +2631,11 @@ function setProgress(percent, message, opts) {
   }
   setProgressStateBadge(payload ? payload.state : failed ? null : null);
   updateLinearSteps(p, message, failed, payload || (failed ? lastProgressPayload : null));
+  // B5b 翻譯中（S09）：狀態卡一句現況＋已完成幾條＋大約還要多久；技術原句只進紀錄
+  if (progressBusy && job === "translate") {
+    runFlow.onProgress({ percent: p, message, payload: payload || lastProgressPayload, stepIndex: lastStepIdx });
+    packActions.renderStatusCard();
+  }
   setProgBarWorking(false);
   // 日誌去重（AI 等待秒數變化不重寫）。AI 翻譯中的完整文案（批次/重試/token 明細）
   // 已經在上面 consumeProgressPayload／consumeCoverageMessage 完整寫進進階統計面板，
@@ -2628,15 +2701,22 @@ function setBusy(busy, jobKind) {
     resetStopButton(stop);
   }
   if (fontStop) fontStop.hidden = !busy || kind !== "font";
+  // 右欄的進度訊息翻譯中收起（狀態卡已經在說，一件事只在一處說；技術原句在紀錄）
+  const railMessage = $("rail-status-message");
+  if (railMessage) railMessage.hidden = !!busy && kind === "translate";
+  // 審查 5b：右欄的百分比、進度條、條數也收起（狀態卡已顯示）；右欄只留步驟燈號與詳細數字
+  for (const id of ["prog-pct", "prog-count", "prog-fill"]) {
+    const el = $(id);
+    const target = id === "prog-fill" ? el?.parentElement : el;
+    if (target) target.hidden = !!busy && kind === "translate";
+  }
   // 仍鎖定：開第二個重任務、改路徑、連線設定等
   // btn-run、btn-inst 不在這裡：它們改用 aria-disabled＋就地原因（狀態卡、D 區 S20）
   const hardLockIds = [
-    "btn-repair",
     "btn-output-pick",
     "btn-save-adv",
     "btn-test-api",
     "use-ai",
-    "backup-before-apply",
     "api-provider",
     "api-key",
     "base-url",
@@ -2976,7 +3056,9 @@ function syncUiState() {
   const packState = packActions.renderStatusCard();
   const aiGroup = $("ai-options-group");
   if (aiGroup) {
-    const showAi = packState.showAiRow && hasInstance && !!instanceValidation.ok;
+    // E1 展開：按「更換」或第一次（說明 aiChoice 還沒退場）時才展開四選一；平常只有狀態卡那一列
+    const showAi =
+      packState.showAiRow && hasInstance && !!instanceValidation.ok && (aiRowExpanded || disclosure.isShown("aiChoice"));
     aiGroup.hidden = !showAi;
     aiGroup.setAttribute("aria-hidden", showAi ? "false" : "true");
   }
@@ -2988,9 +3070,8 @@ function syncUiState() {
       page === "translate" && !(hasInstance && !!instanceValidation.ok) && !progressBusy;
   }
   // 開始翻譯／停止翻譯在狀態卡（renderStatusCard），這裡不再另外控制
-  // 「補充漏翻」與「重新翻譯缺漏」已移除：補翻整併進「開始翻譯」的
+  // 舊的補翻按鈕與「重新翻譯缺漏」已移除：整併進「開始翻譯」的
   // 「接續補完」選項與同輪自動重試；兩顆按鈕留著只會讓人不知道該按哪個。
-  toggleHidden("btn-repair", !failed || locked);
   void refreshConsistencyMergeUi();
   // 只看磁碟有沒有可分享檔案（hasShareableFiles）會讓「分享給其他玩家」在選到一個
   // 本機早有舊結果的資料夾時就提早出現，跟這次根本還沒跑翻譯互相矛盾。注意：
@@ -3533,6 +3614,16 @@ async function refreshAiStatus() {
       refreshAiStatusInFlight = null;
     }
   })();
+  // B5b：狀態卡 AI 列跟著最新狀態重畫（AI 狀態只在那一列）
+  const aiStatusTask = refreshAiStatusInFlight;
+  void aiStatusTask.then(async () => {
+    if (cloudTopUpInfo === null && aiModeFromUi() === "local") await refreshCloudTopUpInfo();
+    try {
+      syncUiState();
+    } catch (_) {
+      /* 畫面還沒準備好時略過 */
+    }
+  });
   return refreshAiStatusInFlight;
 }
 
@@ -3676,7 +3767,7 @@ async function changeAiMode(mode) {
     }
   }
   if (revision !== aiModeRevision) return latestAiStatus;
-  // 切換事件不發起遠端驗證；真正開始翻譯時 ensureAiReadyForAction 會取得最新狀態。
+  // 切換事件不發起遠端驗證；真正開始翻譯時 AI 閘門（runFlow.beforeStart）會取得最新狀態。
   return latestAiStatus;
 }
 
@@ -3691,63 +3782,23 @@ function queueAiModeChange(mode) {
 }
 
 /**
- * 選了本地模型的人，第一次要先明確同意才會用到雲端補量（P0-05）。
- *
- * 「本地模型」這個選擇本身就表達了不想把文字送上網、也不想付費。舊版這個開關
- * 沒設定過時預設是開的，於是本地翻不好時會靜默改打雲端 API，用掉使用者自己的額度。
- * 後端已改成預設關閉；這裡負責問一次，讓想用的人有辦法打開。
- * 已經選過（不論開或關）的人不會再被問。
+ * 本地翻不好時改用線上 AI 補完：還沒選過、而且已設好線上 AI（自訂金鑰或已登入的 ChatGPT）時，
+ * 由開始前確認（§3.1）問一次（G0.6：預設只用本地）。這裡只讀，不跳對話框。
  */
-async function ensureCloudTopUpConsent() {
-  let view;
+async function refreshCloudTopUpInfo() {
   try {
-    view = await invoke("cloud_topup_choice_cmd");
-  } catch (_) {
-    return; // 問不到就當作沒同意，後端預設關閉，不影響翻譯進行
-  }
-  if (!view || !view.needsConsent) return;
-
-  const yes = await confirmDialog({ ...CLOUD_TOPUP_CONSENT });
-  try {
-    setSetting(LOCAL_CLOUD_TOPUP_KEY, yes ? "1" : "0");
-  } catch (_) {
-    /* 存不起來就下次再問，不擋翻譯 */
-  }
-  appendLog(
-    yes
-      ? "已同意：本地翻不好時改用線上 AI 補完（會用到你的 API 額度）。"
-      : "已選擇只用本地模型：文字不會送出，也不會產生費用。翻不好的句子會列進待補清單。",
-    "info"
-  );
-}
-
-async function ensureAiReadyForAction() {
-  await aiModeChangePromise;
-  let status = await refreshAiStatus();
-  if (status && status.ready !== false) {
-    const mode = String((status.aiMode || status.ai_mode) || aiModeFromUi());
-    if (mode === "gpt") return gptStatusIsUsable(await refreshGptStatus());
-    if (mode === "local") {
-      await ensureCloudTopUpConsent();
-      return ensureLocalLlmReady({ refreshAiStatus, appendLog, silent: true });
+    const view = await invoke("cloud_topup_choice_cmd");
+    if (!view || !view.needsConsent) {
+      cloudTopUpInfo = { needsConsent: false, configured: false };
+      return;
     }
-    return true;
+    const api = await invoke("get_api_settings").catch(() => null);
+    const hasKey = !!(api && (api.hasKey ?? api.has_key));
+    const gptUsable = hasKey ? false : gptStatusIsUsable(await refreshGptStatus().catch(() => null));
+    cloudTopUpInfo = { needsConsent: true, configured: hasKey || gptUsable };
+  } catch (_) {
+    cloudTopUpInfo = { needsConsent: false, configured: false }; // 問不到就不出這一列（後端預設關閉）
   }
-  const mode = String((status && (status.aiMode || status.ai_mode)) || aiModeFromUi());
-  if (mode === "local") {
-    await ensureCloudTopUpConsent();
-    return ensureLocalLlmReady({ refreshAiStatus, appendLog });
-  }
-  const message = String((status && status.message) || "目前無法確認 AI 狀態。");
-  appendLog(message, "warn");
-  if (!(status && (status.discordReady || status.discord_ready))) {
-    $("managed-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  } else if (mode === "custom") {
-    $("api-key")?.focus();
-  } else if (mode === "gpt") {
-    $("gpt-auth-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
-  return false;
 }
 
 /**
@@ -3868,7 +3919,7 @@ async function checkResourcePackHealth(instancePath) {
 async function handleCloseWhileBusy() {
   const jobName =
     window.__busyJobKind === "repair" ? "修復" :
-    window.__busyJobKind === "supplement" ? "補充漏翻" : "翻譯";
+    window.__busyJobKind === "supplement" ? "接續補完" : "翻譯";
   const leave = await confirmDialog({
     title: jobName + "還在進行中",
     body:
@@ -4423,9 +4474,6 @@ function wireCriticalUiDelegation() {
         case "btn-overflow":
           run(btn.id, () => openAppSettings("general"));
           break;
-        case "btn-repair":
-          run(btn.id, () => onRepair());
-          break;
         case "btn-package":
           run(btn.id, () => packageShare());
           break;
@@ -4461,6 +4509,7 @@ async function adoptInstancePath(p, { silentProbe = false } = {}) {
   resetStepPanelForNewInstance();
   hideLocalCacheCard();
   packActions.clearRemoval();
+  runFlow.onFolderChanged();
   packChangeProbe = null;
   versionDetectFailed = false;
   clearAutoDetectedVersion();
@@ -4573,7 +4622,6 @@ function wireWorkbenchActions() {
   bind("btn-quit", () => onQuitApp());
   bind("btn-run", () => onRun());
   bind("btn-stop", () => onStop());
-  bind("btn-repair", () => onRepair());
   bind("btn-package", () => packageShare());
 }
 
@@ -4979,6 +5027,8 @@ async function ensureGameClosed(instancePath, actionLabel) {
 async function onRun() {
   // 狀態卡的主要按鈕停用時用 aria-disabled（仍可聚焦、讀得到原因），點了不動作
   if (isAriaDisabled($("btn-run"))) return;
+  // B5b：「重新翻譯」刻意多一步，先進開始前確認（R-8）；確認模式裡再按才開跑
+  if (runFlow.interceptRun(packActions.currentState())) return;
   packActions.clearRemoval();
   return runExclusive("run", onRunInner, {
     onBusy: () => appendLog("「開始翻譯」已經在執行中，請稍候。", "warn"),
@@ -5000,6 +5050,11 @@ async function onRunInner() {
     }
   }
   if (!outputDir) return log("翻譯結果位置還沒準備好，請重新選擇遊戲資料夾。");
+
+  // B5b：AI 閘門（翻譯、修復、接續補完共用；不開任何對話框）＋按下開始時記住 §3.1 的選擇（備份、本地翻不好時）。
+  // 放在三選一之前：不會先問三選一、再說 AI 不能用。沒通過時原因在狀態卡 AI 列。
+  const start = await runFlow.beforeStart("run");
+  if (!start.ok) return;
 
   // 覆蓋提醒不能只看 localCacheProbe：它只在「選資料夾」或「啟動還原」時才填，
   // 剛跑完一次翻譯、或探測失敗時是 null，於是最該提醒的情況反而不提醒。
@@ -5045,7 +5100,10 @@ async function onRunInner() {
     }
     if (choice === "supplement") {
       appendLog("改用「接續補完」：沿用既有結果，只補沒翻到的句子。");
-      return onSupplementInner();
+      // 同一次點擊：開始翻譯時選了「這次不用 AI」，轉成接續補完也不用 AI（明確帶入，審查 1b）
+      // 第二輪審查 1b／1d：轉接續補完前記住 §3.1 的選擇並清掉「這次不用 AI」（改明確帶入）
+      const handOffConfirmed = await runFlow.handOffToSupplement();
+      return onSupplementInner({ skipAi: !start.useAi, overwriteConfirmed: handOffConfirmed });
     }
     if (choice === "newcopy") {
       const nextDir = await invoke("next_result_dir_cmd", { outputDir }).catch(() => "");
@@ -5064,30 +5122,7 @@ async function onRunInner() {
   applyPending.hideCard();
 
   writeLastInstancePath(instancePath);
-  let useAi = !!$("use-ai").checked;
-  if (useAi && !(await ensureAiReadyForAction())) {
-    // 使用者明明開了 AI，卻被問「要不要不用 AI 跑一次」是多餘的岔路——
-    // 這裡只講「為什麼現在不能用」與「怎麼解決」，把不用 AI 降級成次要選項。
-    const aiMode = aiModeFromUi();
-    const why =
-      aiMode === "local"
-        ? "本地模型現在啟動不起來。常見原因是模型資料夾被移動或刪除，或這台電腦的記憶體不足。"
-        : aiMode === "gpt"
-          ? "GPT 登入尚未完成或已過期。"
-          : "自訂 API 金鑰尚未通過驗證。";
-    const fallback = await confirmDialog({
-      title: "AI 現在無法使用",
-      body:
-        why +
-        "\n\n上方的 AI 區塊可以重新設定。如果你想先看看翻譯效果，也可以不使用 AI 跑一次——" +
-        "術語表、翻譯記憶與簡繁轉換都不需要 AI，之後再按「補充漏翻」把剩下的補上。",
-      confirmLabel: "先不使用 AI 跑一次",
-      cancelLabel: "回去設定 AI",
-    });
-    if (!fallback) return;
-    useAi = false;
-    appendLog("這一輪不使用 AI：只用術語表、翻譯記憶與簡繁轉換。之後可用「補充漏翻」再補。", "warn");
-  }
+  const useAi = start.useAi;
   let targetVersion = ($("target-version")?.value || "").trim();
   if (targetVersion && !isSupportedMinecraftVersion(targetVersion)) {
     setVersionBlock(unsupportedVersionMessage(targetVersion));
@@ -5111,14 +5146,20 @@ async function onRunInner() {
   // 第一次勾要同列確認；B5a-2）。開始前不再跳三選一。只管結果資料夾，備份照 backupChoice（G1.8）。
   const skipResultFolder = deleteResultsAfterApplyEnabled();
 
+  // 審查 1d：真的要開跑才記住 §3.1 的選擇（三選一取消、版本擋下都不記）
+  await runFlow.commitRunChoices();
+  const overwriteConfirmed = runFlow.takeOverwriteConfirmed();
+
   setBusy(true, "translate");
+  currentRunOrigin = "run";
+  runFlow.beginRun({ localMode: useAi && aiModeFromUi() === "local" });
   lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
   currentRunStamp = newRunStamp();
   clearLog("開始翻譯");
   resetCoverageMetrics("翻譯統計蒐集中");
-  // 只有「開始翻譯」（全新一輪）才清空步驟計時；修復／補充漏翻是接續同一輪，時間要繼續累加。
+  // 只有「開始翻譯」（全新一輪）才清空步驟計時；修復／接續補完是接續同一輪，時間要繼續累加。
   resetStepTimings();
   if ($("btn-package")) $("btn-package").disabled = true;
   // 「不保留」只管翻譯結果資料夾；備份一律照設定（後端讀 translate.backupChoice）
@@ -5136,8 +5177,11 @@ async function onRunInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
+    // 審查 1c（G0.5）：本地模型在輪次開始之後才啟動；啟動不起來走 S12，finally 照樣關閉這一輪
+    await startLocalForRound(localRoundOptions(useAi));
     const result = await invoke("one_click_translate", {
       instancePath,
       outputDir,
@@ -5222,6 +5266,7 @@ async function onRunInner() {
       appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「分享給其他玩家」。");
     }
     await cleanupPreparedTranslationHelper();
+    runOk = true;
   } catch (e) {
     if (isCancellation(e)) {
       setTranslationState("idle");
@@ -5229,6 +5274,7 @@ async function onRunInner() {
     } else if (isDiscordGateError(e)) {
       setTranslationState("idle");
       setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "請先完成 Discord 驗證");
+      runFlow.recordFailure(currentRunOrigin, formatInvokeError(e));
       handleDiscordGateError(e);
       return;
     } else {
@@ -5239,11 +5285,12 @@ async function onRunInner() {
       appendLog("可把上方錯誤訊息留下來方便排查。");
     }
   } finally {
+    runFlow.endRun({ ok: runOk });
     setBusy(false);
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
   }
-  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
+  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx, 0, { overwriteConfirmed });
 }
 
 /** 舊版共用 work／work\\翻譯結果 → 應改走 per-instance */
@@ -5302,10 +5349,14 @@ async function onRepairInner() {
     /* 繼續交給後端 */
   }
 
-  const useAi = !!$("use-ai").checked;
-  if (useAi && !(await ensureAiReadyForAction())) return;
+  // B5b：同一個 AI 閘門；沒通過時狀態卡顯示紅色 AI 列並停用「修復翻譯檔」（不跳視窗）
+  const start = await runFlow.beforeStart("repair");
+  if (!start.ok) return;
+  const useAi = start.useAi;
 
   setBusy(true, "translate");
+  currentRunOrigin = "repair";
+  runFlow.beginRun({ localMode: useAi && aiModeFromUi() === "local" });
   lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
@@ -5316,8 +5367,11 @@ async function onRepairInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
+    // 審查 1c（G0.5）：本地模型在輪次開始之後才啟動；啟動不起來走 S12，finally 照樣關閉這一輪
+    await startLocalForRound(localRoundOptions(useAi));
     const result = await invoke("repair_translation_pack", {
       outputDir,
       useAi,
@@ -5335,6 +5389,7 @@ async function onRepairInner() {
     }
     setTranslationState("complete");
     if (isApplyPending(result)) applyFollowUp = { result, ctx: applyContextFromUi(outputDir) };
+    runOk = true;
   } catch (e) {
     if (isCancellation(e)) {
       setTranslationState("idle");
@@ -5342,13 +5397,15 @@ async function onRepairInner() {
     } else if (isDiscordGateError(e)) {
       setTranslationState("idle");
       setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "請先完成 Discord 驗證");
+      runFlow.recordFailure(currentRunOrigin, formatInvokeError(e));
       handleDiscordGateError(e);
       return;
     } else {
       setTranslationState("failed");
     }
-    handleRunFailure(e, "修復失敗");
+    handleRunFailure(e, "修復失敗", "repair");
   } finally {
+    runFlow.endRun({ ok: runOk });
     setBusy(false);
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
@@ -5365,17 +5422,19 @@ async function onRepairInner() {
  */
 async function onSupplement() {
   return runExclusive("supplement", onSupplementInner, {
-    onBusy: () => appendLog("「補充漏翻」已經在執行中，請稍候。", "warn"),
+    onBusy: () => appendLog("「接續補完」已經在執行中，請稍候。", "warn"),
   });
 }
 
-async function onSupplementInner() {
+async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } = {}) {
   const outputDir = selectedOutputDir();
   if (!outputDir) {
     return log("請選與上次相同的「翻譯結果」位置。");
   }
-  const useAi = !!$("use-ai")?.checked;
-  if (useAi && !(await ensureAiReadyForAction())) return;
+  // B5b：同一個 AI 閘門；從狀態卡按接續補完、AI 還沒就緒 → 紅色 AI 列＋接續補完停用（不跳視窗）
+  const start = await runFlow.beforeStart("supplement", { skipAi });
+  if (!start.ok) return;
+  const useAi = start.useAi;
   try {
     const st = await invoke("session_status", { outputDir });
     if (!(st.ok || st.OK)) {
@@ -5396,10 +5455,12 @@ async function onSupplementInner() {
   }
 
   setBusy(true, "translate");
+  currentRunOrigin = "supplement";
+  runFlow.beginRun({ localMode: useAi && aiModeFromUi() === "local" });
   lastStepIdx = -1;
   setTranslationState("running");
   lastProgressLogKey = "";
-  clearLog("開始再補一些");
+  clearLog("開始接續補完");
   // 補充漏翻是接續同一個整合包的翻譯效果，不是另開一輪新翻譯——進階統計要接著累加，
   // 不能讓「翻譯」階段辛苦累出來的數字被「補充」階段的新引擎歸零蓋掉。
   resetCoverageMetrics("補翻統計蒐集中", { carryForward: true });
@@ -5408,8 +5469,11 @@ async function onSupplementInner() {
   await paintBeforeInvoke();
 
   let applyFollowUp = null;
+  let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
+    // 審查 1c（G0.5）：本地模型在輪次開始之後才啟動；啟動不起來走 S12，finally 照樣關閉這一輪
+    await startLocalForRound(localRoundOptions(useAi));
     const result = await invoke("supplement_translate", {
       outputDir,
       useAi,
@@ -5444,6 +5508,7 @@ async function onSupplementInner() {
       appendLog("複查完成，結果已重新套用到遊戲。", "info");
     }
     await cleanupPreparedTranslationHelper();
+    runOk = true;
   } catch (e) {
     if (isCancellation(e)) {
       setTranslationState("idle");
@@ -5451,18 +5516,20 @@ async function onSupplementInner() {
     } else if (isDiscordGateError(e)) {
       setTranslationState("idle");
       setProgress(Math.max(lastRealPercent, Math.floor(displayPercent) || 0), "請先完成 Discord 驗證");
+      runFlow.recordFailure(currentRunOrigin, formatInvokeError(e));
       handleDiscordGateError(e);
       return;
     } else {
       setTranslationState("failed");
     }
-    handleRunFailure(e, "再補一些失敗");
+    handleRunFailure(e, "接續補完失敗", "supplement");
   } finally {
+    runFlow.endRun({ ok: runOk });
     setBusy(false);
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
   }
-  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
+  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx, 0, { overwriteConfirmed });
 }
 
 /** 停止：後端在下一個檢查點乾淨收尾，已完成的檔案保留 */
@@ -5478,6 +5545,9 @@ async function onStop() {
     btn.textContent = STOP_LABELS.sending;
   }
   setProgressStateBadge("cancelling");
+  // B5b S10：狀態卡「正在停止，寫出已翻好的部分…」（停止鈕本身的文字照舊由 stop-button 管，G4.25）
+  runFlow.markStopping();
+  packActions.renderStatusCard();
   appendLog(
     "已要求停止，等目前這一步做完就會收尾；有效譯文會上傳共享庫，已上傳過的不會重複灌庫。",
     "warn"
@@ -5706,7 +5776,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   // 分頁方向鍵（規格 §6）：左右切換「翻譯」「字體工具」，只有目前分頁在 Tab 順序裡
   syncWorkbenchTabKeys = wireTabKeys($("workbench-tabs"));
   // 設定改存實體檔案（跟著工具走），不再只依賴 WebView2 的 localStorage 快取。
-  // 必須在 initTheme／loadBackupPreference 之前完成，否則那些函式會讀到還沒
+  // 必須在 initTheme 等讀設定的函式之前完成，否則那些函式會讀到還沒
   // 從檔案同步回來的舊值。失敗會靜默降級成純 localStorage，不擋啟動。
   await loadSettings().catch(() => null);
   // 後端在「翻譯中被要求關閉」時發這個訊號，由前端問使用者並先落檔
@@ -5739,7 +5809,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       ).catch(() => {});
     });
     initWebviewScale();
-    loadBackupPreference();
+    restoreUseAiChoice();
     syncAiPanel(false);
     apiSettingsTask = refreshApiSettings().catch((e) => {
       try {
@@ -5908,6 +5978,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       // 「不使用 AI」只是關掉 AI 那一層，共享庫／術語表／翻譯記憶照跑，
       // 也不必為它去切換後端的 AI 模式（那會白白觸發登入檢查）。
       syncUseAiFromSource();
+      // B5b：記住「不使用 AI」（關掉工具再開仍是不使用 AI）
+      setSetting(USE_AI_KEY, nextMode === "none" ? "0" : "1");
       if (nextMode === "none") {
         syncUiState();
         return;
@@ -5923,17 +5995,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireLocalLlm({
     refreshAiStatus,
     appendLog,
-    // 下載完就該能翻譯：關掉 overlay、回到工作台、把「開始翻譯」帶到眼前。
-    onReadyToTranslate: () => {
+    // 「完成，回到翻譯」：只關浮層回到狀態卡（不直接開跑）；AI 列重讀狀態，焦點交給主要按鈕
+    onReadyToTranslate: async () => {
       showAppPage("translate");
+      await refreshAiStatus();
       const run = $("btn-run");
-      if (run && !run.hidden) {
-        run.scrollIntoView({ behavior: "smooth", block: "center" });
-        run.focus?.();
-        appendLog("本地模型已就緒，可以按「開始翻譯」。");
-      } else {
-        appendLog("本地模型已就緒。選好遊戲資料夾後就能開始翻譯。");
-      }
+      if (run && !run.hidden) run.focus?.();
+      else $("status-card-sentence")?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
     },
   });
   if ($("btn-gpt-overlay-close")) $("btn-gpt-overlay-close").onclick = closeGptLoginOverlay;
@@ -6057,9 +6125,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
       syncUiState();
     };
-  }
-  if ($("backup-before-apply")) {
-    $("backup-before-apply").onchange = saveBackupPreference;
   }
   // btn-quit／btn-run／btn-stop／supplement／repair 已由 wireWorkbenchActions 接線
   if ($("btn-save-adv")) $("btn-save-adv").onclick = onSaveAdv;
@@ -6454,6 +6519,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       const message = p.message || p.Message || "";
       if (!message) return;
       consumeCoverageMessage(message);
+      // B5b：本地模型字句的白話結論（次行一次）、N-07；原句照舊只進紀錄
+      runFlow.noteMessage(message);
       if (level === "error") appendError(message);
       else if (level === "warn") appendLog(message, "warn");
       else appendLog(message, "info");

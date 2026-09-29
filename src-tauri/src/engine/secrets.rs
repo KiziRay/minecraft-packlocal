@@ -78,8 +78,11 @@ fn default_model() -> String {
 /// 曾經是 `local`：新使用者選完資料夾按下第一顆按鈕，換來的是「請先登入 Discord」
 /// 加上數 GB 下載——最貴的一條路被放在最前面。改為 `custom` 後，沒設定金鑰時
 /// 前端會直接提供「先用基本翻譯跑一次」的出口，使用者永遠有下一步可走。
+/// B5b：沒選過＝空字串，由 [`migrate_legacy_ai_mode`] 決定——有自訂金鑰的舊設定維持自訂 API，
+/// 其餘是本地模型（與前端預設 #ai-source-local 一致，規格 §9 待確認 2）。舊版這裡是 "custom"，
+/// 全新安裝的後端是自訂 API、畫面卻勾本地模型，前後端不一致。
 fn default_ai_mode() -> String {
-    "custom".into()
+    String::new()
 }
 
 fn default_gpt_model() -> String {
@@ -193,7 +196,7 @@ fn normalize_ai_mode(mode: &str) -> Option<&'static str> {
 pub fn migrate_legacy_ai_mode(mode: &str, has_key: bool) -> &'static str {
     match normalize_ai_mode(mode) {
         Some(m) => m,
-        None if mode.trim().eq_ignore_ascii_case("managed") => {
+        None if mode.trim().is_empty() || mode.trim().eq_ignore_ascii_case("managed") => {
             if has_key {
                 "custom"
             } else {
@@ -791,6 +794,22 @@ mod tests {
         validate_model, AiProvider, MaxTokensField,
     };
     use serde_json::json;
+
+    /// B5b：預設 AI 前後端一致（規格待確認 2：維持本地模型）。前端 index.html 的預設勾選是
+    /// #ai-source-local（JS 測試 b5b-wiring.test.mjs 鎖住）；後端沒有設定、空值、未知值都是 local。
+    #[test]
+    fn b5b_default_ai_mode_is_local_like_the_frontend() {
+        let fresh: super::SecretsFile = serde_json::from_str("{}").expect("空設定檔要能讀");
+        assert_eq!(super::effective_ai_mode(&fresh), "local");
+        assert_eq!(migrate_legacy_ai_mode("", false), "local");
+        // 舊設定檔沒有 ai_mode 欄位、但已經填了自訂金鑰：維持自訂 API（不讓升級改掉玩家的來源）
+        assert_eq!(migrate_legacy_ai_mode("", true), "custom");
+        assert_eq!(migrate_legacy_ai_mode("something-else", true), "local");
+        let html = include_str!("../../../src/index.html");
+        let local = html.find("id=\"ai-source-local\"").expect("前端有本地模型選項");
+        let tag_end = html[local..].find('>').expect("標籤結尾") + local;
+        assert!(html[local..tag_end].contains("checked"), "前端預設勾選本地模型");
+    }
 
     #[test]
     fn turning_off_cloud_top_up_actually_works_whatever_type_it_was_stored_as() {

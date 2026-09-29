@@ -183,3 +183,20 @@
   color: var(--ink);
 }
 .tab-badge[hidden] { display: none; }
+
+/* B5b 規格 §3.1 開始前確認：每列一行；紅列（需要處理）帶唯一的修正按鈕 */
+.status-card-rows { display: grid; gap: var(--space-2); margin: var(--space-3) 0 0; }
+.status-card-rows[hidden] { display: none; }
+.prestart-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--line, currentColor); border-radius: 8px; }
+.prestart-row[data-tone="block"] { border-color: var(--danger, #c0392b); border-left-width: 4px; }
+.prestart-row-text { font-weight: 600; }
+.prestart-options { display: inline-flex; flex-wrap: wrap; gap: var(--space-3); }
+.prestart-option, .prestart-ack { display: inline-flex; align-items: center; gap: var(--space-1); }
+.prestart-note { flex-basis: 100%; color: var(--muted); }
+
+/* B5b 規格 §3.2 翻譯中：已完成幾條＋進度條、大約還要多久、白話徽章、保證語 */
+.status-card-progress { margin: var(--space-2) 0 0; }
+.status-card-progress[hidden] { display: none; }
+.status-card-progress-line { display: flex; flex-wrap: wrap; gap: var(--space-3); margin: var(--space-1) 0 0; }
+.status-card-progress-line [hidden], .status-card-reassure[hidden] { display: none; }
+.status-card-reassure { margin: var(--space-1) 0 0; color: var(--muted); }

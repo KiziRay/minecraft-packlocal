@@ -33,7 +33,6 @@ let health = { status: "missing", backup: "", detail: "" };
 const KEY_MAP = {
   "modpack-i18n-theme": "appearance.theme",
   "modpack-i18n-consent-hide-v1.0.9": "consent.hideVersion",
-  "modpack-i18n-backup-before-apply": "translate.backupBeforeApply",
   "modpack-i18n-font-prefs": "appearance.fontPrefs",
   "modpack-i18n-sfx-volume-v1": "appearance.sfxVolume",
   "modpack-i18n-sfx-muted-v1": "appearance.sfxMuted",
@@ -59,6 +58,11 @@ const KEY_MAP = {
   "mcpl-banner-update-dismissed": "ui.banner.updateDismissedVersion",
   "mcpl-delete-results-after-apply": "translate.deleteResultsAfterApply",
   "mcpl-delete-results-ack": "translate.deleteResultsAck",
+  "mcpl-use-ai": "translate.useAi",
+  "mcpl-disclosure-prestart": "ui.disclosure.prestart",
+  "mcpl-disclosure-ai-choice": "ui.disclosure.aiChoice",
+  "mcpl-disclosure-run-tips": "ui.disclosure.runTips",
+  "mcpl-disclosure-local-start": "ui.disclosure.localStart",
 };
 
 /** 舊版鍵名 → 目前鍵名。目前的鍵沒有值時，才用舊鍵的值搬進設定檔。 */
@@ -72,6 +76,8 @@ const REMOVED_LOCAL_KEYS = [
   "modpack-i18n-keep-local-model-v1",
   // B5a-2：「發現已翻過時提醒我」刪除（狀態卡永遠顯示現況），設定檔裡的舊值一律忽略
   "modpack-i18n-cache-remind-v1",
+  // B5b：隱藏的「套用前建立備份」勾選刪除（備份照 translate.backupChoice，§3.1 備份列第一次問）
+  "modpack-i18n-backup-before-apply",
 ];
 
 export { KEY_MAP, LEGACY_ALIASES };

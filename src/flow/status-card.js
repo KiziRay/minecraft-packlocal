@@ -8,6 +8,7 @@
  */
 import { ACTION, STATE } from "./pack-state.js";
 import { DISCLOSURES } from "./disclosure.js";
+import { renderPrestartRows, renderRunProgress } from "./prestart-view.js";
 
 /** 主要動作 → 狀態卡裡對應的按鈕 id（同一時間只露出其中一顆）。 */
 export const PRIMARY_BUTTON_IDS = Object.freeze({
@@ -70,6 +71,9 @@ export function planStatusCard(state, { extraShown = null } = {}) {
     more: Array.isArray(s.more) ? s.more : [],
     showAiRow: !!s.showAiRow,
     versionRow: !!s.showVersionRow,
+    // B5b：§3.1 開始前確認的列（只在顯示 AI 列的狀態）與翻譯中進度區（S09）
+    rows: s.showAiRow && Array.isArray(s.rows) ? s.rows : [],
+    progress: s.id === STATE.translating && s.progress ? s.progress : null,
   };
 }
 
@@ -105,7 +109,7 @@ function renderActionList(container, items, doc, onAction, className) {
  * 把計畫套到畫面上。`$` 取 id、`doc` 用來建次要按鈕；`onAction` 收次要／更多按鈕的動作。
  * 主要按鈕沿用既有接線（#btn-run→onRun、#btn-stop→onStop），這裡只管顯示。
  */
-export function applyStatusCard(plan, { $, doc, onAction = () => {} }) {
+export function applyStatusCard(plan, { $, doc, onAction = () => {}, onRowChange = () => {} }) {
   const card = $("status-card");
   if (!card) return;
   card.hidden = plan.hidden;
@@ -161,6 +165,8 @@ export function applyStatusCard(plan, { $, doc, onAction = () => {} }) {
   }
   setHidden($("status-card-more"), plan.more.length === 0);
   setHidden($("status-card-version-row"), !plan.versionRow);
+  renderPrestartRows(plan.rows || [], { $, doc, onAction: (action) => onAction(action, { action }), onRowChange });
+  renderRunProgress(plan.progress || null, { $ });
 }
 
 /** 主要按鈕被點到時：aria-disabled 的按鈕仍會收到 click，要在這裡擋下。 */

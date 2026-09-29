@@ -12,12 +12,22 @@
  */
 
 import { applyVersionGate, folderGateState, readyDetailLines, resultState } from "./folder-state.js";
+import { aiBlockedState, applyPrestart, reTranslatePrestart } from "./prestart.js";
+import { failureState } from "./run-failure.js";
 
 export const STATE = Object.freeze({
   consent: "S00",
   noFolder: "S01",
   folderNotRight: "S02",
   translating: "S09",
+  /** B5b：停止中（只有停止鈕本身，G4.25 文字不變）。 */
+  stopping: "S10",
+  /** B5b：出錯（依原因給主要按鈕）。 */
+  failed: "S12",
+  /** B5b：開始前確認模式（從重新翻譯進入）。 */
+  prestart: "S13",
+  /** B5b：從狀態卡按接續補完／修復、AI 還沒就緒（紅色 AI 列＋同一顆主要按鈕停用）。 */
+  aiBlocked: "AI-BLOCKED",
   removedWithResult: "S19a",
   removedNoResult: "S19b",
   /** 暫行「可開始」：一句現況＋「開始翻譯」（呼叫舊 onRun，之後的彈窗照舊，B5b 改）。 */
@@ -93,6 +103,14 @@ function normalize(input) {
     versionUnknown: !!src.versionUnknown,
     hasOptions: typeof src.hasOptions === "boolean" ? src.hasOptions : null,
     extraShown: typeof src.extraShown === "function" ? src.extraShown : () => true,
+    // B5b：開始前確認（§3.1 列）、翻譯中進度、出錯
+    prestart: src.prestart && typeof src.prestart === "object" ? src.prestart : null,
+    progress: src.progress && typeof src.progress === "object" ? src.progress : null,
+    stopping: !!src.stopping,
+    failure:
+      src.failure && typeof src.failure === "object" && String(src.failure.instancePath || "").trim() === instancePath && instancePath
+        ? src.failure
+        : null,
   };
 }
 
@@ -155,7 +173,10 @@ export function removalDetailLines(result) {
 export function computePackState(input) {
   const i = normalize(input);
   // 審查 5a：偵測不到 MC 版本時，所有會開始翻譯的狀態都停用（可開始、S15、S18 的次要、S19b）
-  return applyVersionGate(computeState(i), { versionUnknown: i.versionUnknown });
+  const gated = applyVersionGate(computeState(i), { versionUnknown: i.versionUnknown });
+  // B5b：顯示 AI 列的狀態就是 §3.1 開始前確認模式：紅列時主要按鈕停用（先處理標紅的那一列）
+  if (gated && gated.showAiRow && i.prestart && Array.isArray(i.prestart.rows)) return applyPrestart(gated, i.prestart.rows);
+  return gated;
 }
 
 function computeState(i) {
@@ -170,8 +191,21 @@ function computeState(i) {
   }
 
   if (i.busy && (i.busyKind === "translate" || !i.busyKind)) {
+    const view = i.progress || {};
+    if (i.stopping || view.stopping) {
+      // S10：只有停止鈕本身（文字由 stop-button 管，G4.25／G4.29 不變）
+      return state(STATE.stopping, {
+        sentence: "正在停止，寫出已翻好的部分…",
+        primary: { action: ACTION.stop, label: "停止翻譯" },
+      });
+    }
+    const tips = i.extraShown("runTips");
     return state(STATE.translating, {
-      sentence: `正在翻「${name}」`,
+      sentence: view.sentence || `正在翻「${name}」`,
+      extraLine: tips ? "可以縮小視窗；翻譯中先別開這個模組整合包" : "",
+      disclosureKey: "runTips",
+      detailLines: Array.isArray(view.notes) ? view.notes : [],
+      progress: i.progress,
       primary: { action: ACTION.stop, label: "停止翻譯" },
     });
   }
@@ -218,6 +252,16 @@ function computeState(i) {
     return state(STATE.pendingCard, { sentence: "已翻完，還沒套用到遊戲" });
   }
 
+  // B5b：從狀態卡按接續補完／修復、AI 還沒就緒（R-8 不經過 §3.1，直接在這裡顯示紅列）
+  const origin = i.prestart && i.prestart.aiBlockOrigin;
+  if (origin === "supplement" || origin === "repair") return aiBlockedState(origin);
+
+  // B5b：S12 出錯（本批暫用錯誤字串判斷原因）
+  if (i.failure) return failureState(i.failure.classified);
+
+  // B5b：從 S15／已翻譯／S18 按「重新翻譯」→ 開始前確認（刻意多一步，R-8）
+  if (i.prestart && i.prestart.open) return reTranslatePrestart(name);
+
   if (i.removal) {
     const hasResult = i.removal.hasResult ?? i.hasResult;
     const detailLines = removalDetailLines(i.removal.result);
@@ -246,10 +290,20 @@ function computeState(i) {
     translationComplete: i.translationComplete,
     extraShown: i.extraShown,
   });
-  if (after) return after;
+  if (after) return { ...after, reTranslate: true };
 
+  // S13（還沒翻過）：開始前確認模式本身；第一次多說「確認下面幾項就能開始」（規格 §2.2 S13）
+  const fresh = !i.translationComplete && !i.hasResult;
+  const firstTime = i.extraShown("prestart");
   return state(STATE.ready, {
-    sentence: i.translationComplete ? "這個模組整合包已翻譯" : `已選好「${name}」，可以開始翻譯`,
+    sentence: i.translationComplete
+      ? "這個模組整合包已翻譯"
+      : fresh
+        ? firstTime
+          ? "還沒翻過，確認下面幾項就能開始"
+          : "還沒翻過"
+        : `已選好「${name}」，可以開始翻譯`,
+    reTranslate: i.translationComplete,
     primary: { action: ACTION.run, label: i.translationComplete ? "重新翻譯" : "開始翻譯" },
     more: i.hasResult ? [{ action: ACTION.deleteAndRestart, label: "刪除結果並重翻", danger: true }] : [],
     // 原本在開始前「保留結果」詢問裡的提醒（B5a-2 刪了那個詢問）；B5d：知道有沒有 options.txt 時改由 N-04 說或不說

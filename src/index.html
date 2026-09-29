@@ -109,6 +109,16 @@
                     <button type="button" id="btn-status-extra-dismiss" class="text-button">不再顯示</button>
                   </p>
                   <p id="status-card-detail" class="status-card-detail" hidden></p>
+                  <!-- B5b 規格 §3.2 翻譯中：已完成幾條＋進度條、大約還要多久、白話徽章；只在重試／放慢時「已翻好的不會遺失」 -->
+                  <div id="status-card-progress" class="status-card-progress" hidden>
+                    <div class="prog-bar"><div id="status-card-fill" class="prog-fill"></div></div>
+                    <p class="status-card-progress-line">
+                      <span id="status-card-count" hidden></span>
+                      <span id="status-card-eta" hidden></span>
+                      <span id="status-card-badge" class="state-badge" hidden></span>
+                    </p>
+                    <p id="status-card-reassure" class="status-card-reassure" hidden></p>
+                  </div>
                   <div class="status-card-actions">
                     <button type="button" id="btn-card-pick" class="primary-button" hidden>選擇遊戲資料夾</button>
                     <button type="button" id="btn-run" class="primary-button start-translate" hidden>
@@ -126,6 +136,140 @@
                     <label for="status-card-version">Minecraft 版本</label>
                     <select id="status-card-version"></select>
                   </p>
+                  <!-- B5b 規格 §3.1 開始前確認：每列一行（E1 AI 列、本地翻不好時、備份）；紅列帶唯一的修正按鈕 -->
+                  <div id="status-card-rows" class="status-card-rows" hidden></div>
+                <!-- E1 展開：四選一與該來源的準備（「更換」或第一次時展開；AI 狀態只在上面那一列） -->
+                <section id="ai-options-group" class="ai-home-panel options-group" aria-labelledby="opt-group-ai" hidden>
+                  <div class="ai-home-head">
+                    <h2 id="opt-group-ai" class="options-group-title">AI 輔助翻譯<button type="button" class="help-tip" data-help="ai-source" aria-label="說明：用哪種 AI 翻">?</button></h2>
+                    <!--
+                      「啟用 AI」以前是獨立的勾選框，跟下面的來源選擇是兩個控制項
+                      在講同一件事——使用者得先勾這個、再選來源，還要自己想通
+                      「不勾的話下面選什麼還算數嗎」。
+                      現在來源選擇裡直接有「不使用 AI」，這個勾選框保留但隱藏，
+                      單純當成 JS 既有邏輯的狀態欄位，由來源選擇同步。
+                    -->
+                    <label class="option-row compact-option ai-toggle-row" for="use-ai" hidden>
+                      <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
+                      <span><strong>啟用 AI</strong></span>
+                    </label>
+                  </div>
+                  <!--
+                    來源選擇**必須放在 #ai-panel 外面**。
+                    選「不使用 AI」時 syncAiPanel() 會把 #ai-panel 整個隱藏，
+                    來源選擇如果在裡面就會跟著消失——使用者選了「不使用 AI」之後
+                    再也找不到地方切回其他選項，只能重開程式。
+                    #ai-panel 裡只放「選了某個 AI 來源之後才需要的設定」。
+                  -->
+                  <div class="ai-source-segmented" role="radiogroup" aria-label="AI 來源">
+                    <label class="ai-source-seg" for="ai-source-local">
+                      <input type="radio" id="ai-source-local" name="ai-source" value="local" checked />
+                      <span><strong>本地模型</strong><small>不想花錢、有獨立顯示卡；沒有顯示卡也能用，但一包可能要好幾小時</small></span>
+                    </label>
+                    <label class="ai-source-seg" for="ai-source-custom">
+                      <input type="radio" id="ai-source-custom" name="ai-source" value="custom" />
+                      <span><strong>自訂 API</strong><small>想要最快、願意用自己的服務商帳戶付少量費用</small></span>
+                    </label>
+                    <label class="ai-source-seg" for="ai-source-gpt">
+                      <input type="radio" id="ai-source-gpt" name="ai-source" value="gpt" />
+                      <span><strong>ChatGPT</strong><small>已經有 ChatGPT 帳號、不想另外申請金鑰</small></span>
+                    </label>
+                    <!--
+                      「不使用 AI」程式碼上一直支援（use_ai=false），而且共享庫查詢
+                      不需要登入也不需要下載——但介面從來沒把它當成一個選項呈現，
+                      使用者無從得知。這正是「事後才發現原來可以這樣做」。
+                    -->
+                    <label class="ai-source-seg" for="ai-source-none">
+                      <input type="radio" id="ai-source-none" name="ai-source" value="none" />
+                      <span><strong>不使用 AI</strong><small>先試試看，或模組整合包大多已有社群翻譯</small></span>
+                    </label>
+                  </div>
+                  <p id="ai-source-note" class="ai-source-note" hidden>三種 AI 都需要登入 Discord。「不使用 AI」不必登入也不必下載，只用共享庫裡其他玩家已翻好的內容——多數模組整合包這樣就能翻掉大部分。</p>
+                  <div id="ai-panel" class="ai-panel">
+                    <!-- AI 狀態只在狀態卡 E1 列（B5b）；這一行保留給既有程式寫入，不顯示 -->
+                    <p class="ai-status" data-state="checking" hidden><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
+                    <div id="ai-config-card" class="ai-config-card">
+                        <div id="managed-auth-panel" class="managed-auth-panel">
+                          <div class="managed-auth-compact">
+                            <div class="auth-status-line">
+                              <strong id="discord-auth-title">Discord 尚未驗證</strong>
+                              <button type="button" class="help-tip" data-help="discord" aria-label="說明：為什麼要登入 Discord">?</button>
+                              <p id="discord-auth-note">翻譯前請登入並加入官方伺服器，方便維護、收集建議與調整工具。</p>
+                            </div>
+                            <div class="managed-auth-actions">
+                              <button type="button" id="btn-discord-login" class="small-button">登入 Discord</button>
+                              <button type="button" id="btn-discord-join" class="small-button">加入官方伺服器</button>
+                              <button type="button" id="btn-discord-refresh" class="text-button">重新檢查</button>
+                              <button type="button" id="btn-discord-logout" class="text-button" hidden>登出</button>
+                            </div>
+                          </div>
+                          <div id="discord-login-fallback" class="login-fallback" hidden>
+                            <p id="discord-login-fallback-note">請在瀏覽器完成授權；完成後可按關閉。</p>
+                            <div class="input-row"><input id="discord-login-url" type="text" readonly value="正在準備登入網址" /><button type="button" id="btn-copy-login-url" class="small-button">複製</button></div>
+                            <div class="login-fallback-actions">
+                              <button type="button" id="btn-open-login-url" class="text-button">重新開啟</button>
+                              <button type="button" id="btn-cancel-login" class="text-button">取消登入</button>
+                              <button type="button" id="btn-close-discord-fallback" class="text-button">關閉</button>
+                            </div>
+                          </div>
+                        </div>
+                        <div id="gpt-auth-panel" class="managed-auth-panel" hidden>
+                          <div class="managed-auth-compact">
+                            <div class="auth-status-line">
+                              <strong id="gpt-auth-title">尚未登入 ChatGPT</strong>
+                              <p id="gpt-auth-note">用你的 ChatGPT 帳號登入（在瀏覽器輸入登入碼）。翻譯會消耗你的 ChatGPT 帳號額度；開始翻譯前會先試翻一句確認能用。登入資料只存在這台電腦。</p>
+                            </div>
+                            <div class="managed-auth-actions">
+                              <button type="button" id="btn-gpt-login" class="small-button">登入／顯示裝置碼</button>
+                              <button type="button" id="btn-gpt-refresh" class="text-button">重新檢查</button>
+                              <button type="button" id="btn-gpt-cancel" class="text-button" hidden>取消</button>
+                              <button type="button" id="btn-gpt-logout" class="text-button" hidden>登出 ChatGPT</button>
+                            </div>
+                            <p class="field-help">
+                              ChatGPT 帳號只支援一個翻譯模型，工具已自動選好，不用挑。
+                            </p>
+                          </div>
+                        </div>
+                        <div id="local-llm-panel" class="managed-auth-panel" hidden>
+                          <div class="managed-auth-compact">
+                            <div class="auth-status-line">
+                              <strong id="local-llm-title">尚未安裝本地模型</strong>
+                              <p id="local-llm-note">兩步：先同意並偵測這台電腦，確認後再開始下載。速度隨電腦而異，空間不夠就不會下載。</p>
+                              <p id="local-llm-error" class="local-llm-error" hidden></p>
+                            </div>
+                            <div class="managed-auth-actions">
+                              <button type="button" id="btn-local-llm-setup" class="small-button">同意並偵測</button>
+                              <button type="button" id="btn-local-llm-stop" class="text-button" hidden title="關閉本地模型服務，釋放記憶體與顯示記憶體">停用本地模型</button>
+                            </div>
+                          </div>
+                        </div>
+                        <div id="adv-details" class="ai-custom-panel" hidden>
+                          <div class="field-block">
+                            <label for="api-provider">服務商預設（不用填網址）</label>
+                            <select id="api-provider">
+                              <option value="deepseek">DeepSeek（推薦／便宜划算）</option>
+                              <option value="glm">智譜 GLM</option>
+                              <option value="openai">OpenAI</option>
+                              <option value="qwen">阿里雲通義千問</option>
+                              <option value="other">其他 OpenAI 相容服務</option>
+                            </select>
+                            <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商。</small>
+                          </div>
+                          <div class="field-block"><label for="api-key">API 金鑰</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
+                          <small id="api-key-note" class="field-status">金鑰只存本機並用於翻譯／測試；畫面上的 ######## 只是遮罩，不是真金鑰。留空再儲存會保留已存金鑰。</small>
+                          <div id="custom-endpoint-fields" hidden>
+                            <div class="field-block"><label for="base-url">服務網址</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://api.example.com/v1" /></div>
+                            <div class="field-block"><label for="api-model">模型名稱</label><input id="api-model" type="text" autocomplete="off" placeholder="例如 model-name" /></div>
+                          </div>
+                          <div class="field-row api-key-actions">
+                            <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
+                            <button type="button" id="btn-test-api" class="small-button">測試金鑰</button>
+                          </div>
+                          <small id="api-test-status" class="field-status" aria-live="polite"></small>
+                        </div>
+                    </div>
+                  </div>
+                </section>
                   <details id="status-card-more" class="status-card-more" hidden>
                     <summary>更多</summary>
                     <div id="status-card-more-list" class="status-card-more-list"></div>
@@ -218,141 +362,9 @@
                   </div>
                 </section>
 
-                <section id="ai-options-group" class="ai-home-panel options-group" aria-labelledby="opt-group-ai">
-                  <div class="ai-home-head">
-                    <h2 id="opt-group-ai" class="options-group-title">AI 輔助翻譯<button type="button" class="help-tip" data-help="ai-source" aria-label="說明：用哪種 AI 翻">?</button></h2>
-                    <!--
-                      「啟用 AI」以前是獨立的勾選框，跟下面的來源選擇是兩個控制項
-                      在講同一件事——使用者得先勾這個、再選來源，還要自己想通
-                      「不勾的話下面選什麼還算數嗎」。
-                      現在來源選擇裡直接有「不使用 AI」，這個勾選框保留但隱藏，
-                      單純當成 JS 既有邏輯的狀態欄位，由來源選擇同步。
-                    -->
-                    <label class="option-row compact-option ai-toggle-row" for="use-ai" hidden>
-                      <input type="checkbox" id="use-ai" checked /><span class="check-box" aria-hidden="true"></span>
-                      <span><strong>啟用 AI</strong></span>
-                    </label>
-                  </div>
-                  <!--
-                    來源選擇**必須放在 #ai-panel 外面**。
-                    選「不使用 AI」時 syncAiPanel() 會把 #ai-panel 整個隱藏，
-                    來源選擇如果在裡面就會跟著消失——使用者選了「不使用 AI」之後
-                    再也找不到地方切回其他選項，只能重開程式。
-                    #ai-panel 裡只放「選了某個 AI 來源之後才需要的設定」。
-                  -->
-                  <div class="ai-source-segmented" role="radiogroup" aria-label="AI 來源">
-                    <label class="ai-source-seg" for="ai-source-local">
-                      <input type="radio" id="ai-source-local" name="ai-source" value="local" checked />
-                      <span><strong>本地模型</strong><small>免費 · 首次要下載模型 · 較慢</small></span>
-                    </label>
-                    <label class="ai-source-seg" for="ai-source-custom">
-                      <input type="radio" id="ai-source-custom" name="ai-source" value="custom" />
-                      <span><strong>自訂 API</strong><small>最快 · 用你自己的金鑰與額度</small></span>
-                    </label>
-                    <label class="ai-source-seg" for="ai-source-gpt">
-                      <input type="radio" id="ai-source-gpt" name="ai-source" value="gpt" />
-                      <span><strong>ChatGPT</strong><small>用你自己的 ChatGPT 帳號登入</small></span>
-                    </label>
-                    <!--
-                      「不使用 AI」程式碼上一直支援（use_ai=false），而且共享庫查詢
-                      不需要登入也不需要下載——但介面從來沒把它當成一個選項呈現，
-                      使用者無從得知。這正是「事後才發現原來可以這樣做」。
-                    -->
-                    <label class="ai-source-seg" for="ai-source-none">
-                      <input type="radio" id="ai-source-none" name="ai-source" value="none" />
-                      <span><strong>不使用 AI</strong><small>免下載 · 免登入 · 只用社群翻譯</small></span>
-                    </label>
-                  </div>
-                  <p id="ai-source-note" class="ai-source-note">三種 AI 都需要登入 Discord。「不使用 AI」不必登入也不必下載，只用共享庫裡其他玩家已翻好的內容——多數模組整合包這樣就能翻掉大部分。</p>
-                  <div id="ai-panel" class="ai-panel">
-                    <p class="ai-status" data-state="checking"><span class="status-dot"></span><span id="key-status" aria-live="polite">AI：正在確認可用方式</span></p>
-                    <div id="ai-config-card" class="ai-config-card">
-                        <div id="managed-auth-panel" class="managed-auth-panel">
-                          <div class="managed-auth-compact">
-                            <div class="auth-status-line">
-                              <strong id="discord-auth-title">Discord 尚未驗證</strong>
-                              <button type="button" class="help-tip" data-help="discord" aria-label="說明：為什麼要登入 Discord">?</button>
-                              <p id="discord-auth-note">翻譯前請登入並加入官方伺服器，方便維護、收集建議與調整工具。</p>
-                            </div>
-                            <div class="managed-auth-actions">
-                              <button type="button" id="btn-discord-login" class="small-button">登入 Discord</button>
-                              <button type="button" id="btn-discord-join" class="small-button">加入官方伺服器</button>
-                              <button type="button" id="btn-discord-refresh" class="text-button">重新檢查</button>
-                              <button type="button" id="btn-discord-logout" class="text-button" hidden>登出</button>
-                            </div>
-                          </div>
-                          <div id="discord-login-fallback" class="login-fallback" hidden>
-                            <p id="discord-login-fallback-note">請在瀏覽器完成授權；完成後可按關閉。</p>
-                            <div class="input-row"><input id="discord-login-url" type="text" readonly value="正在準備登入網址" /><button type="button" id="btn-copy-login-url" class="small-button">複製</button></div>
-                            <div class="login-fallback-actions">
-                              <button type="button" id="btn-open-login-url" class="text-button">重新開啟</button>
-                              <button type="button" id="btn-cancel-login" class="text-button">取消登入</button>
-                              <button type="button" id="btn-close-discord-fallback" class="text-button">關閉</button>
-                            </div>
-                          </div>
-                        </div>
-                        <div id="gpt-auth-panel" class="managed-auth-panel" hidden>
-                          <div class="managed-auth-compact">
-                            <div class="auth-status-line">
-                              <strong id="gpt-auth-title">尚未登入 ChatGPT</strong>
-                              <p id="gpt-auth-note">用你的 ChatGPT 帳號登入（在瀏覽器輸入登入碼）。翻譯會消耗你的 ChatGPT 帳號額度；開始翻譯前會先試翻一句確認能用。登入資料只存在這台電腦。</p>
-                            </div>
-                            <div class="managed-auth-actions">
-                              <button type="button" id="btn-gpt-login" class="small-button">登入／顯示裝置碼</button>
-                              <button type="button" id="btn-gpt-refresh" class="text-button">重新檢查</button>
-                              <button type="button" id="btn-gpt-cancel" class="text-button" hidden>取消</button>
-                              <button type="button" id="btn-gpt-logout" class="text-button" hidden>登出 ChatGPT</button>
-                            </div>
-                            <p class="field-help">
-                              ChatGPT 帳號只支援一個翻譯模型，工具已自動選好，不用挑。
-                            </p>
-                          </div>
-                        </div>
-                        <div id="local-llm-panel" class="managed-auth-panel" hidden>
-                          <div class="managed-auth-compact">
-                            <div class="auth-status-line">
-                              <strong id="local-llm-title">尚未安裝本地模型</strong>
-                              <p id="local-llm-note">兩步：先同意並偵測這台電腦，確認後再開始下載。速度隨電腦而異，空間不夠就不會下載。</p>
-                              <p id="local-llm-error" class="local-llm-error" hidden></p>
-                            </div>
-                            <div class="managed-auth-actions">
-                              <button type="button" id="btn-local-llm-setup" class="small-button">同意並偵測</button>
-                              <button type="button" id="btn-local-llm-stop" class="text-button" hidden title="關閉本地模型服務，釋放記憶體與顯示記憶體">停用本地模型</button>
-                            </div>
-                          </div>
-                        </div>
-                        <div id="adv-details" class="ai-custom-panel" hidden>
-                          <div class="field-block">
-                            <label for="api-provider">服務商預設（不用填網址）</label>
-                            <select id="api-provider">
-                              <option value="deepseek">DeepSeek（推薦／便宜划算）</option>
-                              <option value="glm">智譜 GLM</option>
-                              <option value="openai">OpenAI</option>
-                              <option value="qwen">阿里雲通義千問</option>
-                              <option value="other">其他 OpenAI 相容服務</option>
-                            </select>
-                            <small id="api-provider-note" class="field-status">選擇你取得 Key 的服務商。</small>
-                          </div>
-                          <div class="field-block"><label for="api-key">API 金鑰</label><input id="api-key" type="text" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="輸入後會顯示為 ########" aria-describedby="api-key-note" /></div>
-                          <small id="api-key-note" class="field-status">金鑰只存本機並用於翻譯／測試；畫面上的 ######## 只是遮罩，不是真金鑰。留空再儲存會保留已存金鑰。</small>
-                          <div id="custom-endpoint-fields" hidden>
-                            <div class="field-block"><label for="base-url">服務網址</label><input id="base-url" type="text" autocomplete="off" placeholder="例如 https://api.example.com/v1" /></div>
-                            <div class="field-block"><label for="api-model">模型名稱</label><input id="api-model" type="text" autocomplete="off" placeholder="例如 model-name" /></div>
-                          </div>
-                          <div class="field-row api-key-actions">
-                            <button type="button" id="btn-save-adv" class="small-button">儲存設定</button>
-                            <button type="button" id="btn-test-api" class="small-button">測試金鑰</button>
-                          </div>
-                          <small id="api-test-status" class="field-status" aria-live="polite"></small>
-                        </div>
-                    </div>
-                  </div>
-                </section>
-
                 <!-- 開始翻譯／停止翻譯在上面的狀態卡（唯一位置）。 -->
                 <div class="action-area primary-action">
                   <div class="action-row secondary-actions">
-                    <button type="button" id="btn-repair" class="text-button" hidden>修復翻譯檔</button>
                     <button type="button" id="btn-merge-consistency" class="text-button" hidden title="把「用詞不一致建議.json」的建議譯名併入本機術語表（不會直接改遊戲檔）">併入用詞建議</button>
                   </div>
                   <p id="consistency-merge-hint" class="share-hint" hidden>結果資料夾有「用詞不一致建議.json」時可按「併入用詞建議」寫進術語表；預設不覆蓋你已有的譯名。</p>
@@ -456,7 +468,7 @@
               <p id="step-total-time" class="step-total-time" hidden></p>
               <div class="prog-bar"><div id="prog-fill" class="prog-fill"></div></div>
               <p id="prog-count" class="prog-count" aria-live="polite">尚未開始</p>
-              <p class="status-message"><span class="status-dot"></span><span id="prog-msg" aria-live="polite">尚未開始</span><span id="prog-state" class="state-badge" hidden></span></p>
+              <p id="rail-status-message" class="status-message"><span class="status-dot"></span><span id="prog-msg" aria-live="polite">尚未開始</span><span id="prog-state" class="state-badge" hidden></span></p>
               <details class="hits-fold">
                 <summary>進階統計</summary>
                 <p class="metric-audience">給想看細節的人</p>
@@ -611,12 +623,6 @@
           </div>
           </section>
           </div>
-
-          <!-- 備份選擇在設定視窗「資料與備份」；這個舊勾選保留 id 給相容程式碼（app.js、settings-store KEY_MAP），不顯示，B5b 取代後才刪 -->
-          <label class="option-row" for="backup-before-apply" hidden>
-          <input type="checkbox" id="backup-before-apply" checked /><span class="check-box" aria-hidden="true"></span>
-          <span><strong>套用前建立備份</strong><span class="settings-tier tier-recommended">建議開著</span></span>
-          </label>
 
           <section id="translation-helper-group" class="options-group" aria-labelledby="opt-group-helper">
           <details class="advanced-details options-group-fold">
@@ -876,7 +882,7 @@
         <p id="local-llm-done" class="local-llm-done" hidden>本地模型已就緒，可以直接開始翻譯。</p>
         <div class="device-code-actions">
           <button type="button" id="btn-local-llm-install" class="primary-button" hidden>開始下載</button>
-          <button type="button" id="btn-local-llm-start-translate" class="primary-button" hidden>關閉並開始翻譯</button>
+          <button type="button" id="btn-local-llm-start-translate" class="primary-button" hidden>完成，回到翻譯</button>
           <button type="button" id="btn-local-llm-cancel" class="text-button">取消</button>
         </div>
       </div>

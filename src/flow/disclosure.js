@@ -34,6 +34,27 @@ export const DISCLOSURES = Object.freeze({
     settingPath: "ui.disclosure.packChanged",
     topic: "重新翻譯會不會很久",
   }),
+  // B5b：開始前確認（第一次多一句）、E1 AI 列「適合誰」、翻譯中附加行、本地模型第一次較久
+  prestart: Object.freeze({
+    storageKey: "mcpl-disclosure-prestart",
+    settingPath: "ui.disclosure.prestart",
+    topic: "開始前要確認什麼",
+  }),
+  aiChoice: Object.freeze({
+    storageKey: "mcpl-disclosure-ai-choice",
+    settingPath: "ui.disclosure.aiChoice",
+    topic: "四種 AI 各適合誰",
+  }),
+  runTips: Object.freeze({
+    storageKey: "mcpl-disclosure-run-tips",
+    settingPath: "ui.disclosure.runTips",
+    topic: "翻譯中可以做什麼",
+  }),
+  localStart: Object.freeze({
+    storageKey: "mcpl-disclosure-local-start",
+    settingPath: "ui.disclosure.localStart",
+    topic: "本地模型啟動",
+  }),
 });
 
 const RETIRED = "retired";

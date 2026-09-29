@@ -2,7 +2,6 @@ export const THEME_STORAGE_KEY = "modpack-i18n-theme";
 export const CONSENT_STORAGE_KEY = "modpack-i18n-consent-hide-v1.0.9";
 /** 舊鍵：讀得到就視同已勾過，不要讓既有使用者重看一次同意畫面。 */
 export const CONSENT_STORAGE_KEY_LEGACY = ["modpack-i18n-consent-hide-v1.0.6"];
-export const BACKUP_STORAGE_KEY = "modpack-i18n-backup-before-apply";
 export const FONT_PREFS_STORAGE_KEY = "modpack-i18n-font-prefs";
 export const USAGE_FEEDBACK_CLIENT_ID_KEY = "modpack-i18n-usage-feedback-client-id-v1";
 export const USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY = "modpack-i18n-usage-feedback-last-submit-at-v1";

@@ -39,6 +39,9 @@ export function createPackActions(deps) {
   let bannerAreaInstance = null;
   let pendingUpdateBannerInfo = null;
   let updateChecker = null;
+  /** 最近一次畫出的狀態（B5b：按「重新翻譯」時要知道是不是要先進確認模式）。 */
+  let lastState = null;
+  const runFlow = () => deps.runFlow || null;
 
   const instancePath = () => ($("instance")?.value || "").trim();
   const folders = () => deps.folderChecks || null;
@@ -75,6 +78,11 @@ export function createPackActions(deps) {
       versionUnknown: !!s.versionUnknown,
       hasOptions: folders() ? folders().hasOptions(path) : null,
       extraShown: (key) => deps.disclosure.isShown(key),
+      // B5b：開始前確認（§3.1 列）、S12、翻譯中進度與停止中
+      prestart: runFlow() ? runFlow().prestartInput() : null,
+      failure: runFlow() ? runFlow().failureInput() : null,
+      progress: runFlow() ? runFlow().progressInput(deps.pathLeaf(path || "")) : null,
+      stopping: runFlow() ? runFlow().isStopping() : false,
     };
   }
 
@@ -82,8 +90,14 @@ export function createPackActions(deps) {
   function renderStatusCard() {
     const input = packStateInput();
     const state = computePackState(input);
+    lastState = state;
     try {
-      applyStatusCard(planStatusCard(state), { $, doc, onAction: onStatusCardAction });
+      applyStatusCard(planStatusCard(state), {
+        $,
+        doc,
+        onAction: onStatusCardAction,
+        onRowChange: (id, value, ack) => runFlow() && runFlow().onRowChange(id, value, ack),
+      });
       syncRunElsewhere(state, input.instancePath);
       if (folders()) folders().syncBanners(state.id, input.instancePath);
     } catch (e) {
@@ -116,6 +130,11 @@ export function createPackActions(deps) {
 
   function onStatusCardAction(action, item) {
     if (folders() && folders().handles(action)) return void folders().onAction(action, item || {});
+    // B5b：§3.1 列（更換、這次不用 AI、返回、AI 修正按鈕）、S12 與 AI-BLOCKED 的動作
+    if (runFlow() && runFlow().onAction(action)) return;
+    if (action === "supplement") return void deps.onSupplement();
+    if (action === "repair") return void deps.onRepair();
+    if (action === "issue-report") return void deps.openIssueReport();
     if (action === ACTION.deleteAndRestart) return void deleteResultAndRestart();
     if (action === ACTION.pickFolder) return void deps.onPickInstance();
     if (action === ACTION.applyResult) return void applyRemovedResult();
@@ -342,6 +361,7 @@ export function createPackActions(deps) {
   }
 
   return {
+    currentState: () => lastState,
     isRemovalShownFor,
     clearRemoval,
     renderStatusCard,
