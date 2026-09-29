@@ -14,6 +14,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 use super::nanazip_ensure;
 use super::security::sanitize_folder_name;
+use super::share_apply_script::{is_support_file, write_support_files, APPLY_SCRIPT_NAME, SHARE_TOP_LEVEL_DIRS, SUPPORT_FILES};
 use super::session::{is_tool_resource_pack, resolve_canonical_tool_zip};
 use super::win_process::hide_console;
 
@@ -28,7 +29,6 @@ pub const CLOUD_URL_SHORTCUT_NAME: &str = "ZeitFrei雲端.url";
 /// 本機 SFX 與下載檔名（R2 物件鍵仍用長 token）。
 pub const SHARE_SFX_FILENAME: &str = "模組包繁中翻譯自解檔.exe";
 const CLOUD_URL: &str = "https://cloud.zeitfrei.uk/";
-const APPLY_SCRIPT_NAME: &str = "套用翻譯.ps1";
 const SFX_CONFIG_NAME: &str = "sfx_config.txt";
 
 /// 工作目錄是否至少有一個可分享檔（資源包／覆寫等；不含說明／session）。
@@ -86,22 +86,7 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
     fs::create_dir_all(&stage).map_err(|e| format!("無法建立暫存：{e}"))?;
 
     let result = (|| {
-        let canonical = resolve_canonical_tool_zip(work_root);
-        let pack_zip_name = canonical
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
-            .filter(|n| n.to_ascii_lowercase().ends_with(".zip"))
-            .or_else(|| {
-                canonical.as_ref().and_then(|p| {
-                    p.file_name()
-                        .map(|s| format!("{}.zip", s.to_string_lossy()))
-                })
-            })
-            .unwrap_or_else(|| "模組包翻譯工具.zip".to_string());
-        stage_shareable_files(work_root, &stage)?;
-        write_cloud_url_shortcut(&stage.join(CLOUD_URL_SHORTCUT_NAME))?;
-        write_apply_script(&stage.join(APPLY_SCRIPT_NAME), &pack_zip_name)?;
+        let pack_zip_name = stage_share_payload(work_root, &stage)?;
         let config_path = stage.join(SFX_CONFIG_NAME);
         write_sfx_config(&config_path, &pack_zip_name)?;
 
@@ -119,7 +104,7 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
                 "-y",
             ])
             .arg(&archive_7z)
-            .arg(APPLY_SCRIPT_NAME)
+            .args(SUPPORT_FILES.iter().filter(|n| stage.join(n).is_file()))
             .arg(CLOUD_URL_SHORTCUT_NAME)
             .args(shareable_top_level_args(&stage)?)
             .stdout(Stdio::null())
@@ -142,13 +127,34 @@ pub fn package_translation_sfx(work_root: &Path, dest_dir: &Path, name: &str) ->
     result
 }
 
-fn shareable_top_level_args(stage: &Path) -> Result<Vec<PathBuf>, String> {
+/// S1：把可分享檔、雲端捷徑與收件端支援檔（檔案清單、模組清單、套用／還原腳本、說明）放進暫存區；回傳主翻譯資源包檔名。
+pub(crate) fn stage_share_payload(work_root: &Path, stage: &Path) -> Result<String, String> {
+    let canonical = resolve_canonical_tool_zip(work_root);
+    let pack_zip_name = canonical
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".zip"))
+        .or_else(|| {
+            canonical.as_ref().and_then(|p| {
+                p.file_name()
+                    .map(|s| format!("{}.zip", s.to_string_lossy()))
+            })
+        })
+        .unwrap_or_else(|| "模組包翻譯工具.zip".to_string());
+    stage_shareable_files(work_root, stage)?;
+    write_cloud_url_shortcut(&stage.join(CLOUD_URL_SHORTCUT_NAME))?;
+    write_support_files(stage, &pack_zip_name, super::text_sources::game_root(work_root).as_deref())?;
+    Ok(pack_zip_name)
+}
+
+pub(crate) fn shareable_top_level_args(stage: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for entry in fs::read_dir(stage).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == APPLY_SCRIPT_NAME
+        if is_support_file(&name)
             || name == CLOUD_URL_SHORTCUT_NAME
             || name == SFX_CONFIG_NAME
             || name.ends_with(".7z")
@@ -379,62 +385,11 @@ fn write_cloud_url_shortcut(path: &Path) -> Result<(), String> {
     fs::write(path, body).map_err(|e| format!("寫入雲端捷徑失敗：{e}"))
 }
 
-fn write_apply_script(path: &Path, pack_zip_name: &str) -> Result<(), String> {
-    let pack_zip_name = pack_zip_name.replace('\'', "''");
-    // 接收端：提醒選 Minecraft 目錄 → 依 allowlist 複製（對齊 apply_to_instance）→ 捷徑放到根目錄
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-$packZip = '{pack_zip_name}'
-$root = if ($args.Count -ge 1 -and $args[0]) {{ $args[0] }} else {{ Split-Path -Parent $MyInvocation.MyCommand.Path }}
-$root = (Resolve-Path $root).Path
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '請選擇 Minecraft 遊戲資料夾（實例根目錄，需含 mods 或 resourcepacks）。翻譯會自動套用。'
-$dialog.ShowNewFolderButton = $false
-if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {{
-  [System.Windows.Forms.MessageBox]::Show('已取消套用。', '模組包翻譯') | Out-Null
-  exit 1
-}}
-$mc = $dialog.SelectedPath
-$hasMods = Test-Path (Join-Path $mc 'mods')
-$hasRp = Test-Path (Join-Path $mc 'resourcepacks')
-if (-not $hasMods -and -not $hasRp) {{
-  [System.Windows.Forms.MessageBox]::Show("選取的資料夾不像 Minecraft 實例根目錄（找不到 mods 或 resourcepacks）。`n`n請選整合包實例根，不要只選 .minecraft 子資料夾。", '模組包翻譯') | Out-Null
-  exit 1
-}}
-function Ensure-Dir([string]$p) {{ if (-not (Test-Path $p)) {{ New-Item -ItemType Directory -Path $p -Force | Out-Null }} }}
-function Copy-Tree([string]$src, [string]$dst) {{
-  if (-not (Test-Path $src)) {{ return }}
-  Ensure-Dir $dst
-  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
-}}
-$rp = Join-Path $root 'resourcepacks'
-$srcZip = Join-Path $rp $packZip
-if (Test-Path $srcZip) {{
-  Ensure-Dir (Join-Path $mc 'resourcepacks')
-  Copy-Item -Path $srcZip -Destination (Join-Path $mc 'resourcepacks' $packZip) -Force -ErrorAction Stop
-}} elseif (Test-Path $rp) {{
-  [System.Windows.Forms.MessageBox]::Show("找不到資源包 $packZip，分享檔可能不完整。", '模組包翻譯') | Out-Null
-}}
-foreach ($name in @('config','patchouli_books','kubejs','minemenu','datapacks','defaultconfigs','global_packs','paxi','data')) {{
-  $src = Join-Path $root $name
-  if (Test-Path $src) {{ Copy-Tree $src (Join-Path $mc $name) }}
-}}
-$url = Join-Path $root 'ZeitFrei雲端.url'
-if (Test-Path $url) {{
-  Copy-Item -Path $url -Destination (Join-Path $mc 'ZeitFrei雲端.url') -Force -ErrorAction SilentlyContinue
-}}
-[System.Windows.Forms.MessageBox]::Show("翻譯已套用到：`n$mc`n`n請關閉遊戲後重開，語言選繁體中文（台灣），並在資源包列表只啟用：`n$packZip", '模組包翻譯') | Out-Null
-"#
-    );
-    fs::write(path, script).map_err(|e| format!("寫入套用腳本失敗：{e}"))
-}
-
 fn write_sfx_config(path: &Path, pack_zip_name: &str) -> Result<(), String> {
     let config = format!(
         ";!@Install@!UTF-8!\r\n\
 Title=\"模組包翻譯套用\"\r\n\
-BeginPrompt=\"只含一個翻譯資源包（{pack_zip_name}）。請選含 mods 或 resourcepacks 的 Minecraft 實例根；解壓密碼見下載頁（{SHARE_SFX_PASSWORD}）。\"\r\n\
+BeginPrompt=\"翻譯資源包：{pack_zip_name}。請先關閉 Minecraft。解壓後會開啟套用視窗：選含 mods 的遊戲資料夾；套用前會先把會被覆蓋的檔備份到遊戲資料夾的 .mcpl-share-backup，可以還原。解壓密碼見下載頁（{SHARE_SFX_PASSWORD}）。\"\r\n\
 ExtractTitle=\"解壓翻譯檔\"\r\n\
 ExtractDialogText=\"正在解壓…\"\r\n\
 GUIFlags=\"8+32+64+256+4096\"\r\n\
@@ -520,11 +475,10 @@ fn is_shareable_path(root: &Path, path: &Path) -> bool {
         return false;
     }
     // 嚴格白名單：只裝對方可安裝的翻譯產物（不含 JAR 副本／extra／備份／日誌／說明）
+    // S1：頂層白名單與收件端腳本共用 SHARE_TOP_LEVEL_DIRS
     match first {
-        "resourcepacks" | "patchouli_books" | "kubejs" | "minemenu" | "datapacks"
-        | "defaultconfigs" | "global_packs" | "paxi" | "data" => true,
         "config" => components.next().is_some(),
-        _ => false,
+        other => SHARE_TOP_LEVEL_DIRS.contains(&other),
     }
 }
 

@@ -100,6 +100,12 @@ mod sentence_split;
 mod script_literals;
 mod script_scan;
 mod share_policy;
+mod share_apply_script;
+mod share_apply_script_text;
+#[cfg(test)]
+mod share_apply_script_tests;
+#[cfg(test)]
+mod share_apply_script_fix_tests;
 mod share_pack;
 mod share_upload;
 mod security;
