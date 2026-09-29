@@ -116,6 +116,7 @@ mod security;
 mod scan_cache;
 mod search_system;
 mod session;
+pub mod result_owner;
 mod shared_identity;
 mod shared_tm;
 mod shared_contribute_queue;
@@ -132,7 +133,7 @@ mod updater;
 mod usage_feedback;
 
 pub use apply_instance::{
-    apply_to_instance, delete_apply_backups_in, has_apply_backups_in, restore_last_apply_in, ApplyResult,
+    apply_to_instance, delete_apply_backups_in, has_apply_backups_in, pending_when_copied, restore_last_apply_in, ApplyResult,
     ApplyStatus, DeleteBackupResult, RestoreResult,
 };
 pub use archive_overlay::translate_archive_overlays;

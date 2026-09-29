@@ -18,11 +18,12 @@ const indexHtml = read("../index.html");
  * （B5d 的接續卡、寫入權限卡已刪，改由 D 區「上次」與狀態卡 S04 說，文案掃描見 flow/folder-state.test.mjs「詞表」。）
  */
 function startScreenHtml() {
-  let page = sliceElement(indexHtml, '<div id="page-translate"');
-  for (const id of ["apply-pending-card", "local-cache-card", "pack-meta-card"]) {
-    page = withoutElement(page, `<section id="${id}"`);
-  }
+  // B5c：待套用卡、本機已有翻譯卡、整合包資訊卡已併入狀態卡（不再排除）；分享與人工補翻浮層一起掃
+  const page = sliceElement(indexHtml, '<div id="page-translate"');
+  void withoutElement;
   return [
+    sliceElement(indexHtml, '<div id="share-overlay"'),
+    sliceElement(indexHtml, '<div id="manual-fix-overlay"'),
     sliceElement(indexHtml, "<title>"),
     sliceElement(indexHtml, '<header class="winbar"'),
     sliceElement(indexHtml, '<nav id="workbench-tabs"'),
@@ -62,6 +63,15 @@ const APP_START_SCREEN_FUNCTIONS = [
   "async function onPickInstance(",
   "async function refreshPackTranslationName(",
   "async function refreshReferencePack(",
+  // B5c：完成與套用段寫給玩家看的字
+  "async function copyShareUrl(",
+  "function packageShare(",
+  "async function onCopyFailedItems(",
+  "async function onImportTranslations(",
+  "async function handleCloseWhileBusy(",
+  "async function usageFeedbackMaybeNudge(",
+  "function onRunNewCopy(",
+  "async function openCurrentResultFolder(",
 ];
 
 function appStartScreenSource() {
@@ -96,6 +106,11 @@ const COPY_MODULES = [
   "../flow/run-progress.js",
   "../flow/run-failure.js",
   "../flow/run-flow.js",
+  // B5c：完成卡、套用、人工補翻、分享的文案
+  "../flow/result-card.js",
+  "../flow/result-actions.js",
+  "../flow/pack-results.js",
+  "../ui/apply-pending.js",
 ];
 
 function report(hits) {

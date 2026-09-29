@@ -10,7 +10,7 @@ export const STOP_LABELS = Object.freeze({
   sent: "停止已送出",
   afterFirstStop: "正在寫出已翻部分…（再按會放棄套用）",
   /** 滑鼠停在按鈕上時的完整說明 */
-  afterFirstStopTitle: "目前正在把已翻好的部分寫出並裝進遊戲。再按一次會放棄這些步驟、立刻中斷。",
+  afterFirstStopTitle: "目前正在把已翻好的部分寫出並套用到遊戲。再按一次會放棄這些步驟、立刻中斷。",
 });
 
 /** 恢復成一般的「停止翻譯」（審查 F6：一併清掉第一次停止後加的提示）。 */

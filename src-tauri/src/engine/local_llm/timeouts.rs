@@ -86,9 +86,10 @@ impl TimeoutTracker {
 fn give_up_message(waited: Duration) -> String {
     let minutes = (waited.as_secs() + 59) / 60;
     format!(
-        "本地模型在這台電腦上一直等不到回應（這一輪累計等了約 {minutes} 分鐘），先停下本地翻譯。\
+        "{mark}（這一輪累計等了約 {minutes} 分鐘），先停下本地翻譯。\
 電腦可能記憶體不足或太慢；已翻好的部分都保留。建議改用線上 AI（自訂 API 或 GPT），\
-或關閉其他程式後按「接續補完」從停下的地方繼續。"
+或關閉其他程式後按「接續補完」從停下的地方繼續。",
+        mark = crate::engine::run_interrupt::LOCAL_STUCK_MARK
     )
 }
 

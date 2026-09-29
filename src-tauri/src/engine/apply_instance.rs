@@ -37,6 +37,8 @@ pub enum ApplyStatus {
     NeedsBackupChoice,
     /// 選了不備份，這次會蓋掉原檔：要玩家確認
     NeedsOverwriteConfirm,
+    /// B5c：整份複製來的遊戲資料夾（或原位置連不到）：要先「當成新的模組整合包」才能套用
+    ForkNeeded,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -114,6 +116,18 @@ impl ApplyResult {
             player_summary: message,
             warnings: Vec::new(),
         }
+    }
+}
+
+/// B5c：翻完才套用時，複製資料夾（識別碼相同、原位置還在）或原位置連不到被擋，
+/// 回「已翻完、還沒套用」狀態而不是錯誤——翻譯本身沒有失敗（G1.24 的拒絕與零寫入不變：
+/// 擋下發生在第一次寫入前的身分檢查）。其他錯誤照舊是錯誤。
+pub fn pending_when_copied(result: Result<ApplyResult, String>) -> Result<ApplyResult, String> {
+    match result {
+        Err(message) if message.contains(super::apply_identity::FORK_HINT) => {
+            Ok(ApplyResult::pending(ApplyStatus::ForkNeeded, message, Vec::new()))
+        }
+        other => other,
     }
 }
 
@@ -802,7 +816,7 @@ fn describe_applied(
     policy: BackupPolicy,
     uncertain: Option<&str>,
 ) -> String {
-    let mut lines = vec!["已把翻譯裝進遊戲，直接開遊戲就是繁體中文。".to_string()];
+    let mut lines = vec!["已把翻譯套用到遊戲，直接開遊戲就是繁體中文。".to_string()];
     if let Some(zip) = &plan.zip_name {
         lines.push(format!("• 翻譯資源包「{zip}」：已啟用並排在最高優先"));
     }
@@ -827,21 +841,21 @@ fn describe_applied(
     }
     if !result.outdated_texts.is_empty() {
         lines.push(format!(
-            "• 整合包已更新，需重新翻譯：{} 個文字檔的來源在翻譯之後被改過，舊的翻譯沒有放進遊戲（{}）",
+            "• 模組整合包已更新，需重新翻譯：{} 個文字檔的來源在翻譯之後被改過，舊的翻譯沒有放進遊戲（{}）",
             result.outdated_texts.len(),
             preview(&result.outdated_texts)
         ));
     }
     if !result.retired_files.is_empty() {
         lines.push(format!(
-            "• 整合包已移除原文、不再需要的舊翻譯已從遊戲拿掉（還原原檔或刪除工具加的檔）：{} 個（{}）",
+            "• 模組整合包已移除原文、不再需要的舊翻譯已從遊戲拿掉（還原原檔或刪除工具加的檔）：{} 個（{}）",
             result.retired_files.len(),
             preview(&result.retired_files)
         ));
     }
     if !result.source_removed_texts.is_empty() {
         lines.push(format!(
-            "• 有 {} 個譯文的英文原文已被整合包移除，沒有放進遊戲（{}）",
+            "• 有 {} 個譯文的英文原文已被模組整合包移除，沒有放進遊戲（{}）",
             result.source_removed_texts.len(),
             preview(&result.source_removed_texts)
         ));
@@ -876,7 +890,7 @@ fn describe_applied(
     }
     lines.push(match policy {
         BackupPolicy::Backup if result.backup_reused => {
-            "• 備份：已確認這個整合包目前的原檔都有有效備份".to_string()
+            "• 備份：已確認這個模組整合包目前的原檔都有有效備份".to_string()
         }
         BackupPolicy::Backup if result.backup_created => "• 備份：已備份會被覆蓋的原檔".to_string(),
         BackupPolicy::Backup => "• 備份：這次沒有需要備份的原檔".to_string(),
@@ -1255,6 +1269,10 @@ mod final_tests;
 #[cfg(test)]
 #[path = "apply_instance_readonly_tests.rs"]
 mod readonly_tests;
+
+#[cfg(test)]
+#[path = "apply_instance_b5c_tests.rs"]
+mod b5c_tests;
 
 #[cfg(test)]
 #[path = "apply_instance_b3_tests.rs"]

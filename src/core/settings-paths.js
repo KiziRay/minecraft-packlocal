@@ -46,6 +46,8 @@ export const SETTING_PATHS = [
   "ui.disclosure.aiChoice",
   "ui.disclosure.runTips",
   "ui.disclosure.localStart",
+  "ui.disclosure.resultReasons",
+  "ui.disclosure.manualFix",
   "ui.banner.updateDismissedVersion",
 ];
 

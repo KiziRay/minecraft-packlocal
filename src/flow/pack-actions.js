@@ -68,8 +68,6 @@ export function createPackActions(deps) {
       hasResult: !!s.localCacheProbe,
       removal: isRemovalShownFor(path) ? lastRemoval : null,
       pickFolderFresh: deps.disclosure.isShown("pickFolder"),
-      // 暫留的舊卡在畫面上時，狀態卡不得講相反的話（B5b／B5c 取代前的保守分支）
-      applyPendingShown: !!$("apply-pending-card") && !$("apply-pending-card").hidden,
       translationComplete: s.translationState === "complete",
       // B5d：選資料夾就判定
       folder: folders() ? folders().gateInput(path) : null,
@@ -83,6 +81,8 @@ export function createPackActions(deps) {
       failure: runFlow() ? runFlow().failureInput() : null,
       progress: runFlow() ? runFlow().progressInput(deps.pathLeaf(path || "")) : null,
       stopping: runFlow() ? runFlow().isStopping() : false,
+      // B5c：這一包的完成結果（依包保存）、本機結果探測、待套用（S11／S14／S17）
+      ...(deps.resultActions ? deps.resultActions.stateInput(path, { busy: !!s.progressBusy }) : {}),
     };
   }
 
@@ -91,6 +91,7 @@ export function createPackActions(deps) {
     const input = packStateInput();
     const state = computePackState(input);
     lastState = state;
+    if (deps.resultActions) deps.resultActions.noteCardShown(state);
     try {
       applyStatusCard(planStatusCard(state), {
         $,
@@ -130,6 +131,9 @@ export function createPackActions(deps) {
 
   function onStatusCardAction(action, item) {
     if (folders() && folders().handles(action)) return void folders().onAction(action, item || {});
+    // B5c：完成卡（套用、當成新的、人工補翻、分享、開啟結果資料夾、併入用詞建議）
+    if (deps.resultActions && deps.resultActions.onAction(action)) return;
+    if (action === "run-new-copy") return void (deps.runNewCopy && deps.runNewCopy());
     // B5b：§3.1 列（更換、這次不用 AI、返回、AI 修正按鈕）、S12 與 AI-BLOCKED 的動作
     if (runFlow() && runFlow().onAction(action)) return;
     if (action === "supplement") return void deps.onSupplement();
@@ -205,18 +209,18 @@ export function createPackActions(deps) {
     const quarantined = Array.isArray(result.quarantined) ? result.quarantined : [];
     if (quarantined.length) deps.appendLog("隔離區裡你原本的版本：\n" + quarantined.join("\n"), "warn");
     lastRemoval = { instancePath: path, result, hasResult: hadResult };
-    const card = $("local-cache-card");
-    if (card) card.hidden = true;
+    if (deps.resultActions) deps.resultActions.forget(path);
     deps.setTranslationState("ready");
     await deps.refreshBackupState();
     deps.syncUiState();
   }
 
-  /** S19a 主要按鈕：把這台電腦上的翻譯結果再套用到遊戲。 */
+  /** S19a 主要按鈕：把這台電腦上的翻譯結果再套用到遊戲（B5c：同一套套用流程，只套到目前這包）。 */
   async function applyRemovedResult() {
-    await deps.applyCachedTranslation();
-    const pendingShown = $("apply-pending-card") && !$("apply-pending-card").hidden;
-    if (deps.getState().translationState === "complete" || pendingShown) lastRemoval = null;
+    const path = instancePath();
+    if (deps.resultActions) await deps.resultActions.apply();
+    // 套用有結果（成功或回到 S11）就收掉 S19a，狀態卡改說套用結果
+    if (deps.resultActions && deps.resultActions.stateInput(path).result) lastRemoval = null;
     deps.syncUiState();
   }
 
@@ -242,6 +246,7 @@ export function createPackActions(deps) {
       return;
     }
     deps.appendLog("已刪除翻譯結果，按「開始翻譯」可以從頭翻一次。", "warn");
+    if (deps.resultActions) deps.resultActions.forget(instancePath());
     deps.hideLocalCacheCard();
     deps.clearShareableFiles();
     deps.setTranslationState("ready");
@@ -256,6 +261,7 @@ export function createPackActions(deps) {
         doc,
         onAction: (banner) => {
           if (banner.id === "N-01") updateChecker?.showUpdateModal();
+          if ((banner.id === "N-05" || banner.id === "N-09") && deps.onBannerAction) deps.onBannerAction(banner);
           if (banner.id === "N-02" && banner.folder) {
             void invoke("open_path", { path: parentFolder(banner.folder) }).catch((e) =>
               deps.appendLog("無法開啟資料夾：" + deps.formatInvokeError(e), "warn")
@@ -311,17 +317,12 @@ export function createPackActions(deps) {
     watchOverlay($("gpt-login-overlay"), { onEscape: click("btn-gpt-overlay-close") });
     watchOverlay($("local-llm-overlay"), { onEscape: click("btn-local-llm-overlay-close") });
     watchOverlay($("pack-options-modal"), { onEscape: () => deps.closeMoreDrawer() });
+    // B5c：分享給朋友、人工補翻（關閉＝放棄本次流程、不改任何設定）
+    watchOverlay($("share-overlay"), { onEscape: click("btn-share-close"), backdropEscape: true });
+    watchOverlay($("manual-fix-overlay"), { onEscape: click("btn-manual-fix-close"), backdropEscape: true });
   }
 
   function wireStatusCardActions() {
-    // 暫留的舊卡（待套用、接續）是各自直接改 hidden 的；它們一出現／消失就重畫狀態卡
-    if (typeof MutationObserver !== "undefined") {
-      const observer = new MutationObserver(() => deps.syncUiState());
-      ["apply-pending-card"].forEach((id) => {
-        const el = $(id);
-        if (el) observer.observe(el, { attributes: true, attributeFilter: ["hidden"] });
-      });
-    }
     const bind = (id, fn) => {
       const el = $(id);
       if (!el) return;
@@ -334,6 +335,7 @@ export function createPackActions(deps) {
     };
     bind("btn-card-pick", () => deps.onPickInstance());
     bind("btn-card-apply", () => applyRemovedResult());
+    // B5c：S11「套用到遊戲」與其他結果動作走同一顆 generic 主要按鈕（data-action）
     // B5d：其他主要動作共用一顆（動作與路徑寫在 data-*）
     bind(GENERIC_PRIMARY_ID, () => {
       const el = $(GENERIC_PRIMARY_ID);

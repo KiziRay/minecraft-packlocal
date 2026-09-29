@@ -182,9 +182,12 @@ export function isChoiceOpen() {
 /**
  * 顯示多選項對話框。回傳被選中選項的 `value`；取消／Esc／點背景回 `null`。
  *
- * @param {{title:string, body?:string, options:Array<{value:string,label:string,detail:string}>, cancelLabel?:string}} config
+ * B5c：`ack`＝某個選項要先在同一個框裡勾選才可按（D-04「不備份」；規格 §3.5）。
+ *
+ * @param {{title:string, body?:string, options:Array<{value:string,label:string,detail:string}>, cancelLabel?:string,
+ *   ack?: {label: string, forValue: string}}} config
  */
-export function choiceDialog({ title, body = "", options = [], cancelLabel = "取消" } = {}) {
+export function choiceDialog({ title, body = "", options = [], cancelLabel = "取消", ack = null } = {}) {
   const root = buildChoice();
   if (choiceResolve) closeChoice(null);
 
@@ -195,6 +198,8 @@ export function choiceDialog({ title, body = "", options = [], cancelLabel = "�
 
   const list = root.querySelector(".choice-options");
   list.textContent = "";
+  const gated = [];
+  let ackBox = null;
   for (const option of Array.isArray(options) ? options : []) {
     if (!option || !option.value) continue;
     const button = document.createElement("button");
@@ -208,8 +213,35 @@ export function choiceDialog({ title, body = "", options = [], cancelLabel = "�
     detail.textContent = String(option.detail || "");
     button.appendChild(label);
     button.appendChild(detail);
-    button.onclick = () => closeChoice(option.value);
+    const needsAck = !!(ack && ack.label && ack.forValue === option.value);
+    if (needsAck) {
+      button.setAttribute("aria-disabled", "true");
+      gated.push(button);
+    }
+    button.onclick = () => {
+      if (needsAck && !(ackBox && ackBox.checked)) return;
+      closeChoice(option.value);
+    };
     list.appendChild(button);
+  }
+  if (gated.length) {
+    const row = document.createElement("label");
+    row.className = "option-row compact-option confirm-ack";
+    ackBox = document.createElement("input");
+    ackBox.type = "checkbox";
+    ackBox.className = "confirm-ack-box";
+    const mark = document.createElement("span");
+    mark.className = "check-box";
+    mark.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    const strong = document.createElement("strong");
+    strong.textContent = String(ack.label);
+    text.appendChild(strong);
+    row.appendChild(ackBox);
+    row.appendChild(mark);
+    row.appendChild(text);
+    ackBox.onchange = () => gated.forEach((b) => b.setAttribute("aria-disabled", ackBox.checked ? "false" : "true"));
+    list.appendChild(row);
   }
 
   const cancel = root.querySelector(".choice-cancel");

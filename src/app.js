@@ -46,6 +46,9 @@ import { createSfxControls } from "./settings/sfx.js";
 import { wireUpdateChecker } from "./core/update.js";
 import { initWebviewScale, onScalePersisted, setWebviewAutoScale, setWebviewScalePercent } from "./ui-scale.js";
 import { createRunFlow } from "./flow/run-flow.js";
+import { failureCodeOf } from "./flow/run-failure.js";
+import { createPackResults } from "./flow/pack-results.js";
+import { FEEDBACK_BANNER, createResultActions, feedbackNudgeDue } from "./flow/result-actions.js";
 import { createAiGate, startLocalForRound } from "./flow/run-start.js";
 import { AI_FIX } from "./flow/ai-readiness.js";
 import {
@@ -133,8 +136,10 @@ let translationState = "idle";
  * 也會被當成剛完成一次翻譯——右欄停在「尚未開始」卻同時排了使用回饋彈窗。
  */
 let resultSource = "none";
+/** B5c：結果資料夾裡「用詞不一致建議」的條數（完成卡「更多」的併入用詞建議）。 */
+let consistencyMergeCount = 0;
+let consistencyMergeProbe = "";
 let pendingUsageFeedbackNudge = false;
-let usageFeedbackDelayTimerId = 0;
 let feedbackStep = 1;
 let issueSubmitBusy = false;
 /** 這次開啟的回報已經送出成功：送出鈕停用，避免重複開討論串。 */
@@ -703,16 +708,49 @@ function initWinbarChrome() {
 
 /** 翻譯完成但還沒裝進遊戲時的後續處理（備份選擇、覆蓋確認、遊戲開著、還沒啟動過遊戲）。 */
 const applyPending = createApplyPendingFlow({
-  $,
   invoke,
   confirmDialog,
   choiceDialog,
   appendLog: (text, level) => appendLog(text, level),
   setBusy: (busy, kind) => setBusy(busy, kind),
   saveBackupChoice: (value) => saveBackupChoiceSetting(value),
-  onApplied: async () => {
+  onApplied: (result, context) => resultActions.onApplied(result, context),
+  onPending: (result, context) => resultActions.onPending(result, context),
+  onFailed: (reason, context) => resultActions.onFailed(reason, context),
+  onBrokenRecord: (context) =>
+    offerRecordReset({ confirmDialog, invoke, appendLog: (text, level) => appendLog(text, level) }, context.instancePath),
+});
+
+/** B5c：完成結果與待套用依模組整合包保存；完成卡、套用、人工補翻、分享的流程在 flow/result-actions.js。 */
+const packResults = createPackResults();
+const resultActions = createResultActions({
+  store: packResults,
+  applyPending,
+  invoke,
+  appendLog: (text, level) => appendLog(text, level),
+  sync: () => syncUiState(),
+  currentPath: () => ($("instance")?.value || "").trim(),
+  probe: () => localCacheProbe, // 歸屬由 result-actions 以 probe.ownerPath 比對（審查 1a）
+  selectedOutputDir: () => selectedOutputDir(),
+  packName: () => packNameForTranslate() || null,
+  aiMode: () => aiModeFromUi(),
+  onlineConfigured: () => !!(cloudTopUpInfo && cloudTopUpInfo.configured),
+  disclosure,
+  canShare: () => hasShareableFiles && !progressBusy && !shareUploadInFlight,
+  canMergeTerms: () => consistencyMergeCount > 0,
+  backupChoice: () => currentBackupChoice(),
+  showBanner: (banner) => packActions.bannerArea().show(banner),
+  offerFork: (path) => offerForkInstance({ confirmDialog, invoke, appendLog: (text, level) => appendLog(text, level) }, path),
+  openShare: () => packageShare(),
+  openManualFix: () => openManualFixOverlay(),
+  openResultFolder: () => openCurrentResultFolder(),
+  mergeTerms: () => onMergeConsistencySuggestions(),
+  openIssueReport: () => showIssueOverlay(),
+  onCleanCompletion: () => noteCleanCompletion(),
+  onCardCollapsed: () => void usageFeedbackMaybeNudge(),
+  onApplied: () => {
     setTranslationState("complete");
-    await refreshBackupState();
+    void refreshBackupState();
   },
 });
 
@@ -720,7 +758,6 @@ const applyPending = createApplyPendingFlow({
 const removalFlow = createRemovalFlow({
   invoke,
   confirmDialog,
-  ensureGameClosed: (path, label) => ensureGameClosed(path, label),
   formatError: (e) => formatInvokeError(e),
   onBusy: (on) => setBusy(on, "apply"),
 });
@@ -851,7 +888,7 @@ const packActions = createPackActions({
     shareUploadInFlight,
     busyJobKind: window.__busyJobKind || "",
     dataMigrating: isDataMigrating(),
-    localCacheProbe,
+    localCacheProbe: ownedProbe(),
     packChangeProbe,
     versionUnknown: versionUnknown({
       detectFailed: versionDetectFailed,
@@ -874,10 +911,12 @@ const packActions = createPackActions({
   refreshBackupState: () => refreshBackupState(),
   setTranslationState: (state) => setTranslationState(state),
   hideLocalCacheCard: () => hideLocalCacheCard(),
+  resultActions,
+  runNewCopy: () => onRunNewCopy(),
+  onBannerAction: (banner) => onBannerAction(banner),
   clearShareableFiles: () => {
     hasShareableFiles = false;
   },
-  applyCachedTranslation: () => applyCachedTranslation(),
   pathLeaf: (path) => pathLeaf(path),
   stopOnboarding: (markSeen, opts) => stopOnboarding(markSeen, opts),
   hideIssueOverlay: () => hideIssueOverlay(),
@@ -1039,81 +1078,20 @@ async function resolveOutputDirForInstance(instancePath) {
 let localCacheProbe = null;
 let localCacheProbeToken = 0;
 
+/** 本機結果探測（B5c：卡片已併入狀態卡 S14／S17／S11，這裡只保留探測結果）。 */
 function hideLocalCacheCard() {
   localCacheProbe = null;
-  const card = $("local-cache-card");
-  if (card) card.hidden = true;
 }
 
-function logApplyWarnings(result) {
-  const warnings = result?.warnings || [];
-  for (const w of warnings) {
-    if (w) appendLog(String(w), "warn");
-  }
+function showLocalCacheCard(probe, ownerPath) {
+  // B5d：「有變動」不是可用的結果（S15 由狀態卡說）
+  // 審查 1a：記下這份探測屬於哪個遊戲資料夾；路徑不符時一律當沒有（ownedProbe）
+  localCacheProbe = isUsableProbe(probe) ? { ...probe, ownerPath: String(ownerPath || "").trim() } : null;
 }
 
-function showLocalCacheCard(probe) {
-  // B5d：「有變動」不是可用的結果（S15 由狀態卡說），不進這張卡
-  localCacheProbe = isUsableProbe(probe) ? probe : null;
-  const card = $("local-cache-card");
-  if (!card) return;
-  // 正在翻譯時不顯示：進度條已經回答了「有沒有翻譯」這件事，卡片只會製造矛盾訊息。
-  // 剛移除翻譯（狀態卡 S19）時也不顯示：「套用到遊戲」只在狀態卡一處。
-  if (
-    !localCacheProbe ||
-    translationState === "running" ||
-    packActions.isRemovalShownFor(($("instance")?.value || "").trim())
-  ) {
-    card.hidden = true;
-    return;
-  }
-  card.hidden = false;
-  const badge = $("local-cache-badge");
-  if (badge) {
-    badge.hidden = false;
-    badge.textContent =
-      localCacheProbe.status === "ready" ? "可直接分享" : "可接續";
-    badge.dataset.state = localCacheProbe.status;
-  }
-  const msg = $("local-cache-message");
-  if (msg) msg.textContent = localCacheProbe.message || "";
-  const packEl = $("local-cache-pack");
-  if (packEl) {
-    const packLabel =
-      localCacheProbe.packName ||
-      localCacheProbe.pack_name ||
-      localCacheProbe.canonicalZip ||
-      localCacheProbe.canonical_zip ||
-      "";
-    packEl.hidden = !packLabel;
-    packEl.textContent = packLabel ? `資源包：${packLabel}` : "";
-  }
-  const pathEl = $("local-cache-path");
-  if (pathEl) {
-    const shown = localCacheProbe.workRoot || localCacheProbe.outputDir || "";
-    pathEl.hidden = !shown;
-    pathEl.textContent = shown ? `位置：${shown}` : "";
-  }
-  const warnEl = $("local-cache-warn");
-  if (warnEl) {
-    const probeOut = String(localCacheProbe.outputDir || "").trim();
-    const selected = String(selectedOutputDir() || "").trim();
-    const mismatch =
-      customOutputEnabled() &&
-      probeOut &&
-      selected &&
-      probeOut.replace(/\\/g, "/").toLowerCase() !== selected.replace(/\\/g, "/").toLowerCase();
-    warnEl.hidden = !mismatch;
-    warnEl.textContent = mismatch
-      ? "本包「另指定結果資料夾」與探測到的快取位置不同；再次套用／分享以快取位置為準。"
-      : "";
-  }
-  const shareable = !!localCacheProbe.shareable;
-  const applyable = !!localCacheProbe.applyable || shareable;
-  const pending = Number(localCacheProbe.pendingCount || 0) > 0;
-  if ($("btn-cache-apply")) $("btn-cache-apply").hidden = !applyable;
-  if ($("btn-cache-supplement")) $("btn-cache-supplement").hidden = !pending && localCacheProbe.status !== "partial";
-  if ($("btn-cache-share")) $("btn-cache-share").hidden = !shareable;
+/** 目前（或指定）遊戲資料夾自己的探測結果；上一包留下的不算。 */
+function ownedProbe(path = ($("instance")?.value || "").trim()) {
+  return localCacheProbe && samePath(localCacheProbe.ownerPath, path) ? localCacheProbe : null;
 }
 
 async function probeLocalPackCache(instancePath, { silent } = {}) {
@@ -1145,7 +1123,7 @@ async function probeLocalPackCache(instancePath, { silent } = {}) {
       if (probe.outputDir && !customOutputEnabled()) {
         setAutoOutputDir(probe.outputDir);
       }
-      showLocalCacheCard(probe);
+      showLocalCacheCard(probe, path);
       if (probe.shareable) {
         hasShareableFiles = true;
         if (translationState === "idle" || translationState === "ready") {
@@ -1174,89 +1152,12 @@ async function probeLocalPackCache(instancePath, { silent } = {}) {
   }
 }
 
-async function applyCachedTranslation() {
-  const instancePath = ($("instance")?.value || "").trim();
-  const outputDir =
-    (localCacheProbe && localCacheProbe.outputDir) || selectedOutputDir();
-  if (!instancePath || !outputDir) {
-    return appendLog("請先選好遊戲資料夾與結果位置。", "warn");
-  }
-  if (!(await ensureGameClosed(instancePath, "再次套用"))) return;
-  const packName =
-    (localCacheProbe &&
-      (localCacheProbe.packName || localCacheProbe.pack_name || localCacheProbe.canonicalZip || localCacheProbe.canonical_zip)) ||
-    packNameForTranslate() ||
-    null;
-  setBusy(true, "apply");
-  let pendingApply = null;
-  try {
-    appendLog("正在把本機翻譯結果再次套用到遊戲…");
-    const result = await invoke("apply_translation_to_game", {
-      instancePath,
-      outputDir,
-      packName,
-    });
-    const summary = result?.playerSummary || result?.player_summary || result?.message || "套用完成。";
-    if (isApplyPending(result)) {
-      pendingApply = result;
-    } else {
-      appendLog(summary);
-      logApplyWarnings(result);
-      setTranslationState("complete");
-    }
-    await refreshShareableState();
-  } catch (e) {
-    appendError("再次套用失敗：" + formatInvokeError(e));
-    offerRecordResetIfBroken(e, instancePath);
-  } finally {
-    setBusy(false);
-  }
-  if (pendingApply) await applyPending.handle(pendingApply, { instancePath, outputDir, packName });
-}
-
-function wireLocalCacheCard() {
-  if ($("btn-cache-open")) {
-    $("btn-cache-open").onclick = async () => {
-      const work =
-        (localCacheProbe && (localCacheProbe.workRoot || localCacheProbe.outputDir)) ||
-        resultWorkDir(selectedOutputDir());
-      if (!work) return appendLog("還沒有結果位置可打開。", "warn");
-      try {
-        await invoke("open_path", { path: work });
-      } catch (e) {
-        appendLog("無法打開：" + formatInvokeError(e), "warn");
-      }
-    };
-  }
-  if ($("btn-cache-apply")) $("btn-cache-apply").onclick = () => applyCachedTranslation();
-  if ($("btn-cache-supplement")) {
-    $("btn-cache-supplement").onclick = () => {
-      if (typeof onSupplement === "function") onSupplement();
-    };
-  }
-  if ($("btn-cache-share")) {
-    $("btn-cache-share").onclick = () => {
-      if (localCacheProbe?.outputDir && !customOutputEnabled()) {
-        setAutoOutputDir(localCacheProbe.outputDir);
-      }
-      // 直接呼叫同一個函式，不用 .click() 代打另一顆按鈕：
-      // 那會讓事件同時經過「直接接線」與「文件委派保底」兩條路徑，變成一次點擊兩次動作。
-      const btn = $("btn-package");
-      if (btn && !btn.disabled) packageShare();
-      else appendLog("目前尚無可分享檔案；請確認結果資料夾內容。", "warn");
-    };
-  }
-}
-
 /**
  * 啟動時**不再**自動填入上次的遊戲資料夾。
  *
  * 使用者要求：開工具不該自動帶出上一次的翻譯紀錄，只有他自己選了資料夾之後，
- * 才去偵測「本機是否已有翻譯」。舊行為會在啟動時就回填路徑、驗證、探快取，
- * 讓人以為工具已經在處理某個整合包了——那不是他這次要做的事。
- *
- * 上次的路徑仍然記著：當「選資料夾」對話框的起始位置，以及 D 區「上次：<包名>」
- * （B5d：按下才走跟瀏覽一樣的檢查，啟動時不探測）。
+ * 才去偵測「本機是否已有翻譯」。上次的路徑仍然記著：當「選資料夾」對話框的起始位置，
+ * 以及 D 區「上次：<包名>」（B5d：按下才走跟瀏覽一樣的檢查，啟動時不探測）。
  */
 async function restoreLastInstanceOnStartup() {
   hideLocalCacheCard();
@@ -1627,32 +1528,10 @@ function log(msg) {
   appendLog(msg);
 }
 
+/** 後端的完整結論只進紀錄（畫面上的結論是狀態卡的完成卡，規格 §3.7）。 */
 function setLogFinal(msg) {
   appendLog("────────");
-  if (errorLogCount > 0) {
-    appendLog("本次共記錄 " + errorLogCount + " 筆錯誤／警告相關行。", "warn");
-  }
   appendLog(msg);
-  maybeHintAiQuota(msg);
-}
-
-/** AI 額度用完：提示支持（不提服務商名稱） */
-function maybeHintAiQuota(text) {
-  const s = String(text || "");
-  if (!/額度|餘額|沒有回應|金鑰無效|無權限|沒有有效回應|請我喝珍奶|沒有餘力|429|quota exhausted/.test(s)) {
-    return;
-  }
-  const mode = aiModeFromUi();
-  appendLog("────────", "warn");
-  if (mode === "gpt") {
-    appendLog("GPT 來源使用你的 ChatGPT／OpenAI 帳號額度；請稍後再試、換模型，或改用自訂 API。", "warn");
-  } else if (mode === "custom") {
-    appendLog("自訂 API 使用你填入服務商的金鑰與額度；請到該服務商後台確認金鑰、餘額與速率限制。", "warn");
-  } else if (mode === "local") {
-    appendLog("本地模型在這台電腦執行；若沒有回應，請先完成安裝與健康檢查。", "warn");
-  } else {
-    appendLog("請確認目前 AI 來源的額度與登入狀態。", "warn");
-  }
 }
 
 /** 使用者按停止不是錯誤，畫面不該變成一片紅字 */
@@ -1692,8 +1571,9 @@ function offerRecordResetIfBroken(e, instancePath) {
 
 function handleRunFailure(e, whatFailed, origin = "run") {
   offerRecordResetIfBroken(e);
-  // B5b S12：依原因給主要按鈕（本批暫用錯誤字串判斷，分類碼在後續批次）；停止不是錯誤
-  if (!isCancellation(e)) runFlow.recordFailure(origin, formatInvokeError(e));
+  // S12：依原因給主要按鈕；停止不是錯誤
+  // B5c：有後端分類碼就用碼（failureCodeOf），沒有才退回字串判斷
+  if (!isCancellation(e)) runFlow.recordFailure(origin, formatInvokeError(e), failureCodeOf(e));
   if (isCancellation(e)) {
     // 這裡是「已經停下來了」的收尾，不是「正在停」。舊版把訊息寫「已停止」
     // 卻同時掛上 cancelling 徽章（顯示「取消中」），畫面上兩個互相矛盾的狀態
@@ -2039,52 +1919,60 @@ function showFeedbackOverlay() {
   if (status) status.textContent = "";
 }
 
-function scheduleUsageFeedbackNudge() {
-  clearTimeout(usageFeedbackDelayTimerId);
-  const delayMs = 8000 + Math.floor(Math.random() * 7001);
-  usageFeedbackDelayTimerId = window.setTimeout(() => {
-    void usageFeedbackMaybeNudge();
-  }, delayMs);
+const USAGE_COMPLETIONS_KEY = "mcpl-usage-completions";
+/** 有一次完整跑完、還沒判斷過要不要提醒回饋（完成卡收合或下次啟動時判斷）。 */
+const USAGE_NUDGE_PENDING_KEY = "mcpl-usage-nudge-pending";
+
+function readUsageNumber(key) {
+  try {
+    return Number(localStorage.getItem(key) || 0) || 0;
+  } catch (_) {
+    return 0;
+  }
 }
 
+/** 一輪完整跑完（中途停下不算）：記一次完成，等完成卡收合或下次啟動再判斷 N-09。 */
+function noteCleanCompletion() {
+  try {
+    localStorage.setItem(USAGE_COMPLETIONS_KEY, String(readUsageNumber(USAGE_COMPLETIONS_KEY) + 1));
+    localStorage.setItem(USAGE_NUDGE_PENDING_KEY, "1");
+  } catch (_) {}
+}
+
+/** 完成卡收合（換資料夾）或啟動時呼叫：有待判斷的完成才看要不要出 N-09。 */
 async function usageFeedbackMaybeNudge() {
-  const ov = $("feedback-overlay");
-  if (!ov) return;
-  if (translationState !== "complete") return;
-  if (isBlockingOverlayOpen()) {
+  if (!readUsageNumber(USAGE_NUDGE_PENDING_KEY)) return;
+  if (progressBusy || isBlockingOverlayOpen()) {
     pendingUsageFeedbackNudge = true;
     return;
   }
-  if (!ov.hidden) return;
-
-  const now = Date.now();
-  const lastSubmit = (() => {
-    try {
-      return Number(localStorage.getItem(USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY) || 0);
-    } catch (_) {
-      return 0;
-    }
-  })();
-  const lastNudge = (() => {
-    try {
-      return Number(localStorage.getItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY) || 0);
-    } catch (_) {
-      return 0;
-    }
-  })();
-
-  const submitCooldownMs = 21 * 24 * 60 * 60 * 1000;
-  const nudgeCooldownMs = 14 * 24 * 60 * 60 * 1000;
-  if (lastSubmit && now - lastSubmit < submitCooldownMs) return;
-  if (lastNudge && now - lastNudge < nudgeCooldownMs) return;
-
-  const prob = 0.2;
-  if (Math.random() > prob) return;
-
   try {
-    localStorage.setItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY, String(now));
+    localStorage.removeItem(USAGE_NUDGE_PENDING_KEY);
   } catch (_) {}
-  showFeedbackOverlay();
+  const due = feedbackNudgeDue({
+    completions: readUsageNumber(USAGE_COMPLETIONS_KEY),
+    lastSubmit: readUsageNumber(USAGE_FEEDBACK_LAST_SUBMIT_AT_KEY),
+    lastNudge: readUsageNumber(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY),
+  });
+  if (!due) return;
+  try {
+    localStorage.setItem(USAGE_FEEDBACK_LAST_NUDGE_AT_KEY, String(Date.now()));
+  } catch (_) {}
+  // N-09（規格 §3.4）：橫幅一句＋「填寫」；不疊在完成卡上、不直接跳問卷
+  packActions.bannerArea().show({ ...FEEDBACK_BANNER });
+}
+
+/** 橫幅按鈕（N-05 開字體工具、N-09 開使用回饋）。 */
+function onBannerAction(banner) {
+  if (!banner) return;
+  if (banner.id === "N-05") {
+    showAppPage("font");
+    return;
+  }
+  if (banner.id === "N-09") {
+    packActions.bannerArea().hide("N-09");
+    showFeedbackOverlay();
+  }
 }
 
 function advanceFeedbackStep() {
@@ -2792,9 +2680,9 @@ function setBusy(busy, jobKind) {
   syncUiState();
   if (!busy && typeof window.zfUpdateModalMaybeShowPending === "function") window.zfUpdateModalMaybeShowPending();
   if (!busy) packActions.maybeShowUpdateBanner();
-  if (!busy && pendingUsageFeedbackNudge && translationState === "complete" && !isBlockingOverlayOpen()) {
+  if (!busy && pendingUsageFeedbackNudge && !isBlockingOverlayOpen()) {
     pendingUsageFeedbackNudge = false;
-    scheduleUsageFeedbackNudge();
+    void usageFeedbackMaybeNudge();
   }
 }
 
@@ -2882,8 +2770,7 @@ function setTranslationState(state) {
   // 一進 running 就把來源標成 run：翻譯／補翻／修復三條路徑都會經過這裡。
   if (translationState === "running") {
     resultSource = "run";
-    // 正在翻譯時「本機已有翻譯」卡片沒有意義：進度條已經在跑了，卡片還說
-    // 「可接續補翻」是兩個互相矛盾的訊息同時出現在畫面上。
+    // 正在翻譯時舊的探測結果沒有意義（狀態卡在說進度）
     hideLocalCacheCard();
   }
   document.body.dataset.translationState = translationState;
@@ -2893,10 +2780,7 @@ function setTranslationState(state) {
     refreshShareableState();
     freezeAllStepTimings();
   }
-  // 只有「這次真的跑過翻譯」才問回饋。單純還原快取不算使用了一次。
-  if (translationState === "complete" && resultSource === "run") {
-    scheduleUsageFeedbackNudge();
-  }
+  // N-09 不在這裡判斷（審查 6）：完整跑完由 resultActions 記一次，完成卡收合或下次啟動才出
 }
 
 /** 右欄在沒跑過翻譯、但本機有舊結果時，要說「上次結果」而不是「尚未開始」。 */
@@ -3042,7 +2926,6 @@ function syncUiState() {
   const page = document.body.dataset.appPage || "translate";
   const instanceReady = hasInstance && !!instanceValidation.ok && !versionBlocked;
   document.body.dataset.instanceReady = instanceReady ? "1" : "0";
-  syncPackMetaUi();
 
   const hideMore = !(hasInstance && !!instanceValidation.ok);
   const moreBtn = $("btn-more-options");
@@ -3073,17 +2956,6 @@ function syncUiState() {
   // 舊的補翻按鈕與「重新翻譯缺漏」已移除：整併進「開始翻譯」的
   // 「接續補完」選項與同輪自動重試；兩顆按鈕留著只會讓人不知道該按哪個。
   void refreshConsistencyMergeUi();
-  // 只看磁碟有沒有可分享檔案（hasShareableFiles）會讓「分享給其他玩家」在選到一個
-  // 本機早有舊結果的資料夾時就提早出現，跟這次根本還沒跑翻譯互相矛盾。注意：
-  // probeLocalPackCache 找到快取時也會把 translationState 設成 "complete"（見
-  // showCachedResultOnRail 那條路徑），單看 complete 篩不掉這個情境，要一併檢查
-  // resultSource === "run"（真的走過這次翻譯／補翻／修復）——舊結果要分享
-  // 走「本機已有翻譯」卡片自己的「打包分享」按鈕，這顆只在這次真的翻完才出現。
-  const canShare = hasShareableFiles && !locked && complete && resultSource === "run";
-  toggleHidden("btn-package", !canShare);
-  // 「複製沒翻到的／貼回翻譯」跟分享同時機出現：這次真的跑完翻譯才有意義
-  toggleHidden("btn-copy-failed", !canShare);
-  toggleHidden("btn-import-translations", !canShare);
   clearShareUrlIfInstanceChanged();
   const fontFileReady = !!($("font-file")?.value || "").trim();
   const fontOutReady = !!($("font-output")?.value || "").trim();
@@ -3109,22 +2981,11 @@ function syncUiState() {
 
   syncTranslationHelperPanel();
 
-  const packageButton = $("btn-package");
-  if (packageButton) {
-    packageButton.disabled = !canShare;
-    packageButton.textContent = lastShareUrl ? "複製分享連結" : "分享給其他玩家";
+  const shareOverlay = $("share-overlay");
+  if (shareOverlay) {
+    shareOverlay.hidden = !shareConfirmationOpen;
+    shareOverlay.setAttribute("aria-hidden", shareConfirmationOpen ? "false" : "true");
   }
-  const shareHint = $("share-hint");
-  if (shareHint) {
-    shareHint.hidden = !canShare || shareConfirmationOpen;
-    if (canShare && lastShareUrl) {
-      shareHint.textContent = "連結已在剪貼簿；再按一次只會複製。";
-    } else if (canShare && !shareConfirmationOpen) {
-      shareHint.textContent = "完成後可分享帶密碼自解檔（只含一個最新工具資源包）。";
-    }
-  }
-  const confirmPanel = $("share-confirm-panel");
-  if (confirmPanel) confirmPanel.hidden = !shareConfirmationOpen || !hasShareableFiles;
   const confirmButton = $("btn-share-confirm");
   const reviewed = !!$("share-confirm-reviewed")?.checked;
   const privateFiles = !!$("share-confirm-private")?.checked;
@@ -3312,30 +3173,30 @@ function clearShareUrlIfInstanceChanged() {
 
 async function copyShareUrl(url) {
   const steps =
-    "【接收端四步驟】\n" +
-    "1. 下載自解 exe，輸入密碼 cloud.zeitfrei.uk（下載頁也會顯示）\n" +
-    "2. 執行後選整合包實例根目錄（需含 mods 或 resourcepacks；Prism 多實例勿選錯）\n" +
-    "3. 完全關閉遊戲後重開，語言選繁體中文（台灣）\n" +
-    "4. 資源包列表只啟用包內那一個「模組包翻譯工具+*」zip\n\n" +
+    "【朋友這樣裝】\n" +
+    "1. 下載後執行，密碼：cloud.zeitfrei.uk\n" +
+    "2. 照畫面選你的遊戲資料夾（裡面有 mods）；會先備份會被覆蓋的檔\n" +
+    "3. 關掉遊戲再開，語言選繁體中文（台灣）\n\n" +
     url;
   try {
     await navigator.clipboard.writeText(steps);
-    appendLog("連結與安裝步驟已複製（24 小時有效）");
+    appendLog("分享連結與安裝步驟已複製（24 小時內有效）");
+    showAppToast("已複製分享連結", 2600);
   } catch (_) {
-    appendLog("無法寫入剪貼簿，請再按「複製分享連結」。", "warn");
+    appendLog("無法寫入剪貼簿，請再按一次「分享給朋友」。", "warn");
   }
 }
 
+/** 完成卡次要「分享給朋友」：第一次開浮層確認（對外發布）；已建立過就只複製連結。本機舊結果也能分享。 */
 function packageShare() {
   if (lastShareUrl) {
     return copyShareUrl(lastShareUrl);
   }
   if (!hasShareableFiles) {
-    return log("請先完成翻譯並產生可安裝檔，再建立分享檔。");
+    return log("這個模組整合包還沒有可分享的翻譯結果。");
   }
   shareConfirmationOpen = true;
   syncUiState();
-  $("share-confirm-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 async function confirmShareUpload() {
@@ -3365,19 +3226,25 @@ function closeShareConfirmation() {
 async function uploadSharePackage() {
   let outputDir = selectedOutputDir();
   let work = resultWorkDir(outputDir);
-  if (localCacheProbe?.shareable && (localCacheProbe.workRoot || localCacheProbe.outputDir)) {
-    work = localCacheProbe.workRoot || resultWorkDir(localCacheProbe.outputDir);
-    outputDir = localCacheProbe.outputDir || outputDir;
+  const probe = ownedProbe();
+  if (probe?.shareable && (probe.workRoot || probe.outputDir)) {
+    work = probe.workRoot || resultWorkDir(probe.outputDir);
+    outputDir = probe.outputDir || outputDir;
   }
   if (!outputDir || !work) return log("請先完成翻譯（還沒有可打包的翻譯結果）。");
   try {
     const auth = await invoke("discord_auth_status");
     if (!auth || !(auth.loggedIn || auth.logged_in) || !(auth.inGuild || auth.in_guild)) {
+      const status = $("share-status");
+      if (status) {
+        status.textContent = "分享前要先登入 Discord 並加入官方伺服器（在 AI 列的「登入 Discord」）";
+        status.hidden = false;
+      }
       return log("分享前請先登入 Discord 並加入 ZeitFrei 官方伺服器。");
     }
     const ai = await invoke("ai_status");
     void ai;
-    const name = ($("pack-name").value || "模組包翻譯分享").trim();
+    const name = ($("pack-name")?.value || "模組整合包翻譯分享").trim();
     appendLog("正在整理可安裝檔案並上傳…");
     const result = await invoke("upload_share_package_cmd", { workRoot: work, name });
     const url = String(result.url || result || "").trim();
@@ -3852,64 +3719,6 @@ async function releaseLocalModelAfterRun(round) {
 }
 
 /**
- * 翻譯套用後檢查資源包清單是否健康，壞掉就主動提供修復。
- *
- * 這是使用者那次閃退換來的：整合包自己的 ~150 個資源包全部沒被啟用，
- * 字體 builder 找不到 prominent:textures/gui/realms.png，
- * 「Default font failed to load」→ 模型沒烘焙 → 標題畫面空指標。
- * 光看遊戲的錯誤訊息完全看不出跟翻譯有關，所以工具要自己抓出來。
- */
-async function checkResourcePackHealth(instancePath) {
-  if (!instancePath) return;
-  let report;
-  try {
-    report = await invoke("verify_resource_packs_cmd", { instancePath });
-  } catch (_) {
-    return;
-  }
-  const disabled = Array.isArray(report?.presentButDisabled) ? report.presentButDisabled : [];
-  // 修復範圍已縮到「工具動過的項目」，所以有一個就值得問，不必等到超過三個
-  if (!report?.listEmpty && disabled.length === 0) return;
-
-  appendLog(report.summary || "資源包清單可能不完整。", "warn");
-  const shown = disabled.slice(0, 6).map((n) => "・" + n).join("\n");
-  const more = disabled.length > 6 ? "\n…共 " + disabled.length + " 個" : "";
-  // 說明要回答四件事：為什麼要修、怎麼會這樣、修了什麼、不修會怎樣。
-  // 少了任何一項，使用者只能憑感覺按下去——那不是知情的選擇。
-  const backupNote = report?.backupUsed
-    ? "工具比對的是套用前的備份「" + report.backupUsed + "」。"
-    : "這台電腦上找不到套用前的備份，所以只會加回工具自己的翻譯包。";
-  const fix = await confirmDialog({
-    title: report.listEmpty ? "資源包清單是空的" : "資源包清單少了東西",
-    body:
-      (report.summary || "") +
-      "\n\n【為什麼要修】\n" +
-      "遊戲設定檔裡的資源包清單少了項目。翻譯包不在清單裡，遊戲就讀不到翻譯，" +
-      "你會看到全部都還是英文。\n" +
-      "\n【怎麼會這樣】\n" +
-      "多半是遊戲或啟動器在套用之後重新寫過這個檔案，把清單蓋掉了；也可能是手動改過。" +
-      backupNote +
-      "\n\n【會加回哪些】\n" + shown + more +
-      "\n翻譯包會排在最後（優先權最高，才蓋得過其他語言的資源包）。" +
-      "\n**整合包原本就關著的資源包不會被啟用**——那是整合包作者刻意關掉的，工具不動它。" +
-      "\n\n【不修會怎樣】\n" +
-      "翻譯不會生效。先前實測還遇過資源包遺失導致字體載入失敗、進而開不了遊戲。" +
-      "\n\n修改前會先另存一份遊戲設定檔，改壞了可以還原。",
-    confirmLabel: "修復資源包清單",
-    cancelLabel: "先不要",
-    danger: !!report.listEmpty,
-  });
-  if (!fix) return;
-  try {
-    const fixed = await invoke("repair_resource_packs_cmd", { instancePath });
-    appendLog((fixed?.summary || "已修復資源包清單。") + "請重新啟動遊戲確認。");
-    showAppToast("已修復資源包清單，請重開遊戲", 3000);
-  } catch (e) {
-    appendLog("修復失敗：" + formatInvokeError(e), "warn");
-  }
-}
-
-/**
  * 翻譯進行中被要求關閉工具時的處理。
  *
  * 使用者實測過「翻到一半關掉、重開續翻」的後果：前一小時的紀錄被覆寫、
@@ -3920,15 +3729,13 @@ async function handleCloseWhileBusy() {
   const jobName =
     window.__busyJobKind === "repair" ? "修復" :
     window.__busyJobKind === "supplement" ? "接續補完" : "翻譯";
+  // D-15（規格 §3.5）：不可逆（中斷要重跑），不是刪除或無備份覆蓋 → 不用紅色；預設焦點「繼續執行」
   const leave = await confirmDialog({
-    title: jobName + "還在進行中",
-    body:
-      "現在關閉會中斷" + jobName + "。已經完成的部分會保留，下次可以接續，\n" +
-      "但這一輪還沒寫出的內容會遺失。\n\n" +
-      "如果只是想把視窗收起來，可以按「繼續執行」，工具會在背景把它跑完。",
+    title: `${jobName}還在進行，要結束工具嗎？`,
+    body: "已翻好的會寫出，之後可按接續補完。只想收起視窗的話，按「繼續執行」。",
     confirmLabel: "仍要關閉",
     cancelLabel: "繼續執行",
-    danger: true,
+    initialFocus: "cancel",
   });
   if (!leave) return;
   appendLog("使用者選擇中斷並關閉工具，正在保存進度…", "warn");
@@ -3950,57 +3757,101 @@ async function handleCloseWhileBusy() {
  * 表格格式就是 `命名空間,鍵,原文,譯文,原因`——譯文欄留空給他填，
  * 填完直接用「貼回翻譯」貼回來就好。
  */
+function setManualFixStatus(text) {
+  const el = $("manual-fix-status");
+  if (!el) return;
+  el.textContent = String(text || "");
+  el.hidden = !text;
+}
+
+/** 完成卡次要「人工補翻」：浮層（第一次多一段怎麼請線上 AI 翻，規格 §4.2 manual-fix）。 */
+function openManualFixOverlay() {
+  const ov = $("manual-fix-overlay");
+  if (!ov) return;
+  const help = $("manual-fix-help");
+  if (help) help.hidden = !disclosure.isShown("manualFix");
+  setManualFixStatus("");
+  ov.hidden = false;
+  ov.setAttribute("aria-hidden", "false");
+}
+
+function closeManualFixOverlay() {
+  const ov = $("manual-fix-overlay");
+  if (!ov) return;
+  ov.hidden = true;
+  ov.setAttribute("aria-hidden", "true");
+}
+
+function currentResultOutputDir() {
+  const probe = ownedProbe();
+  return (probe && (probe.outputDir || probe.output_dir)) || selectedOutputDir();
+}
+
 async function onCopyFailedItems() {
-  const outputDir = selectedOutputDir();
-  if (!outputDir) return appendLog("還沒有翻譯結果可以匯出。", "warn");
+  const outputDir = currentResultOutputDir();
+  if (!outputDir) return setManualFixStatus("還沒有翻譯結果可以複製。");
   try {
     const csv = await invoke("failed_items_csv_cmd", { outputDir });
     const lines = String(csv || "").split("\n").filter(Boolean).length - 1;
     if (lines <= 0) {
-      return appendLog("這一包沒有待補項目，不需要匯出。");
+      return setManualFixStatus("這個模組整合包的語言檔沒有還是英文的句子。");
     }
     await navigator.clipboard.writeText(csv);
     appendLog(
-      `已複製 ${formatCount(lines)} 條沒翻到的項目到剪貼簿。貼到線上 AI 請它翻「譯文」那一欄，` +
-        "翻完把整張表（或「鍵<Tab>譯文」兩欄）複製起來，回來按「貼回翻譯」。" +
-        "工具會逐條檢查 %s、§ 這類格式符號，對不上的會退回不寫進遊戲。"
+      `已複製 ${formatCount(lines)} 條沒翻到的項目到剪貼簿（格式：命名空間,鍵,原文,譯文,原因）。` +
+        "工具會逐條檢查 %s、§ 這類格式符號，對不上的會保留英文。"
     );
+    setManualFixStatus(`已複製 ${formatCount(lines)} 條，翻好後按「貼回翻譯」`);
     showAppToast(`已複製沒翻到的 ${formatCount(lines)} 條`, 3000);
   } catch (e) {
-    appendLog("匯出失敗：" + formatInvokeError(e), "warn");
+    appendLog("複製失敗：" + formatInvokeError(e), "warn");
+    setManualFixStatus("複製失敗，完整原因在紀錄");
   }
 }
 
-/** 把線上翻好的內容貼回來併入翻譯結果。 */
+/** 把線上翻好的內容貼回來併入翻譯結果；併入後自動重新套用到遊戲（規格 §3.8 四、貼回翻譯）。 */
 async function onImportTranslations() {
-  const outputDir = selectedOutputDir();
-  if (!outputDir) return appendLog("還沒有翻譯結果可以匯入。", "warn");
+  const outputDir = currentResultOutputDir();
+  if (!outputDir) return setManualFixStatus("還沒有翻譯結果可以貼回。");
   let text = "";
   try {
     text = await navigator.clipboard.readText();
   } catch (_) {
-    return appendLog("讀不到剪貼簿內容。請先複製翻好的表格再按一次。", "warn");
+    return setManualFixStatus("讀不到剪貼簿，請先複製翻好的表格再按一次");
   }
   if (!String(text || "").trim()) {
-    return appendLog("剪貼簿是空的。請先複製翻好的表格。", "warn");
+    return setManualFixStatus("剪貼簿是空的，請先複製翻好的表格");
   }
-  const go = await confirmDialog({
-    title: "要把剪貼簿的翻譯併入嗎？",
-    body:
-      "會逐條檢查格式符號（%s、§ 等），對不上的原樣退回不寫進遊戲。\n\n" +
-      "併入後會重建翻譯資源包，你需要重新套用或重開遊戲才看得到。",
-    confirmLabel: "併入",
-    cancelLabel: "取消",
-  });
-  if (!go) return;
+  let report;
   try {
-    const report = await invoke("import_translations_cmd", { outputDir, text });
-    // 通知型對話框改成紀錄＋toast（規格 §1.2）；紀錄寫完整清單，toast 照實（沒併入就不說已併入）
-    const view = describeImportReport(report);
-    appendLog(view.log || "匯入完成。", view.level);
-    showAppToast(view.toast, 3000);
+    report = await invoke("import_translations_cmd", { outputDir, text });
   } catch (e) {
-    appendLog("匯入失敗：" + formatInvokeError(e), "warn");
+    appendLog("貼回翻譯失敗：" + formatInvokeError(e), "warn");
+    return setManualFixStatus("貼回失敗，完整原因在紀錄");
+  }
+  // 照實說：toast 一句、紀錄寫完整清單（沒併入就不說已併入）
+  const view = describeImportReport(report);
+  appendLog(view.log || "貼回完成。", view.level);
+  setManualFixStatus(view.toast);
+  disclosure.retire("manualFix");
+  if (Number(report?.accepted) > 0) {
+    closeManualFixOverlay();
+    showAppToast(view.toast, 3000);
+    // 併入後重建了翻譯資源包：自動重新套用到目前這包（只套到這包，套用前比對資料夾）
+    await resultActions.apply();
+  }
+}
+
+/** 完成卡次要「開啟結果資料夾」。 */
+async function openCurrentResultFolder() {
+  const owned = ownedProbe();
+  const probeWork = owned && (owned.workRoot || owned.work_root);
+  const work = probeWork || resultWorkDir(currentResultOutputDir());
+  if (!work) return appendLog("還沒有結果位置可打開。", "warn");
+  try {
+    await invoke("open_path", { path: work });
+  } catch (e) {
+    appendLog("無法打開：" + formatInvokeError(e), "warn");
   }
 }
 
@@ -4240,189 +4091,6 @@ function pathLeaf(path) {
   return parts.length ? parts[parts.length - 1] : text;
 }
 
-const PACK_META_STORAGE_PREFIX = "mcpl.packMeta.";
-
-function packMetaStorageKey(instancePath) {
-  const path = String(instancePath || "").trim().toLowerCase();
-  if (!path) return "";
-  let hash = 0;
-  for (let i = 0; i < path.length; i += 1) {
-    hash = (Math.imul(31, hash) + path.charCodeAt(i)) | 0;
-  }
-  return PACK_META_STORAGE_PREFIX + Math.abs(hash).toString(36);
-}
-
-// 整合包資訊要跨 session 記住：舊版存 sessionStorage，關掉工具就忘，同一個包每次都要重填。
-function loadPackMeta(instancePath) {
-  const key = packMetaStorageKey(instancePath);
-  if (!key) return {};
-  for (const store of [localStorage, sessionStorage]) {
-    try {
-      const raw = store.getItem(key);
-      if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") return parsed;
-    } catch (_) {
-      /* 換下一個來源 */
-    }
-  }
-  return {};
-}
-
-function savePackMeta(instancePath, data) {
-  const key = packMetaStorageKey(instancePath);
-  if (!key) return;
-  try {
-    localStorage.setItem(key, JSON.stringify(data || {}));
-  } catch (_) {
-    /* ignore quota */
-  }
-}
-
-function packMetaFromForm() {
-  return {
-    displayName: ($("pack-display-name")?.value || "").trim(),
-    packRef: ($("pack-ref")?.value || "").trim(),
-    packVersion: ($("pack-version-meta")?.value || "").trim(),
-    skipped: false,
-  };
-}
-
-function formatPackMetaSummary(meta) {
-  const parts = [];
-  if (meta.displayName) parts.push(`名稱：${meta.displayName}`);
-  if (meta.packRef) parts.push(`連結／包名：${meta.packRef}`);
-  if (meta.packVersion) parts.push(`版本：${meta.packVersion}`);
-  return parts.join(" · ") || "已儲存整合包資訊";
-}
-
-function syncPackMetaUi() {
-  const card = $("pack-meta-card");
-  if (!card) return;
-  const instanceReady = document.body.dataset.instanceReady === "1";
-  const instancePath = ($("instance")?.value || "").trim();
-  if (!instanceReady || !instancePath) {
-    card.hidden = true;
-    return;
-  }
-  const meta = loadPackMeta(instancePath);
-  const form = $("pack-meta-form");
-  const summary = $("pack-meta-summary");
-  const toggle = $("btn-pack-meta-toggle");
-  const editing = form?.dataset.editing === "1";
-  const hasSaved = !!(meta.displayName || meta.packRef || meta.packVersion);
-  card.hidden = false;
-  // 按過「略過」就收成一行，但仍留「填寫資訊」可以回頭。舊版寫了 skipped 卻沒人讀，
-  // 那顆按鈕等於按了沒反應；直接整張藏掉又會變成無法反悔的死路。
-  const skipped = !!meta.skipped && !hasSaved && !editing;
-  card.dataset.skipped = skipped ? "1" : "0";
-  if (hasSaved && summary && !editing) {
-    if (form) form.hidden = true;
-    summary.hidden = false;
-    const text = $("pack-meta-summary-text");
-    if (text) text.textContent = formatPackMetaSummary(meta);
-    if (toggle) {
-      toggle.textContent = "修改";
-      toggle.setAttribute("aria-expanded", "false");
-    }
-  } else if (editing) {
-    if (form) form.hidden = false;
-    if (summary) summary.hidden = true;
-    if (toggle) {
-      toggle.textContent = "收合";
-      toggle.setAttribute("aria-expanded", "true");
-    }
-    if ($("pack-display-name")) $("pack-display-name").value = meta.displayName || "";
-    if ($("pack-ref")) $("pack-ref").value = meta.packRef || "";
-    if ($("pack-version-meta")) $("pack-version-meta").value = meta.packVersion || "";
-  } else {
-    if (form) form.hidden = true;
-    if (summary) summary.hidden = false;
-    const text = $("pack-meta-summary-text");
-    if (text) {
-      text.textContent = skipped ? "已略過；需要時可再填寫。" : "尚未填寫；不填也能翻譯。";
-    }
-    if (toggle) {
-      toggle.textContent = "填寫資訊";
-      toggle.setAttribute("aria-expanded", "false");
-    }
-    if ($("pack-display-name")) $("pack-display-name").value = meta.displayName || "";
-    if ($("pack-ref")) $("pack-ref").value = meta.packRef || "";
-    if ($("pack-version-meta")) $("pack-version-meta").value = meta.packVersion || "";
-  }
-}
-
-function savePackMetaFromForm() {
-  const instancePath = ($("instance")?.value || "").trim();
-  if (!instancePath) return;
-  const data = packMetaFromForm();
-  savePackMeta(instancePath, data);
-  appendLog("已記住這個整合包的資訊，下次開工具不用再填。");
-  const form = $("pack-meta-form");
-  if (form) delete form.dataset.editing;
-  syncPackMetaUi();
-}
-
-function skipPackMetaCard() {
-  const instancePath = ($("instance")?.value || "").trim();
-  if (!instancePath) return;
-  savePackMeta(instancePath, { ...loadPackMeta(instancePath), skipped: true });
-  const form = $("pack-meta-form");
-  if (form) delete form.dataset.editing;
-  syncPackMetaUi();
-}
-
-function editPackMetaCard() {
-  const form = $("pack-meta-form");
-  if (form) form.dataset.editing = "1";
-  // 使用者主動要填了，就不再算「已略過」。
-  const path = ($("instance")?.value || "").trim();
-  if (path) {
-    const meta = loadPackMeta(path);
-    if (meta.skipped) savePackMeta(path, { ...meta, skipped: false });
-  }
-  const summary = $("pack-meta-summary");
-  if (summary) summary.hidden = true;
-  if (form) form.hidden = false;
-  const instancePath = ($("instance")?.value || "").trim();
-  const meta = loadPackMeta(instancePath);
-  if ($("pack-display-name")) $("pack-display-name").value = meta.displayName || "";
-  if ($("pack-ref")) $("pack-ref").value = meta.packRef || "";
-  if ($("pack-version-meta")) $("pack-version-meta").value = meta.packVersion || "";
-  const toggle = $("btn-pack-meta-toggle");
-  if (toggle) {
-    toggle.textContent = "收合";
-    toggle.setAttribute("aria-expanded", "true");
-  }
-}
-
-function togglePackMetaForm() {
-  const form = $("pack-meta-form");
-  const toggle = $("btn-pack-meta-toggle");
-  if (!form) return;
-  const expanded = form.dataset.editing === "1" || toggle?.getAttribute("aria-expanded") === "true";
-  if (!expanded) {
-    editPackMetaCard();
-  } else {
-    delete form.dataset.editing;
-    syncPackMetaUi();
-  }
-}
-
-function wirePackMetaCard() {
-  const pairs = [
-    ["btn-pack-meta-toggle", togglePackMetaForm],
-    ["btn-pack-meta-save", savePackMetaFromForm],
-    ["btn-pack-meta-skip", skipPackMetaCard],
-  ];
-  pairs.forEach(([id, handler]) => {
-    const el = $(id);
-    if (!el || el.dataset.wired) return;
-    el.dataset.wired = "1";
-    el.addEventListener("click", handler);
-  });
-}
-
 function wireCriticalUiDelegation() {
   if (document.documentElement.dataset.criticalUiDelegated === "1") return;
   document.documentElement.dataset.criticalUiDelegated = "1";
@@ -4444,15 +4112,6 @@ function wireCriticalUiDelegation() {
       if (btn.dataset.wired === "1") return;
       if (btn.disabled) return;
       switch (btn.id) {
-        case "btn-pack-meta-toggle":
-          run(btn.id, () => togglePackMetaForm());
-          break;
-        case "btn-pack-meta-save":
-          run(btn.id, () => savePackMetaFromForm());
-          break;
-        case "btn-pack-meta-skip":
-          run(btn.id, () => skipPackMetaCard());
-          break;
         case "tab-translate":
           run(btn.id, () => showAppPage("translate"));
           break;
@@ -4473,9 +4132,6 @@ function wireCriticalUiDelegation() {
           break;
         case "btn-overflow":
           run(btn.id, () => openAppSettings("general"));
-          break;
-        case "btn-package":
-          run(btn.id, () => packageShare());
           break;
         default:
           break;
@@ -4503,14 +4159,33 @@ async function onQuitApp() {
  * 從「瀏覽…」與「接續補完」兩個入口共用同一段流程——兩邊要走一模一樣的路，
  * 不然接續進來的狀態會跟自己選資料夾進來的不一致。
  */
+/** 上一次選定（瀏覽或手動輸入）的遊戲資料夾：換資料夾時收合它的完成卡。 */
+let lastAdoptedPath = "";
+
+/**
+ * 換資料夾（瀏覽、上次、手動輸入共用）：上一包的探測、移除結果、開始前草稿、另存旗標、
+ * 結果位置一律清掉；上一包的完成卡收合（依包保存，回來再現）。審查 1a。
+ */
+function beginFolderChange(nextPath) {
+  hideLocalCacheCard();
+  packActions.clearRemoval();
+  runFlow.onFolderChanged();
+  resultActions.onFolderChanged(lastAdoptedPath);
+  lastAdoptedPath = String(nextPath || "").trim();
+  runNewCopyOnce = false;
+  packChangeProbe = null;
+  const output = $("output");
+  if (output && !customOutputEnabled()) {
+    output.value = "";
+    output.dataset.autoPath = "";
+  }
+}
+
 async function adoptInstancePath(p, { silentProbe = false } = {}) {
   // 換整合包＝一切從頭：步驟燈號、計時、統計都要歸零，
   // 否則上一包的狀態會留在畫面上，看起來像這一包已經翻過。
   resetStepPanelForNewInstance();
-  hideLocalCacheCard();
-  packActions.clearRemoval();
-  runFlow.onFolderChanged();
-  packChangeProbe = null;
+  beginFolderChange(p);
   versionDetectFailed = false;
   clearAutoDetectedVersion();
   $("instance").value = p;
@@ -4622,7 +4297,11 @@ function wireWorkbenchActions() {
   bind("btn-quit", () => onQuitApp());
   bind("btn-run", () => onRun());
   bind("btn-stop", () => onStop());
-  bind("btn-package", () => packageShare());
+  // B5c：人工補翻與分享浮層（完成卡次要按鈕打開）
+  bind("btn-copy-failed", () => onCopyFailedItems());
+  bind("btn-import-translations", () => onImportTranslations());
+  bind("btn-manual-fix-close", () => closeManualFixOverlay());
+  bind("btn-share-close", () => closeShareConfirmation());
 }
 
 function forceClearBlockingOverlays({ keepConsent = false } = {}) {
@@ -4659,10 +4338,6 @@ function forceClearBlockingOverlays({ keepConsent = false } = {}) {
   } catch (_) {
     /* ignore */
   }
-}
-
-function getActivePackMeta() {
-  return loadPackMeta(($("instance")?.value || "").trim());
 }
 
 function initReloadGuard() {
@@ -4853,7 +4528,8 @@ async function checkSelectedFolder(path) {
  */
 async function onInstanceTypedPath(path) {
   // B5d：手動輸入與瀏覽同一套檢查（checkSelectedFolder），看到的提示一樣
-  packChangeProbe = null;
+  // 審查 1a：也走同一個換資料夾收尾（不沿用上一包的探測與結果位置）
+  beginFolderChange(path);
   versionDetectFailed = false;
   clearAutoDetectedVersion();
   const ok = await checkSelectedFolder(path);
@@ -4993,31 +4669,6 @@ async function onTestApiKey() {
  * 失效方向刻意設成放行：後端偵測不出來（非 Windows、權限不足、查詢失敗）時 known=false，
  * 這裡直接回 true。這個檢查只能擋「確定在跑」，不能變成新的卡關來源。
  */
-async function ensureGameClosed(instancePath, actionLabel) {
-  let verdict = null;
-  try {
-    verdict = await invoke("is_game_running_cmd", { instancePath });
-  } catch (_) {
-    return true; // 查不到就放行
-  }
-  if (!verdict || !verdict.running) return true;
-  const retry = await confirmDialog({
-    title: "遊戲好像還開著",
-    body:
-      `偵測到這個整合包的 Minecraft 正在執行。現在${actionLabel}，檔案會被鎖住，` +
-      "可能只套用一半，遊戲裡會出現殘缺翻譯甚至閃退。\n\n請先完全關閉遊戲與啟動器，再按「我已關閉，重新檢查」。",
-    affected: [instancePath],
-    danger: true,
-    confirmLabel: "我已關閉，重新檢查",
-    cancelLabel: "先不要繼續",
-  });
-  if (!retry) {
-    appendLog(`已取消${actionLabel}：請先關閉 Minecraft 再試一次。`, "warn");
-    return false;
-  }
-  return ensureGameClosed(instancePath, actionLabel);
-}
-
 /**
  * 開始翻譯：同一件事正在跑時，重複點擊一律忽略。
  *
@@ -5056,70 +4707,11 @@ async function onRunInner() {
   const start = await runFlow.beforeStart("run");
   if (!start.ok) return;
 
-  // 覆蓋提醒不能只看 localCacheProbe：它只在「選資料夾」或「啟動還原」時才填，
-  // 剛跑完一次翻譯、或探測失敗時是 null，於是最該提醒的情況反而不提醒。
-  // 這裡在按下開始翻譯的當下補探一次，並把 hasShareableFiles 也納入判斷。
-  if (!localCacheProbe && (hasShareableFiles || outputDir)) {
-    await probeLocalPackCache(instancePath, { silent: true }).catch(() => null);
-  }
-  // B5d：模組整合包有變動（S15）時不算已有結果，不跳三選一（規格 §8.3）
-  const hasExistingResult = hasUsableExistingResult({
-    probe: localCacheProbe,
-    hasShareableFiles,
-    packChanged: !!packChangeProbe,
-  });
-  if (hasExistingResult) {
-    // 舊版只有「仍要重新翻譯／取消」兩個選項，使用者既看不出「重新翻譯」會發生
-    // 什麼事，也沒有「這次另外存一份」的路。改成講清楚每個選項的後果。
-    const existingPath =
-      localCacheProbe?.workRoot || localCacheProbe?.outputDir || resultWorkDir(outputDir);
-    const choice = await choiceDialog({
-      title: "這個整合包已經翻譯過了，這次想怎麼做？",
-      body: "既有的翻譯結果在：\n" + (existingPath || "（位置未知）"),
-      options: [
-        {
-          value: "supplement",
-          label: "接續補完（建議）",
-          detail: "沿用既有結果，只補之前沒翻到的句子。最快，也不會動到已經翻好的內容。",
-        },
-        {
-          value: "overwrite",
-          label: "覆蓋重翻",
-          detail: "刪掉舊結果、整包重新翻一次。譯文品質不滿意想重來時選這個。",
-        },
-        {
-          value: "newcopy",
-          label: "另存一份新的",
-          detail: "舊的完整保留，這次的結果存到新資料夾。想比較兩次結果或換了 AI 來源時選這個。",
-        },
-      ],
-      cancelLabel: "取消",
-    });
-    if (!choice) {
-      return appendLog("已取消；可使用上方「本機已有翻譯」直接打開、套用或分享。", "warn");
-    }
-    if (choice === "supplement") {
-      appendLog("改用「接續補完」：沿用既有結果，只補沒翻到的句子。");
-      // 同一次點擊：開始翻譯時選了「這次不用 AI」，轉成接續補完也不用 AI（明確帶入，審查 1b）
-      // 第二輪審查 1b／1d：轉接續補完前記住 §3.1 的選擇並清掉「這次不用 AI」（改明確帶入）
-      const handOffConfirmed = await runFlow.handOffToSupplement();
-      return onSupplementInner({ skipAi: !start.useAi, overwriteConfirmed: handOffConfirmed });
-    }
-    if (choice === "newcopy") {
-      const nextDir = await invoke("next_result_dir_cmd", { outputDir }).catch(() => "");
-      if (nextDir) {
-        outputDir = nextDir;
-        setAutoOutputDir(nextDir);
-        appendLog("這次的結果會另存到新位置：\n" + nextDir);
-      } else {
-        appendLog("無法建立新的結果資料夾，改為覆蓋既有結果。", "warn");
-      }
-    }
-  }
+  // B5c：已有舊結果的三選一刪除（規格 §3.8 一）：已翻好的包由狀態卡決定主要按鈕
+  // （S14 接續補完、S17 重新翻譯→§3.1）；「另存一份新的結果」在 §3.1「更多」（onRunNewCopy）。
 
-  // 遊戲開著也照常翻譯：只有最後「裝進遊戲」那一步需要關遊戲，
-  // 後端會回「已翻完、還沒裝進遊戲」，到時再按「套用到遊戲」即可。
-  applyPending.hideCard();
+  // 遊戲開著也照常翻譯：只有最後「套用到遊戲」那一步需要關遊戲，
+  // 後端會回「已翻完、還沒套用」（狀態卡 S11），到時再按「套用到遊戲」即可。
 
   writeLastInstancePath(instancePath);
   const useAi = start.useAi;
@@ -5142,6 +4734,19 @@ async function onRunInner() {
     return log(unsupportedVersionMessage(targetVersion));
   }
 
+  // 審查 2：「另存一份新的結果」在所有早退檢查（版本擋下等）之後才用掉並建新資料夾
+  if (runNewCopyOnce) {
+    runNewCopyOnce = false;
+    const nextDir = await invoke("next_result_dir_cmd", { outputDir }).catch(() => "");
+    if (nextDir) {
+      outputDir = nextDir;
+      setAutoOutputDir(nextDir);
+      appendLog("這次的結果會另存到新位置：\n" + nextDir);
+    } else {
+      appendLog("無法建立新的結果資料夾，改為覆蓋既有結果。", "warn");
+    }
+  }
+
   // 要不要留下「翻譯結果」改由設定「翻完刪除翻譯結果」決定（唯一位置在設定→資料與備份，
   // 第一次勾要同列確認；B5a-2）。開始前不再跳三選一。只管結果資料夾，備份照 backupChoice（G1.8）。
   const skipResultFolder = deleteResultsAfterApplyEnabled();
@@ -5161,7 +4766,6 @@ async function onRunInner() {
   resetCoverageMetrics("翻譯統計蒐集中");
   // 只有「開始翻譯」（全新一輪）才清空步驟計時；修復／接續補完是接續同一輪，時間要繼續累加。
   resetStepTimings();
-  if ($("btn-package")) $("btn-package").disabled = true;
   // 「不保留」只管翻譯結果資料夾；備份一律照設定（後端讀 translate.backupChoice）
   const backupNote = {
     always: "套用到遊戲前會先備份遊戲原本的檔案。",
@@ -5176,7 +4780,7 @@ async function onRunInner() {
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
-  let applyFollowUp = null;
+  let finished = null;
   let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
@@ -5206,9 +4810,12 @@ async function onRunInner() {
     }
     setProgress(
       100,
-      completedWithPending
-        ? `本輪流程完成，仍有 ${formatCount(pendingCount)} 條待補`
-        : "翻譯流程完成",
+      // B5c：中途停下或還有英文時不寫「完成」（結論在狀態卡完成卡）
+      result?.interruption?.aiStopped || result?.interruption?.stoppedByUser
+        ? "這一輪中途停下，已翻好的部分已保留"
+        : completedWithPending
+          ? `還有 ${formatCount(pendingCount)} 條是英文`
+          : "翻譯流程跑完",
       {
         payload: {
           state: completedWithPending ? "completed_with_pending" : "completed",
@@ -5220,50 +4827,29 @@ async function onRunInner() {
         },
       }
     );
-    let msg = result.playerSummary || result.player_summary || "翻譯完成，請看日誌。";
     const notYetApplied = isApplyPending(result);
-    if (notYetApplied) {
-      applyFollowUp = { result, ctx: { instancePath, outputDir, packName: packNameForTranslate() || null } };
-    }
-    // 結論先行：完成訊息本身偏技術，先給一句人話，讓使用者知道「現在就能玩」，
-    // 不用讀完整份報告才敢開遊戲。少數原文保留是正常的，一併先講清楚。
-    const headline = notYetApplied
-      ? "翻譯已完成，但還沒裝進遊戲（原因與下一步見下方）。"
-      : staysUnchangedCount > 0
-      ? "可以直接開遊戲了，主要遊戲文字都已是繁體中文。\n少數專有名詞、單位符號與附魔等級維持原文是正常的，翻了反而會出錯。"
-      : "可以直接開遊戲了，主要遊戲文字都已是繁體中文。";
-    msg = headline + "\n\n" + msg;
+    finished = { result, ctx: { instancePath, outputDir, packName: packNameForTranslate() || null } };
+    // 後端完整結論只進紀錄；畫面上的結論是完成卡（依實際比例、原因，停下絕不寫「完成」）
+    let msg = result.playerSummary || result.player_summary || "";
     if (result.minemenuMsg || result.minemenu_msg) {
       msg += "\n\n" + (result.minemenuMsg || result.minemenu_msg);
     }
     const siblingWarning = siblingInstanceWarning(result);
-    if (siblingWarning) {
-      msg += "\n\n【請確認】" + siblingWarning;
-      appendLog(siblingWarning, "warn");
-    }
-    // 套用完檢查資源包清單有沒有被弄壞。使用者實測遇過清單被清空，導致字體
-    // 找不到材質 → 資源重載失敗 → 模型沒烘焙 → 標題畫面直接閃退。
-    await checkResourcePackHealth(instancePath);
+    if (siblingWarning) appendLog(siblingWarning, "warn");
     consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
     if (notYetApplied) {
-      // 還沒裝進遊戲：翻譯結果是之後「套用到遊戲」的來源，不能照「不保留」刪掉
-      appendLog("翻譯已完成，還沒裝進遊戲；翻譯結果先保留，等你按「套用到遊戲」。", "warn");
+      // 還沒套用：翻譯結果是之後「套用到遊戲」的來源，不能照「翻完刪除翻譯結果」刪掉
+      appendLog("翻譯結果先保留，等你按「套用到遊戲」。", "warn");
     } else if (skipResultFolder) {
-      appendLog("已依你的選擇不保留翻譯結果，正在清理暫存資料夾…");
+      appendLog("已依你的設定不保留翻譯結果，正在清理結果資料夾…");
       try {
         await invoke("delete_result_folder_cmd", { outputDir });
-        appendLog("翻譯已完成並裝進遊戲；依你的選擇沒有保留翻譯結果（備份照你的設定處理）。");
+        appendLog("已套用到遊戲；依你的設定沒有保留翻譯結果（備份照你的設定處理）。");
       } catch (cleanupErr) {
-        appendLog(
-          "翻譯已完成並直接套用，但清理翻譯結果資料夾時發生問題：" +
-            (cleanupErr?.message || cleanupErr),
-          "warn"
-        );
+        appendLog("已套用到遊戲，但清理翻譯結果資料夾時發生問題：" + (cleanupErr?.message || cleanupErr), "warn");
       }
-    } else {
-      appendLog("翻譯已完成並直接套用。想分享給其他玩家時，再按「分享給其他玩家」。");
     }
     await cleanupPreparedTranslationHelper();
     runOk = true;
@@ -5290,7 +4876,23 @@ async function onRunInner() {
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
   }
-  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx, 0, { overwriteConfirmed });
+  if (finished) {
+    await resultActions.finishRun(finished.result, {
+      origin: "run",
+      ...finished.ctx,
+      overwriteConfirmed,
+      localModelClosed: useAi && aiModeFromUi() === "local",
+    });
+  }
+}
+
+/** B5c：§3.1「更多」→ 另存一份新的結果（取代三選一的「另存一份新的」）：這一輪結果放新資料夾。 */
+let runNewCopyOnce = false;
+function onRunNewCopy() {
+  if (progressBusy) return;
+  runNewCopyOnce = true;
+  appendLog("這一輪會另存一份新的結果，舊的完整保留。按「開始重新翻譯」開始。");
+  showAppToast("這一輪會另存一份新的結果", 2600);
 }
 
 /** 舊版共用 work／work\\翻譯結果 → 應改走 per-instance */
@@ -5366,7 +4968,7 @@ async function onRepairInner() {
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
-  let applyFollowUp = null;
+  let finished = null;
   let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
@@ -5377,18 +4979,12 @@ async function onRepairInner() {
       useAi,
       translationMode: supplementTranslationMode(),
     });
-    setProgress(100, "修復完成！");
-    {
-      let msg = result.playerSummary || result.player_summary || "翻譯完成，請看日誌。";
-      const siblingWarning = siblingInstanceWarning(result);
-      if (siblingWarning) {
-        msg += "\n\n【請確認】" + siblingWarning;
-        appendLog(siblingWarning, "warn");
-      }
-      setLogFinal(msg);
-    }
+    setProgress(100, "修復完成");
+    const siblingWarning = siblingInstanceWarning(result);
+    if (siblingWarning) appendLog(siblingWarning, "warn");
+    setLogFinal(result.playerSummary || result.player_summary || "");
     setTranslationState("complete");
-    if (isApplyPending(result)) applyFollowUp = { result, ctx: applyContextFromUi(outputDir) };
+    finished = { result, ctx: applyContextFromUi(outputDir) };
     runOk = true;
   } catch (e) {
     if (isCancellation(e)) {
@@ -5410,7 +5006,7 @@ async function onRepairInner() {
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
   }
-  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx);
+  if (finished) await resultActions.finishRun(finished.result, { origin: "repair", ...finished.ctx, localModelClosed: useAi && aiModeFromUi() === "local" });
 }
 
 /** 只補缺漏：不重掃 mods，讀工作階段 + AI */
@@ -5468,7 +5064,7 @@ async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } 
   void hideUiForTranslateRun();
   await paintBeforeInvoke();
 
-  let applyFollowUp = null;
+  let finished = null;
   let runOk = false;
   const modelRound = await localModelRounds.begin();
   try {
@@ -5484,8 +5080,8 @@ async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } 
     setProgress(
       100,
       completedWithPending
-        ? `補譯完成，仍有 ${formatCount(pendingCount)} 條待補；品質暫緩項目不會重送`
-        : "補譯完成！",
+        ? `已接續補完，還有 ${formatCount(pendingCount)} 條是英文`
+        : "已接續補完。",
       {
         payload: {
           state: completedWithPending ? "completed_with_pending" : "completed",
@@ -5493,20 +5089,13 @@ async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } 
         },
       }
     );
-    let msg = result.playerSummary || result.player_summary || "翻譯完成，請看日誌。";
+    const msg = result.playerSummary || result.player_summary || "";
     const siblingWarning = siblingInstanceWarning(result);
-    if (siblingWarning) {
-      msg += "\n\n【請確認】" + siblingWarning;
-      appendLog(siblingWarning, "warn");
-    }
+    if (siblingWarning) appendLog(siblingWarning, "warn");
     consumeCoverageMessage(msg);
     setLogFinal(msg);
     setTranslationState("complete");
-    if (isApplyPending(result)) {
-      applyFollowUp = { result, ctx: applyContextFromUi(outputDir) };
-    } else {
-      appendLog("複查完成，結果已重新套用到遊戲。", "info");
-    }
+    finished = { result, ctx: applyContextFromUi(outputDir) };
     await cleanupPreparedTranslationHelper();
     runOk = true;
   } catch (e) {
@@ -5529,7 +5118,14 @@ async function onSupplementInner({ skipAi = false, overwriteConfirmed = false } 
     refreshBackupState();
     void releaseLocalModelAfterRun(modelRound);
   }
-  if (applyFollowUp) await applyPending.handle(applyFollowUp.result, applyFollowUp.ctx, 0, { overwriteConfirmed });
+  if (finished) {
+    await resultActions.finishRun(finished.result, {
+      origin: "supplement",
+      ...finished.ctx,
+      overwriteConfirmed,
+      localModelClosed: useAi && aiModeFromUi() === "local",
+    });
+  }
 }
 
 /** 停止：後端在下一個檢查點乾淨收尾，已完成的檔案保留 */
@@ -5583,31 +5179,24 @@ async function onOpenGlossary() {
   }
 }
 
+/** 結果資料夾有沒有用詞不一致建議（完成卡「更多」裡的「併入用詞建議」只在有時出現）。 */
 async function refreshConsistencyMergeUi() {
-  const btn = $("btn-merge-consistency");
-  const hint = $("consistency-merge-hint");
-  const outputDir = selectedOutputDir();
-  if (!btn) return;
-  if (!outputDir || translationState !== "complete") {
-    btn.hidden = true;
-    if (hint) hint.hidden = true;
-    return;
-  }
-  const work = resultWorkDir(outputDir);
-  try {
-    const status = await invoke("consistency_suggestions_status_cmd", { workRoot: work });
-    const exists = !!(status && (status.exists || status.exists === true));
-    const count = Number(status?.count || 0);
-    btn.hidden = !exists;
-    if (hint) {
-      hint.hidden = !exists;
-      if (exists) {
-        hint.textContent = `結果資料夾有用詞不一致建議（約 ${count} 條）。按「併入用詞建議」寫進術語表；預設不覆蓋你已有的譯名。`;
-      }
+  const outputDir = currentResultOutputDir();
+  const key = translationState === "complete" && outputDir ? resultWorkDir(outputDir) : "";
+  if (key === consistencyMergeProbe) return;
+  consistencyMergeProbe = key;
+  let count = 0;
+  if (key) {
+    try {
+      const status = await invoke("consistency_suggestions_status_cmd", { workRoot: key });
+      count = status && status.exists ? Math.max(1, Number(status.count || 0)) : 0;
+    } catch (_) {
+      count = 0;
     }
-  } catch (_) {
-    btn.hidden = true;
-    if (hint) hint.hidden = true;
+  }
+  if (count !== consistencyMergeCount) {
+    consistencyMergeCount = count;
+    syncUiState();
   }
 }
 
@@ -5628,6 +5217,7 @@ async function onMergeConsistencySuggestions() {
     appendLog(message);
     if (result?.glossaryPath) appendLog("術語表：" + result.glossaryPath);
     showAppToast(message, 3600);
+    consistencyMergeProbe = "";
     await refreshConsistencyMergeUi();
   } catch (e) {
     const msg = formatInvokeError(e);
@@ -5865,16 +5455,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     console.warn("[boot] initReloadGuard", e);
   }
   try {
-    wireLocalCacheCard();
-  } catch (e) {
-    console.warn("[boot] wireLocalCacheCard", e);
-  }
-  try {
-    applyPending.wire();
-  } catch (e) {
-    console.warn("[boot] applyPending.wire", e);
-  }
-  try {
     folderChecks.wireVersionRow({ onPicked: () => (versionDetectFailed = false) });
   } catch (e) {
     console.warn("[boot] folderChecks.wireVersionRow", e);
@@ -5888,11 +5468,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     void wirePrivacySettings();
   } catch (e) {
     console.warn("[boot] wirePrivacySettings", e);
-  }
-  try {
-    wirePackMetaCard();
-  } catch (e) {
-    console.warn("[boot] wirePackMetaCard", e);
   }
   try {
     wireWorkbenchActions();
@@ -6130,7 +5705,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   if ($("btn-save-adv")) $("btn-save-adv").onclick = onSaveAdv;
   if ($("btn-test-api")) $("btn-test-api").onclick = onTestApiKey;
   if ($("btn-glossary")) $("btn-glossary").onclick = onOpenGlossary;
-  if ($("btn-merge-consistency")) $("btn-merge-consistency").onclick = onMergeConsistencySuggestions;
   if ($("btn-helper-prepare")) $("btn-helper-prepare").onclick = prepareTranslationHelper;
   if ($("btn-helper-rescan")) $("btn-helper-rescan").onclick = rescanAfterTranslationHelper;
   if ($("btn-helper-cleanup")) $("btn-helper-cleanup").onclick = cleanupTranslationHelperFromPanel;
@@ -6405,7 +5979,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   };
   // btn-suggest-rp 已不存在於 HTML；建議路徑改由 resolveOutputDirForInstance 自動決定。
-  // btn-package 已由 wireWorkbenchActions 接線
   if ($("btn-share-confirm")) $("btn-share-confirm").onclick = confirmShareUpload;
   if ($("btn-share-cancel")) $("btn-share-cancel").onclick = closeShareConfirmation;
   ["share-confirm-reviewed", "share-confirm-private"].forEach((id) => {
@@ -6549,6 +6122,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   try {
     await restoreLastInstanceOnStartup();
+    // 審查 6：上次有完整跑完、還沒判斷過的回饋提醒，下次啟動時判斷（N-09）
+    window.setTimeout(() => void usageFeedbackMaybeNudge(), 8000);
   } catch (e) {
     try {
       appendLog("啟動時還原上次整合包略過：" + formatInvokeError(e), "warn");

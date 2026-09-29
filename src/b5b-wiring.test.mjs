@@ -41,16 +41,13 @@ const dialogCalls = (text) => (text.match(/\b(confirmDialog|choiceDialog)\s*\(/g
 test("按一次開始翻譯：開跑前最多一個確認畫面（只有暫留的三選一），AI 問題不跳視窗", () => {
   const body = fnBody(app, "async function onRunInner() {");
   const before = body.slice(0, body.indexOf('setBusy(true, "translate")'));
-  assert.equal(dialogCalls(before), 1, "開跑前只剩「已有舊結果三選一」（B5c 刪）");
-  assert.match(before, /choiceDialog\(/);
+  assert.equal(dialogCalls(before), 0, "B5c：三選一已刪，開跑前沒有任何對話框");
   assert.ok(!/AI 現在無法使用|被移動或刪除|補充漏翻/.test(body), "舊的 AI 無法使用對話框與說法已刪");
   assert.match(before, /runFlow\.beforeStart\("run"\)/);
-  // AI 閘門在三選一之前：不會先問三選一、再告訴你 AI 不能用
-  assert.ok(before.indexOf('runFlow.beforeStart("run")') < before.indexOf("choiceDialog("));
-  // 審查 1d／4a：三選一之後才記住 §3.1 的選擇，並把本輪已確認帶進套用
+  // 審查 1d／4a：AI 閘門之後、版本檢查之後才記住 §3.1 的選擇，並把本輪已確認帶進套用（B5c：經 finishRun）
   const commitAt = before.indexOf("runFlow.commitRunChoices()");
-  assert.ok(commitAt > before.indexOf("choiceDialog("), "三選一之後才記住");
-  assert.match(body, /applyPending\.handle\(applyFollowUp\.result, applyFollowUp\.ctx, 0, \{ overwriteConfirmed \}\)/);
+  assert.ok(commitAt > before.indexOf('runFlow.beforeStart("run")'), "閘門之後才記住");
+  assert.match(body, /resultActions\.finishRun\(finished\.result, \{[\s\S]*?overwriteConfirmed,/);
 });
 
 test("三個入口（翻譯、修復、接續補完）都改用同一個 AI 閘門，沒通過就交給狀態卡，不開對話框", () => {

@@ -276,92 +276,7 @@
                   </details>
                 </section>
 
-                <!--
-                  翻譯已完成、還沒裝進遊戲（遊戲開著、還沒啟動過遊戲、沒選備份、不備份要確認覆蓋）。
-                  這不是翻譯失敗：處理完原因後按「套用到遊戲」即可，不用重翻。
-                -->
-                <section id="apply-pending-card" class="local-cache-card" hidden aria-labelledby="apply-pending-title">
-                  <header class="local-cache-head">
-                    <h2 id="apply-pending-title" class="options-group-title">已翻完，還沒裝進遊戲</h2>
-                  </header>
-                  <p id="apply-pending-message" class="local-cache-message"></p>
-                  <div class="action-row local-cache-actions">
-                    <button type="button" id="btn-apply-pending" class="secondary-button">套用到遊戲</button>
-                    <button type="button" id="btn-apply-pending-dismiss" class="text-button">稍後再說</button>
-                  </div>
-                </section>
-
-                <section id="local-cache-card" class="local-cache-card" hidden aria-labelledby="local-cache-title">
-                  <header class="local-cache-head">
-                    <h2 id="local-cache-title" class="options-group-title">本機已有翻譯</h2>
-                    <span id="local-cache-badge" class="local-cache-badge" hidden></span>
-                  </header>
-                  <p id="local-cache-message" class="local-cache-message"></p>
-                  <p id="local-cache-pack" class="local-cache-path" hidden></p>
-                  <p id="local-cache-path" class="local-cache-path" hidden></p>
-                  <p id="local-cache-warn" class="local-cache-warn field-status" hidden></p>
-                  <div class="action-row local-cache-actions">
-                    <button type="button" id="btn-cache-open" class="secondary-button">打開結果</button>
-                    <button type="button" id="btn-cache-apply" class="secondary-button" hidden>再次套用</button>
-                    <button type="button" id="btn-cache-supplement" class="text-button" hidden>接續補翻</button>
-                    <button type="button" id="btn-cache-share" class="secondary-button share-cta" hidden>打包分享</button>
-                  </div>
-                </section>
-
-                <section id="pack-meta-card" class="pack-meta-card" hidden aria-labelledby="pack-meta-title">
-                  <header class="pack-meta-head">
-                    <h2 id="pack-meta-title" class="options-group-title">整合包資訊（選填）</h2>
-                    <div class="pack-meta-head-actions">
-                      <span class="share-button-row">
-                        <button type="button" id="btn-package" class="text-button share-cta" disabled hidden>分享給其他玩家</button>
-                        <button type="button" class="help-tip" data-help="share" aria-label="說明：分享給朋友">?</button>
-                      </span>
-                      <span class="share-button-row">
-                        <button type="button" id="btn-copy-failed" class="text-button" hidden>複製沒翻到的</button>
-                        <button type="button" id="btn-import-translations" class="text-button" hidden>貼回翻譯</button>
-                      </span>
-                      <button type="button" id="btn-pack-meta-toggle" class="text-button" aria-expanded="false">填寫資訊</button>
-                    </div>
-                  </header>
-                  <p id="share-hint" class="share-hint" hidden>完成後可分享帶密碼自解檔（只含一個最新工具資源包）。</p>
-                  <div id="share-confirm-panel" class="share-confirm-panel" hidden>
-                    <strong>上傳前請確認</strong>
-                    <p>會打包成帶密碼的自解 exe（密碼見下載頁），上傳後得到 24 小時短連結。本機結果與分享檔均只含<strong>一個</strong>最新工具資源包。成功後按鈕改成「複製分享連結」，網址只留在記憶體、不寫進日誌。請確認內容可以給其他玩家使用，也沒有私人檔案。</p>
-                    <label class="option-row" for="share-confirm-reviewed"><input type="checkbox" id="share-confirm-reviewed" /><span class="check-box" aria-hidden="true"></span><span><strong>我已自行檢查翻譯</strong><small>我已在遊戲中確認目前結果可以接受。</small></span></label>
-                    <label class="option-row" for="share-confirm-private"><input type="checkbox" id="share-confirm-private" /><span class="check-box" aria-hidden="true"></span><span><strong>我確認沒有私人內容</strong><small>分享檔只包含可安裝翻譯內容，不包含金鑰與本機路徑。</small></span></label>
-                    <div class="action-row"><button type="button" id="btn-share-confirm" class="primary-button" disabled>確認並建立連結</button><button type="button" id="btn-share-cancel" class="text-button">先不要分享</button></div>
-                  </div>
-                  <div id="pack-meta-form" class="pack-meta-form" hidden>
-                    <div class="field-grid">
-                      <div class="field-block full-field">
-                        <label for="pack-display-name">顯示名稱</label>
-                        <input id="pack-display-name" type="text" autocomplete="off" placeholder="例：ATM10 繁中" />
-                      </div>
-                      <div class="field-block full-field">
-                        <label for="pack-ref">整合包連結或名稱</label>
-                        <input id="pack-ref" type="text" autocomplete="off" placeholder="CurseForge／Modrinth 連結或包名" />
-                      </div>
-                      <div class="field-block">
-                        <label for="pack-version-meta">整合包版本</label>
-                        <input id="pack-version-meta" type="text" autocomplete="off" placeholder="例：1.2.0" />
-                      </div>
-                    </div>
-                    <div class="action-row pack-meta-actions">
-                      <button type="button" id="btn-pack-meta-skip" class="text-button">略過</button>
-                      <button type="button" id="btn-pack-meta-save" class="secondary-button">儲存</button>
-                    </div>
-                  </div>
-                  <!--
-                    這裡以前還有一顆 id="btn-pack-meta-edit"（固定寫死「修改」）跟標題列的
-                    btn-pack-meta-toggle 同時可見——後者本來就是前者的完整超集
-                    （togglePackMetaForm() 就是呼叫 editPackMetaCard()），兩顆按鈕做一樣的事，
-                    只是文字不同步（一顆說「填寫資訊」一顆說「修改」）。移除多餘的那顆。
-                  -->
-                  <div id="pack-meta-summary" class="pack-meta-summary">
-                    <p id="pack-meta-summary-text" class="pack-meta-summary-text"></p>
-                  </div>
-                </section>
-
+                <!-- B5c：待套用卡、本機已有翻譯卡、整合包資訊卡併入狀態卡 S11／S14／S17；分享與人工補翻改浮層（規格 §1.2、§3.0） -->
                 <!-- 開始翻譯／停止翻譯在上面的狀態卡（唯一位置）。 -->
                 <div class="action-area primary-action">
                   <div class="action-row secondary-actions">
@@ -687,6 +602,50 @@
       <div class="update-actions">
         <button type="button" id="btn-update-manual" class="secondary-button">手動下載</button>
         <button type="button" id="btn-update-now" class="primary-button">立即更新</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- B5c：分享給朋友（浮層；第一次兩項勾選屬「對外發布」確認，規格 §3.5） -->
+  <div id="share-overlay" class="feedback-overlay" hidden aria-hidden="true">
+    <div class="feedback-shell" role="dialog" aria-modal="true" aria-labelledby="share-title">
+      <header class="feedback-top">
+        <div>
+          <p class="stage-kicker">分享給朋友</p>
+          <h2 id="share-title">把翻譯分享給朋友<button type="button" class="help-tip" data-help="share" aria-label="說明：分享給朋友">?</button></h2>
+        </div>
+        <button type="button" id="btn-share-close" class="text-button">關閉</button>
+      </header>
+      <div class="feedback-body">
+        <p id="share-hint" class="field-help">朋友會拿到這次的翻譯資源包與任務、設定裡的譯文；不含你的金鑰、帳號與電腦路徑。連結 24 小時內有效。</p>
+        <div id="share-confirm-panel" class="share-confirm-panel">
+          <label class="option-row" for="share-confirm-reviewed"><input type="checkbox" id="share-confirm-reviewed" /><span class="check-box" aria-hidden="true"></span><span><strong>我已自行檢查翻譯</strong><small>我已在遊戲中確認目前結果可以接受。</small></span></label>
+          <label class="option-row" for="share-confirm-private"><input type="checkbox" id="share-confirm-private" /><span class="check-box" aria-hidden="true"></span><span><strong>我確認沒有私人內容</strong><small>分享檔只包含可安裝的翻譯內容。</small></span></label>
+          <div class="action-row"><button type="button" id="btn-share-confirm" class="primary-button" disabled>建立分享連結</button><button type="button" id="btn-share-cancel" class="text-button">先不要分享</button></div>
+        </div>
+        <p id="share-status" class="field-status" aria-live="polite" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- B5c：人工補翻（浮層；複製沒翻到的→請線上 AI 翻→貼回翻譯，貼回後自動重新套用） -->
+  <div id="manual-fix-overlay" class="feedback-overlay" hidden aria-hidden="true">
+    <div class="feedback-shell" role="dialog" aria-modal="true" aria-labelledby="manual-fix-title">
+      <header class="feedback-top">
+        <div>
+          <p class="stage-kicker">人工補翻</p>
+          <h2 id="manual-fix-title">自己補上還是英文的句子</h2>
+        </div>
+        <button type="button" id="btn-manual-fix-close" class="text-button">關閉</button>
+      </header>
+      <div class="feedback-body">
+        <p id="manual-fix-help" class="field-help">按「複製沒翻到的」，貼到線上 AI 請它翻「譯文」那一欄；翻完把整張表複製起來，回來按「貼回翻譯」。格式符號對不上的句子會保留英文。</p>
+        <p id="manual-fix-limit" class="field-help">只處理語言檔裡還是英文的句子；已翻好的句子、任務書與圖片上的字不在這裡改。</p>
+        <div class="action-row">
+          <button type="button" id="btn-copy-failed" class="secondary-button">複製沒翻到的</button>
+          <button type="button" id="btn-import-translations" class="secondary-button">貼回翻譯</button>
+        </div>
+        <p id="manual-fix-status" class="field-status" aria-live="polite" hidden></p>
       </div>
     </div>
   </div>

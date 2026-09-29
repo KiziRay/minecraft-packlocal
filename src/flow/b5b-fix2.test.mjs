@@ -140,12 +140,14 @@ test("1b／1d：三選一轉接續補完前清「這次不用 AI」並記住 §3
   flow.onAction("ai-skip-once");
   const start = await flow.beforeStart("run");
   assert.equal(start.ok, true);
-  await flow.handOffToSupplement();
-  assert.deepEqual(st.saved, ["always"], "備份列在轉接續補完前記住");
+  // B5c 審查 2b：handOffToSupplement 已刪（三選一刪除後無呼叫端）；記住 §3.1 的選擇改由 commitRunChoices
+  await flow.commitRunChoices();
+  assert.deepEqual(st.saved, ["always"], "備份列在開跑前記住");
   const sup = await flow.beforeStart("supplement", { skipAi: !start.useAi });
   assert.equal(sup.useAi, false);
   // 之後從卡片按開始翻譯：「這次不用 AI」已清掉，AI 列照實變紅
   assert.equal((await flow.beforeStart("run")).ok, false);
-  const body = app.slice(app.indexOf("async function onRunInner("), app.indexOf("onSupplementInner({ skipAi"));
-  assert.ok(body.includes("await runFlow.handOffToSupplement()"), "onRunInner 在轉接續補完前呼叫");
+  // B5c：三選一刪除後，開始翻譯不再轉接續補完（接續補完是 S14 的主要按鈕，直接開跑，R-8）
+  const body = app.slice(app.indexOf("async function onRunInner("), app.indexOf("async function onRepair("));
+  assert.ok(!body.includes("onSupplementInner("), "開始翻譯不再轉成接續補完");
 });

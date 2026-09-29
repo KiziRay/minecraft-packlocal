@@ -1,36 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   APPLY_STATUS,
+  applyFailureReason,
   NO_BACKUP_ACK,
   applyStatusOf,
   createApplyPendingFlow,
-  describeApplyPending,
   isApplyPending,
   previewList,
 } from "./apply-pending.js";
 
-function fakeDom() {
-  const nodes = {
-    "apply-pending-card": { hidden: true },
-    "apply-pending-title": { textContent: "" },
-    "apply-pending-message": { textContent: "" },
-    "btn-apply-pending": {},
-    "btn-apply-pending-dismiss": {},
-  };
-  return { $: (id) => nodes[id] || null, nodes };
-}
-
-function makeFlow({ choice = null, confirm = true, applyResults = [] } = {}) {
-  const dom = fakeDom();
-  const calls = { invoke: [], saved: [], confirms: [], logs: [] };
+function makeFlow({ choice = null, confirm = true, applyResults = [], applyError = null } = {}) {
+  const calls = { invoke: [], saved: [], confirms: [], choices: [], logs: [], pending: [], applied: [], failed: [] };
   const flow = createApplyPendingFlow({
-    $: dom.$,
     invoke: async (cmd, args) => {
       calls.invoke.push({ cmd, args });
-      return applyResults.shift() || { status: "applied", playerSummary: "已把翻譯裝進遊戲" };
+      if (applyError) throw applyError;
+      return applyResults.shift() || { status: "applied", playerSummary: "已把翻譯套用到遊戲" };
     },
-    choiceDialog: async () => choice,
+    choiceDialog: async (opts) => {
+      calls.choices.push(opts);
+      return choice;
+    },
     confirmDialog: async (opts) => {
       calls.confirms.push(opts);
       return confirm;
@@ -38,8 +30,11 @@ function makeFlow({ choice = null, confirm = true, applyResults = [] } = {}) {
     appendLog: (text, level) => calls.logs.push({ text, level }),
     setBusy: () => {},
     saveBackupChoice: async (value) => calls.saved.push(value),
+    onPending: (result, context) => calls.pending.push({ result, context }),
+    onApplied: (result, context) => calls.applied.push({ result, context }),
+    onFailed: (reason, context) => calls.failed.push({ reason, context }),
   });
-  return { flow, dom, calls };
+  return { flow, calls };
 }
 
 const ctx = { instancePath: "C:/game", outputDir: "C:/out", packName: "繁體中文翻譯" };
@@ -51,45 +46,48 @@ test("沒有狀態欄位的舊結果視為已套用；兩種結果形狀都認�
   assert.equal(isApplyPending({ applyStatus: "applied" }), false);
 });
 
-test("遊戲開著：不是失敗，顯示「已翻完，關掉遊戲後按套用到遊戲」並提供按鈕", async () => {
-  const { flow, dom, calls } = makeFlow();
+test("B5c 遊戲開著：不是失敗、不開對話框，交給狀態卡 S11（onPending）；按套用沿用既有命令", async () => {
+  const { flow, calls } = makeFlow();
   const done = await flow.handle({ applyStatus: "gameRunning", applyMessage: "翻譯已完成，但遊戲開著" }, ctx);
   assert.equal(done, false);
-  assert.equal(dom.nodes["apply-pending-card"].hidden, false);
-  assert.match(dom.nodes["apply-pending-title"].textContent, /已翻完，關掉遊戲後按「套用到遊戲」/);
+  assert.equal(calls.pending.length, 1);
+  assert.equal(calls.confirms.length + calls.choices.length, 0);
   assert.equal(calls.invoke.length, 0, "遊戲開著時不自動重試");
-  // 關遊戲後按按鈕：沿用既有套用命令
-  flow.wire();
-  dom.nodes["btn-apply-pending"].onclick();
-  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(await flow.applyNow(ctx), true);
   assert.equal(calls.invoke[0].cmd, "apply_translation_to_game");
   assert.equal(calls.invoke[0].args.instancePath, "C:/game");
+  assert.equal(calls.applied.length, 1);
 });
 
-test("第一次套用：選要備份後寫回設定並重新套用", async () => {
+test("第一次套用（D-04）：選要備份後寫回設定並重新套用；對話框標題問句、按鈕「先不要套用」", async () => {
   const { flow, calls } = makeFlow({ choice: "always" });
   const done = await flow.handle({ applyStatus: "needsBackupChoice" }, ctx);
   assert.equal(done, true);
   assert.deepEqual(calls.saved, ["always"]);
   assert.equal(calls.invoke.length, 1);
   assert.equal(calls.invoke[0].args.overwriteConfirmed, false);
+  assert.equal(calls.choices[0].title, "要先備份會被覆蓋的原檔嗎？");
+  assert.equal(calls.choices[0].cancelLabel, "先不要套用");
 });
 
-test("選不備份必須勾選「我了解之後無法還原被覆蓋的檔案」", async () => {
+test("B5c D-04：選不備份在同一個框勾選「我了解…」，不再另開紅色「確定不備份嗎？」", async () => {
   const { flow, calls } = makeFlow({ choice: "never", confirm: true });
   await flow.handle({ applyStatus: "needsBackupChoice" }, ctx);
-  assert.equal(calls.confirms[0].ackLabel, NO_BACKUP_ACK);
+  assert.deepEqual(calls.choices[0].ack, { label: NO_BACKUP_ACK, forValue: "never" });
+  assert.equal(calls.confirms.length, 0, "沒有第二個對話框");
   assert.deepEqual(calls.saved, ["never"]);
   assert.equal(calls.invoke[0].args.overwriteConfirmed, true);
+  const src = readFileSync(new URL("./apply-pending.js", import.meta.url), "utf8");
+  assert.ok(!src.includes("確定不備份嗎"));
 });
 
-test("關掉備份選擇對話框：不寫設定、不套用，留說明卡", async () => {
-  const { flow, dom, calls } = makeFlow({ choice: null });
+test("關掉備份選擇對話框：不寫設定、不套用，回狀態卡 S11", async () => {
+  const { flow, calls } = makeFlow({ choice: null });
   const done = await flow.handle({ applyStatus: "needsBackupChoice" }, ctx);
   assert.equal(done, false);
   assert.deepEqual(calls.saved, []);
   assert.equal(calls.invoke.length, 0);
-  assert.equal(dom.nodes["apply-pending-card"].hidden, false);
+  assert.equal(calls.pending.length, 1);
 });
 
 test("不備份模式：每次覆蓋前都確認，取消就不套用", async () => {
@@ -111,9 +109,24 @@ test("B5a-1 D-03：覆蓋無備份的確認標題是問句、危險（預設焦�
   assert.equal(calls.confirms[0].danger, true);
 });
 
-test("沒有 options.txt：請先啟動一次遊戲", () => {
-  assert.equal(describeApplyPending({ status: "noOptionsTxt" }).title, "請先啟動一次遊戲");
+test("B5c：套用時複製資料夾被擋 → 回「已翻完未套用」（forkNeeded），不是失敗、不直接跳 D-10", async () => {
+  const { flow, calls } = makeFlow({ applyError: "這份是複製出來的…請按「把這份當成新的整合包」" });
+  assert.equal(await flow.applyNow(ctx), false);
+  assert.equal(calls.failed.length, 0);
+  assert.equal(calls.pending[0].result.applyStatus, "forkNeeded");
+  assert.equal(calls.confirms.length, 0);
 });
+
+test("B5c：其他套用失敗 → S11 失敗變體的白話原因（不再一律「請確認遊戲已關閉」）", async () => {
+  const { flow, calls } = makeFlow({ applyError: "寫入失敗：os error 53 找不到網路路徑" });
+  assert.equal(await flow.applyNow(ctx), false);
+  assert.equal(calls.failed[0].reason, "網路磁碟或遊戲資料夾連不上");
+  assert.equal(applyFailureReason("被另一個程序使用中 (os error 32)"), "有檔案被占用，請先關閉遊戲");
+  assert.equal(applyFailureReason("奇怪的錯誤"), "發生錯誤，完整原因在紀錄");
+  const src = readFileSync(new URL("./apply-pending.js", import.meta.url), "utf8");
+  assert.ok(!src.includes("apply-pending-card"), "待套用卡已併入狀態卡");
+});
+
 
 test("覆蓋清單過長時只列前幾個", () => {
   const list = Array.from({ length: 12 }, (_, i) => `f${i}`);
@@ -122,7 +135,6 @@ test("覆蓋清單過長時只列前幾個", () => {
   assert.match(shown[8], /另有 4 個/);
 });
 
-import { readFileSync } from "node:fs";
 import { isBrokenRecordError } from "./apply-pending.js";
 import { ROW_COPY } from "../settings/settings-copy.js";
 

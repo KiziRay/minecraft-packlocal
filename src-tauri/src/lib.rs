@@ -310,7 +310,7 @@ struct LogPayload {
 
 fn backup_status(applied: &ApplyResult) -> String {
     if !applied.is_applied() {
-        "尚未裝進遊戲（見上方說明）".into()
+        "尚未套用到遊戲（見上方說明）".into()
     } else if applied.backup_reused {
         format!("沿用既有備份：{}", applied.backup_dir)
     } else if applied.backup_created {
@@ -801,6 +801,9 @@ struct OneClickResult {
     display_safety: engine::DisplaySafety,
     /// B4：這一輪有沒有中途停下（使用者停止／AI 不可用）、沒回應與品質沒過各幾條（B8 顯示）
     interruption: engine::run_interrupt::InterruptionView,
+    /// B5c：套用到遊戲的完整結果（備份位置、語言、隔離、模組已更新、舊產物、退休、讀不到…），
+    /// 完成卡「已幫你做的事」「還是英文的部分」照這份寫，不再從中文句子猜。由 with_apply_notice 填入。
+    apply_result: Option<ApplyResult>,
 }
 
 /// 把套用狀態接到翻譯結果上；還沒裝進遊戲時，結論的第一句就要講這件事。
@@ -808,10 +811,11 @@ fn with_apply_notice(mut result: OneClickResult, applied: &ApplyResult) -> OneCl
     result.display_safety = engine::take_run_report(Path::new(&result.report.minecraft_dir));
     result.apply_status = applied.status;
     result.pending_overwrites = applied.pending_overwrites.clone();
+    result.apply_result = Some(applied.clone());
     if !applied.is_applied() {
         result.apply_message = applied.player_summary.clone();
         result.player_summary = format!(
-            "【翻譯已完成，還沒裝進遊戲】\n{}\n\n{}",
+            "【翻譯已完成，還沒套用到遊戲】\n{}\n\n{}",
             applied.player_summary, result.player_summary
         );
     }
@@ -832,7 +836,8 @@ fn apply_after_run(
 ) -> Result<ApplyResult, String> {
     // 開始翻譯時「保留／不保留翻譯結果」只管結果資料夾；備份一律照設定
     let policy = engine::apply_record::policy_for_run(false);
-    let applied = apply_to_instance(instance, work, Some(pack_name), policy)?;
+    // B5c：複製資料夾被擋＝已翻完、還沒套用（不是翻譯失敗；零寫入，G1.4／G1.24）
+    let applied = engine::pending_when_copied(apply_to_instance(instance, work, Some(pack_name), policy))?;
     if !applied.is_applied() {
         emit_warn(app, &applied.player_summary);
     }
@@ -1803,7 +1808,7 @@ fn begin_user_stop_finalize(app: &AppHandle, user_stopped: &mut bool) {
     if !*user_stopped {
         emit_warn(
             app,
-            "已停止翻譯：正在寫出已翻好的部分並裝進遊戲（不會再翻新的內容；之後按「接續補完」會從這裡繼續）…",
+            "已停止翻譯：正在寫出已翻好的部分並套用到遊戲（不會再翻新的內容；之後按「接續補完」會從這裡繼續）…",
         );
     }
     *user_stopped = true;
@@ -3098,7 +3103,7 @@ fn run_one_click(
             keys_zh: built.keys_total,
             keys_hk_hint: report.keys_from_zh_hk_hint,
             note: format!(
-                "完整流程後產生。可「只補缺漏」續翻。剩餘約 {} 條。{}",
+                "完整流程後產生。可按「接續補完」續翻。剩餘約 {} 條。{}",
                 pending_count, quest_note
             ),
             target_version: resolved_version.clone(),
@@ -3222,7 +3227,7 @@ fn run_one_click(
         );
     }
 
-    let apply_progress = "正在把翻譯裝進遊戲（備份照你的設定）…";
+    let apply_progress = "正在把翻譯套用到遊戲（備份照你的設定）…";
     emit_progress_stage(
         app,
         dev_progress::STAGE_APPLY,
@@ -3253,7 +3258,7 @@ fn run_one_click(
             app,
             "info",
             &format!(
-                "已裝進遊戲：{}；翻譯過的模組檔 {} 個。備份：{}",
+                "已套用到遊戲：{}；翻譯過的模組檔 {} 個。備份：{}",
                 applied.zip_copied.as_deref().unwrap_or("其他翻譯檔"),
                 applied.jars_copied,
                 backup_status(&applied)
@@ -3340,13 +3345,13 @@ fn run_one_click(
     let stage_failures = stage_ledger.player_summary();
     // B4：AI 中途停下（停止、額度、斷線太久）不可以講成「完成」
     let headline = match (engine::run_interrupt::current().is_some(), applied.is_applied()) {
-        (true, true) => "這一輪中途停下，沒有全部完成。已翻好的部分都已裝進遊戲；按「接續補完」會從停下的地方繼續。",
-        (true, false) => "這一輪中途停下，沒有全部完成，而且還沒裝進遊戲（原因見最上面）；已翻好的部分都有保留。",
+        (true, true) => "這一輪中途停下，沒有全部完成。已翻好的部分都已套用到遊戲；按「接續補完」會從停下的地方繼續。",
+        (true, false) => "這一輪中途停下，沒有全部完成，而且還沒套用到遊戲（原因見最上面）；已翻好的部分都有保留。",
         _ => match (stage_ledger.has_total_failure(), applied.is_applied()) {
-        (false, true) => "完成！整合包裡玩得到的文字已翻成台灣繁體中文（圖片上的字除外），並已裝進遊戲。",
-        (false, false) => "翻好了，還沒裝進遊戲（原因與下一步見最上面）。",
-        (true, true) => "這一輪沒有全部完成。已完成的部分都已裝進遊戲，但有內容完全沒翻到（見下方）。",
-        (true, false) => "這一輪沒有全部完成，而且還沒裝進遊戲；有內容完全沒翻到（見下方）。",
+        (false, true) => "翻譯流程跑完，已套用到遊戲。實際中文比例與還是英文的部分以完成卡為準（圖片上的字翻不到）。",
+        (false, false) => "翻好了，還沒套用到遊戲（原因與下一步見最上面）。",
+        (true, true) => "這一輪沒有全部完成。已完成的部分都已套用到遊戲，但有內容完全沒翻到（見下方）。",
+        (true, false) => "這一輪沒有全部完成，而且還沒套用到遊戲；有內容完全沒翻到（見下方）。",
         },
     };
     let player_summary = format!(
@@ -3363,8 +3368,7 @@ fn run_one_click(
 • 資源包 zip：\n{}\n\
 • 詳見「覆蓋範圍說明.txt」\n\n\
 【請你】\n\
-{}\n\
-3. 補翻／修復時「結果存哪」選你設的根目錄（會找到「{}」）",
+{}",
         process_note,
         translated_count_note,
         pending_note,
@@ -3379,13 +3383,13 @@ fn run_one_click(
         work.display(),
         built.pack_path,
         engine::apply_notice::after_run_next_steps(&applied),
-        RESULT_DIR_NAME,
     );
 
     // 沒回應清單只留「現在仍缺」的（同一輪後面的補充可能已補上）
     let no_answer_left = count_map(&remaining_pending(&no_answer, &zh));
     let deferred_left = count_map(&remaining_pending(&quality_deferred_for_view, &zh));
     Ok(with_apply_notice(OneClickResult {
+        apply_result: None,
         interruption: engine::run_interrupt::view(no_answer_left, deferred_left),
         display_safety: Default::default(),
         run_plan: plan.clone(),
@@ -3609,7 +3613,7 @@ fn save_pending_manifest(
     .map_err(|e| e.to_string())
 }
 
-/// 只補缺漏：讀上次工作階段 + 現有資源包，不重掃 mods。AI 是選用功能。
+/// 接續補完：讀上次工作階段 + 現有資源包，不重掃 mods。AI 是選用功能。
 #[tauri::command]
 async fn supplement_translate(
     app: AppHandle,
@@ -3927,6 +3931,7 @@ fn run_supplement(
             emit_warn(app, w);
         }
         return Ok(with_apply_notice(OneClickResult {
+        apply_result: None,
              interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
              display_safety: Default::default(),
              run_plan: supplement_plan.clone(),
@@ -4042,7 +4047,7 @@ fn run_supplement(
         emit_warn(
             app,
             &format!(
-                "AI 中途停下：{}。已補好的都保留並裝進遊戲；排除原因後再按一次會從停下的地方繼續。",
+                "AI 中途停下：{}。已補好的都保留並套用到遊戲；排除原因後再按一次會從停下的地方繼續。",
                 reason.lines().next().unwrap_or("AI 不可用")
             ),
         );
@@ -4283,6 +4288,7 @@ fn run_supplement(
     };
 
     Ok(with_apply_notice(OneClickResult {
+        apply_result: None,
         interruption: engine::run_interrupt::view(
             count_map(&remaining_pending(&ai_report.no_answer, &zh)),
             count_map(&session.quality_deferred),
@@ -4542,7 +4548,7 @@ fn run_repair(
         actions.push(r.note());
     } else if need > 0 {
         actions.push(format!(
-            "尚有約 {} 條缺漏未補（修復不會連線補譯；可再按「只補缺漏」）。",
+            "尚有約 {} 條還是英文（修復不會連線翻譯；可再按「接續補完」）。",
             need
         ));
     } else {
@@ -4694,7 +4700,7 @@ fn run_repair(
 • zip：\n{}\n\n\
 【接下來】\n\
 {}\n\
-3. 若還有英文 → 同一根目錄按「只補缺漏」",
+3. 若還有英文 → 按「接續補完」",
         actions
             .iter()
             .map(|a| format!("• {a}"))
@@ -4709,6 +4715,7 @@ fn run_repair(
     );
 
     Ok(with_apply_notice(OneClickResult {
+        apply_result: None,
         interruption: engine::run_interrupt::view(0, count_map(&session.quality_deferred)),
         display_safety: Default::default(),
         run_plan: repair_plan.clone(),
@@ -5760,6 +5767,10 @@ struct LocalPackCacheProbe {
     message: String,
     pack_name: Option<String>,
     canonical_zip: Option<String>,
+    /// B5c 審查 3a：條數與比例可信嗎（上一輪沒跑完＝Aborted 時不可信，前端不寫數字）
+    counts_trusted: bool,
+    /// B5c 審查 3a：最新一輪結果有沒有套用到這個遊戲資料夾（唯讀比對；不知道＝None）
+    last_applied: Option<bool>,
 }
 
 fn file_mtime_ms(path: &Path) -> Option<u64> {
@@ -5859,6 +5870,8 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
             message: "上次翻譯後模組整合包有變動，要重新翻譯。".into(),
             pack_name,
             canonical_zip,
+            counts_trusted: false,
+            last_applied: None,
         });
     }
     if !matched && !shareable {
@@ -5924,6 +5937,8 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
         message,
         pack_name,
         canonical_zip,
+        counts_trusted: trust_counts,
+        last_applied: engine::result_owner::latest_applied(instance, &work),
     })
 }
 
@@ -6009,6 +6024,8 @@ fn probe_local_pack_cache_cmd(
         message: "此整合包尚未找到本機翻譯結果。完成一次翻譯後，重開工具即可直接分享。".into(),
         pack_name: None,
         canonical_zip: None,
+        counts_trusted: false,
+        last_applied: None,
     }))
 }
 
@@ -6860,13 +6877,25 @@ async fn apply_translation_to_game(
             "warn",
             "【警告】請先完全關閉 Minecraft，再套用（避免檔案被鎖）",
         );
-        emit_progress(&app2, 40, "套用：把翻譯裝進遊戲（備份照你的設定）…");
+        emit_progress(&app2, 40, "套用：把翻譯套用到遊戲（備份照你的設定）…");
+        // B5c 審查 1：套用前確認結果屬於這個遊戲資料夾（零寫入）；舊版結果沒有歸屬紀錄時放行並註記
+        let owner_note = match engine::result_owner::guard(&instance, &out) {
+            Ok(note) => note,
+            Err(e) => {
+                emit_error(&app2, &e);
+                emit_progress(&app2, 0, "套用失敗");
+                return Err(e);
+            }
+        };
         let policy = engine::apply_record::policy_for_run(overwrite_confirmed.unwrap_or(false));
-        let r = apply_to_instance(&instance, &out, pack_name.as_deref(), policy);
+        let mut r = apply_to_instance(&instance, &out, pack_name.as_deref(), policy);
+        if let (Some(note), Ok(ok)) = (owner_note, r.as_mut()) {
+            ok.warnings.push(note);
+        }
         match &r {
             Ok(ok) if !ok.is_applied() => {
                 emit_warn(&app2, &ok.player_summary);
-                emit_progress(&app2, 0, "還沒裝進遊戲");
+                emit_progress(&app2, 0, "還沒套用到遊戲");
             }
             Ok(ok) => {
                 for w in &ok.warnings {
@@ -7069,3 +7098,7 @@ mod lib_b5a2_tests;
 #[cfg(test)]
 #[path = "lib_b5d_tests.rs"]
 mod lib_b5d_tests;
+
+#[cfg(test)]
+#[path = "lib_b5c_tests.rs"]
+mod lib_b5c_tests;

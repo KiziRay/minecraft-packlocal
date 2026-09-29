@@ -14,6 +14,7 @@
 import { applyVersionGate, folderGateState, readyDetailLines, resultState } from "./folder-state.js";
 import { aiBlockedState, applyPrestart, reTranslatePrestart } from "./prestart.js";
 import { failureState } from "./run-failure.js";
+import { RESULT_STATE, resultCardState } from "./result-card.js";
 
 export const STATE = Object.freeze({
   consent: "S00",
@@ -32,13 +33,17 @@ export const STATE = Object.freeze({
   removedNoResult: "S19b",
   /** 暫行「可開始」：一句現況＋「開始翻譯」（呼叫舊 onRun，之後的彈窗照舊，B5b 改）。 */
   ready: "READY",
-  /** 暫行：舊的「已翻完未套用卡」出現時（主要動作由該卡提供，B5c 併入狀態卡 S11）。 */
-  pendingCard: "S11-card",
+  /** B5c：已翻完、還沒套用（依包保存）。 */
+  applyPending: RESULT_STATE.applyPending,
+  /** B5c：部分完成且已套用。 */
+  partial: RESULT_STATE.partial,
+  /** B5c：已完成、已套用（R-1 例外：下一步是開遊戲）。 */
+  done: RESULT_STATE.done,
   busy: "BUSY",
 });
 
 /** 主要按鈕可以是 0 顆的狀態（規格 R-1 例外）。S20 不是狀態卡狀態，所以不在這裡。 */
-export const ZERO_PRIMARY_ALLOWED = Object.freeze(["S10", "S17", "S18", "S11-card"]);
+export const ZERO_PRIMARY_ALLOWED = Object.freeze(["S10", "S17", "S18"]);
 
 export const ACTION = Object.freeze({
   acceptConsent: "accept-consent",
@@ -94,7 +99,11 @@ function normalize(input) {
     removal:
       removal && String(removal.instancePath || "").trim() === instancePath && instancePath ? removal : null,
     pickFolderFresh: src.pickFolderFresh !== false,
-    applyPendingShown: !!src.applyPendingShown,
+    // B5c：這一包最近一輪的完成結果（依包保存）與完成卡需要的脈絡；沒有時用本機結果探測
+    result: src.result && typeof src.result === "object" ? src.result : null,
+    resultCtx: src.resultCtx && typeof src.resultCtx === "object" ? src.resultCtx : {},
+    probeSummary: src.probeSummary && typeof src.probeSummary === "object" ? src.probeSummary : null,
+    lastRunPlanNote: String(src.lastRunPlanNote || ""),
     translationComplete: !!src.translationComplete,
     // B5d：選資料夾就判定（folder-state.js）
     folder: src.folder && typeof src.folder === "object" ? src.folder : null,
@@ -173,10 +182,27 @@ export function removalDetailLines(result) {
 export function computePackState(input) {
   const i = normalize(input);
   // 審查 5a：偵測不到 MC 版本時，所有會開始翻譯的狀態都停用（可開始、S15、S18 的次要、S19b）
-  const gated = applyVersionGate(computeState(i), { versionUnknown: i.versionUnknown });
+  const gated = withPrestartMore(applyVersionGate(computeState(i), { versionUnknown: i.versionUnknown }), i);
   // B5b：顯示 AI 列的狀態就是 §3.1 開始前確認模式：紅列時主要按鈕停用（先處理標紅的那一列）
-  if (gated && gated.showAiRow && i.prestart && Array.isArray(i.prestart.rows)) return applyPrestart(gated, i.prestart.rows);
+  if (gated && gated.showAiRow && i.prestart && Array.isArray(i.prestart.rows)) {
+    // B5c：S14 接續補完不經過 §3.1（R-8），只帶 AI 列
+    const rows = gated.aiRowOnly ? i.prestart.rows.filter((r) => r && r.id === "ai") : i.prestart.rows;
+    return applyPrestart(gated, rows);
+  }
   return gated;
+}
+
+/**
+ * B5c：§3.1 開始前確認的「更多」（規格 §3.1）：已有結果時「另存一份新的結果」（取代三選一的另存）、
+ * 上次 runPlan 有覆寫時一行說明。只加在會開始新一輪翻譯的確認狀態（S13、可開始、S15、S19b）。
+ */
+function withPrestartMore(st, i) {
+  if (!st || !st.showAiRow || st.aiRowOnly) return st;
+  if (!["S13", STATE.ready, "S15", STATE.removedNoResult].includes(st.id)) return st;
+  const more = Array.isArray(st.more) ? st.more.slice() : [];
+  if (i.hasResult || i.translationComplete || i.result) more.push({ action: "run-new-copy", label: "另存一份新的結果" });
+  if (i.lastRunPlanNote) more.push({ note: i.lastRunPlanNote });
+  return { ...st, more };
 }
 
 function computeState(i) {
@@ -247,11 +273,6 @@ function computeState(i) {
     });
   }
 
-  // 暫行（B5c 取代）：待套用卡在畫面上時，主要動作「套用到遊戲」在那張卡
-  if (i.applyPendingShown) {
-    return state(STATE.pendingCard, { sentence: "已翻完，還沒套用到遊戲" });
-  }
-
   // B5b：從狀態卡按接續補完／修復、AI 還沒就緒（R-8 不經過 §3.1，直接在這裡顯示紅列）
   const origin = i.prestart && i.prestart.aiBlockOrigin;
   if (origin === "supplement" || origin === "repair") return aiBlockedState(origin);
@@ -281,6 +302,11 @@ function computeState(i) {
     });
   }
 
+  // B5c：S11 已翻完、還沒套用（依包保存；換資料夾整張換，回來再現）
+  if (i.result && (i.result.applyStatus !== "applied" || i.resultCtx.applyFailure || i.resultCtx.gameStillRunning)) {
+    return resultCardState(i.result, { ...i.resultCtx, packName: name });
+  }
+
   // B5d：S15 暫行（模組整合包有變動）、S18（已套用、這台電腦沒留結果）
   const after = resultState({
     packName: name,
@@ -291,6 +317,16 @@ function computeState(i) {
     extraShown: i.extraShown,
   });
   if (after) return { ...after, reTranslate: true };
+
+  // B5c：S14／S17（這一輪的結果；沒有時用本機結果探測，取代「本機已有翻譯」卡）
+  if (i.result) return resultCardState(i.result, { ...i.resultCtx, packName: name });
+  if (i.probeSummary && i.hasResult && i.hasTranslationRecord) {
+    return resultCardState(i.probeSummary, { ...i.resultCtx, packName: name });
+  }
+  // 本機有結果、這個遊戲資料夾卻沒有套用紀錄（例：移除過或從沒套用）：S11「套用到遊戲」
+  if (i.probeSummary && i.hasResult && !i.hasTranslationRecord) {
+    return resultCardState({ ...i.probeSummary, applyStatus: "notApplied" }, { ...i.resultCtx, packName: name });
+  }
 
   // S13（還沒翻過）：開始前確認模式本身；第一次多說「確認下面幾項就能開始」（規格 §2.2 S13）
   const fresh = !i.translationComplete && !i.hasResult;

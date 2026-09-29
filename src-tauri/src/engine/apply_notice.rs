@@ -28,12 +28,12 @@ pub fn language_display_name(code: Option<&str>) -> String {
     name.into()
 }
 
-/// 翻譯／修復結論最後的「接下來」：依有沒有真的裝進遊戲決定說法。
+/// 翻譯／修復結論最後的「接下來」：依有沒有真的套用到遊戲決定說法。
 pub fn after_run_next_steps(applied: &ApplyResult) -> String {
     if applied.is_applied() {
-        "1. 已自動裝進遊戲、啟用資源包並把遊戲語言設成繁體中文（台灣）\n2. 直接開遊戲即可，不用自己切語言".into()
+        "1. 已自動套用到遊戲、啟用資源包並把遊戲語言設成繁體中文（台灣）\n2. 直接開遊戲即可，不用自己切語言".into()
     } else {
-        "1. 翻好了，還沒裝進遊戲（原因見最上面）\n2. 處理好之後按「套用到遊戲」，不用重新翻譯".into()
+        "1. 翻好了，還沒套用到遊戲（原因見最上面）\n2. 處理好之後按「套用到遊戲」，不用重新翻譯".into()
     }
 }
 
@@ -42,7 +42,7 @@ pub fn reapply_log_line(applied: &ApplyResult, action: &str) -> String {
     if applied.is_applied() {
         format!("{action}後已重新套用到遊戲。")
     } else {
-        format!("{action}完成：翻好了，還沒裝進遊戲（處理好之後按「套用到遊戲」）。")
+        format!("{action}完成：翻好了，還沒套用到遊戲（處理好之後按「套用到遊戲」）。")
     }
 }
 
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn next_steps_follow_real_apply_status() {
         let applied = after_run_next_steps(&result(ApplyStatus::Applied));
-        assert!(applied.contains("已自動裝進遊戲"), "{applied}");
+        assert!(applied.contains("已自動套用到遊戲"), "{applied}");
         for status in [
             ApplyStatus::GameRunning,
             ApplyStatus::NoOptionsTxt,
@@ -101,8 +101,8 @@ mod tests {
             ApplyStatus::NeedsOverwriteConfirm,
         ] {
             let pending = after_run_next_steps(&result(status));
-            assert!(pending.contains("翻好了，還沒裝進遊戲"), "{pending}");
-            assert!(!pending.contains("已自動裝進遊戲"), "{pending}");
+            assert!(pending.contains("翻好了，還沒套用到遊戲"), "{pending}");
+            assert!(!pending.contains("已自動套用到遊戲"), "{pending}");
             assert!(pending.contains("套用到遊戲"), "{pending}");
         }
     }
@@ -112,6 +112,6 @@ mod tests {
         assert!(reapply_log_line(&result(ApplyStatus::Applied), "修復").contains("已重新套用"));
         let pending = reapply_log_line(&result(ApplyStatus::GameRunning), "修復");
         assert!(!pending.contains("已重新套用"), "{pending}");
-        assert!(pending.contains("翻好了，還沒裝進遊戲"), "{pending}");
+        assert!(pending.contains("翻好了，還沒套用到遊戲"), "{pending}");
     }
 }

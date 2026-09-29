@@ -1,7 +1,8 @@
 /**
  * B5b S12 出錯（規格 §2.2 S12）：一句白話原因＋依原因的主要按鈕。
  *
- * 本批暫用錯誤字串判斷原因（計畫 B5b#6）；結構化分類碼由後續批次（B5c 起由 with_apply_notice／interruption 帶出）取代。
+ * B5c：先用後端分類碼（interruption.cause、FailureClass 代碼、WriteIssue 代碼）；沒有碼或看不懂才退回
+ * B5b 的錯誤字串判斷（退路）。
  * 純函式、不碰 DOM。完整原因照舊寫進紀錄，這裡只給狀態卡一句。
  */
 
@@ -15,14 +16,45 @@ export const FAILURE_ACTION = Object.freeze({
 
 const RETRY_LABEL = "再試一次";
 
+/** 從錯誤物件或結果取後端分類碼（沒有就空字串）。 */
+export function failureCodeOf(error) {
+  if (!error || typeof error !== "object") return "";
+  const intr = error.interruption && typeof error.interruption === "object" ? error.interruption : null;
+  return String(error.code || error.cause || (intr && (intr.cause || intr.failureClass)) || "");
+}
+
 /**
  * @param {string} text 錯誤訊息（formatInvokeError 後的文字）
  * @param {"run"|"supplement"|"repair"} origin 哪個動作失敗（「再試一次」重跑同一個）
+ * @param {{code?: string}} [opts] 後端分類碼（有就優先）
  */
-export function classifyFailure(text, origin = "run") {
+export function classifyFailure(text, origin = "run", { code = "" } = {}) {
   const t = String(text || "");
   const retry = { action: origin === "supplement" || origin === "repair" ? origin : "run", label: RETRY_LABEL };
   const ai = (kind, reason) => ({ kind, group: "ai", reason, primary: { action: FAILURE_ACTION.changeAi, label: "換 AI 再試" } });
+  // B5c：後端分類碼（interruption.cause／FailureClass／WriteIssue）優先
+  switch (String(code || "")) {
+    case "quota":
+    case "quota_exhausted":
+      return ai("quota", "AI 額度用完或帳戶沒有餘額");
+    case "auth":
+    case "auth_invalid":
+      return ai("key", "金鑰被服務商拒絕");
+    case "relogin":
+      return ai("discord", "要先登入 Discord 並加入官方伺服器");
+    case "local_gone":
+    case "local_stuck":
+      return ai("local", "本地模型沒有回應");
+    case "no_output":
+      return ai("ai", "AI 一直給不出可用的翻譯");
+    case "network":
+    case "timeout":
+      return { kind: "network", group: "other", reason: "連不上服務，檢查網路", primary: retry };
+    case "disk_full":
+      return { kind: "disk", group: "other", reason: "磁碟空間不夠", primary: retry };
+    default:
+      break;
+  }
   // 順序（第二輪審查 6，依後端原句取樣）：磁碟 → Discord → 本地模型 → 額度 → 金鑰 → ChatGPT → 網路 → 可修。
   // 本地模型與額度的原句常夾帶 reqwest 的「error sending request」或「逾時」，所以要排在網路之前；
   // 網路判斷又要在「可修」之前（訊息常帶 .zip 檔名）。

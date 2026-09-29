@@ -74,6 +74,7 @@ export function planStatusCard(state, { extraShown = null } = {}) {
     // B5b：§3.1 開始前確認的列（只在顯示 AI 列的狀態）與翻譯中進度區（S09）
     rows: s.showAiRow && Array.isArray(s.rows) ? s.rows : [],
     progress: s.id === STATE.translating && s.progress ? s.progress : null,
+    inlineReason: s.reasonInline ? String(s.disabledReason || "") : "",
   };
 }
 
@@ -86,6 +87,13 @@ function renderActionList(container, items, doc, onAction, className) {
   if (!container) return;
   container.textContent = "";
   for (const item of items) {
+    if (item && !item.action && item.note) {
+      const p = doc.createElement("p");
+      p.className = "status-card-more-note";
+      p.textContent = String(item.note);
+      container.appendChild(p);
+      continue;
+    }
     if (!item || !item.action) continue;
     const btn = doc.createElement("button");
     btn.type = "button";
@@ -164,6 +172,14 @@ export function applyStatusCard(plan, { $, doc, onAction = () => {}, onRowChange
     renderActionList($("status-card-more-list"), plan.more, doc, onAction, "text-button");
   }
   setHidden($("status-card-more"), plan.more.length === 0);
+  // B5c：S11 按下時遊戲仍開著 → 就地原因（按鈕保持可按，關遊戲後再按一次）
+  if (plan.inlineReason) {
+    const reasonEl = $("status-card-reason");
+    if (reasonEl) {
+      reasonEl.textContent = plan.inlineReason;
+      reasonEl.hidden = false;
+    }
+  }
   setHidden($("status-card-version-row"), !plan.versionRow);
   renderPrestartRows(plan.rows || [], { $, doc, onAction: (action) => onAction(action, { action }), onRowChange });
   renderRunProgress(plan.progress || null, { $ });

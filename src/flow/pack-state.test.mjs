@@ -109,8 +109,9 @@ test("可開始（B5b 起＝S13 還沒翻過）：一句現況＋「開始翻譯
   assert.equal(s.showAiRow, true);
   assert.deepEqual(s.more, [], "沒有結果時沒有「刪除結果並重翻」");
   const withResult = computePackState({ ...base, hasResult: true });
-  assert.equal(withResult.more.length, 1);
   assert.equal(withResult.more[0].action, ACTION.deleteAndRestart, "刪除並重翻只在狀態卡「更多」");
+  // B5c：三選一刪除後，「另存一份新的結果」改在 §3.1「更多」
+  assert.deepEqual(withResult.more.map((m) => m.action), [ACTION.deleteAndRestart, "run-new-copy"]);
 });
 
 test("S02（暫行）：資料夾沒通過或版本太舊時，擋下並給「重新選擇」", () => {
@@ -221,14 +222,13 @@ test("G0.2：說明退場的設定路徑在前後端共用白名單，且 KEY_MA
 });
 
 // ── 審查修正 中2：狀態卡不得與暫留的舊卡矛盾（B5b／B5c 取代前的保守分支）──
-test("中2：待套用卡出現時，狀態句「已翻完，還沒套用到遊戲」且狀態卡不出主要按鈕（主要動作在該卡）", () => {
-  const s = computePackState({ ...base, applyPendingShown: true, translationComplete: true });
-  assert.equal(s.id, STATE.pendingCard);
-  assert.equal(s.sentence, "已翻完，還沒套用到遊戲");
-  assert.equal(s.primary, null);
-  assert.ok(ZERO_PRIMARY_ALLOWED.includes(s.id));
+test("B5c 改寫中2：待套用卡併入狀態卡 S11（主要按鈕「套用到遊戲」在狀態卡，只露出一顆）", () => {
+  const s = computePackState({ ...base, result: { applyStatus: "gameRunning", pending: 0, coverage: 90, fresh: true }, translationComplete: true });
+  assert.equal(s.id, STATE.applyPending);
+  assert.equal(s.sentence, "已翻完，還沒套用：Minecraft 還開著");
+  assert.equal(s.primary.label, "套用到遊戲");
   const plan = planStatusCard(s);
-  assert.equal(Object.values(plan.buttons).filter((b) => !b.hidden).length, 0);
+  assert.equal(Object.values(plan.buttons).filter((b) => !b.hidden).length, 1);
 });
 
 test("B5d 改寫中2：接續卡已刪（併入 D 區「上次：<包名>」），狀態卡不再有 RESUME-card 暫行狀態", () => {
@@ -249,7 +249,7 @@ test("中2：翻譯已完成且沒有待套用時，狀態句「這個模組整�
 });
 
 test("中2：翻譯中與同意頁優先於舊卡", () => {
-  assert.equal(computePackState({ ...base, applyPendingShown: true, busy: true, busyKind: "translate" }).id, STATE.translating);
+  assert.equal(computePackState({ ...base, result: { applyStatus: "gameRunning" }, busy: true, busyKind: "translate" }).id, STATE.translating);
   assert.equal(computePackState({ ...base, consentAccepted: false, resumeShown: true }).id, STATE.consent);
 });
 

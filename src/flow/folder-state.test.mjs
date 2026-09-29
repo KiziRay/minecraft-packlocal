@@ -231,7 +231,7 @@ test("N-03／N-04：只在可開始／有變動時出現；每次選資料夾最
   const shown = (o) => folderBanners(o).show.map((b) => b.id);
   assert.deepEqual(shown({ stateId: "READY", gameRunning: true, hasOptions: false }), ["N-03", "N-04"]);
   assert.deepEqual(shown({ stateId: "S15", gameRunning: true, hasOptions: true }), ["N-03"]);
-  for (const id of ["S04", "S07", "BUSY", "S09", "S11-card", "S01"]) {
+  for (const id of ["S04", "S07", "BUSY", "S09", "S11", "S14", "S17", "S01"]) {
     assert.deepEqual(shown({ stateId: id, gameRunning: true, hasOptions: false }), [], id);
     assert.deepEqual(folderBanners({ stateId: id }).hide.sort(), ["N-03", "N-04"]);
   }
@@ -310,7 +310,8 @@ test("手動輸入與瀏覽同一套檢查；開始翻譯的三選一與本機�
   assert.ok(body("async function adoptInstancePath(").includes("checkSelectedFolder("));
   assert.ok(body("async function onInstanceTypedPath(").includes("checkSelectedFolder("));
   assert.ok(body("async function checkSelectedFolder(").includes("folderChecks.inspect("));
-  assert.ok(body("async function onRunInner(").includes("hasUsableExistingResult("));
+  // B5c：三選一已刪（已有結果由狀態卡決定），開始翻譯不再判斷「已有可用結果」
+  assert.ok(!body("async function onRunInner(").includes("choiceDialog("));
   assert.ok(body("function showLocalCacheCard(").includes("isUsableProbe("));
   assert.ok(body("async function onPickInstance(").includes("folderChecks.pickStart()"));
   assert.ok(!body("async function restoreLastInstanceOnStartup(").includes("probe_local_pack_cache_cmd"), "啟動時不探測（百分比按下後才算）");

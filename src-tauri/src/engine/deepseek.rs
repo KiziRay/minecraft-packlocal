@@ -445,26 +445,32 @@ fn ai_quota_support_message(detail: &str) -> String {
 fn ai_quota_support_message_for(detail: &str, provider: AiProvider, _managed: bool) -> String {
     let d = sanitize_provider_name(detail);
     if matches!(provider, AiProvider::Codex) {
+        let title = super::run_interrupt::CHATGPT_BUSY_TITLE;
         return format!(
-            "【ChatGPT 暫時不能翻譯】\n\
+            "{title}\n\
 {d}\n\n\
 這次 ChatGPT 不接受翻譯請求，可能是翻譯用量已達上限，也可能只是短時間內送出太多次；這不一定代表你平常聊天的額度用完了。\n\
 翻譯會消耗你的 ChatGPT 帳號額度，可以到 ChatGPT「設定 → 使用量」查看什麼時候重設。\n\
-工具在試翻時就停下來了，沒有寫入任何翻譯。請稍後再試、重新登入 ChatGPT，或改用自訂 API／本地模型。"
+如果是開始前試翻時停下，還沒寫入任何翻譯；翻到一半才停下時，已翻好的部分都保留，額度重設後按「接續補完」。"
         );
     }
     if matches!(provider, AiProvider::LocalLlm) {
         return format!(
             "【本地模型沒有回應】\n\
 {d}\n\n\
-請確認已完成本地模型安裝，且健康檢查已通過。速度隨這台電腦而異。"
+請確認已完成本地模型安裝。速度隨這台電腦而異。"
         );
     }
+    // B5c：額度與金鑰分開標題（規格 §5.3）；完成卡的原因句由前端依 interruption.cause 寫，這段只進紀錄
+    let title = match super::retry_policy::classify_message(&d) {
+        super::retry_policy::FailureClass::AuthInvalid => "【自訂 API 金鑰被服務商拒絕】",
+        _ => "【自訂 API 額度用完或帳戶沒有餘額】",
+    };
     format!(
-        "【自訂 API 額度或金鑰無法使用】\n\
+        "{title}\n\
 {d}\n\n\
 自訂 API 使用你填入服務商的金鑰與額度。\n\
-請到該服務商後台確認金鑰、餘額與速率限制；也可改用 GPT 或本地模型。"
+請到該服務商後台確認金鑰、餘額與速率限制；也可改用 ChatGPT 或本地模型。"
     )
 }
 
@@ -517,7 +523,7 @@ fn is_auth_relogin_error(msg: &str) -> bool {
 }
 
 fn auth_relogin_message() -> String {
-    "Discord 登入已失效或需重新確認會員資格，請回到工具重新登入後再試。".into()
+    format!("{}或需重新確認會員資格，請回到工具重新登入後再試。", super::run_interrupt::RELOGIN_MARK)
 }
 
 fn auth_unavailable_message() -> String {
@@ -3753,7 +3759,8 @@ fn run_batches_with(
                 let streak_limit = EMPTY_ROUNDS_ABORT * batch_state.parallel_cap.max(1);
                 if stop.is_none() && outage_since.is_none() && no_progress_streak >= streak_limit.max(EMPTY_ROUNDS_ABORT) {
                     stop = Some(BatchStop::NoProgress(format!(
-                        "AI 連續 {no_progress_streak} 批都沒有新譯文，提前結束；已保留已成功譯文（最後一次：{}）",
+                        "AI 連續 {no_progress_streak} 批{}，提前結束；已保留已成功譯文（最後一次：{}）",
+                        super::run_interrupt::NO_PROGRESS_MARK,
                         truncate_err_msg(errors.last().map(String::as_str).unwrap_or("沒有回應"), 80)
                     )));
                 }
@@ -3963,18 +3970,22 @@ fn notify_auto_retry(engine: &Engine, class: retry_policy::FailureClass, attempt
 fn local_process_gone_message(context: Option<&str>) -> Option<String> {
     match crate::engine::local_llm::own_server_liveness() {
         crate::engine::local_llm::OwnServerLiveness::Exited(code) => Some(format!(
-            "{}本地模型程式已經結束（{code}），通常是這台電腦的記憶體不足。已翻好的部分都會保留；\
+            "{}{mark}（{code}），通常是這台電腦的記憶體不足。已翻好的部分都會保留；\
 關閉其他程式後按「接續補完」，工具會重新啟動模型並從停下的地方繼續。",
-            context.map(|c| format!("{c}：")).unwrap_or_default()
+            context.map(|c| format!("{c}：")).unwrap_or_default(),
+            mark = super::run_interrupt::LOCAL_GONE_MARK
         )),
         _ => None,
     }
 }
 
 fn local_not_running_message() -> String {
-    "連不上本地模型：它沒有在執行（可能已經當掉或被關閉）。已翻好的部分都會保留；\
-按「接續補完」會重新啟動模型並從停下的地方繼續。"
-        .to_string()
+    // 開頭字樣＝run_interrupt::LOCAL_UNREACHABLE_MARK（cause_for 認這個）
+    format!(
+        "{}：它沒有在執行（可能已經當掉或被關閉）。已翻好的部分都會保留；\
+按「接續補完」會重新啟動模型並從停下的地方繼續。",
+        super::run_interrupt::LOCAL_UNREACHABLE_MARK
+    )
 }
 
 /// B4：從 llama-server 的回應讀出實際速度（`timings.predicted_per_second`），用來調整等待上限；
@@ -4240,7 +4251,7 @@ fn translate_chunk(
                         continue;
                     }
                     if is_local && err.is_connect() {
-                        let gone = local_process_gone_message(Some("連不上本地模型"))
+                        let gone = local_process_gone_message(Some(super::run_interrupt::LOCAL_UNREACHABLE_MARK))
                             .unwrap_or_else(local_not_running_message);
                         return Err(ChunkError {
                             message: gone,
@@ -5062,7 +5073,8 @@ mod tests {
         );
         assert!(message.contains("不一定代表你平常聊天的額度用完了"));
         assert!(message.contains("翻譯會消耗你的 ChatGPT 帳號額度"), "要誠實說明會用到額度");
-        assert!(message.contains("沒有寫入任何翻譯"));
+        // B5c（規格 §5.3）：「沒寫入」只限試翻時；翻到一半停下要說已翻好的保留
+        assert!(message.contains("試翻時停下，還沒寫入任何翻譯") && message.contains("已翻好的部分都保留"));
         assert!(!message.contains("GPT 帳號額度或速率限制"));
         let own_text = message.replace("The usage limit has been reached", "");
         for word in ["Codex", "端點", "權杖", "探測", "預檢", "429", "Token", "token"] {

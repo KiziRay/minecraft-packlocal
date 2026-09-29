@@ -55,6 +55,17 @@ export const DISCLOSURES = Object.freeze({
     settingPath: "ui.disclosure.localStart",
     topic: "本地模型啟動",
   }),
+  // B5c：完成卡每類原因與「已幫你做的事」第一次展開（之後只條數）；人工補翻浮層怎麼請線上 AI 翻
+  resultReasons: Object.freeze({
+    storageKey: "mcpl-disclosure-result-reasons",
+    settingPath: "ui.disclosure.resultReasons",
+    topic: "還是英文的原因",
+  }),
+  manualFix: Object.freeze({
+    storageKey: "mcpl-disclosure-manual-fix",
+    settingPath: "ui.disclosure.manualFix",
+    topic: "怎麼人工補翻",
+  }),
 });
 
 const RETIRED = "retired";

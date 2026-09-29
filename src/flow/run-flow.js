@@ -194,15 +194,6 @@ export function createRunFlow(deps) {
     skipAiOnce = "";
   }
 
-  /**
-   * 同一次點擊在三選一改成接續補完（第二輪審查 1b／1d）：先記住 §3.1 的選擇（備份列不會在開始後變成 D-04）、
-   * 清掉「這次不用 AI」（改由呼叫端明確帶 skipAi），回傳本輪是否已確認不備份覆蓋（給接續補完的套用用）。
-   */
-  async function handOffToSupplement() {
-    await commitRunChoices();
-    return takeOverwriteConfirmed();
-  }
-
   /** 套用時讀一次：本輪是否已在 §3.1 確認不備份覆蓋（讀完就清，下一輪沒勾照跳 D-03）。 */
   function takeOverwriteConfirmed() {
     const value = overwriteConfirmed;
@@ -211,8 +202,8 @@ export function createRunFlow(deps) {
   }
 
   /** 開跑後（翻譯、修復、接續補完）失敗：S12。停止不是錯誤。 */
-  function recordFailure(origin, text) {
-    failure = { instancePath: deps.instancePath(), origin, classified: classifyFailure(text, origin) };
+  function recordFailure(origin, text, code = "") {
+    failure = { instancePath: deps.instancePath(), origin, classified: classifyFailure(text, origin, { code }) };
   }
 
   function clearFailure() {
@@ -298,7 +289,6 @@ export function createRunFlow(deps) {
     interceptRun,
     beforeStart,
     commitRunChoices,
-    handOffToSupplement,
     takeOverwriteConfirmed,
     recordFailure,
     clearFailure,

@@ -63,6 +63,8 @@ const KEY_MAP = {
   "mcpl-disclosure-ai-choice": "ui.disclosure.aiChoice",
   "mcpl-disclosure-run-tips": "ui.disclosure.runTips",
   "mcpl-disclosure-local-start": "ui.disclosure.localStart",
+  "mcpl-disclosure-result-reasons": "ui.disclosure.resultReasons",
+  "mcpl-disclosure-manual-fix": "ui.disclosure.manualFix",
 };
 
 /** 舊版鍵名 → 目前鍵名。目前的鍵沒有值時，才用舊鍵的值搬進設定檔。 */
