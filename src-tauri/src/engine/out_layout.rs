@@ -476,8 +476,9 @@ pub fn layout_search_bases(user_or_work: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// 建議「結果根目錄」：遊戲實例旁的專用資料夾（不是 resourcepacks）
-pub fn suggest_output_base(instance_path: &Path) -> Result<PathBuf, String> {
+/// 建議「結果根目錄」：遊戲資料夾旁的專用資料夾（不是 resourcepacks）。
+/// 只算路徑、不建資料夾（B5d：選資料夾與改設定都是查詢，G1.36）；開始翻譯時由 ensure_result_layout 建。
+pub fn suggest_output_base_path(instance_path: &Path) -> PathBuf {
     let mc = if instance_path.join("mods").is_dir() {
         instance_path.to_path_buf()
     } else if instance_path.join("minecraft").join("mods").is_dir() {
@@ -496,9 +497,7 @@ pub fn suggest_output_base(instance_path: &Path) -> Result<PathBuf, String> {
     } else {
         mc
     };
-    let base = instance_root.join("繁中翻譯輸出");
-    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-    Ok(base)
+    instance_root.join("繁中翻譯輸出")
 }
 
 #[cfg(test)]

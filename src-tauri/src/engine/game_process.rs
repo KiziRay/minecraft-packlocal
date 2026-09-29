@@ -32,24 +32,63 @@ fn norm(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 從命令列字串判斷是否指向這個實例。
+/// 從命令列字串判斷是否指向這個遊戲資料夾。
 ///
 /// 啟動器（CurseForge／Prism／MultiMC／官方）都會把 `--gameDir`／`-Duser.dir` 或
-/// natives 路徑指到實例資料夾底下，所以「命令列含實例路徑」是穩定的判準。
-/// 另外接受實例資料夾的最後一段名稱，涵蓋命令列用相對路徑的啟動器。
+/// natives 路徑指到遊戲資料夾底下，所以「命令列含遊戲資料夾路徑」是穩定的判準。
+/// 另外接受最後一段名稱（夠獨特時），涵蓋命令列用相對路徑的啟動器。
+///
+/// B5d（與分享腳本 GS1.14 同演算法）：
+/// - 遊戲資料夾叫 `.minecraft`／`minecraft`（Prism／MultiMC 實例裡那層）時，同時比對上一層（實例資料夾）：
+///   命令列常只出現實例資料夾（例如 natives 路徑），而 `.minecraft` 這個名稱太常見，不能拿來單獨比對；
+/// - 比對要求後面接分隔符、引號、空白或結尾，「atm10」不會誤中「atm10-2」。
 pub fn command_line_targets_instance(command_line: &str, instance_path: &str) -> bool {
     let haystack = norm(command_line);
     let needle = norm(instance_path);
     if needle.is_empty() {
         return false;
     }
-    if haystack.contains(&needle) {
+    let mut targets = vec![needle.clone()];
+    let (parent, leaf) = match needle.rsplit_once('/') {
+        Some((parent, leaf)) => (parent.to_string(), leaf.to_string()),
+        None => (String::new(), needle.clone()),
+    };
+    let generic_leaf = leaf == ".minecraft" || leaf == "minecraft";
+    if generic_leaf && !parent.is_empty() {
+        targets.push(parent.clone());
+    }
+    if targets.iter().any(|t| contains_bounded(&haystack, t)) {
         return true;
     }
-    // 退一步：實例資料夾名稱夠獨特時（例如 "atm10"）也算數，但太短的名稱不冒險。
-    let leaf = needle.rsplit('/').next().unwrap_or_default();
-    if leaf.len() >= 4 && haystack.contains(&format!("/{leaf}/")) {
-        return true;
+    // 退一步：名稱夠獨特時（例如 "atm10"）也算數，但太短或太常見的名稱不冒險。
+    let names: Vec<String> = if generic_leaf {
+        parent.rsplit('/').next().map(str::to_string).into_iter().collect()
+    } else {
+        vec![leaf]
+    };
+    names
+        .iter()
+        .filter(|n| n.chars().count() >= 4)
+        .any(|n| contains_bounded(&haystack, &format!("/{n}")))
+}
+
+/// `needle` 出現在 `haystack`，而且後面接的是分隔符、引號、空白或結尾。
+fn contains_bounded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let end = from + pos + needle.len();
+        match haystack[end..].chars().next() {
+            None => return true,
+            Some(c) if c == '/' || c == '"' || c == '\'' || c.is_whitespace() || c == ';' => return true,
+            _ => {}
+        }
+        from = from + pos + 1;
+        while !haystack.is_char_boundary(from) {
+            from += 1;
+        }
     }
     false
 }

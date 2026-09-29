@@ -26,7 +26,7 @@ pub fn ensure_space(path: &Path, need: u64) -> Result<(), String> {
         Some(free) if free < need => Err(format!(
             "磁碟空間不足，無法開始翻譯。\n\
 目標磁碟可用空間約 {}，建議至少留 {} 再試。\n\
-請清出一些空間，或把「翻譯結果放哪」改到空間較多的磁碟。",
+請清出一些空間，或到「設定→翻譯結果放哪裡」改到空間較多的磁碟。",
             human(free),
             human(need)
         )),
@@ -35,42 +35,25 @@ pub fn ensure_space(path: &Path, need: u64) -> Result<(), String> {
 }
 
 /// 確認目錄可寫入：建立測試檔後刪除。失敗回玩家白話。
+///
+/// B5d：原因依 io::ErrorKind／os error 分類（folder_check::classify_io_error），
+/// 不再一律寫「請改選你有權限的位置」（那句會讓提權判斷把磁碟滿、網路磁碟、防毒全當成權限問題）。
+/// 只在套用與寫結果時用；選資料夾時用唯讀的 folder_check::check_write_access_readonly。
 #[allow(dead_code)]
 pub fn probe_writable(path: &Path) -> Result<(), String> {
-    if let Err(e) = fs::create_dir_all(path) {
-        return Err(format!(
-            "這個資料夾無法寫入，請改選你有權限的位置（例如文件或桌面下的資料夾）。\n\
-路徑：{}\n（細節：{e}）",
-            path.display()
-        ));
-    }
+    let fail = |e: std::io::Error| {
+        let issue = super::folder_check::classify_io_error(&e, path);
+        super::folder_check::issue_message(issue, path, &e.to_string())
+    };
+    fs::create_dir_all(path).map_err(fail)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let probe = path.join(format!("{WRITE_PROBE_NAME}-{stamp}"));
-    match fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            Ok(())
-        }
-        Err(e) => {
-            let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("access") || msg.contains("permission") || msg.contains("denied") {
-                Err(format!(
-                    "這個資料夾無法寫入，請改選你有權限的位置（例如文件或桌面下的資料夾）。\n\
-遊戲或啟動器可能正在使用檔案，請先關閉後再試。\n路徑：{}",
-                    path.display()
-                ))
-            } else {
-                Err(format!(
-                    "這個資料夾無法寫入，請改選你有權限的位置（例如文件或桌面下的資料夾）。\n\
-路徑：{}\n（細節：{e}）",
-                    path.display()
-                ))
-            }
-        }
-    }
+    fs::write(&probe, b"ok").map_err(fail)?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 /// 空間 + 寫入權限一次過（階 3 前置）。

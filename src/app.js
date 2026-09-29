@@ -58,6 +58,8 @@ import { settingsHealthBanner } from "./ui/banner.js";
 import { DISPLAY_CATEGORY, buildIssuePayload, describeIssueResult } from "./ui/issue-report.js";
 import { isAriaDisabled } from "./flow/status-card.js";
 import { createPackActions, describeImportReport } from "./flow/pack-actions.js";
+import { createFolderChecks, runWhileCurrent } from "./flow/folder-checks.js";
+import { hasUsableExistingResult, isUsableProbe, samePath, versionUnknown } from "./flow/folder-state.js";
 import { createDisclosure } from "./flow/disclosure.js";
 import {
   announceMainState,
@@ -162,6 +164,10 @@ let instanceValidation = { ok: false, reason: "尚未選擇遊戲資料夾。" }
 /** 偵測到 Minecraft＜1.13 時為 true，禁用開始翻譯 */
 let versionBlocked = false;
 let versionBlockReason = "";
+/** B5d：偵測不到 MC 版本（狀態卡就地選，選好前開始翻譯停用） */
+let versionDetectFailed = false;
+/** B5d：探測結果「上次翻譯後模組整合包有變動」（S15）；不是可用的結果，不放進 localCacheProbe */
+let packChangeProbe = null;
 let coverageSkippedSeen = new Set();
 let coverageMetrics = {
   glossary: 0,
@@ -730,6 +736,20 @@ const removalFlow = createRemovalFlow({
   onBusy: (on) => setBusy(on, "apply"),
 });
 
+/** B5d 選資料夾就判定（瀏覽、手動輸入、上次共用）在 src/flow/folder-checks.js。 */
+const folderChecks = createFolderChecks({
+  $,
+  invoke,
+  appendLog: (text, level) => appendLog(text, level),
+  syncUiState: () => syncUiState(),
+  adoptInstancePath: (path) => adoptInstancePath(path),
+  getCurrentPath: () => ($("instance")?.value || "").trim(),
+  readLastInstancePath: () => readLastInstancePath(),
+  confirmDialog,
+  disclosure,
+  bannerArea: () => packActions.bannerArea(),
+});
+
 /**
  * B5a-1 流程接線（狀態卡、D 區、S19、刪除結果並重翻、橫幅、浮層焦點）在 src/flow/pack-actions.js；
  * 這裡只把 app.js 的狀態與既有函式交給它。
@@ -738,6 +758,7 @@ const packActions = createPackActions({
   $,
   doc: document,
   invoke,
+  folderChecks,
   getSetting,
   setSetting,
   disclosure,
@@ -752,6 +773,12 @@ const packActions = createPackActions({
     busyJobKind: window.__busyJobKind || "",
     dataMigrating: isDataMigrating(),
     localCacheProbe,
+    packChangeProbe,
+    versionUnknown: versionUnknown({
+      detectFailed: versionDetectFailed,
+      selectValue: $("target-version")?.value || "",
+      autoDetected: $("target-version")?.dataset.autoDetected || "",
+    }),
     translationState,
     hasApplyBackups,
   }),
@@ -966,7 +993,8 @@ function logApplyWarnings(result) {
 }
 
 function showLocalCacheCard(probe) {
-  localCacheProbe = probe && probe.status && probe.status !== "none" ? probe : null;
+  // B5d：「有變動」不是可用的結果（S15 由狀態卡說），不進這張卡
+  localCacheProbe = isUsableProbe(probe) ? probe : null;
   const card = $("local-cache-card");
   if (!card) return;
   // 正在翻譯時不顯示：進度條已經回答了「有沒有翻譯」這件事，卡片只會製造矛盾訊息。
@@ -1042,6 +1070,17 @@ async function probeLocalPackCache(instancePath, { silent } = {}) {
       customBaseDir: readOutputStorageMode() === "custom" ? readOutputCustomRoot() || null : null,
     });
     if (token !== localCacheProbeToken) return null;
+    // B5d 審查 2：結果回來時使用者已換資料夾 → 丟掉（不把上一個資料夾的結果畫到這個）
+    if (!stillSelected(path)) return null;
+    // B5d：同一個遊戲資料夾、上次翻譯後 mods 變了 → S15（不是已有可用結果、不跳三選一）
+    packChangeProbe = probe && (probe.modsChanged || probe.status === "changed") ? probe : null;
+    if (packChangeProbe) {
+      hideLocalCacheCard();
+      hasShareableFiles = false;
+      if (!silent) appendLog(probe.message || "上次翻譯後模組整合包有變動，要重新翻譯。", "warn");
+      syncUiState();
+      return probe;
+    }
     if (probe && probe.status && probe.status !== "none") {
       if (probe.outputDir && !customOutputEnabled()) {
         setAutoOutputDir(probe.outputDir);
@@ -1156,145 +1195,16 @@ function wireLocalCacheCard() {
  * 才去偵測「本機是否已有翻譯」。舊行為會在啟動時就回填路徑、驗證、探快取，
  * 讓人以為工具已經在處理某個整合包了——那不是他這次要做的事。
  *
- * 上次的路徑仍然記著，但只用來當「選資料夾」對話框的起始位置（方便，不誤導）。
+ * 上次的路徑仍然記著：當「選資料夾」對話框的起始位置，以及 D 區「上次：<包名>」
+ * （B5d：按下才走跟瀏覽一樣的檢查，啟動時不探測）。
  */
 async function restoreLastInstanceOnStartup() {
   hideLocalCacheCard();
   setTranslationState("idle");
   resetStepPanelForNewInstance();
   showSettingsHealthNotice();
-  await offerResumeUnfinishedRun();
-}
-
-/** 上次那包的路徑，只在「有沒有沒做完的翻譯」這個問題上用得到。 */
-let resumeCandidatePath = "";
-
-function setCardText(id, value) {
-  const el = $(id);
-  if (el) el.textContent = String(value ?? "");
-}
-
-function hideResumeCard() {
-  const card = $("resume-card");
-  if (card) card.hidden = true;
-}
-
-/**
- * 啟動時看看上次那包翻到一半沒有，有的話主動問要不要接著做。
- *
- * 為什麼要問而不是直接接續：使用者這次打開工具不見得是為了同一包。
- * 所以路徑仍然**不自動填**，按了「接續補完」才走跟自己選資料夾一樣的流程。
- *
- * 全程靜默失敗——探測不到就當作沒事，絕不能讓啟動流程卡住。
- */
-async function offerResumeUnfinishedRun() {
-  const card = $("resume-card");
-  if (!card) return;
-  const path = readLastInstancePath();
-  if (!path) return;
-  let probe = null;
-  try {
-    probe = await invoke("probe_local_pack_cache_cmd", {
-      instancePath: path,
-      outputDir: null,
-      customBaseDir: readOutputStorageMode() === "custom" ? readOutputCustomRoot() || null : null,
-    });
-  } catch (_) {
-    return; // 資料夾被搬走／刪掉是常態，不是錯誤
-  }
-  const pending = Number(probe?.pendingCount ?? probe?.pending_count ?? 0);
-  // 只在「真的還有東西沒翻」時打擾；已完成的那包由既有的「本機已有翻譯」卡片負責
-  if (!probe || probe.status !== "partial" || pending <= 0) return;
-
-  resumeCandidatePath = path;
-  const percent = Number(probe.completionPercent ?? probe.completion_percent ?? 0);
-  const packName = String(probe.packName || probe.pack_name || "").trim();
-  const who = packName ? `「${packName}」` : "上一個整合包";
-  const howFar = percent > 0 ? `已完成約 ${percent}%，` : "";
-  setCardText(
-    "resume-message",
-    `${who}${howFar}還有約 ${pending} 句沒翻完。要接著把它做完嗎？`
-  );
-  setCardText("resume-path", path);
-  card.hidden = false;
-}
-
-function wireResumeCard() {
-  const go = $("btn-resume-continue");
-  if (go) {
-    go.onclick = async () => {
-      const path = resumeCandidatePath;
-      hideResumeCard();
-      if (!path) return;
-      try {
-        await adoptInstancePath(path, { silentProbe: false });
-      } catch (e) {
-        appendLog("接續上次的翻譯失敗：" + formatInvokeError(e), "warn");
-      }
-    };
-  }
-  const dismiss = $("btn-resume-dismiss");
-  // 只關掉這次的提示；紀錄留著，下次開工具還是會問。
-  if (dismiss) dismiss.onclick = () => hideResumeCard();
-}
-
-/**
- * 選完資料夾就檢查寫入權限，不要等翻完三小時才在套用階段失敗。
- *
- * 站長要求「必要時可以向使用者索取管理員權限」——關鍵是「必要時」：
- * 絕不在啟動時要求，只在真的寫不進去時給一個一鍵解法。
- */
-async function checkWriteAccessFor(instancePath) {
-  const card = $("write-access-card");
-  if (!card) return;
-  const path = String(instancePath || "").trim();
-  if (!path) {
-    card.hidden = true;
-    return;
-  }
-  let report = null;
-  try {
-    report = await invoke("check_write_access_cmd", { instancePath: path });
-  } catch (_) {
-    card.hidden = true;
-    return;
-  }
-  if (!report || report.writable) {
-    card.hidden = true;
-    return;
-  }
-  setCardText("write-access-message", report.message || "這個資料夾目前寫不進去。");
-  setCardText("write-access-path", report.path || path);
-  // 只有真的是權限問題才給提權按鈕；磁碟滿了提權也沒用
-  const admin = $("btn-relaunch-admin");
-  if (admin) admin.hidden = !report.needsAdmin;
-  card.hidden = false;
-}
-
-function wireWriteAccessCard() {
-  const admin = $("btn-relaunch-admin");
-  if (admin) {
-    admin.onclick = async () => {
-      const instancePath = ($("instance")?.value || "").trim();
-      try {
-        const out = await invoke("relaunch_as_admin_cmd", { instancePath });
-        if (!out?.relaunching) {
-          // UAC 被取消不是錯誤——他只是不想提權，讓他改選資料夾就好
-          appendLog("已取消以管理員身分開啟。你也可以改選一個放在自己資料夾底下的整合包。");
-        }
-      } catch (e) {
-        appendLog("無法以管理員身分重新開啟：" + formatInvokeError(e), "warn");
-      }
-    };
-  }
-  const dismiss = $("btn-write-access-dismiss");
-  if (dismiss) {
-    dismiss.onclick = () => {
-      const card = $("write-access-card");
-      if (card) card.hidden = true;
-      void onPickInstance();
-    };
-  }
+  // B5d：接續上次卡刪除；D 區「上次：<包名>」只讀路徑與包名，按下才檢查（規格 §1.2）
+  syncUiState();
 }
 
 /** 設定檔壞掉時把原因講清楚，不要讓偏好無聲無息回到預設值。 */
@@ -4551,45 +4461,70 @@ async function adoptInstancePath(p, { silentProbe = false } = {}) {
   resetStepPanelForNewInstance();
   hideLocalCacheCard();
   packActions.clearRemoval();
+  packChangeProbe = null;
+  versionDetectFailed = false;
+  clearAutoDetectedVersion();
   $("instance").value = p;
-  writeLastInstancePath(p);
-  const ok = await validateSelectedInstance(p);
+  // B5d：選資料夾就判定（驗證、形狀、寫入；唯讀、背景、≤3 秒）→ 身分與遊戲是否開著在背景接著查
+  const ok = await checkSelectedFolder(p);
+  if (ok === null) return null; // 又選了別的資料夾
   setTranslationState(ok ? "ready" : "idle");
-  if (ok) {
-    // 選資料夾成功一次＝熟手：S01 的附加說明退場（規格 §4.2 pick-folder）
-    disclosure.retire("pickFolder");
-    resumeOnboarding();
+  if (!ok) {
+    // 資料夾不對或連不到：不再碰它（斷線的網路磁碟不該再卡後面的查詢），原因在狀態卡
+    syncUiState();
+    return null;
   }
-  await detectVersionForInstance(p, false);
-  await refreshPackTranslationName(p);
-  await refreshReferencePack();
-  $("output").value = "";
-  $("output").dataset.autoPath = "";
-  $("output").dataset.customPath = "";
-  if (!customOutputEnabled()) {
-    try {
-      const base = await resolveOutputDirForInstance(p);
-      if (base) {
+  // 審查 1b：檢查通過才記成「上次」（與手動輸入一致）
+  writeLastInstancePath(p);
+  // 選資料夾成功一次＝熟手：S01 的附加說明退場（規格 §4.2 pick-folder）
+  disclosure.retire("pickFolder");
+  resumeOnboarding();
+  // 審查 2：每個 await 之後確認使用者沒換資料夾，換了就停（舊資料夾的結果不寫到畫面上）
+  let probe = null;
+  await runWhileCurrent(p, () => ($("instance")?.value || "").trim(), [
+    () => detectVersionForInstance(p, false),
+    () => refreshPackTranslationName(p),
+    () => refreshReferencePack(),
+    async () => {
+      $("output").value = "";
+      $("output").dataset.autoPath = "";
+      $("output").dataset.customPath = "";
+      const base = customOutputEnabled() ? "" : await resolveOutputDirForInstance(p).catch(() => "");
+      return () => {
+        if (!base) return;
         setAutoOutputDir(base);
         appendLog(
           "這個模組整合包的結果位置：\n" +
             base +
             "\n翻譯完成會套用到遊戲資料夾。不同模組整合包請勿共用同一個結果資料夾。"
         );
+      };
+    },
+    async () => {
+      try {
+        syncUiState();
+      } catch (_) {
+        /* ignore */
       }
-    } catch (_) {
-      /* 略 */
-    }
-  }
-  try {
-    syncUiState();
-  } catch (_) {
-    /* ignore */
-  }
-  await refreshTranslationHelper();
-  // 選完資料夾當下就檢查寫得進去沒有——不要等翻完三小時才在套用階段失敗
-  void checkWriteAccessFor(p);
-  return probeLocalPackCache(p, { silent: silentProbe });
+      await refreshTranslationHelper();
+    },
+    // 寫得進去沒有已在 checkSelectedFolder 一起判定（狀態卡 S04）
+    async () => {
+      probe = await probeLocalPackCache(p, { silent: silentProbe });
+    },
+  ]);
+  return probe;
+}
+
+/** 審查 2：非同步結果回來時，畫面上的遊戲資料夾還是不是 `path`。 */
+function stillSelected(path) {
+  return samePath(($("instance")?.value || "").trim(), path);
+}
+
+/** 審查 5b：換資料夾時清掉上一個資料夾自動偵測留下的版本（玩家自己選的保留）。 */
+function clearAutoDetectedVersion() {
+  const select = $("target-version");
+  if (select && select.dataset.autoDetected === "true") select.value = "";
 }
 
 async function onPickInstance() {
@@ -4599,11 +4534,9 @@ async function onPickInstance() {
     return;
   }
   try {
-    const p = await pickDir("選擇遊戲資料夾", readLastInstancePath());
-    if (p) {
-      hideResumeCard();
-      await adoptInstancePath(p);
-    }
+    // 起始位置：上次路徑，沒有時用偵測到的常見啟動器資料夾（B5d【待確認 1】）
+    const p = await pickDir("選擇遊戲資料夾", await folderChecks.pickStart());
+    if (p) await adoptInstancePath(p);
   } catch (e) {
     log(String(e));
   }
@@ -4747,6 +4680,10 @@ async function detectVersionForInstance(instancePath, silent) {
   if (!select || !instancePath) return null;
   try {
     const detected = await invoke("detect_mc_version", { instancePath });
+    // B5d 審查 2：結果回來時已換資料夾 → 不改下拉
+    if (!stillSelected(instancePath)) return null;
+    // 審查 5b：這個資料夾偵測不到時，不留上一個資料夾自動偵測的值
+    if (!detected && select.dataset.autoDetected === "true") select.value = "";
     if (detected && !isSupportedMinecraftVersion(detected)) {
       clearVersionBlock();
       setVersionBlock(unsupportedVersionMessage(detected));
@@ -4777,10 +4714,14 @@ async function detectVersionForInstance(instancePath, silent) {
     } else if (status && !silent) {
       status.textContent = "找不到版本，請從下拉選單指定 1.13 以上";
     }
+    // B5d：偵測不到 → 狀態卡就地選（§3.1 MC 版本列）
+    versionDetectFailed = !detected;
     syncUiState();
     return detected || null;
   } catch (e) {
     if (status && !silent) status.textContent = "版本偵測失敗，請從下拉選單手動指定 1.13 以上";
+    versionDetectFailed = true;
+    syncUiState();
     return null;
   }
 }
@@ -4832,6 +4773,25 @@ async function validateSelectedInstance(path) {
 }
 
 /**
+ * B5d 選資料夾就判定（瀏覽、手動輸入、上次共用同一套）：folderChecks.inspect 一次做驗證、
+ * 資料夾形狀（選到 mods、啟動器清單、伺服器）與唯讀寫入檢查；身分與遊戲是否開著在背景接著查。
+ * 驗證結果同步到 instanceValidation（開始翻譯時仍會再驗一次）。回 true／false；又換了資料夾回 null。
+ */
+async function checkSelectedFolder(path) {
+  const instancePath = String(path || "").trim();
+  if (!instancePath) return validateSelectedInstance("");
+  const out = await folderChecks.inspect(instancePath);
+  if (out.stale) return null;
+  const v = out.validation || {};
+  const reason = String(v.reason || "").trim() || (out.ok ? "遊戲資料夾可以翻譯。" : "遊戲資料夾檢查沒過。");
+  const hints = Array.isArray(v.hints) ? v.hints.filter(Boolean) : [];
+  instanceValidation = { ok: !!out.ok, reason, hints };
+  setInstanceValidateStatus(!!out.ok, hints.length ? `${reason} ${hints[0]}` : reason, out.ok ? "ok" : "error");
+  syncUiState();
+  return !!out.ok;
+}
+
+/**
  * 手動貼上／輸入遊戲資料夾路徑（跟「瀏覽…」挑資料夾是兩條不同的輸入路徑）。
  *
  * 只做驗證還不夠：舊版這裡只呼叫 validateSelectedInstance，於是（1）路徑沒被記住，
@@ -4844,18 +4804,23 @@ async function validateSelectedInstance(path) {
  * 兩件事：記住路徑、重新對齊快取探測。
  */
 async function onInstanceTypedPath(path) {
-  const ok = await validateSelectedInstance(path);
+  // B5d：手動輸入與瀏覽同一套檢查（checkSelectedFolder），看到的提示一樣
+  packChangeProbe = null;
+  versionDetectFailed = false;
+  clearAutoDetectedVersion();
+  const ok = await checkSelectedFolder(path);
   if (!ok) return;
   writeLastInstancePath(path);
-  if (!customOutputEnabled()) {
-    try {
-      const base = await resolveOutputDirForInstance(path);
-      if (base) setAutoOutputDir(base);
-    } catch (_) {
-      /* 略：輸出路徑之後仍可從「本包選項」手動調整 */
-    }
-  }
-  await probeLocalPackCache(path, { silent: true }).catch(() => null);
+  // 審查 2：打字中又換了路徑就停
+  await runWhileCurrent(path, () => ($("instance")?.value || "").trim(), [
+    () => detectVersionForInstance(path, true),
+    async () => {
+      // 略：輸出路徑之後仍可從「本包選項」手動調整
+      const base = customOutputEnabled() ? "" : await resolveOutputDirForInstance(path).catch(() => "");
+      return () => base && setAutoOutputDir(base);
+    },
+    () => probeLocalPackCache(path, { silent: true }).catch(() => null),
+  ]);
 }
 
 async function refreshPackTranslationName(instancePath) {
@@ -5042,9 +5007,12 @@ async function onRunInner() {
   if (!localCacheProbe && (hasShareableFiles || outputDir)) {
     await probeLocalPackCache(instancePath, { silent: true }).catch(() => null);
   }
-  const hasExistingResult =
-    (localCacheProbe && (localCacheProbe.status === "ready" || localCacheProbe.shareable)) ||
-    hasShareableFiles;
+  // B5d：模組整合包有變動（S15）時不算已有結果，不跳三選一（規格 §8.3）
+  const hasExistingResult = hasUsableExistingResult({
+    probe: localCacheProbe,
+    hasShareableFiles,
+    packChanged: !!packChangeProbe,
+  });
   if (hasExistingResult) {
     // 舊版只有「仍要重新翻譯／取消」兩個選項，使用者既看不出「重新翻譯」會發生
     // 什麼事，也沒有「這次另外存一份」的路。改成講清楚每個選項的後果。
@@ -5837,14 +5805,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     console.warn("[boot] applyPending.wire", e);
   }
   try {
-    wireResumeCard();
+    folderChecks.wireVersionRow({ onPicked: () => (versionDetectFailed = false) });
   } catch (e) {
-    console.warn("[boot] wireResumeCard", e);
-  }
-  try {
-    wireWriteAccessCard();
-  } catch (e) {
-    console.warn("[boot] wireWriteAccessCard", e);
+    console.warn("[boot] folderChecks.wireVersionRow", e);
   }
   try {
     wireCriticalUiDelegation();

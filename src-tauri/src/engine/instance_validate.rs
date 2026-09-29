@@ -1,4 +1,5 @@
-//! 遊戲／整合包實例資料夾驗證：選路徑與一鍵翻譯入口共用。
+//! 遊戲資料夾驗證：選資料夾（瀏覽、手動輸入、上次）與開始翻譯共用。
+//! 玩家看得到的字（reason、hints）一律用詞表（src/copy/terms.js）的說法，B5d 集中在這裡改。
 
 use serde::Serialize;
 use std::fs;
@@ -31,20 +32,34 @@ impl InstanceValidation {
         Self {
             ok: true,
             mc_dir: mc.display().to_string(),
-            reason: "已確認為可翻譯的遊戲／整合包實例。".into(),
+            reason: "遊戲資料夾可以翻譯。".into(),
             missing: Vec::new(),
             hints,
         }
     }
 }
 
-/// 驗證路徑是否為可翻譯的 Minecraft 實例（對齊 scan／套用所需結構）。
+/// 找不到 mods 時的原因句（與 jar_scan::resolve_minecraft_dir 同一句）。
+pub const NO_MODS_REASON: &str = "這裡找不到 mods，可能選到上一層或下一層。";
+
+impl InstanceValidation {
+    /// 逾時或連不到這個資料夾本身（網路磁碟斷線、外接硬碟拔掉）。
+    pub fn unreachable(network: bool) -> Self {
+        Self::fail(
+            if network { "連不到這個網路磁碟上的資料夾，可能是連線不穩。" } else { "連不到這個資料夾（外接硬碟沒接上？）。" },
+            vec!["路徑".into()],
+            vec!["接上後按「重新檢查」。".into()],
+        )
+    }
+}
+
+/// 驗證路徑是否為可翻譯的遊戲資料夾（對齊掃描與套用所需結構）。
 pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
     if instance_or_mc.as_os_str().is_empty() {
         return InstanceValidation::fail(
             "尚未選擇遊戲資料夾。",
             vec!["路徑".into()],
-            vec!["請選取包含 mods 的實例資料夾。".into()],
+            vec!["請選模組整合包的遊戲資料夾（裡面有 mods）。".into()],
         );
     }
     if !instance_or_mc.exists() {
@@ -56,9 +71,9 @@ pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
     }
     if !instance_or_mc.is_dir() {
         return InstanceValidation::fail(
-            "選取的不是資料夾。",
+            "選到的不是資料夾，請重新選擇。",
             vec!["資料夾".into()],
-            vec!["請選取實例根目錄，而非單一檔案。".into()],
+            vec!["請選模組整合包的遊戲資料夾，不是單一檔案。".into()],
         );
     }
 
@@ -68,10 +83,7 @@ pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
             return InstanceValidation::fail(
                 e,
                 vec!["mods".into()],
-                vec![
-                    "請選啟動器裡的實例資料夾（內有 mods，或 minecraft/mods、.minecraft/mods）。"
-                        .into(),
-                ],
+                vec!["請選模組整合包的遊戲資料夾（裡面有 mods，或 minecraft、.minecraft 裡有 mods）。".into()],
             );
         }
     };
@@ -79,9 +91,9 @@ pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
     let mods = mc.join("mods");
     if !mods.is_dir() {
         return InstanceValidation::fail(
-            "找不到 mods 資料夾。",
+            NO_MODS_REASON,
             vec!["mods".into()],
-            vec!["整合包翻譯需要 mods；請確認選對實例。".into()],
+            vec!["請選模組整合包的遊戲資料夾（裡面有 mods）。".into()],
         );
     }
 
@@ -90,8 +102,8 @@ pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
 
     let jar_count = count_mod_archives(&mods);
     if jar_count == 0 {
-        missing.push("mods/*.jar".into());
-        hints.push("mods 內沒有模組檔（.jar／.zip），無法進行整合包翻譯。".into());
+        missing.push("模組檔".into());
+        hints.push("mods 裡沒有模組檔，無法翻譯。".into());
     }
 
     let has_config = mc.join("config").is_dir();
@@ -118,26 +130,26 @@ pub fn validate_instance_path(instance_or_mc: &Path) -> InstanceValidation {
     .count();
 
     if support_signals == 0 {
-        missing.push("實例特徵".into());
+        missing.push("遊戲資料夾特徵".into());
         hints.push(
-            "未找到 config、options.txt、resourcepacks、saves 或啟動器實例檔（instance.cfg／mmc-pack.json／minecraftinstance.json 等）。"
+            "沒找到 config、options.txt、resourcepacks、saves 或啟動器的設定檔（instance.cfg、mmc-pack.json、minecraftinstance.json 等）。"
                 .into(),
         );
     }
 
     if !missing.is_empty() {
         return InstanceValidation::fail(
-            "此資料夾不像可翻譯的 Minecraft 整合包實例。",
+            "這個資料夾不像模組整合包的遊戲資料夾，請重新選擇。",
             missing,
             hints,
         );
     }
 
     if !has_config {
-        hints.push("未找到 config（仍可翻譯；任務／覆寫來源可能較少）。".into());
+        hints.push("沒找到 config（仍可翻譯；任務與設定檔裡的文字可能較少）。".into());
     }
     if !has_resourcepacks {
-        hints.push("未找到 resourcepacks（套用時會建立）。".into());
+        hints.push("沒找到 resourcepacks（套用時會建立）。".into());
     }
 
     InstanceValidation::pass(&mc, hints)

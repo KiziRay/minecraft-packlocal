@@ -69,6 +69,10 @@
   color: var(--muted);
 }
 .status-card-more { margin-top: var(--space-2); }
+/* B5d：MC 版本就地選（§3.1）與 D 區「上次：<包名>」 */
+.status-card-version-row { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0 0; }
+.status-card-version-row[hidden] { display: none; }
+.last-instance[hidden] { display: none; }
 .status-card-more[hidden] { display: none; }
 .status-card-more > summary {
   cursor: pointer;

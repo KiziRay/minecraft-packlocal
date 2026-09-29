@@ -86,7 +86,7 @@ test("流程邏輯移出 app.js：pack-actions.js 提供狀態卡輸入、D 區�
   assert.ok(!app.includes("function bannerArea()"), "橫幅邏輯在 pack-actions.js");
 });
 
-test("R-1 例外清單只多兩個暫行項（舊卡提供主要動作），不得再擴大", async () => {
+test("R-1 例外清單只多一個暫行項（待套用卡提供主要動作；B5d 已刪接續卡），不得再擴大", async () => {
   const { ZERO_PRIMARY_ALLOWED } = await import("./pack-state.js");
-  assert.deepEqual([...ZERO_PRIMARY_ALLOWED].sort(), ["RESUME-card", "S10", "S11-card", "S17", "S18"].sort());
+  assert.deepEqual([...ZERO_PRIMARY_ALLOWED].sort(), ["S10", "S11-card", "S17", "S18"].sort());
 });

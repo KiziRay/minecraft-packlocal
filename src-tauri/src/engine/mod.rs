@@ -45,6 +45,10 @@ mod ftbquests_lang;
 mod tool_products;
 mod gap_model;
 pub mod game_process;
+pub mod folder_check;
+pub mod folder_identity;
+#[cfg(test)]
+mod folder_check_tests;
 mod glossary;
 mod glossary_modpack;
 mod hashutil;
@@ -200,7 +204,7 @@ pub use failed_items::{build_failed_items_csv, merge_imported, parse_import_text
 pub use pack_repair::repair_pack_list;
 pub use resource_pack_guard::{check_pack_health, PackHealthReport};
 pub use out_layout::{
-    cleanup_transient_work, ensure_result_layout, prune_empty_result_dirs, suggest_output_base,
+    cleanup_transient_work, ensure_result_layout, prune_empty_result_dirs, suggest_output_base_path,
     write_coverage_report, write_gap_summary_file,
     CoverageStats, RESULT_DIR_NAME,
 };

@@ -18,6 +18,8 @@ pub struct WriteAccessReport {
     pub writable: bool,
     /// 需要管理員權限才寫得進去（跟「磁碟滿了」是兩回事，處理方式也不同）
     pub needs_admin: bool,
+    /// 寫不進去的原因分類碼（folder_check::WriteIssue::code；寫得進去是 "ok"）
+    pub code: String,
     pub path: String,
     pub message: String,
 }
@@ -26,51 +28,26 @@ pub struct WriteAccessReport {
 ///
 /// 判斷用路徑而不是只看錯誤碼：Windows 對 `Program Files` 有虛擬化行為，
 /// 有時寫入「看起來成功」卻被導到別的地方，等玩家進遊戲才發現沒生效。
-fn looks_like_protected_location(path: &Path) -> bool {
+///
+/// B5d 審查 3：只認系統磁碟（%SystemDrive%，預設 C:）開頭的 Program Files、Program Files (x86)、
+/// Windows、ProgramData；D:\Program Files、使用者資料夾底下同名的資料夾、網路路徑都不算。
+pub(crate) fn looks_like_protected_location(path: &Path) -> bool {
     let lower = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
-    ["\\program files", "\\program files (x86)", "\\windows\\", "\\programdata\\"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    let lower = lower.strip_prefix("\\\\?\\").unwrap_or(&lower).to_string();
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_ascii_lowercase();
+    ["program files", "program files (x86)", "windows", "programdata"].iter().any(|dir| {
+        let head = format!("{drive}\\{dir}");
+        lower == head || lower.starts_with(&format!("{head}\\"))
+    })
 }
 
 /// 在使用者選完資料夾的當下就檢查，而不是等翻完才失敗。
+///
+/// B5d：改成只讀（不建測試檔，G1.36），原因依錯誤碼分類；只有本機磁碟的系統保護位置才建議管理員
+/// （舊版只要訊息裡有「權限」就叫玩家開管理員，磁碟滿、網路磁碟、OneDrive、防毒全被說成權限問題）。
 pub fn check_write_access(path: &Path) -> WriteAccessReport {
-    let protected = looks_like_protected_location(path);
-    match super::disk::probe_apply_targets(path) {
-        Ok(()) => WriteAccessReport {
-            writable: true,
-            needs_admin: false,
-            path: path.display().to_string(),
-            message: String::new(),
-        },
-        Err(detail) => {
-            let needs_admin = protected || mentions_permission(&detail);
-            let message = if needs_admin {
-                format!(
-                    "這個遊戲資料夾需要系統管理員權限才寫得進去{}。\
-你可以用下面的按鈕以管理員身分重新開啟工具，或改選一個放在你自己資料夾底下的整合包。",
-                    if protected { "（它在系統保護的位置底下）" } else { "" }
-                )
-            } else {
-                format!("這個資料夾目前寫不進去：{detail}")
-            };
-            WriteAccessReport {
-                writable: false,
-                needs_admin,
-                path: path.display().to_string(),
-                message,
-            }
-        }
-    }
-}
-
-fn mentions_permission(detail: &str) -> bool {
-    let lower = detail.to_ascii_lowercase();
-    lower.contains("permission")
-        || lower.contains("denied")
-        || lower.contains("os error 5")
-        || detail.contains("拒絕")
-        || detail.contains("權限")
+    let mc = super::jar_scan::resolve_minecraft_dir(path).unwrap_or_else(|_| path.to_path_buf());
+    super::folder_check::check_write_access_readonly(&mc)
 }
 
 /// 以系統管理員身分重新啟動工具，並把目前的資料夾帶回去。
@@ -156,6 +133,19 @@ mod tests {
     }
 
     #[test]
+    fn b5d_fix3_only_the_system_drive_program_folders_are_protected() {
+        // 審查 3：D:\Program Files、使用者資料夾底下叫 Windows 的資料夾都不算；只比對系統磁碟的開頭
+        let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let other = if sys.eq_ignore_ascii_case("D:") { "E:" } else { "D:" };
+        assert!(looks_like_protected_location(Path::new(&format!(r"{sys}\Program Files\pack"))));
+        assert!(looks_like_protected_location(Path::new(&format!(r"{sys}/Program Files (x86)/pack"))));
+        assert!(!looks_like_protected_location(Path::new(&format!(r"{other}\Program Files\pack"))));
+        assert!(!looks_like_protected_location(Path::new(&format!(r"{sys}\Users\p\Windows\pack"))));
+        assert!(!looks_like_protected_location(Path::new(&format!(r"{sys}\Games\Program Files Backup\pack"))));
+        assert!(!looks_like_protected_location(Path::new(r"\\nas\Program Files\pack")));
+    }
+
+    #[test]
     fn ordinary_user_folders_are_not_flagged() {
         for p in [
             r"C:\Users\jolin\AppData\Roaming\PrismLauncher\instances\pack",
@@ -168,12 +158,13 @@ mod tests {
 
     #[test]
     fn permission_errors_are_told_apart_from_other_failures() {
-        // 這兩種的處理方式完全不同：權限問題可以提權解決，
-        // 磁碟滿了提權也沒用——訊息不該把使用者導向錯的方向。
-        assert!(mentions_permission("Access is denied. (os error 5)"));
-        assert!(mentions_permission("權限不足"));
-        assert!(mentions_permission("Permission denied"));
-        assert!(!mentions_permission("磁碟空間不足"));
-        assert!(!mentions_permission("找不到資料夾"));
+        // 這幾種的處理方式完全不同：只有系統保護位置提權有用，
+        // 磁碟滿、網路磁碟、檔案被占用提權都沒用——不能把玩家導向錯的方向。
+        use super::super::folder_check::{classify_io_error, WriteIssue};
+        let denied = std::io::Error::from_raw_os_error(5);
+        assert_eq!(classify_io_error(&denied, Path::new(r"C:\Program Files\pack")), WriteIssue::NeedsAdmin);
+        assert_eq!(classify_io_error(&denied, Path::new(r"D:\Games\pack")), WriteIssue::Denied);
+        assert_eq!(classify_io_error(&std::io::Error::from_raw_os_error(112), Path::new(r"D:\Games\pack")), WriteIssue::DiskFull);
     }
+
 }

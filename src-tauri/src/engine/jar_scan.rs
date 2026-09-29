@@ -54,7 +54,7 @@ pub fn resolve_minecraft_dir(instance_or_mc: &Path) -> Result<PathBuf, String> {
     if p.join(".minecraft").join("mods").is_dir() {
         return Ok(p.join(".minecraft"));
     }
-    Err("找不到 mods 資料夾。請選遊戲實例資料夾（裡面有 minecraft 或 mods）。".into())
+    Err(super::instance_validate::NO_MODS_REASON.into())
 }
 
 /// 搜尋／整合階段：**不呼叫 AI**。

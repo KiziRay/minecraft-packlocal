@@ -35,6 +35,10 @@ export const SETTING_PATHS = [
   "usage.lastNudgeAt",
   "developer.testMode",
   "ui.disclosure.pickFolder",
+  "ui.disclosure.server",
+  "ui.disclosure.brokenRecord",
+  "ui.disclosure.copied",
+  "ui.disclosure.packChanged",
   "ui.banner.updateDismissedVersion",
 ];
 

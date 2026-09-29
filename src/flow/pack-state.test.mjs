@@ -230,12 +230,12 @@ test("中2：待套用卡出現時，狀態句「已翻完，還沒套用到遊�
   assert.equal(Object.values(plan.buttons).filter((b) => !b.hidden).length, 0);
 });
 
-test("中2：接續卡出現時，狀態句「上次沒翻完」且不出主要按鈕", () => {
+test("B5d 改寫中2：接續卡已刪（併入 D 區「上次：<包名>」），狀態卡不再有 RESUME-card 暫行狀態", () => {
   const s = computePackState({ consentAccepted: true, resumeShown: true });
-  assert.equal(s.id, STATE.resumeCard);
-  assert.equal(s.sentence, "上次沒翻完");
-  assert.equal(s.primary, null);
-  assert.ok(ZERO_PRIMARY_ALLOWED.includes(s.id));
+  assert.equal(s.id, STATE.noFolder, "沒選資料夾就是 S01，下一步是選資料夾或按「上次」");
+  assert.equal(s.primary.action, ACTION.pickFolder);
+  assert.equal(STATE.resumeCard, undefined);
+  assert.ok(!ZERO_PRIMARY_ALLOWED.includes("RESUME-card"));
 });
 
 test("中2：翻譯已完成且沒有待套用時，狀態句「這個模組整合包已翻譯」，主要按鈕文字改「重新翻譯」（仍是 #btn-run）", () => {

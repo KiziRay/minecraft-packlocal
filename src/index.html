@@ -67,39 +67,7 @@
 
                 <p class="coverage-honest inline-honest">會盡量掃齊可讀文字來源（含進階解包）；圖片與硬編碼英文可能仍留下，只寫入翻譯結果副本。</p>
 
-                <!--
-                  開工具時如果上次的翻譯沒跑完，這裡主動問一次要不要接著做。
-                  刻意不自動填路徑（那會讓人以為工具已經在處理某個包），
-                  只有按下「接續補完」才會把資料夾帶進來。
-                -->
-                <section id="resume-card" class="local-cache-card resume-card" hidden aria-labelledby="resume-title">
-                  <header class="local-cache-head">
-                    <h2 id="resume-title" class="options-group-title">上次的翻譯沒有做完</h2>
-                  </header>
-                  <p id="resume-message" class="local-cache-message"></p>
-                  <p id="resume-path" class="local-cache-path"></p>
-                  <div class="action-row local-cache-actions">
-                    <button type="button" id="btn-resume-continue" class="secondary-button">接續補完</button>
-                    <button type="button" id="btn-resume-dismiss" class="text-button">這次不用</button>
-                  </div>
-                </section>
-
-                <!--
-                  資料夾寫不進去的提醒。**選完資料夾當下就檢查**——
-                  等翻完三小時才在套用階段失敗，那三小時就白費了。
-                -->
-                <section id="write-access-card" class="local-cache-card write-access-card" hidden aria-labelledby="write-access-title">
-                  <header class="local-cache-head">
-                    <h2 id="write-access-title" class="options-group-title">這個資料夾需要更高的權限</h2>
-                  </header>
-                  <p id="write-access-message" class="local-cache-message"></p>
-                  <p id="write-access-path" class="local-cache-path"></p>
-                  <div class="action-row local-cache-actions">
-                    <button type="button" id="btn-relaunch-admin" class="secondary-button">以系統管理員身分重新開啟</button>
-                    <button type="button" id="btn-write-access-dismiss" class="text-button">改選其他資料夾</button>
-                  </div>
-                </section>
-
+                <!-- B5d：接續上次卡、寫入權限卡已刪：改由 D 區「上次：<包名>」與狀態卡 S04 說（規格 §1.2） -->
                 <div class="path-block">
                   <div class="path-block-head">
                     <label for="instance">遊戲資料夾</label>
@@ -113,6 +81,8 @@
                   <div class="input-row">
                     <input id="instance" type="text" placeholder="選擇 Minecraft 遊戲資料夾" autocomplete="off" />
                     <button type="button" id="btn-inst" class="small-button">瀏覽…</button>
+                    <!-- 規格 §1.1 D 區【待確認 1】：只讀上次路徑與包名，按下才檢查（百分比與狀態按下後才算） -->
+                    <button type="button" id="btn-last-instance" class="small-button last-instance" hidden></button>
                   </div>
                   <!-- 「要選有 mods 的資料夾」只在狀態卡 S01 說一次（一件事只在一處說） -->
                   <p id="instance-validate-status" class="field-status path-validate" hidden></p>
@@ -146,9 +116,16 @@
                     </button>
                     <button type="button" id="btn-stop" class="danger-button run-control-stop" hidden>停止翻譯</button>
                     <button type="button" id="btn-card-apply" class="primary-button" hidden>套用到遊戲</button>
+                    <!-- B5d：其他主要動作（改用上一層、重新檢查、以系統管理員身分重新開啟、重設套用紀錄、當成新的…）共用這一顆 -->
+                    <button type="button" id="btn-card-action" class="primary-button" hidden></button>
                     <span id="status-card-secondary" class="status-card-secondary"></span>
                   </div>
                   <p id="status-card-reason" class="field-status status-card-reason" hidden></p>
+                  <!-- 規格 §3.1 MC 版本列：偵測不到時就地選（選好前主要按鈕停用） -->
+                  <p id="status-card-version-row" class="status-card-version-row" hidden>
+                    <label for="status-card-version">Minecraft 版本</label>
+                    <select id="status-card-version"></select>
+                  </p>
                   <details id="status-card-more" class="status-card-more" hidden>
                     <summary>更多</summary>
                     <div id="status-card-more-list" class="status-card-more-list"></div>

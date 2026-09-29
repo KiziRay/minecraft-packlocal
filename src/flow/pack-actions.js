@@ -2,11 +2,12 @@
  * B5a-1 主視窗的流程接線（審查要求從 app.js 移出，行為零變更）：
  * 狀態卡輸入與重畫、翻譯中切到其他分頁的共用一行、D 區（S20、移除翻譯）、S19 動作、
  * 刪除結果並重翻、橫幅（N-01、N-02）、浮層焦點登記、狀態卡按鈕接線。
+ * B5d：選資料夾就判定的狀態與動作交給 deps.folderChecks（folder-checks.js）；接續卡已刪。
  *
  * app.js 的狀態與既有函式一律由 deps 注入（getter／callback），這裡不 import app.js。
  */
 import { ACTION, computePackState, folderAreaLock, removeTranslationControl, runElsewhereLine } from "./pack-state.js";
-import { applyStatusCard, isAriaDisabled, planStatusCard } from "./status-card.js";
+import { GENERIC_PRIMARY_ID, applyStatusCard, isAriaDisabled, planStatusCard } from "./status-card.js";
 import { createBannerArea, parentFolder, updateBannerDecision } from "../ui/banner.js";
 import { watchOverlay } from "../ui/modal-scope.js";
 
@@ -40,6 +41,7 @@ export function createPackActions(deps) {
   let updateChecker = null;
 
   const instancePath = () => ($("instance")?.value || "").trim();
+  const folders = () => deps.folderChecks || null;
 
   function isRemovalShownFor(path) {
     return !!lastRemoval && !!path && lastRemoval.instancePath === path;
@@ -63,10 +65,16 @@ export function createPackActions(deps) {
       hasResult: !!s.localCacheProbe,
       removal: isRemovalShownFor(path) ? lastRemoval : null,
       pickFolderFresh: deps.disclosure.isShown("pickFolder"),
-      // 暫留的舊卡在畫面上時，狀態卡不得講相反的話（B5b／B5c／B5d 取代前的保守分支）
+      // 暫留的舊卡在畫面上時，狀態卡不得講相反的話（B5b／B5c 取代前的保守分支）
       applyPendingShown: !!$("apply-pending-card") && !$("apply-pending-card").hidden,
-      resumeShown: !!$("resume-card") && !$("resume-card").hidden,
       translationComplete: s.translationState === "complete",
+      // B5d：選資料夾就判定
+      folder: folders() ? folders().gateInput(path) : null,
+      packChanged: !!s.packChangeProbe,
+      hasTranslationRecord: !!s.hasApplyBackups,
+      versionUnknown: !!s.versionUnknown,
+      hasOptions: folders() ? folders().hasOptions(path) : null,
+      extraShown: (key) => deps.disclosure.isShown(key),
     };
   }
 
@@ -77,6 +85,7 @@ export function createPackActions(deps) {
     try {
       applyStatusCard(planStatusCard(state), { $, doc, onAction: onStatusCardAction });
       syncRunElsewhere(state, input.instancePath);
+      if (folders()) folders().syncBanners(state.id, input.instancePath);
     } catch (e) {
       console.warn("[status-card]", e);
     }
@@ -105,7 +114,8 @@ export function createPackActions(deps) {
     if (badge) badge.hidden = state.id !== "S09";
   }
 
-  function onStatusCardAction(action) {
+  function onStatusCardAction(action, item) {
+    if (folders() && folders().handles(action)) return void folders().onAction(action, item || {});
     if (action === ACTION.deleteAndRestart) return void deleteResultAndRestart();
     if (action === ACTION.pickFolder) return void deps.onPickInstance();
     if (action === ACTION.applyResult) return void applyRemovedResult();
@@ -118,6 +128,7 @@ export function createPackActions(deps) {
     const path = instancePath();
     const busyKind = s.progressBusy ? s.busyJobKind || "translate" : "";
     const lock = folderAreaLock({ busy: s.progressBusy, busyKind, instancePath: path });
+    if (folders()) folders().syncLastButton({ locked: lock.locked, lockReason: lock.reason });
     const reason = $("folder-lock-reason");
     if (reason) {
       reason.textContent = lock.reason;
@@ -194,7 +205,8 @@ export function createPackActions(deps) {
   async function deleteResultAndRestart() {
     const s = deps.getState();
     if (s.progressBusy) return;
-    const probe = s.localCacheProbe;
+    // S15（有變動）時沒有「可用」的結果，但舊結果資料夾仍在，一樣可以刪掉重翻
+    const probe = s.localCacheProbe || s.packChangeProbe;
     if (!probe) return deps.log("目前沒有偵測到本機翻譯結果。");
     const outputDir = probe.outputDir || probe.output_dir || deps.selectedOutputDir();
     if (!outputDir) return deps.log("找不到這份翻譯結果的位置。");
@@ -234,6 +246,7 @@ export function createPackActions(deps) {
         onDismiss: (banner) => {
           // N-01 關閉後這個版本不再出現
           if (banner.id === "N-01" && banner.version) setSetting(UPDATE_BANNER_DISMISSED_KEY, banner.version);
+          if (folders()) folders().noteBannerDismissed(banner);
         },
       });
     }
@@ -285,7 +298,7 @@ export function createPackActions(deps) {
     // 暫留的舊卡（待套用、接續）是各自直接改 hidden 的；它們一出現／消失就重畫狀態卡
     if (typeof MutationObserver !== "undefined") {
       const observer = new MutationObserver(() => deps.syncUiState());
-      ["apply-pending-card", "resume-card"].forEach((id) => {
+      ["apply-pending-card"].forEach((id) => {
         const el = $(id);
         if (el) observer.observe(el, { attributes: true, attributeFilter: ["hidden"] });
       });
@@ -302,13 +315,24 @@ export function createPackActions(deps) {
     };
     bind("btn-card-pick", () => deps.onPickInstance());
     bind("btn-card-apply", () => applyRemovedResult());
+    // B5d：其他主要動作共用一顆（動作與路徑寫在 data-*）
+    bind(GENERIC_PRIMARY_ID, () => {
+      const el = $(GENERIC_PRIMARY_ID);
+      return onStatusCardAction(el.dataset.action || "", { path: el.dataset.path || "" });
+    });
+    bind("btn-last-instance", () => {
+      if (deps.getState().progressBusy) return syncFolderArea();
+      return folders() && folders().useLast();
+    });
     bind("btn-restore", () => onRemoveTranslation());
+    // 附加說明的「不再顯示」與「？」對應目前狀態那一則（B5d 起不只 pickFolder）
+    const disclosureKey = () => ($("status-card") && $("status-card").dataset.disclosure) || "pickFolder";
     bind("btn-status-extra-dismiss", () => {
-      deps.disclosure.retire("pickFolder");
+      deps.disclosure.retire(disclosureKey());
       deps.syncUiState();
     });
     bind("btn-status-extra-help", () => {
-      deps.disclosure.recall("pickFolder");
+      deps.disclosure.recall(disclosureKey());
       deps.syncUiState();
     });
     bind("btn-issue-open-discord", () => deps.openIssueDiscord());

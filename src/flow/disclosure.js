@@ -13,6 +13,27 @@ export const DISCLOSURES = Object.freeze({
     settingPath: "ui.disclosure.pickFolder",
     topic: "怎麼找到遊戲資料夾",
   }),
+  // B5d：選資料夾就判定的附加說明（第一次完整，之後只留「？」）
+  server: Object.freeze({
+    storageKey: "mcpl-disclosure-server",
+    settingPath: "ui.disclosure.server",
+    topic: "為什麼不能翻伺服器資料夾",
+  }),
+  brokenRecord: Object.freeze({
+    storageKey: "mcpl-disclosure-broken-record",
+    settingPath: "ui.disclosure.brokenRecord",
+    topic: "為什麼要先停下",
+  }),
+  copied: Object.freeze({
+    storageKey: "mcpl-disclosure-copied",
+    settingPath: "ui.disclosure.copied",
+    topic: "分開記錄是什麼意思",
+  }),
+  packChanged: Object.freeze({
+    storageKey: "mcpl-disclosure-pack-changed",
+    settingPath: "ui.disclosure.packChanged",
+    topic: "重新翻譯會不會很久",
+  }),
 });
 
 const RETIRED = "retired";

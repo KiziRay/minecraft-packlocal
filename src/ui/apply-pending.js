@@ -267,15 +267,16 @@ export function isForkableError(error) {
  */
 export async function offerForkInstance({ confirmDialog, invoke, appendLog }, instancePath) {
   if (!instancePath) return false;
+  // D-10（規格 §3.5，B5d）：不可逆（不再沿用舊紀錄）、預設焦點「取消」；不刪東西，所以不是紅色危險外觀
   const ok = await confirmDialog({
-    title: "把這份當成新的整合包？",
+    title: "把這份當成新的模組整合包？",
     body:
-      "這個遊戲資料夾是從另一個遊戲資料夾複製來的。當成新的整合包後，工具會替它建立自己的紀錄，" +
-      "另一份的紀錄與備份不受影響。\n" +
-      "從另一份複製過來的翻譯檔無法確定原本是什麼，之後套用時會先保存到隔離區再換成新的翻譯。",
+      "複製來的：兩份分開記錄，另一份的紀錄與備份不受影響。連不到的：確定舊位置已不在才選。" +
+      "複製過來的翻譯檔之後套用時會先放進隔離區。",
     affected: [instancePath],
-    confirmLabel: "當成新的整合包",
-    cancelLabel: "先不要",
+    confirmLabel: "當成新的",
+    cancelLabel: "取消",
+    initialFocus: "cancel",
   });
   if (!ok) return false;
   try {

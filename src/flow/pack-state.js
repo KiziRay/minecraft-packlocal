@@ -5,9 +5,13 @@
  * 畫面由 status-card.js 依這裡的結果畫；翻譯邏輯一律不在這裡。
  *
  * B5a-1 只實作：S00、S01、S02（暫行：資料夾檢查沒過）、S09（暫行：翻譯中只放停止鈕）、
- * S19a／S19b、暫行「可開始」（READY）與 D 區停用原因 S20。其餘狀態由 B5d、B5b、B5c 加。
+ * S19a／S19b、暫行「可開始」（READY）與 D 區停用原因 S20。
+ * B5d 加：S02 三種、S03–S07、檢查中、S15 暫行、S18、MC 版本列（判定在 folder-state.js）；
+ * 接續卡（RESUME-card）刪除，併入 D 區「上次：<包名>」。其餘狀態由 B5b、B5c 加。
  * 失效安全：輸入缺欄位時退回最保守的狀態（沒同意→S00、沒資料夾→S01）。
  */
+
+import { applyVersionGate, folderGateState, readyDetailLines, resultState } from "./folder-state.js";
 
 export const STATE = Object.freeze({
   consent: "S00",
@@ -20,13 +24,11 @@ export const STATE = Object.freeze({
   ready: "READY",
   /** 暫行：舊的「已翻完未套用卡」出現時（主要動作由該卡提供，B5c 併入狀態卡 S11）。 */
   pendingCard: "S11-card",
-  /** 暫行：舊的「上次沒翻完」接續卡出現時（主要動作由該卡提供，B5d 併入「上次：<包名>」）。 */
-  resumeCard: "RESUME-card",
   busy: "BUSY",
 });
 
 /** 主要按鈕可以是 0 顆的狀態（規格 R-1 例外）。S20 不是狀態卡狀態，所以不在這裡。 */
-export const ZERO_PRIMARY_ALLOWED = Object.freeze(["S10", "S17", "S18", "S11-card", "RESUME-card"]);
+export const ZERO_PRIMARY_ALLOWED = Object.freeze(["S10", "S17", "S18", "S11-card"]);
 
 export const ACTION = Object.freeze({
   acceptConsent: "accept-consent",
@@ -83,8 +85,14 @@ function normalize(input) {
       removal && String(removal.instancePath || "").trim() === instancePath && instancePath ? removal : null,
     pickFolderFresh: src.pickFolderFresh !== false,
     applyPendingShown: !!src.applyPendingShown,
-    resumeShown: !!src.resumeShown,
     translationComplete: !!src.translationComplete,
+    // B5d：選資料夾就判定（folder-state.js）
+    folder: src.folder && typeof src.folder === "object" ? src.folder : null,
+    packChanged: !!src.packChanged,
+    hasTranslationRecord: !!src.hasTranslationRecord,
+    versionUnknown: !!src.versionUnknown,
+    hasOptions: typeof src.hasOptions === "boolean" ? src.hasOptions : null,
+    extraShown: typeof src.extraShown === "function" ? src.extraShown : () => true,
   };
 }
 
@@ -101,6 +109,7 @@ function state(id, fields) {
     more: [],
     disabledReason: "",
     showAiRow: false,
+    showVersionRow: false,
     ...fields,
   };
 }
@@ -145,6 +154,11 @@ export function removalDetailLines(result) {
  */
 export function computePackState(input) {
   const i = normalize(input);
+  // 審查 5a：偵測不到 MC 版本時，所有會開始翻譯的狀態都停用（可開始、S15、S18 的次要、S19b）
+  return applyVersionGate(computeState(i), { versionUnknown: i.versionUnknown });
+}
+
+function computeState(i) {
   const name = i.packName || "這個模組整合包";
 
   if (!i.consentAccepted) {
@@ -171,11 +185,6 @@ export function computePackState(input) {
     });
   }
 
-  // 暫行（B5d 取代）：接續卡在畫面上時，下一步由那張卡提供，狀態卡不另出主要按鈕
-  if (i.resumeShown) {
-    return state(STATE.resumeCard, { sentence: "上次沒翻完" });
-  }
-
   if (!i.instancePath) {
     return state(STATE.noFolder, {
       sentence: "選要翻譯的模組整合包遊戲資料夾（裡面有 mods）",
@@ -183,6 +192,12 @@ export function computePackState(input) {
       disclosureKey: "pickFolder",
       primary: { action: ACTION.pickFolder, label: "選擇遊戲資料夾" },
     });
+  }
+
+  // B5d：資料夾本身與身分（S02 三種、S03–S07、檢查中）
+  if (i.folder) {
+    const gate = folderGateState({ ...i.folder, instancePath: i.instancePath, extraShown: i.extraShown });
+    if (gate) return gate;
   }
 
   if (!i.validated || i.versionBlocked) {
@@ -222,12 +237,23 @@ export function computePackState(input) {
     });
   }
 
+  // B5d：S15 暫行（模組整合包有變動）、S18（已套用、這台電腦沒留結果）
+  const after = resultState({
+    packName: name,
+    packChanged: i.packChanged,
+    hasTranslationRecord: i.hasTranslationRecord,
+    hasResult: i.hasResult,
+    translationComplete: i.translationComplete,
+    extraShown: i.extraShown,
+  });
+  if (after) return after;
+
   return state(STATE.ready, {
     sentence: i.translationComplete ? "這個模組整合包已翻譯" : `已選好「${name}」，可以開始翻譯`,
     primary: { action: ACTION.run, label: i.translationComplete ? "重新翻譯" : "開始翻譯" },
     more: i.hasResult ? [{ action: ACTION.deleteAndRestart, label: "刪除結果並重翻", danger: true }] : [],
-    // 原本在開始前「保留結果」詢問裡的提醒（B5a-2 刪了那個詢問）；B5b 開始前確認卡取代
-    detailLines: i.translationComplete ? [] : ["建議先啟動一次遊戲再翻譯：有些模組第一次啟動才產生語言檔。"],
+    // 原本在開始前「保留結果」詢問裡的提醒（B5a-2 刪了那個詢問）；B5d：知道有沒有 options.txt 時改由 N-04 說或不說
+    detailLines: readyDetailLines({ translationComplete: i.translationComplete, hasOptions: i.hasOptions }),
     showAiRow: true,
   });
 }

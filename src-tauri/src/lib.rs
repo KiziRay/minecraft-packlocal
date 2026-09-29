@@ -42,7 +42,7 @@ use engine::{
     save_api_settings, save_api_settings_with_provider, save_session,
     scan_instance, set_ai_mode, set_gpt_model,
     run_search_pipeline, write_search_artifacts,
-    set_minimize_on_close, subtract_covered, suggest_output_base, translate_ftbquests,
+    set_minimize_on_close, subtract_covered, translate_ftbquests,
     translate_archive_overlays, translate_jar_origins, translate_kubejs_literals, translate_minemenu, translate_origins,
     translate_quests_books, translate_text_overlays,
     mode_note, skip_complete_namespaces_with_provenance, TranslationMode, TranslationQuality,
@@ -1551,7 +1551,7 @@ fn cancel_task() -> String {
 }
 
 /// 偵測整合包的 Minecraft 版本（給 UI 預填版本選單）。偵測不到回 null。
-#[tauri::command]
+#[tauri::command(async)]
 fn detect_mc_version(instance_path: String) -> Option<String> {
     let inst = normalize_path(&instance_path);
     let mc = resolve_minecraft_dir(&inst).unwrap_or(inst);
@@ -1560,7 +1560,7 @@ fn detect_mc_version(instance_path: String) -> Option<String> {
 
 /// Returns the resource-pack version used in the generated pack name.  This
 /// intentionally does not expose or reuse the application version.
-#[tauri::command]
+#[tauri::command(async)]
 fn detect_pack_translation_name(instance_path: String) -> Result<PackVersionInfo, String> {
     let instance = normalize_path_strict(&instance_path)?;
     let (_, info) = build_pack_name(&instance);
@@ -1744,7 +1744,7 @@ fn apply_backup_location_cmd(instance_path: String) -> Result<String, String> {
 }
 
 /// 檢查目前實例／結果位置是否有可還原的工具備份；只讀取，不會修改檔案。
-#[tauri::command]
+#[tauri::command(async)]
 fn has_apply_backups_cmd(
     instance_path: String,
     output_dir: Option<String>,
@@ -4773,25 +4773,31 @@ fn rebuild_zh_from_instance(
 }
 
 /// 建議結果根目錄（實例旁「繁中翻譯輸出」；工具會再建立「翻譯結果」子目錄）
+/// B5d 審查 1：只算路徑、不建資料夾（選資料夾與改設定時是查詢，G1.36）；資料夾等開始翻譯時由
+/// ensure_result_layout 建。背景執行（遊戲資料夾可能在網路磁碟）。
 #[tauri::command]
-fn suggest_resourcepacks_dir(instance_path: String) -> Result<String, String> {
+async fn suggest_resourcepacks_dir(instance_path: String) -> Result<String, String> {
     // 保留舊 command 名以免前端炸掉；語意改為建議「結果根」
     let instance = normalize_path_strict(&instance_path)?;
-    if !instance.exists() {
-        return Err("找不到遊戲資料夾。".into());
-    }
-    let base = suggest_output_base(&instance)?;
-    Ok(base.display().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        if !instance.exists() {
+            return Err("找不到遊戲資料夾。".to_string());
+        }
+        Ok(engine::suggest_output_base_path(&instance).display().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// 「整合包旁『繁中翻譯輸出』」模式要用的路徑。
+/// 「模組整合包旁『繁中翻譯輸出』」模式要用的路徑（只回路徑，不建資料夾：選資料夾、改「翻譯結果放哪裡」
+/// 都會呼叫它，是查詢；資料夾等開始翻譯時由 ensure_result_layout 建，B5d 審查 1／G5d.20）。
 ///
 /// 這個指令一直存在，但**從來沒有被加進 `generate_handler!` 清單**——前端呼叫必定失敗、
 /// 被 `.catch(() => "")` 吞掉，於是設定裡那個選項按了等於沒按，一律靜默落回 AppData 管理模式。
 /// 漏註冊比漏寫更難發現，因為程式碼看起來完全正常；`npm run check:ui` 現在會擋這種漏接。
 #[tauri::command]
-fn suggest_output_dir(instance_path: String) -> Result<String, String> {
-    suggest_resourcepacks_dir(instance_path)
+async fn suggest_output_dir(instance_path: String) -> Result<String, String> {
+    suggest_resourcepacks_dir(instance_path).await
 }
 
 fn empty_report(mc: &str, keys_zh: usize, namespaces: usize, need_ai: usize) -> ScanReport {
@@ -5261,8 +5267,10 @@ mod local_cache_probe_tests {
         fs::create_dir_all(&mods).unwrap();
         fs::write(mods.join("totally-different-pack.jar"), vec![0u8; 9999]).unwrap();
 
-        let probe = probe_cache_at(&instance, &work);
-        assert!(probe.is_none(), "mods 換了應該視為不同整合包，不該回報已有翻譯");
+        // B5d：不再回 None（那會讓畫面像沒翻過），改回「有變動」；但仍不是可用的結果
+        let probe = probe_cache_at(&instance, &work).expect("同一個遊戲資料夾 mods 變了要照實回報");
+        assert_eq!(probe.status, "changed");
+        assert!(probe.mods_changed && !probe.matched && !probe.shareable && !probe.applyable, "{probe:?}");
         let _ = fs::remove_dir_all(work.parent().unwrap());
     }
 }
@@ -5578,7 +5586,7 @@ fn app_settings_path_cmd() -> String {
 }
 
 /// 這個遊戲資料夾寫得進去嗎？**選完資料夾就問**，不要等翻完三小時才失敗。
-#[tauri::command]
+#[tauri::command(async)]
 fn check_write_access_cmd(instance_path: String) -> serde_json::Value {
     let path = normalize_path(&instance_path);
     serde_json::to_value(engine::check_write_access(&path))
@@ -5628,7 +5636,7 @@ fn dev_mode_set_cmd(enabled: bool) -> Result<serde_json::Value, String> {
 
 /// 檢查選取的位置是不是一個可直接安裝的遊戲實例（找得到 minecraft 目錄）。
 /// 回 { ok, mcDir, hasResourcepacks }，讓前端決定要不要走「直接覆蓋安裝、不建資料夾」。
-#[tauri::command]
+#[tauri::command(async)]
 fn check_install_target(instance_path: String) -> serde_json::Value {
     match resolve_minecraft_dir(&PathBuf::from(&instance_path)) {
         Ok(mc) => {
@@ -5643,11 +5651,56 @@ fn check_install_target(instance_path: String) -> serde_json::Value {
     }
 }
 
-/// 嚴格驗證實例是否可開始翻譯（mods＋實例特徵）；選路徑與一鍵入口共用。
+/// 嚴格驗證遊戲資料夾是否可開始翻譯（mods＋遊戲資料夾特徵）；選資料夾與開始翻譯共用。
+/// B5d：背景執行並設上限（斷線的網路磁碟不卡畫面），逾時回「連不到這個資料夾」。
 #[tauri::command]
-fn validate_instance_cmd(instance_path: String) -> Result<InstanceValidation, String> {
+async fn validate_instance_cmd(instance_path: String) -> Result<InstanceValidation, String> {
     let path = normalize_user_path(&instance_path)?;
-    Ok(validate_instance_path(&path))
+    let network = engine::folder_check::is_network_path(&path);
+    let verdict = tauri::async_runtime::spawn_blocking(move || {
+        engine::folder_check::run_with_timeout(engine::folder_check::INSPECT_TIMEOUT, move || validate_instance_path(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(verdict.unwrap_or_else(|| InstanceValidation::unreachable(network)))
+}
+
+/// B5d 選資料夾就判定（瀏覽、手動輸入、上次共用）：驗證、資料夾形狀（選到 mods、啟動器清單、伺服器）、
+/// 寫入檢查。全部只讀（G1.36），背景執行並設上限；逾時回 reachable=false。
+#[tauri::command]
+async fn inspect_folder_cmd(instance_path: String) -> Result<engine::folder_check::FolderInspection, String> {
+    let path = normalize_user_path(&instance_path)?;
+    let job_path = path.clone();
+    let verdict = tauri::async_runtime::spawn_blocking(move || {
+        engine::folder_check::run_with_timeout(engine::folder_check::INSPECT_TIMEOUT, move || {
+            engine::folder_check::inspect_folder(&job_path)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(verdict.unwrap_or_else(|| engine::folder_check::unreachable_inspection(&path)))
+}
+
+/// B5d 選資料夾時的身分判斷（規格 S05–S07）：標記壞、紀錄壞、整份複製來的、原位置連不到。
+/// 只讀（不建 `.mcpl`、不認回、不改紀錄）；原位置檢查放背景、設上限。整體逾時回 unknown（照舊放行，套用前仍會檢查）。
+#[tauri::command]
+async fn inspect_instance_identity_cmd(instance_path: String) -> Result<engine::folder_identity::IdentityCheck, String> {
+    let path = normalize_user_path(&instance_path)?;
+    let verdict = tauri::async_runtime::spawn_blocking(move || {
+        engine::folder_check::run_with_timeout(engine::folder_check::INSPECT_TIMEOUT * 2, move || {
+            let mc = resolve_minecraft_dir(&path).unwrap_or(path);
+            engine::folder_identity::inspect_identity(&mc, engine::folder_check::INSPECT_TIMEOUT)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(verdict.unwrap_or_else(engine::folder_identity::IdentityCheck::unknown))
+}
+
+/// 瀏覽視窗沒有上次路徑時的起始位置：偵測到的常見啟動器資料夾（只讀；找不到回 null）。
+#[tauri::command(async)]
+fn common_launcher_dir_cmd() -> Option<String> {
+    engine::folder_check::common_launcher_dir().map(|p| p.display().to_string())
 }
 
 /// 把「翻譯結果」打包成單一 zip，供使用者手動分享整包翻譯檔。
@@ -5693,6 +5746,8 @@ struct LocalPackCacheProbe {
     /// ready＝可直接打開／套用／分享；partial＝有工作階段可補翻；none＝沒找到
     status: String,
     matched: bool,
+    /// B5d：同一個遊戲資料夾、但上次翻譯後 mods 變了（status＝"changed"）。這時不是「已有可用結果」。
+    mods_changed: bool,
     output_dir: String,
     work_root: String,
     session_path: Option<String>,
@@ -5743,6 +5798,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
     let shareable = has_shareable_content(&work) || has_shareable_content(output_dir);
     // 上一次到底有沒有跑完？沒跑完的計數一律不可信（見 gap_model 的說明）。
     let mut counts_fresh = false;
+    let mut mods_changed_here = false;
     let (matched, pending_count, session_path_str, updated_at_ms, keys_zh) =
         if let Some(ref sp) = session_path {
             match load_session(sp.parent().unwrap_or(&work)) {
@@ -5759,6 +5815,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
                         && live_fingerprint != 0
                         && session.mods_fingerprint != live_fingerprint;
                     let matched = path_matched && !mods_changed;
+                    mods_changed_here = path_matched && mods_changed;
                     counts_fresh = session.last_run_outcome.counts_are_trustworthy();
                     // 只算「補得動」的缺口：羅馬數字、圖示、單位、品牌名本來就
                     // 不該翻，算進去的話使用者永遠看到一個補不完的數字。
@@ -5784,6 +5841,26 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
         None
     };
 
+    // B5d：同一個遊戲資料夾、mods 變了 → 照實回「有變動」（舊版回 None，畫面看起來像沒翻過）。
+    // 這不是可用的結果：不可分享、不可直接套用，兩個消費端（開始翻譯的三選一、本機已有翻譯卡）都不當成已有結果。
+    if mods_changed_here {
+        return Some(LocalPackCacheProbe {
+            status: "changed".into(),
+            matched: false,
+            mods_changed: true,
+            output_dir: output_dir.display().to_string(),
+            work_root: work.display().to_string(),
+            session_path: session_path_str,
+            pending_count: 0,
+            completion_percent: None,
+            shareable: false,
+            applyable: false,
+            updated_at_ms,
+            message: "上次翻譯後模組整合包有變動，要重新翻譯。".into(),
+            pack_name,
+            canonical_zip,
+        });
+    }
     if !matched && !shareable {
         return None;
     }
@@ -5835,6 +5912,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
     Some(LocalPackCacheProbe {
         status: status.into(),
         matched,
+        mods_changed: false,
         output_dir: output_dir.display().to_string(),
         work_root: work.display().to_string(),
         session_path: session_path_str,
@@ -5850,7 +5928,7 @@ fn probe_cache_at(instance: &Path, output_dir: &Path) -> Option<LocalPackCachePr
 }
 
 /// 探測同整合包本機是否已有翻譯結果／工作階段，避免重開工具只為分享又重翻一次。
-#[tauri::command]
+#[tauri::command(async)]
 fn probe_local_pack_cache_cmd(
     instance_path: String,
     output_dir: Option<String>,
@@ -5888,7 +5966,9 @@ fn probe_local_pack_cache_cmd(
             push(&mut candidates, PathBuf::from(custom));
         }
     }
-    if let Ok(beside) = suggest_output_base(&instance) {
+    // 只算路徑不建資料夾（B5d：查詢零寫入，G1.36；舊版在遊戲資料夾建了空的「繁中翻譯輸出」）
+    let beside = engine::suggest_output_base_path(&instance);
+    if beside.is_dir() {
         push(&mut candidates, beside);
     }
 
@@ -5901,7 +5981,8 @@ fn probe_local_pack_cache_cmd(
                 (Some(prev), "ready") if prev.status == "ready" => {
                     probe.updated_at_ms.unwrap_or(0) > prev.updated_at_ms.unwrap_or(0)
                 }
-                (Some(prev), "partial") if prev.status == "none" => true,
+                // B5d 審查 4：「有變動」不是可用結果，後面可接續的 partial 要能取代它
+                (Some(prev), "partial") if prev.status == "none" || prev.status == "changed" => true,
                 (Some(prev), "partial") if prev.status == "partial" => {
                     probe.updated_at_ms.unwrap_or(0) > prev.updated_at_ms.unwrap_or(0)
                 }
@@ -5916,6 +5997,7 @@ fn probe_local_pack_cache_cmd(
     Ok(best.unwrap_or(LocalPackCacheProbe {
         status: "none".into(),
         matched: false,
+        mods_changed: false,
         output_dir: String::new(),
         work_root: String::new(),
         session_path: None,
@@ -6902,6 +6984,9 @@ pub fn run() {
         dev_mode_status_cmd,
         dev_mode_set_cmd,
         check_write_access_cmd,
+        inspect_folder_cmd,
+        inspect_instance_identity_cmd,
+        common_launcher_dir_cmd,
         relaunch_as_admin_cmd,
             check_install_target,
             validate_instance_cmd,
@@ -6979,3 +7064,7 @@ mod lib_b4_tests;
 #[cfg(test)]
 #[path = "lib_b5a2_tests.rs"]
 mod lib_b5a2_tests;
+
+#[cfg(test)]
+#[path = "lib_b5d_tests.rs"]
+mod lib_b5d_tests;

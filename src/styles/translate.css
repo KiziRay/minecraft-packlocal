@@ -285,19 +285,6 @@ textarea {
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--accent) 8%, var(--panel));
 }
-/*
-  接續提示：跟「本機已有翻譯」同一種卡片，但這是啟動時主動冒出來的，
-  用比較低調的中性底色，不要一開工具就搶走選資料夾的注意力。
-*/
-.resume-card {
-  border-color: var(--line);
-  background: color-mix(in srgb, var(--accent) 4%, var(--panel));
-}
-/* 寫不進去是「現在就得處理」，跟設定檔壞掉同一級的警示。 */
-.write-access-card {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
-  background: var(--danger-soft);
-}
 .local-cache-head {
   display: flex;
   align-items: center;

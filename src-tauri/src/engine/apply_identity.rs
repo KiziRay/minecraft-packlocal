@@ -208,7 +208,7 @@ pub fn check_recorded_location(mc: &Path, recorded: &str) -> Result<(), String> 
 }
 
 /// Ok(true)＝在；Ok(false)＝確定不在（所在的磁碟或上層資料夾連得到）；Err＝連不到、無法判斷。
-fn location_state(path: &Path) -> Result<bool, String> {
+pub(crate) fn location_state(path: &Path) -> Result<bool, String> {
     match fs::metadata(long_path(path)) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

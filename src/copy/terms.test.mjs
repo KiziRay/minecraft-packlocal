@@ -14,12 +14,12 @@ const indexHtml = read("../index.html");
 
 /**
  * 開始前畫面＝標題列、分頁、翻譯頁（整合包區、狀態卡、AI 區）與本包選項。
- * 排除別批負責的舊卡（B5d：接續卡、寫入權限卡；B5c：待套用卡、本機已有翻譯卡、整合包資訊卡），
- * 它們之後會併入狀態卡、文案由那兩批依詞表改。
+ * 排除別批負責的舊卡（B5c：待套用卡、本機已有翻譯卡、整合包資訊卡），之後會併入狀態卡、文案由 B5c 依詞表改。
+ * （B5d 的接續卡、寫入權限卡已刪，改由 D 區「上次」與狀態卡 S04 說，文案掃描見 flow/folder-state.test.mjs「詞表」。）
  */
 function startScreenHtml() {
   let page = sliceElement(indexHtml, '<div id="page-translate"');
-  for (const id of ["resume-card", "write-access-card", "apply-pending-card", "local-cache-card", "pack-meta-card"]) {
+  for (const id of ["apply-pending-card", "local-cache-card", "pack-meta-card"]) {
     page = withoutElement(page, `<section id="${id}"`);
   }
   return [
