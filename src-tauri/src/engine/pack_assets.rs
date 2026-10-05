@@ -32,9 +32,89 @@ pub fn move_into(from_root: &Path, to_root: &Path) -> Result<usize, String> {
     copy_tree(&from_root.join(PACK_ASSETS_DIR), &to_root.join(PACK_ASSETS_DIR))
 }
 
+/// 本輪書本輸出的暫存換新（審查 4）。
+///
+/// 整輪翻譯開頭把上一輪的 `pack-assets` 改名成 `pack-assets.old`，三個產出者（JAR 書本、覆寫文字、
+/// 資料包 ZIP）把新書頁寫進新的 `pack-assets`。結束時：
+/// - 失敗、停止、AI 不可用、任何提早離開（含 panic）：舊書頁全部併回（新的優先）——不丟已翻的書頁；
+/// - 三個產出者都完整跑完：舊書頁只留「產出清單上仍有效」的（來源還在、只是這輪沒重做，照 G3.26 不退休），
+///   清單上沒有的（來源已被拿掉、舊版沒記的）才真的丟掉。
+/// 建包（`copy_into_pack`）在換新期間會把舊書頁當底、新的蓋上去，中途建出的 zip 也不會少書。
+pub struct Swap {
+    work: PathBuf,
+    done: bool,
+}
+
+const OLD_DIR: &str = "pack-assets.old";
+
+fn merge_missing(from: &Path, to: &Path, keep: &dyn Fn(&Path) -> bool) -> Result<(), String> {
+    if !from.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(from).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(from) else { continue };
+        let target = to.join(rel);
+        if target.exists() || !keep(rel) {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::copy(entry.path(), &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    }
+    Ok(())
+}
+
+impl Swap {
+    /// 把上一輪的書本輸出移到旁邊。上次當機留下的舊份先併回。資料夾不存在不算錯。
+    pub fn begin(work_root: &Path) -> Result<Swap, String> {
+        let cur = work_root.join(PACK_ASSETS_DIR);
+        let old = work_root.join(OLD_DIR);
+        if old.is_dir() {
+            merge_missing(&old, &cur, &|_| true)?;
+            fs::remove_dir_all(&old).map_err(|e| e.to_string())?;
+        }
+        if cur.is_dir() {
+            fs::rename(&cur, &old).map_err(|e| format!("無法暫存上一輪的書本輸出：{e}"))?;
+        }
+        Ok(Swap { work: work_root.to_path_buf(), done: false })
+    }
+
+    /// `success`＝三個產出者都完整跑完；`keep(相對 pack-assets 的路徑)`＝成功時哪些舊書頁仍有效。
+    pub fn finish(mut self, success: bool, keep: &dyn Fn(&Path) -> bool) {
+        self.done = true;
+        self.settle(success, keep);
+    }
+
+    fn settle(&self, success: bool, keep: &dyn Fn(&Path) -> bool) {
+        let old = self.work.join(OLD_DIR);
+        let result = merge_missing(&old, &self.work.join(PACK_ASSETS_DIR), &|rel| !success || keep(rel));
+        match result {
+            // 併回失敗就留著舊份（下一輪開頭會再併回），不刪
+            Err(e) => crate::dev_log!("translate", "書本輸出併回失敗，舊書頁留在 {OLD_DIR}：{e}"),
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&old);
+            }
+        }
+    }
+}
+
+impl Drop for Swap {
+    fn drop(&mut self) {
+        if !self.done {
+            self.settle(false, &|_| true);
+        }
+    }
+}
+
 /// 建主資源包時呼叫：`work_root/pack-assets/assets` → `pack_dir/assets`。回傳複製的檔數。
 pub fn copy_into_pack(work_root: &Path, pack_dir: &Path) -> Result<usize, String> {
-    copy_tree(&work_root.join(PACK_ASSETS_DIR).join("assets"), &pack_dir.join("assets"))
+    // 本輪書本輸出換新期間（Swap），上一輪的舊書頁當底、新的蓋上去
+    let old = copy_tree(&work_root.join(OLD_DIR).join("assets"), &pack_dir.join("assets"))?;
+    Ok(old + copy_tree(&work_root.join(PACK_ASSETS_DIR).join("assets"), &pack_dir.join("assets"))?)
 }
 
 fn copy_tree(src: &Path, dest: &Path) -> Result<usize, String> {

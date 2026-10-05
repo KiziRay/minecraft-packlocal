@@ -108,8 +108,37 @@ fn read_jar_zh_tw(jar: &Path) -> Vec<(String, HashMap<String, String>)> {
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return out;
     };
+    read_archive_zh_tw(&mut archive, true, &mut out);
+    out
+}
+
+/// B6a-2：子 JAR（`META-INF/jars/*.jar`，只遞迴一層）自帶的 zh_tw 也算模組自帶——
+/// 翻譯時它們照樣被讀進來（B3#4），不抄進資源包，之後子模組更新翻譯才不會被舊副本蓋掉。
+fn read_archive_zh_tw<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    descend: bool,
+    out: &mut Vec<(String, HashMap<String, String>)>,
+) {
+    const MAX_NESTED_JAR_BYTES: u64 = 64 * 1024 * 1024;
     let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
     for name in names {
+        let lower = name.to_ascii_lowercase();
+        if descend && lower.starts_with("meta-inf/jars/") && lower.ends_with(".jar") {
+            let Ok(entry) = archive.by_name(&name) else {
+                continue;
+            };
+            if entry.size() > MAX_NESTED_JAR_BYTES {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if entry.take(MAX_NESTED_JAR_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_NESTED_JAR_BYTES {
+                continue;
+            }
+            if let Ok(mut inner) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+                read_archive_zh_tw(&mut inner, false, out);
+            }
+            continue;
+        }
         let parts: Vec<&str> = name.split('/').collect();
         if parts.len() != 4 || parts[0] != "assets" || parts[2] != "lang" || parts[3] != "zh_tw.json" {
             continue;
@@ -126,7 +155,6 @@ fn read_jar_zh_tw(jar: &Path) -> Vec<(String, HashMap<String, String>)> {
             out.push((parts[1].to_string(), map));
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -229,6 +257,24 @@ mod tests {
         let map = collect_mod_zh_tw(&root);
         assert_eq!(map["a"].get("item.a").map(String::as_str), Some("甲"));
         assert!(!map["a"].contains_key("shared"), "兩個 JAR 內容不同的條目不算模組自帶");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b6a2_nested_jar_zh_tw_counts_as_mod_bundled() {
+        let root = std::env::temp_dir().join(format!("mcpl-native-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("mods")).unwrap();
+        let inner = root.join("inner.jar");
+        write_jar(&inner, &[("assets/lib/lang/zh_tw.json", r#"{"lib.key":"子模組自帶"}"#)]);
+        let bytes = fs::read(&inner).unwrap();
+        let outer = fs::File::create(root.join("mods/outer.jar")).unwrap();
+        let mut zip = zip::ZipWriter::new(outer);
+        zip.start_file("META-INF/jars/lib-1.0.jar", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+        let map = collect_mod_zh_tw(&root);
+        assert_eq!(map["lib"].get("lib.key").map(String::as_str), Some("子模組自帶"));
         let _ = fs::remove_dir_all(root);
     }
 }

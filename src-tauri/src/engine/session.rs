@@ -594,13 +594,21 @@ pub fn discover_prior_zh_sources(
         }
     }
 
+    // B6a-2：遊戲裡的舊翻譯包只認「確認屬於這個整合包」的（旁邊的 .meta.json 指紋與目前 mods/ 相符）。
+    // 同一個遊戲資料夾換過整合包、或整合包更新後，resourcepacks 裡同名的舊包不得混進來；
+    // 無法確認（沒有標記、讀不到 mods/）一律不接續。工具資料夾裡的結果（上面）是這個整合包自己的，不受影響。
     if let Ok(mc) = super::jar_scan::resolve_minecraft_dir(instance) {
         let rp_game = mc.join("resourcepacks");
-        push(rp_game.join("繁體中文翻譯.zip"));
-        push(rp_game.join("繁體中文翻譯"));
-        push(rp_game.join(format!("{pack_name}.zip")));
-        push(rp_game.join(pack_name));
-        collect_tool_packs_in_dir(&rp_game, pack_version, &mut push);
+        let mut push_game = |path: PathBuf| {
+            if existing_pack_matches_current_mods(&mc, &path, instance) {
+                push(path);
+            }
+        };
+        push_game(rp_game.join("繁體中文翻譯.zip"));
+        push_game(rp_game.join("繁體中文翻譯"));
+        push_game(rp_game.join(format!("{pack_name}.zip")));
+        push_game(rp_game.join(pack_name));
+        collect_tool_packs_in_dir(&rp_game, pack_version, &mut push_game);
     }
 
     // 精確當前名優先（mtime 加成），其餘依 mtime 新→舊
@@ -615,6 +623,41 @@ pub fn discover_prior_zh_sources(
         }
     });
     ranked.into_iter().map(|(_, p)| p).collect()
+}
+
+/// 遊戲內既有的翻譯 zip／資料夾是不是這個整合包產生的。
+///
+/// 判準：`{pack}.meta.json`（跟 zip／資料夾同層、由 apply_instance 套用時寫入）裡的
+/// `modsFingerprint` 是否等於目前這個實例的 `mods_fingerprint`。任何一邊拿不到指紋
+/// （沒有標記檔、標記檔壞掉、或現在讀不到 `mods/`）一律回 false——誤合併會把不相干整合包的
+/// 翻譯混進來，錯誤代價比少合併一次大得多。
+pub fn existing_pack_matches_current_mods(mc: &Path, pack_path: &Path, instance: &Path) -> bool {
+    // 只去掉最後的 .zip；資料夾名稱裡的點（MyPack-1.0）屬於名稱本身
+    let name = pack_path.file_name().and_then(|s| s.to_str()).unwrap_or("繁體中文翻譯");
+    let stem = if name.len() > 4 && name.get(name.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".zip")) {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    let meta_path = mc.join("resourcepacks").join(format!("{stem}.meta.json"));
+    let Ok(text) = fs::read_to_string(&meta_path) else {
+        crate::dev_log!("scan", "略過遊戲裡的舊翻譯包 {name}：沒有 {stem}.meta.json，無法確認屬於這個整合包");
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+        crate::dev_log!("scan", "略過遊戲裡的舊翻譯包 {name}：{stem}.meta.json 讀不懂，無法確認屬於這個整合包");
+        return false;
+    };
+    let Some(recorded) = meta.get("modsFingerprint").and_then(|v| v.as_u64()).filter(|r| *r != 0) else {
+        crate::dev_log!("scan", "略過遊戲裡的舊翻譯包 {name}：標記檔沒有模組指紋，無法確認屬於這個整合包");
+        return false;
+    };
+    let live = mods_fingerprint(instance);
+    if live == 0 || live != recorded {
+        crate::dev_log!("scan", "略過遊戲裡的舊翻譯包 {name}：模組指紋與目前不符（整合包更新過或屬於別的整合包），不接續");
+        return false;
+    }
+    true
 }
 
 fn path_matches_pack_name(path: &Path, pack_name: &str) -> bool {

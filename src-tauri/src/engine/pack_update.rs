@@ -137,6 +137,8 @@ pub struct UpdateView {
     pub sentences: usize,
     /// 任務等文字來源改了幾處（翻譯之後來源檔變了、產出者還沒重跑過）
     pub texts_changed: usize,
+    /// 來源已變、但因完整度設定這一輪沒打算翻的項目數（不算「整合包已更新」，只提醒）
+    pub skipped_changed: usize,
     pub mc_before: Option<String>,
     pub mc_now: Option<String>,
     /// Minecraft 版本變了（兩邊都有記錄且不同）
@@ -163,7 +165,8 @@ pub fn inspect(session: &TranslateSession, instance: &Path, work: &Path) -> Upda
     let mc_changed = matches!((&mc_before, &mc_now), (Some(a), Some(b)) if !same_version(a, b));
     let mc = resolve_minecraft_dir(instance).unwrap_or_else(|_| instance.to_path_buf());
     let texts_changed = super::text_sources::count_changed_sources(work, &mc);
-    let mut view = UpdateView { mods_changed, texts_changed, mc_before, mc_now, mc_changed, ..Default::default() };
+    let skipped_changed = super::text_sources::count_skipped_changed_sources(work, &mc);
+    let mut view = UpdateView { mods_changed, texts_changed, skipped_changed, mc_before, mc_now, mc_changed, ..Default::default() };
     if mods_changed && !basis.source_hashes.is_empty() && !basis.mod_files.is_empty() {
         let (new_mods, updated_mods, sentences) = changed_sentences(&mc, Some(work), basis);
         view.counts_known = true;

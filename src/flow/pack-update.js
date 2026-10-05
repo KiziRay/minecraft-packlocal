@@ -58,6 +58,10 @@ export function packUpdateState(input) {
     showAiRow: true,
     showVersionRow: false,
   };
+  // B6a-2：因完整度設定這一輪沒翻、來源已變的項目至少提醒件數
+  const skippedLine = count(u.skippedChanged)
+    ? [`有 ${fmt(u.skippedChanged)} 項因完整度設定未翻、來源已變`]
+    : [];
   if (u.mcChanged && u.mcBefore && u.mcNow) {
     return {
       ...base,
@@ -76,6 +80,7 @@ export function packUpdateState(input) {
     sentence: updateSentence(name, u),
     disclosureKey: "packChanged",
     extraLine: shown("packChanged") ? updateExtraLine(u) : "",
+    detailLines: skippedLine,
     primary: { action: PACK_UPDATE_ACTION.updatePart, label: "翻譯更新的部分" },
     more: [{ action: "delete-and-restart", label: "刪除結果並重翻", danger: true }],
     // R-8：直接開跑，只帶 AI 列（同 S14 接續補完）

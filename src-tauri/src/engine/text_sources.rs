@@ -41,17 +41,28 @@ pub struct TextSource {
     /// 含不上傳的私有字串（伺服器腳本、.tell 類）：分享包也不帶（審查 F6）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private: bool,
+    /// B6a-2：同一個產出由多個來源檔共同決定時，其餘來源（遊戲相對路徑＋原檔指紋）。
+    /// 例：兩個模組 JAR 的書本放進同一個命名空間；任一個改了都算來源變了。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<AlsoSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlsoSource {
+    pub source: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Manifest {
+pub(super) struct Manifest {
     /// 已確認的產出（翻譯結果相對路徑 → 來源）
     #[serde(default)]
-    entries: BTreeMap<String, TextSource>,
+    pub(super) entries: BTreeMap<String, TextSource>,
     /// 進行中、還沒 commit 的暫存（產出者 → 條目）
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pending: BTreeMap<String, BTreeMap<String, TextSource>>,
+    pub(super) pending: BTreeMap<String, BTreeMap<String, TextSource>>,
     /// 退休候選（產出者本輪完成、當時確認來源已不在遊戲）：翻譯結果相對路徑 → 原條目（含來源路徑）。
     /// 套用時還要再確認一次來源仍不在（審查第三輪 2）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -63,12 +74,16 @@ struct Manifest {
     /// 來源改了、但這一版已經處理過（沒有可翻的字所以沒有新產出）→ 不再算「要翻」。舊資料沒有這欄＝照舊行為。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     processed: BTreeMap<String, BTreeMap<String, String>>,
+    /// B6a-2：最近一次整輪翻譯因完整度（tier）略過的產出者。它們的來源改了也不算「整合包已更新」
+    /// （這一輪本來就沒打算翻它們，S15 不該一直掛著）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub(super) skipped: std::collections::BTreeSet<String>,
     /// 產出清單屬於哪個遊戲資料夾（路徑鍵）；套到別的遊戲資料夾時不做任何退休
     #[serde(default, skip_serializing_if = "String::is_empty")]
     game_key: String,
     /// 遊戲資料夾位置（分享包取遊戲原包的 pack.mcmeta 用）
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    game_root: String,
+    pub(super) game_root: String,
     /// 第二輪格式的退休名單（只有路徑、沒有來源）：讀進來轉成 `retiring`，不再寫出
     #[serde(default, skip_serializing)]
     retire: BTreeMap<String, Vec<String>>,
@@ -127,7 +142,7 @@ fn path_of(work: &Path) -> PathBuf {
     work.join(SOURCES_FILE)
 }
 
-fn key_of(work: &Path, output: &Path) -> String {
+pub(super) fn key_of(work: &Path, output: &Path) -> String {
     output.strip_prefix(work).unwrap_or(output).to_string_lossy().replace('\\', "/")
 }
 
@@ -154,6 +169,7 @@ fn read(work: &Path) -> Result<Manifest, String> {
             output_sha256: String::new(),
             producer: String::new(),
             private: false,
+            also: Vec::new(),
         });
     }
     Ok(manifest)
@@ -167,7 +183,7 @@ fn save(work: &Path, manifest: &Manifest) -> Result<(), String> {
 }
 
 /// 讀 → 改 → 有變才寫。讀失敗就不改、不寫，回錯誤。
-fn with_manifest<R>(work: &Path, f: impl FnOnce(&mut Manifest) -> R) -> Result<R, String> {
+pub(super) fn with_manifest<R>(work: &Path, f: impl FnOnce(&mut Manifest) -> R) -> Result<R, String> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read(work)?;
     let before = serde_json::to_string(&manifest).unwrap_or_default();
@@ -276,6 +292,7 @@ pub fn record(work: &Path, output: &Path, mc: &Path, game_source: &Path, read_so
         output_sha256,
         producer: producer.to_string(),
         private: false,
+        also: Vec::new(),
     };
     let key = key_of(work, output);
     let result = with_manifest(work, |m| {
@@ -415,6 +432,16 @@ pub fn drop_unconfirmed(work: &Path, mc: &Path, plan: &mut ApplyPlan, record: &A
 /// B6a-1（唯讀）：翻譯之後來源檔確定被改過的有幾個（任務、腳本等；不在、讀不到的不算）。
 /// 清單屬於別的遊戲資料夾、讀不到清單都回 0（無法確認＝不判已更新）。
 pub fn count_changed_sources(work: &Path, mc: &Path) -> usize {
+    count_changed(work, mc, false)
+}
+
+/// 審查 6（唯讀）：來源已變、但因完整度設定（tier）這一輪沒打算翻的產出者有幾項。不算「整合包已更新」，
+/// 只讓 S15 詳細行提醒「有 N 項因完整度設定未翻、來源已變」。
+pub fn count_skipped_changed_sources(work: &Path, mc: &Path) -> usize {
+    count_changed(work, mc, true)
+}
+
+fn count_changed(work: &Path, mc: &Path, skipped_producers: bool) -> usize {
     let Ok(manifest) = read(work) else { return 0 };
     if manifest.entries.is_empty() || (!manifest.game_key.is_empty() && manifest.game_key != game_key(mc)) {
         return 0;
@@ -432,6 +459,9 @@ pub fn count_changed_sources(work: &Path, mc: &Path) -> usize {
     manifest
         .entries
         .values()
+        .filter(|s| manifest.skipped.contains(&s.producer) == skipped_producers)
+        // B6a-2：模組檔當來源的書本——模組換新版由 mods 指紋偵測（S15 的「更新 N 個模組」），不算任務文字
+        .filter(|s| !s.source.starts_with("mods/"))
         .filter(|s| seen.insert(s.source.clone()))
         .filter(|s| source_state(mc, &s.source) == SourceState::Present && !source_unchanged(mc, s, &empty, &index))
         .filter(|s| !processed_after_change(s))
@@ -440,15 +470,58 @@ pub fn count_changed_sources(work: &Path, mc: &Path) -> usize {
 
 /// 來源還是翻譯當時那份原檔（審查 F-c：與 ToolIndex 同一套判斷）：
 /// 遊戲裡就是它；或遊戲裡是工具版本（標記、套用紀錄、1.0.x 舊版清單），而它對應的原檔就是它。
-fn source_unchanged(mc: &Path, source: &TextSource, record: &ApplyRecord, index: &super::tool_products::ToolIndex) -> bool {
-    let game = mc.join(&source.source);
+pub(super) fn source_unchanged(mc: &Path, source: &TextSource, record: &ApplyRecord, index: &super::tool_products::ToolIndex) -> bool {
+    file_unchanged(mc, &source.source, &source.sha256, record, index)
+        && source.also.iter().all(|a| file_unchanged(mc, &a.source, &a.sha256, record, index))
+}
+
+fn file_unchanged(mc: &Path, rel: &str, sha256: &str, record: &ApplyRecord, index: &super::tool_products::ToolIndex) -> bool {
+    let game = mc.join(rel);
     let current = apply_record::file_sha256(&game);
-    if current.as_deref() == Some(source.sha256.as_str()) {
+    if current.as_deref() == Some(sha256) {
         return true;
     }
     let tool_version = index.classify(&game) == super::tool_products::Provenance::Tool
-        || record.is_tool_version(&source.source, current.as_deref());
-    tool_version && index.original_sha(&game).as_deref() == Some(source.sha256.as_str())
+        || record.is_tool_version(rel, current.as_deref());
+    tool_version && index.original_sha(&game).as_deref() == Some(sha256)
+}
+
+/// B6a-2：已確認的產出清單（翻譯結果相對路徑 → 來源）；讀不到回 None。
+pub(super) fn entries_for(work: &Path) -> Option<BTreeMap<String, TextSource>> {
+    read(work).ok().map(|m| m.entries)
+}
+
+/// 退休候選（含原條目的來源）；讀不到清單回 None。書本套用前檢查用：失敗輪併回的舊書頁可能只剩這裡有紀錄。
+pub(super) fn retiring_for(work: &Path) -> Option<BTreeMap<String, TextSource>> {
+    read(work).ok().map(|m| m.retiring)
+}
+
+/// 已確認的產出路徑（翻譯結果相對路徑）；讀不到清單回空。
+pub fn confirmed_outputs(work: &Path) -> HashSet<String> {
+    entries_for(work).map(|e| e.into_keys().collect()).unwrap_or_default()
+}
+
+/// 審查 4：整輪翻譯開頭忘掉這幾個產出者「最近一次完整跑完」的時間，跑完後用 [`committed_all`] 判斷這輪是不是真的都跑完。
+pub fn reset_rounds(work: &Path, producers: &[&str]) {
+    let result = with_manifest(work, |m| {
+        for p in producers {
+            m.rounds.remove(*p);
+        }
+    });
+    log_err("產出清單", result);
+}
+
+/// 這幾個產出者在 [`reset_rounds`] 之後是不是都完整跑完（commit；部分完成的 confirm_partial 不算）。清單讀不到＝否。
+pub fn committed_all(work: &Path, producers: &[&str]) -> bool {
+    read(work).is_ok_and(|m| producers.iter().all(|p| m.rounds.contains_key(*p)))
+}
+
+/// B6a-2：這一輪整輪翻譯因完整度略過了哪些產出者（取代上一輪的紀錄）。清單讀不到就不記。
+pub fn set_skipped_producers(work: &Path, skipped: &[&str]) {
+    let result = with_manifest(work, |m| {
+        m.skipped = skipped.iter().map(|s| s.to_string()).collect();
+    });
+    log_err("產出清單", result);
 }
 
 #[cfg(test)]

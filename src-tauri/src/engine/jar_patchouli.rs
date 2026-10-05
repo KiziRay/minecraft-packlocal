@@ -32,6 +32,8 @@ pub struct JarPatchouliReport {
 struct ExtractedJar {
     jar_key: String,
     source_jar: PathBuf,
+    /// 實際讀的檔（原檔或原檔備份）
+    read_path: PathBuf,
     entries_scanned: usize,
 }
 
@@ -47,6 +49,8 @@ where
 {
     let mc = resolve_minecraft_dir(instance_or_mc)?;
     let mods = mc.join("mods");
+    // B6a-2：本輪產出清單（assets 書本放進主資源包，記來源 JAR 的指紋）。沒有模組或沒有書也算「完整跑完」
+    super::text_sources::begin(work_root, "jar_patchouli");
     let jars = list_jars(&mods);
     let mut report = JarPatchouliReport {
         jars_scanned: jars.len(),
@@ -54,6 +58,7 @@ where
     };
     if jars.is_empty() {
         report.note = "JAR 內 Patchouli：沒有找到模組 JAR".into();
+        super::text_sources::commit(work_root, "jar_patchouli", &mc);
         return Ok(report);
     }
 
@@ -77,6 +82,7 @@ where
         match extract_patchouli(&read.path, &stage_root, read.keep_zh_tw_only.is_some()) {
             Ok(Some(mut item)) => {
                 item.source_jar = jar.clone();
+                item.read_path = read.path.clone();
                 report.books_found += item.entries_scanned;
                 extracted.push(item);
             }
@@ -86,6 +92,7 @@ where
     }
     if extracted.is_empty() {
         report.note = "JAR 內 Patchouli：沒有找到 data/*/patchouli_books 文字頁面".into();
+        super::text_sources::commit(work_root, "jar_patchouli", &mc);
         return Ok(report);
     }
 
@@ -95,6 +102,19 @@ where
     report.strings_translated = overlay.strings_translated;
     // B3#5：assets/ 底下的書本 zh_tw 放進主資源包（不改寫模組 JAR）；data/ 書本仍需重建 JAR
     report.files_written += super::pack_assets::move_into(&translated_root, work_root)?;
+    {
+        let providers = |rel: &Path| -> Vec<(PathBuf, PathBuf)> {
+            // pack-assets/assets/<ns>/…：提供這個命名空間書本的 JAR 全部算來源（任一個換了都算變了）
+            let ns = rel.components().nth(1).map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
+            extracted
+                .iter()
+                .filter(|item| stage_root.join("resourcepacks").join(&item.jar_key).join("assets").join(&ns).is_dir())
+                .map(|item| (item.source_jar.clone(), item.read_path.clone()))
+                .collect()
+        };
+        super::pack_books::record_pack_assets(work_root, &translated_root, &mc, "jar_patchouli", &providers);
+        super::text_sources::commit(work_root, "jar_patchouli", &mc);
+    }
 
     for (index, item) in extracted.iter().enumerate() {
         cancel::check()?;
@@ -238,6 +258,7 @@ fn extract_patchouli(source_jar: &Path, stage_root: &Path, drop_zh_tw: bool) -> 
     Ok(Some(ExtractedJar {
         jar_key: key,
         source_jar: source_jar.to_path_buf(),
+        read_path: source_jar.to_path_buf(),
         entries_scanned,
     }))
 }

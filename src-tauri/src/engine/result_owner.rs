@@ -95,10 +95,12 @@ pub fn latest_applied(instance: &Path, work: &Path) -> Option<bool> {
         return None;
     }
     let record = super::apply_record::load(&mc).ok()?;
-    let applied = record
-        .files
-        .iter()
-        .any(|(rel, file)| rel.starts_with("resourcepacks/") && zips.contains(&file.sha256));
+    // 套用前有書頁來源已變時，遊戲裡放的是過濾副本（指紋不同）：認它對應的原 zip
+    let applied = record.files.iter().any(|(rel, file)| {
+        rel.starts_with("resourcepacks/")
+            && (zips.contains(&file.sha256)
+                || super::pack_books::original_of_filtered(work, &file.sha256).is_some_and(|orig| zips.contains(&orig)))
+    });
     Some(applied)
 }
 

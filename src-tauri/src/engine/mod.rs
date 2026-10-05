@@ -64,7 +64,7 @@ mod jar_origins;
 mod jar_patchouli;
 mod jar_translate;
 mod jar_sources;
-mod text_sources;
+pub mod text_sources;
 mod lenient_json;
 pub mod local_llm;
 mod local_quality;
@@ -80,7 +80,10 @@ mod out_layout;
 pub mod paths;
 mod pack_version;
 mod pack_out;
-mod pack_assets;
+pub mod pack_assets;
+mod pack_books;
+#[cfg(test)]
+mod b6a2_misc_tests;
 mod markdown_text;
 mod placeholder;
 mod placeholder_fix;
@@ -234,6 +237,7 @@ pub use security::{
 pub use share_pack::{has_shareable_content, package_translation};
 pub use share_upload::{upload_share_package, ShareUploadResult};
 pub use session::{
+    existing_pack_matches_current_mods,
     count_map, discover_prior_zh_sources, filter_local_untranslatable, find_pack_near,
     find_session_file, find_sibling_instances_with_same_mods, has_session_file,
     is_tool_resource_pack, load_pack_zh, load_session,

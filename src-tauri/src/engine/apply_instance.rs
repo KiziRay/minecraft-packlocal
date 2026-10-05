@@ -465,7 +465,9 @@ pub fn apply_to_instance_with_game_state(
     // 審查 F-b：stale、outdated 只列出、維持遊戲現狀（它們不在退休名單上，退休只收
     // text_sources 確認「產出者跑完、來源已不在」的檔）
     // 審查 F1：只放「確認過的產出、內容未動、來源未變」的文字檔
-    let dropped_texts = super::text_sources::drop_unconfirmed(work, &mc, &mut plan, &knowledge.record);
+    let mut dropped_texts = super::text_sources::drop_unconfirmed(work, &mc, &mut plan, &knowledge.record);
+    // B6a-2：主資源包裡的書頁同樣只放「來源還是翻譯當時那份」的（拿掉的列入 outdatedTexts，原 zip 不動）
+    let _filtered_copy = super::pack_books::filter_main_pack(work, &mc, &mut plan, &knowledge.record, &mut dropped_texts)?;
 
     // ── 2a. 逐檔判斷「原本是什麼」──
     let mut decisions = Vec::new();
@@ -1281,3 +1283,7 @@ mod b3_tests;
 #[cfg(test)]
 #[path = "apply_instance_b6a1_tests.rs"]
 mod b6a1_tests;
+
+#[cfg(test)]
+#[path = "apply_instance_b6a2_tests.rs"]
+mod b6a2_tests;

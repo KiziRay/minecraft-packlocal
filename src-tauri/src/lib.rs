@@ -1188,6 +1188,21 @@ fn run_extra_sources(
     span: u8,
 ) -> ExtraSourceSummary {
     let (tasks, skipped) = extra_source_tasks(sources, base, span);
+    // B6a-2：這一輪因完整度略過的產出者（它們的來源改了不算「整合包已更新」）
+    {
+        let flags: [(&str, bool); 8] = [
+            ("ftbquests", sources.ftbquests),
+            ("overlay", sources.text_overlay),
+            ("minemenu", sources.text_overlay),
+            ("archive", sources.archive_overlay),
+            ("origins", sources.origins),
+            ("quests_books", sources.quests_books),
+            ("scripts", sources.script_literals),
+            ("jar_patchouli", sources.jar_patchouli),
+        ];
+        let off: Vec<&str> = flags.iter().filter(|(_, on)| !on).map(|(name, _)| *name).collect();
+        engine::text_sources::set_skipped_producers(work, &off);
+    }
     let mut summary = ExtraSourceSummary {
         skipped,
         ..Default::default()
@@ -1841,27 +1856,7 @@ fn resolve_translation_mode(override_mode: Option<&str>, session_mode: &str) -> 
 /// 的「0 一律不擋」刻意相反，因為誤合併會把不相干整合包的翻譯內容混進來，
 /// 錯誤代價比保守略過大得多。
 fn existing_pack_matches_current_mods(mc: &Path, pack_path: &Path, instance: &Path) -> bool {
-    let stem = pack_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("繁體中文翻譯");
-    let meta_path = mc
-        .join("resourcepacks")
-        .join(format!("{stem}.meta.json"));
-    let Ok(text) = fs::read_to_string(&meta_path) else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    let Some(recorded) = meta.get("modsFingerprint").and_then(|v| v.as_u64()) else {
-        return false;
-    };
-    if recorded == 0 {
-        return false;
-    }
-    let live = engine::mods_fingerprint(instance);
-    live != 0 && live == recorded
+    engine::existing_pack_matches_current_mods(mc, pack_path, instance)
 }
 
 /// B4：使用者按了停止——**不丟已翻部分**：把取消旗標收下（之後的寫檔、套用不會被它打斷），
@@ -2653,6 +2648,22 @@ fn run_one_click(
         "正在建立翻譯檔與資源包…",
     );
     dev_progress::enter("pack_out");
+    // B6a-2／審查 4：書本（主資源包的 pack-assets）每輪重做。三個產出者都會跑時，先把上一輪的書頁移到旁邊，
+    // 新書頁寫進新資料夾；跑完才換掉，失敗、停止、AI 不可用時舊書頁一頁不丟（Swap 離開時自動併回）。
+    const BOOK_PRODUCERS: [&str; 3] = ["jar_patchouli", "overlay", "archive"];
+    let mut book_swap = if !user_stopped && sources.jar_patchouli && sources.text_overlay && sources.archive_overlay {
+        engine::text_sources::reset_rounds(&work, &BOOK_PRODUCERS);
+        match engine::pack_assets::Swap::begin(&work) {
+            Ok(swap) => Some(swap),
+            Err(e) => {
+                emit_warn(&app, &format!("無法暫存上一輪的書本輸出，這輪不重做書本清理（不影響翻譯）：{e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let book_round = book_swap.is_some();
     let jar_translation = rewrite_jars_and_log(&app, &instance, &work, &zh, &en_only)?;
     let jar_patchouli_note = if user_stopped {
         "已停止：JAR 內 Patchouli 這一輪不處理（接續補完時再做）".to_string()
@@ -2768,6 +2779,11 @@ fn run_one_click(
     if extra_summary.cancelled || is_cancelled() {
         // B4：額外來源途中按停止：已寫出的保留，接著寫出主資源包並裝進遊戲
         begin_user_stop_finalize(app, &mut user_stopped);
+    }
+    if let Some(swap) = book_swap.take() {
+        let finished = !user_stopped && !extra_summary.cancelled && engine::text_sources::committed_all(&work, &BOOK_PRODUCERS);
+        let valid = engine::text_sources::confirmed_outputs(&work);
+        swap.finish(finished, &|rel| valid.contains(&format!("pack-assets/{}", rel.to_string_lossy().replace('\\', "/"))));
     }
     for note in &extra_summary.skipped {
         skipped_by_tier.push(note.clone());
@@ -3072,7 +3088,7 @@ fn run_one_click(
     );
 
     // 步驟 4 後重建 zip（含補充寫入）
-    if rem_n > 0 || supplement_filled > 0 {
+    if rem_n > 0 || supplement_filled > 0 || book_round {
         built = engine::build_resource_pack_skipping_bundled(
             &zh,
             &BuildOptions {

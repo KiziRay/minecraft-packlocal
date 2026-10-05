@@ -253,6 +253,10 @@ fn process_archive(
     }
     // B3#5：ZIP 裡 assets 類書本的 zh_tw 放進主資源包
     super::pack_assets::move_into(&translated_root, work_root)?;
+    // B6a-2：這個 ZIP 產生的書本也要記來源指紋（整合包更新換掉 ZIP 後，舊書頁不再放進遊戲）
+    super::pack_books::record_pack_assets(work_root, &translated_root, mc, "archive", &|_| {
+        vec![(archive_path.to_path_buf(), read_path.to_path_buf())]
+    });
 
     let relative_text = relative.to_string_lossy().replace('\\', "/");
     let output_path = archive_output_path(work_root, &relative_text, archive_path);
